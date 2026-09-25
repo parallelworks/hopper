@@ -1,0 +1,72 @@
+package hopper
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/parallelworks/hopper/driver"
+)
+
+// notifier sends insert notifications for jobs inserted outside a caller's
+// transaction, coalesced so that a client sends at most one notification per
+// queue per interval however many jobs it inserts. It fires on the trailing
+// edge, after the inserts of the window have committed, so a notified worker
+// always finds the jobs.
+//
+// Inserts inside a caller's transaction notify from within the transaction
+// instead, since only Postgres knows when it commits.
+type notifier struct {
+	exec     driver.Executor
+	logger   *slog.Logger
+	interval time.Duration
+
+	mu      sync.Mutex
+	pending map[string]struct{}
+	timer   *time.Timer
+}
+
+func newNotifier(exec driver.Executor, logger *slog.Logger, interval time.Duration) *notifier {
+	return &notifier{exec: exec, logger: logger, interval: interval, pending: map[string]struct{}{}}
+}
+
+// mark schedules a notification for queue.
+func (n *notifier) mark(queue string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.pending[queue] = struct{}{}
+	if n.timer == nil {
+		n.timer = time.AfterFunc(n.interval, n.flush)
+	}
+}
+
+// flushNow sends anything pending without waiting for the timer.
+func (n *notifier) flushNow() {
+	n.mu.Lock()
+	timer := n.timer
+	n.mu.Unlock()
+	if timer != nil && timer.Stop() {
+		n.flush()
+	}
+}
+
+func (n *notifier) flush() {
+	n.mu.Lock()
+	queues := make([]string, 0, len(n.pending))
+	for q := range n.pending {
+		queues = append(queues, q)
+	}
+	clear(n.pending)
+	n.timer = nil
+	n.mu.Unlock()
+	if len(queues) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := n.exec.Notify(ctx, driver.ChannelInsert, queues); err != nil {
+		// Workers still poll, so a lost notification costs latency, not work.
+		n.logger.WarnContext(ctx, "hopper: notify inserts", "queues", queues, "error", err)
+	}
+}

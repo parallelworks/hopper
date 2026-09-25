@@ -55,6 +55,9 @@ type InsertOpts struct {
 	// Metadata is a JSON object stored with the job, for trace context and
 	// similar. It is not passed to the worker as args.
 	Metadata json.RawMessage
+	// Unique makes the job unique among live jobs of its kind. See
+	// UniqueOpts.
+	Unique *UniqueOpts
 }
 
 // merge returns opts with the non-zero fields of over applied on top.
@@ -73,6 +76,9 @@ func (opts InsertOpts) merge(over InsertOpts) InsertOpts {
 	}
 	if len(over.Metadata) > 0 {
 		opts.Metadata = over.Metadata
+	}
+	if over.Unique != nil {
+		opts.Unique = over.Unique
 	}
 	return opts
 }

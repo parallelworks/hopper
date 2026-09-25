@@ -22,6 +22,17 @@ import (
 // Driver implements driver.Driver[pgx.Tx] on a pgxpool.Pool.
 type Driver struct {
 	pool *pgxpool.Pool
+	cfg  Config
+}
+
+// Config tunes the driver. The zero value is fine for a pool that connects
+// directly to Postgres.
+type Config struct {
+	// ListenConnConfig is used for the LISTEN connection instead of the
+	// pool's connection settings. Set it to a direct Postgres address when
+	// the pool goes through a transaction pooler such as PgBouncer, which
+	// cannot carry LISTEN.
+	ListenConnConfig *pgx.ConnConfig
 }
 
 var _ driver.Driver[pgx.Tx] = (*Driver)(nil)
@@ -29,10 +40,19 @@ var _ driver.Driver[pgx.Tx] = (*Driver)(nil)
 // New returns a driver on pool. The pool is shared with the application; the
 // driver does not close it.
 func New(pool *pgxpool.Pool) *Driver {
+	return NewWithConfig(pool, nil)
+}
+
+// NewWithConfig is New with driver settings.
+func NewWithConfig(pool *pgxpool.Pool, cfg *Config) *Driver {
 	if pool == nil {
 		panic("hopperpgx: nil pool")
 	}
-	return &Driver{pool: pool}
+	d := &Driver{pool: pool}
+	if cfg != nil {
+		d.cfg = *cfg
+	}
+	return d
 }
 
 // Pool returns the underlying pool.
@@ -50,7 +70,50 @@ func (d *Driver) UnwrapTx(tx pgx.Tx) driver.Executor {
 
 // Capabilities implements driver.Driver.
 func (d *Driver) Capabilities() driver.Capabilities {
-	return driver.Capabilities{Copy: true}
+	return driver.Capabilities{Copy: true, Listen: true}
+}
+
+// Listener implements driver.Driver. It opens a dedicated connection.
+func (d *Driver) Listener(ctx context.Context) (driver.Listener, error) {
+	cfg := d.cfg.ListenConnConfig
+	if cfg == nil {
+		cfg = d.pool.Config().ConnConfig
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg.Copy())
+	if err != nil {
+		return nil, fmt.Errorf("hopperpgx: connect listener: %w", err)
+	}
+	// Name the connection so operators (and tests) can tell it apart in
+	// pg_stat_activity: "hopper-listener:<schema>".
+	if _, err := conn.Exec(ctx, "SELECT set_config('application_name', 'hopper-listener:' || current_schema(), false)"); err != nil {
+		return nil, errors.Join(fmt.Errorf("hopperpgx: name listener: %w", err), conn.Close(context.WithoutCancel(ctx)))
+	}
+	return &listener{conn: conn}, nil
+}
+
+type listener struct {
+	conn *pgx.Conn
+}
+
+func (l *listener) Listen(ctx context.Context, channels ...string) error {
+	for _, ch := range channels {
+		if _, err := l.conn.Exec(ctx, "LISTEN "+pgx.Identifier{ch}.Sanitize()); err != nil {
+			return fmt.Errorf("hopperpgx: listen %s: %w", ch, err)
+		}
+	}
+	return nil
+}
+
+func (l *listener) Next(ctx context.Context) (driver.Notification, error) {
+	n, err := l.conn.WaitForNotification(ctx)
+	if err != nil {
+		return driver.Notification{}, err
+	}
+	return driver.Notification{Channel: n.Channel, Payload: n.Payload}, nil
+}
+
+func (l *listener) Close(ctx context.Context) error {
+	return l.conn.Close(ctx)
 }
 
 // Migrator implements driver.Driver.
@@ -63,6 +126,7 @@ type dbtx interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
 // executor runs operations on either the pool or a transaction.
