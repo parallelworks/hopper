@@ -1,0 +1,918 @@
+# hopper: design and implementation plan
+
+hopper is a high-performance job queue and message broker for Go. It gives
+applications durable background jobs, scheduled and periodic work, and pub/sub
+messaging with transactional guarantees, using the database they already run.
+PostgreSQL is the first engine. One Apache-2.0 library replaces both an
+in-process job framework (such as River) and a separate broker (such as
+RabbitMQ).
+
+- **Module:** `github.com/parallelworks/hopper`
+- **License:** Apache-2.0
+- **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
+- **Status:** design. This document is the plan of record, and changes to it go through PRs.
+
+The name refers to a feed hopper, which releases work into a machine one piece
+at a time, and to RADM Grace Hopper. It is also a fitting name for something
+meant to replace a *rabbit*.
+
+---
+
+## 1. Goals
+
+1. **Performance under load.** hopper is built for production traffic at its
+   heaviest. Every hot-path operation works on sets: claim N jobs, finalize N
+   results and insert N rows, each in one round trip. The live jobs table stays
+   small no matter how much history accumulates, so its indexes stay in memory.
+   Performance targets are release gates, measured in CI (§8).
+2. **Transactional enqueue and publish.** A job or message is written in the same
+   transaction as the business data that caused it. Either both commit or neither
+   does, so no outbox table or dual-write reconciliation is needed.
+3. **At-least-once execution, exactly-once in the common case.** Every job runs to
+   completion or ends in a terminal state with a recorded reason. A job runs twice only
+   when its process is lost mid-job. Workers must be idempotent, and the docs will
+   say so prominently. `CompleteTx` makes "do the work and mark it done" atomic when
+   the work is in the same database.
+4. **Horizontal scale with no coordination service.** Any number of processes run
+   hopper clients against one database. Work is claimed with `FOR UPDATE SKIP LOCKED`.
+   Singleton duties run on a leader elected through the database. Adding replicas
+   adds throughput.
+5. **An idiomatic, modern Go API.** Generic, type-safe args and workers. `context`
+   everywhere. `log/slog`. Range-over-func iterators for listing. Errors that work with
+   `errors.Is` and `errors.As`. Zero-config defaults that are correct in production.
+   The type system catches mistakes at compile time wherever possible.
+6. **A complete feature set.** Priorities, scheduling, cron, retries with custom
+   backoff, unique jobs and debouncing, snooze, cancellation, timeouts, awaitable
+   results, global concurrency and rate limits, batches, workflows, topic-routed
+   pub/sub, ordering keys, dead-lettering and replay. These are the features teams
+   reach for in River, Oban, Sidekiq, BullMQ and RabbitMQ, all in one library.
+7. **Engine-agnostic by design.** Postgres is the first engine. The core talks to
+   storage through a `Driver` interface defined at the level of queue operations, not
+   SQL strings, and every engine must pass a shared conformance, concurrency and chaos
+   suite (§5).
+8. **Runs inside the application process.** hopper is a library, not a server. It
+   scales out with the application.
+9. **Lean core, layered features.** The core module depends only on the standard
+   library and pgx. Integrations (OpenTelemetry, the web UI, other engines) are separate
+   modules, so applications pay only for what they import.
+10. **FIPS-friendly.** hopper does no cryptography of its own, so it works under
+    `GODEBUG=fips140=only`. Tests run in that mode.
+
+## 2. Non-goals
+
+- **Broker wire protocols** (AMQP, STOMP, MQTT). hopper is a Go API. Non-Go producers
+  use the documented SQL insert contract (§10).
+- **Network ingress** (HTTP or gRPC endpoints for enqueueing). Applications that want
+  one can wrap `client.Insert` in their own handler with their own authentication.
+  The docs include a short example.
+- **A hosted UI in the core module.** The web UI is the separate `hopperui` module (§13).
+- **Application-level cryptography.** hopper does not encrypt args. The `Codec` hook
+  (§7.13) lets applications encrypt payloads themselves if they need to.
+
+## 3. Concepts
+
+| Term | Meaning |
+| --- | --- |
+| **Job** | One unit of work: a kind, args, a queue, a priority, a schedule and an attempt history. |
+| **Kind** | A string naming the job type (`"send_email"`). It maps to exactly one worker. |
+| **Args** | A Go struct implementing `Kind() string`, encoded by the configured `Codec` (JSON by default). |
+| **Queue** | A named lane with a per-client worker count and optional cluster-wide concurrency and rate limits. Queues can be declared in config or added at runtime. |
+| **Worker** | Code that performs one kind of job: a type implementing `Worker[T]`, or a plain function. |
+| **Client** | The per-process runtime. It inserts, claims, works and finalizes jobs, and holds a liveness lease. |
+| **Driver** | The storage engine binding (`hopperpgx` for Postgres). It is generic over the engine's transaction type. |
+| **Leader** | The one client, elected through the database, that runs periodic jobs and maintenance. |
+| **History** | Finalized jobs, moved out of the live table into time-partitioned storage for inspection and replay. |
+| **Topic / Subscription** | A message published to a topic is delivered as one job to each matching subscription. |
+| **Ordering key** | An optional key that makes delivery FIFO per key (for example, per customer) without global ordering. |
+| **Batch / Workflow** | Groups of jobs with completion callbacks (batch) or dependencies between them (workflow). |
+
+## 4. Public API sketch
+
+This sketch is illustrative. Exact names are settled in the M1 PR.
+
+### 4.1 Jobs and workers
+
+```go
+type SendEmail struct {
+    UserID int64  `json:"user_id" hopper:"unique"` // part of the unique key
+    Tmpl   string `json:"tmpl"`
+}
+
+func (SendEmail) Kind() string { return "send_email" }
+
+// Optional: per-kind insert defaults, overridable per call.
+func (SendEmail) InsertOpts() hopper.InsertOpts {
+    return hopper.InsertOpts{Queue: "email", MaxAttempts: 10}
+}
+
+type SendEmailWorker struct {
+    hopper.WorkerDefaults[SendEmail] // default Timeout, NextRetry, etc.
+    Mailer *mail.Client
+}
+
+func (w *SendEmailWorker) Work(ctx context.Context, job *hopper.Job[SendEmail]) error {
+    // A returned error schedules a retry with backoff.
+    // return hopper.Snooze(time.Minute)  // reschedule without using up an attempt
+    // return hopper.Cancel(err)          // discard now, with no retry
+    return w.Mailer.Send(ctx, job.Args.UserID, job.Args.Tmpl)
+}
+
+func (w *SendEmailWorker) Timeout(*hopper.Job[SendEmail]) time.Duration { return 30 * time.Second }
+
+workers := hopper.NewWorkers()
+hopper.AddWorker(workers, &SendEmailWorker{Mailer: m})
+hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[ResizeImage]) error {
+    return resize(ctx, job.Args)
+})
+```
+
+`AddWorker` panics if a kind is registered twice. It is called at startup, like
+`http.Handle`. Calling `Insert` with an args type that has no registered worker on this
+client is allowed (another service may work it), but `Config.StrictKinds` rejects it.
+
+### 4.2 Client
+
+```go
+client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{
+    Queues: map[string]hopper.QueueConfig{
+        hopper.QueueDefault: {MaxWorkers: 100},
+        "email": {
+            MaxWorkers:  50,                            // per client
+            GlobalLimit: 200,                           // across all clients
+            RateLimit:   hopper.PerSecond(500),         // across all clients
+        },
+    },
+    Workers: workers,
+    Periodic: []hopper.PeriodicJob{
+        hopper.Cron("*/15 * * * *", SyncAllocations{}, nil),
+        hopper.Every(30*time.Second, RefreshCache{}, &hopper.PeriodicOpts{RunOnStart: true}),
+    },
+    Middleware: []hopper.Middleware{hopperotel.Middleware(otel.GetTracerProvider())},
+    // Logger defaults to slog.Default(); every other field has a production default.
+})
+// client is a *hopper.Client[pgx.Tx]. The driver fixes the transaction type,
+// so InsertTx only accepts a transaction from the right engine.
+
+// Run blocks until ctx is cancelled, then drains gracefully. It fits errgroup.
+g.Go(func() error { return client.Run(ctx) })
+
+// Or manage the lifecycle explicitly:
+err = client.Start(ctx)
+err = client.Stop(ctx) // stop claiming, drain, flush; when ctx expires, cancel job contexts
+```
+
+### 4.3 Inserting
+
+```go
+// Transactional: the job exists only if tx commits.
+res, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42, Tmpl: "welcome"}, &hopper.InsertOpts{
+    Priority:    hopper.PriorityHigh,
+    ScheduledAt: time.Now().Add(time.Hour),
+    Unique:      &hopper.UniqueOpts{ByPeriod: 24 * time.Hour, OnConflict: hopper.UniqueReplace},
+})
+res.Job.ID; res.Duplicate
+
+// Bulk: a single statement, or COPY for large non-unique batches.
+results, err := client.InsertManyTx(ctx, tx, []hopper.InsertParams{
+    {Args: SendEmail{UserID: 1}}, {Args: SendEmail{UserID: 2}},
+})
+
+// Awaitable results (request/reply).
+res, err = client.Insert(ctx, RenderReport{ID: 7}, &hopper.InsertOpts{Await: true})
+report, err := hopper.Await[ReportURL](ctx, client, res.Job.ID) // worker called hopper.SetOutput(ctx, url)
+```
+
+### 4.4 Managing and observing
+
+```go
+client.JobCancel(ctx, id)            // works on any live job, including one running on another pod
+client.JobRetry(ctx, id)             // re-drive a discarded or cancelled job from history
+job, err := client.JobGet(ctx, id)   // live or historical
+
+for job, err := range client.Jobs(ctx, hopper.JobFilter{
+    Queue: "email", States: []hopper.JobState{hopper.JobStateDiscarded},
+}) { ... }                           // iter.Seq2, pages transparently
+
+client.Queues().Pause(ctx, "email")
+client.Queues().Add(ctx, "tenant_42", hopper.QueueConfig{MaxWorkers: 5}) // runtime, multi-tenant
+
+for ev := range client.Events(ctx, hopper.EventJobFailed, hopper.EventJobDiscarded) { ... }
+
+stats, err := client.Stats(ctx)      // depth, age of oldest job, throughput and leader, by queue
+```
+
+### 4.5 Messaging
+
+```go
+type AllocationCreated struct{ ID int64 `json:"id"` }
+
+func (AllocationCreated) Topic() string { return "allocation.created" }
+
+// Declarative: the subscription row is upserted when the client starts.
+hopper.Subscribe(workers, hopper.Subscription{Name: "billing", Pattern: "allocation.*", Queue: "billing"},
+    func(ctx context.Context, msg *hopper.Message[AllocationCreated]) error {
+        return bill(ctx, msg.Payload.ID) // nil acks; an error nacks with backoff
+    })
+
+err = client.PublishTx(ctx, tx, AllocationCreated{ID: 42}, &hopper.PublishOpts{
+    OrderingKey: "allocation:42",   // FIFO per key
+    DedupKey:    "evt-7f3a",        // idempotent publish
+    TTL:         10 * time.Minute,  // expire undelivered
+})
+```
+
+### 4.6 Batches and workflows
+
+```go
+b := client.NewBatch(hopper.BatchOpts{OnSuccess: ReportDone{RunID: 9}, OnFailure: AlertOps{RunID: 9}})
+b.Add(ProcessShard{Shard: 0}, nil)
+b.Add(ProcessShard{Shard: 1}, nil)
+err = b.InsertTx(ctx, tx)
+
+wf := hopper.NewWorkflow("ingest-9")
+fetch := wf.Add(Fetch{URL: u})
+parse := wf.Add(Parse{}, hopper.After(fetch))
+wf.Add(Index{}, hopper.After(parse))
+wf.Add(Notify{}, hopper.After(parse))
+err = client.InsertWorkflowTx(ctx, tx, wf)
+```
+
+### 4.7 API conventions
+
+- Options are pointer-to-struct and `nil` means "defaults". There are no functional
+  options.
+- Sentinel and typed errors: `hopper.ErrNotFound`, `hopper.ErrClientStopped`,
+  `*hopper.UniqueConflictError`, and so on.
+- Anything that lists returns `iter.Seq2[T, error]`. Anything that streams returns
+  `iter.Seq[T]` bound to a context.
+- IDs are typed: `hopper.JobID` (UUIDv7, §6.1), so a job ID can't be confused with an
+  application's own integer keys.
+- No package-level mutable state. Everything hangs off `Workers` and `Client`, so
+  tests can run many clients in one process.
+
+## 5. Architecture
+
+```
+            ┌──────────────────────────── hopper.Client[TTx] ─────────────────────────────┐
+ Insert ───►│ inserter ──────────────────────────────────────────────┐                     │
+            │                                                        ▼                     │
+            │ per-queue producer ── claim(N) ──► worker pool ──► finalizer (batched) ──────┼──► Driver ──► Postgres
+            │        ▲                                                                     │
+            │   notify / poll       lease keeper (liveness, cancel signals)                │
+            │                       leader: periodic · rescuer · retention · partitions    │
+            └──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.1 The driver boundary
+
+The core package (`hopper`) imports only the standard library. It defines:
+
+```go
+type Driver[TTx any] interface {
+    Executor() Executor                 // pool-scoped operations
+    UnwrapTx(tx TTx) Executor           // operations inside the caller's transaction
+    Listener(ctx context.Context) (Listener, error) // ErrNotSupported → polling only
+    Capabilities() Capabilities         // e.g. COPY, LISTEN, advisory locks
+}
+
+type Executor interface {
+    JobInsertMany(ctx context.Context, p []JobInsertParams) ([]JobInsertResult, error)
+    JobClaim(ctx context.Context, p ClaimParams) ([]*JobRow, error)
+    JobFinalizeMany(ctx context.Context, p FinalizeParams) (FinalizeResult, error)
+    LeaseRenew(ctx context.Context, p LeaseParams) (LeaseResult, error)
+    LeaderAttempt(ctx context.Context, p LeaderParams) (bool, error)
+    // ... rescue, retention, queues, subscriptions, listing
+}
+```
+
+The methods are queue operations, not SQL. Each engine is free to implement them in
+the way that performs best on that engine.
+
+| Package | Engine | Module |
+| --- | --- | --- |
+| `hopper/driver/hopperpgx` | Postgres via pgx v5 (the reference driver) | core |
+| `hopper/driver/hoppersql` | Postgres via `database/sql` (lib/pq, pgx stdlib); polling only | core |
+| `hopper/drivertest` | Conformance, concurrency and chaos suite every driver must pass | core |
+| `hoppersqlite` (later) | SQLite: embedded, single-node and local development | separate module |
+| `hoppermongo` (later) | MongoDB (replica set, for transactions) | separate module |
+
+An engine needs atomic claims, transactions for transactional enqueue, and a server
+clock. Push notifications are optional, because polling is always available. The two
+planned engines meet these requirements differently, which is why the interface is
+defined as operations rather than SQL:
+
+- **SQLite** has a single writer, so a claim is an `UPDATE … RETURNING` inside a
+  `BEGIN IMMEDIATE` transaction, and SKIP LOCKED is unnecessary. There is no LISTEN,
+  so clients in the same process wake each other directly and other processes poll.
+  Retention is a batched `DELETE`.
+- **MongoDB** claims with atomic `findOneAndUpdate` or `updateMany` (tagging a batch
+  with a claim token, then reading it back). It uses `$$NOW` for server time, change
+  streams for notifications, and TTL indexes or dropped collections for retention.
+  `TTx` is a session context.
+
+`Capabilities` tells the core which strategies an engine supports, for example batch
+claims, push notifications and retention by partition drop. Postgres-specific parts
+of this document (the schema, the SQL insert contract, and partition retention) are
+the Postgres driver's implementation of these operations, not requirements on every
+engine.
+
+## 6. Schema (Postgres)
+
+Tables are prefixed with `hopper_` and live in whatever schema is first in the
+connection's `search_path`, so users can isolate hopper in its own schema.
+
+```sql
+CREATE TYPE hopper_job_state AS ENUM (
+  'pending',     -- waiting on workflow dependencies (M8); reserved now to avoid an enum migration
+  'available',   -- ready once scheduled_at <= now()
+  'scheduled',   -- inserted or snoozed with a future scheduled_at
+  'running',
+  'retryable',   -- failed; will run again at scheduled_at
+  'completed',
+  'cancelled',
+  'discarded'    -- out of attempts, expired, or cancelled by the worker: the dead-letter state
+);
+
+-- Live jobs only. Finalized jobs move to hopper_job_history, so this table
+-- (and its indexes) stay sized to the backlog, not to all-time volume.
+CREATE TABLE hopper_jobs (
+  id                  uuid        NOT NULL DEFAULT hopper_uuidv7() PRIMARY KEY,  -- public job ID (§6.1)
+  seq                 bigint      GENERATED ALWAYS AS IDENTITY,  -- internal FIFO tie-break
+  kind                text        NOT NULL,
+  queue               text        NOT NULL DEFAULT 'default',
+  state               hopper_job_state NOT NULL DEFAULT 'available',
+  priority            smallint    NOT NULL DEFAULT 2 CHECK (priority BETWEEN 1 AND 4),
+  attempt             smallint    NOT NULL DEFAULT 0,
+  max_attempts        smallint    NOT NULL DEFAULT 25,
+  scheduled_at        timestamptz NOT NULL DEFAULT now(),
+  attempted_at        timestamptz,
+  attempted_by        bigint,                    -- hopper_clients.id holding the claim
+  args                jsonb       NOT NULL DEFAULT '{}',
+  metadata            jsonb       NOT NULL DEFAULT '{}',   -- trace context, topic, message ID
+  errors              jsonb       NOT NULL DEFAULT '[]',   -- [{at, attempt, error, trace}]
+  unique_key          text,
+  ordering_key        text,
+  partition_key       text,                      -- for partitioned rate/concurrency limits (M7)
+  batch_id            uuid,
+  expires_at          timestamptz,               -- TTL: discarded if not started by then
+  cancel_requested_at timestamptz,
+  await               boolean     NOT NULL DEFAULT false,   -- notify waiters on finalize
+  created_at          timestamptz NOT NULL DEFAULT now()
+) WITH (fillfactor = 70);
+
+-- Claim path: the only index the hot query touches.
+CREATE INDEX hopper_jobs_claim ON hopper_jobs (queue, priority, scheduled_at, seq)
+  WHERE state IN ('available', 'scheduled', 'retryable');
+
+-- Running set: rescue, cancel delivery, global limits. Bounded by total concurrency.
+CREATE INDEX hopper_jobs_running ON hopper_jobs (queue, attempted_by) WHERE state = 'running';
+
+-- Uniqueness applies only while a job is live.
+CREATE UNIQUE INDEX hopper_jobs_unique ON hopper_jobs (kind, unique_key) WHERE unique_key IS NOT NULL;
+
+-- Finalized jobs. Two-level partitioning: by outcome, then by time, so retention is
+-- DROP TABLE on an old partition, with no DELETE and no vacuum debt.
+CREATE TABLE hopper_job_history (
+  LIKE hopper_jobs,
+  finalized_at timestamptz NOT NULL,
+  output       jsonb
+) PARTITION BY LIST (state);
+-- hopper_job_history_completed PARTITION BY RANGE (finalized_at)  -- hourly partitions
+-- hopper_job_history_failed    PARTITION BY RANGE (finalized_at)  -- daily; cancelled + discarded
+
+-- Liveness: one lease row per running client process.
+CREATE TABLE hopper_clients (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  hostname    text        NOT NULL,
+  started_at  timestamptz NOT NULL DEFAULT now(),
+  expires_at  timestamptz NOT NULL,
+  info        jsonb       NOT NULL DEFAULT '{}'    -- version, queues, pid
+);
+
+CREATE TABLE hopper_leader (
+  name       text PRIMARY KEY DEFAULT 'default',
+  client_id  bigint      NOT NULL,
+  elected_at timestamptz NOT NULL,
+  expires_at timestamptz NOT NULL
+);
+
+CREATE TABLE hopper_queues (
+  name          text PRIMARY KEY,
+  paused_at     timestamptz,
+  global_limit  int,                    -- NULL = unlimited
+  rate_per_sec  double precision,       -- NULL = unlimited
+  rate_burst    int,
+  tokens        double precision,
+  refilled_at   timestamptz,
+  metadata      jsonb       NOT NULL DEFAULT '{}',
+  updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE hopper_periodic (          -- last inserted slot per periodic job
+  name      text PRIMARY KEY,
+  last_slot timestamptz NOT NULL
+);
+
+CREATE TABLE hopper_subscriptions (
+  name       text PRIMARY KEY,
+  pattern    text NOT NULL,             -- AMQP topic syntax
+  kind       text NOT NULL,
+  queue      text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE hopper_schema (version int PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
+```
+
+M6 adds the ordering-key index (§10), M7 adds `hopper_batches`, and M8 adds
+`hopper_job_deps`. These are sketched in §10 and §11.
+
+### 6.1 Job IDs
+Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
+and logs shared with customers), they don't reveal volume, and producers on other
+systems can generate them without coordination. Because v7 IDs are time-ordered,
+index inserts stay local like a sequence.
+
+- **Generated in the database.** `hopper_uuidv7()` is installed by the migrations.
+  On Postgres 18 and later it calls the built-in `uuidv7()`. On 14–17 it is a SQL
+  function that builds a v7 UUID from `clock_timestamp()` and the built-in
+  `gen_random_uuid()`. Generation therefore works the same for Go inserts, `COPY`
+  and the SQL contract, and hopper's Go code needs no random number generator or
+  cryptography. Engines without a database-side generator (MongoDB) generate IDs in
+  the driver.
+- **Ordering uses `seq`, not the ID.** Several IDs created in the same millisecond
+  are not guaranteed to sort in insertion order on every Postgres version. An
+  internal identity column, `seq`, provides the tie-break for claim order and for
+  strict ordering keys. It is never exposed in the API.
+- **In Go**, IDs are `hopper.JobID`, a `[16]byte` type in the core package with
+  `String`, `ParseJobID`, text and JSON marshalling, and `sql.Scanner` /
+  `driver.Valuer` support. The core adds no UUID dependency.
+- **Internal IDs stay compact.** `hopper_clients.id` remains a `bigint`, because it
+  never leaves the database and is written into every running job.
+
+### 6.2 State machine
+
+```
+insert ──► available ─┐                        ┌──► completed  ─┐
+insert ──► scheduled ─┼─► (claim) running ─────┼──► cancelled   ├──► moved to hopper_job_history
+           retryable ─┘        │    │          └──► discarded  ─┘        │
+               ▲               │    └──► retryable / scheduled (snooze)  │
+               └───────────────┘                                        │
+  rescuer: running, owner's lease expired ──► retryable (or discarded)   │
+  JobRetry ◄─────────────────────────────────────────────────────────────┘
+  JobCancel: any live state; running jobs are signalled and finalize as cancelled
+```
+
+`available`, `scheduled` and `retryable` all mean "claim once `scheduled_at <= now()`".
+They are separate states only so operators can see why a job is waiting. As a result
+there is **no scheduler loop** moving jobs between states.
+
+## 7. Core algorithms
+
+### 7.1 Clock
+All time comparisons use the database's `now()`, never the application clock, so clock
+skew between pods cannot cause early or duplicate execution.
+
+### 7.2 Insert
+- **Single and small batches:** one `INSERT … SELECT FROM unnest($kinds, $args, …)
+  ON CONFLICT (kind, unique_key) WHERE unique_key IS NOT NULL DO NOTHING RETURNING …`.
+  Conflicting rows are resolved to the existing job, and the result reports
+  `Duplicate: true`. Any batch size costs one round trip.
+- **Bulk:** `InsertMany` switches to `COPY` for batches of non-unique jobs above a
+  threshold (256 by default). This is the fastest way to load rows into Postgres.
+- **Unique jobs:** the key is built from the kind, the fields tagged `hopper:"unique"`
+  (or the whole args), and optionally the queue and a time period. It is stored as
+  canonical text, with no hashing, so it is FIPS-clean and readable in SQL. Keys over
+  1 KiB are rejected at insert. Uniqueness covers live jobs, meaning those not yet
+  finalized. `UniqueReplace` updates the args and `scheduled_at` of
+  a non-running duplicate, which gives debouncing.
+- **Wake-up:** after the insert, `pg_notify('hopper_insert', queue)` fires once per queue
+  per transaction. Postgres delivers notifications only on commit, so no worker wakes
+  for an uncommitted job (§7.11). When the inserting client also works that queue and
+  the insert is not inside a caller's transaction, it wakes its local producer
+  directly, with no database round trip.
+
+### 7.3 Claim
+Each queue has a producer. The claim is a single statement:
+
+```sql
+UPDATE hopper_jobs j
+SET state = 'running', attempt = attempt + 1, attempted_at = now(), attempted_by = $client
+FROM (
+  SELECT id FROM hopper_jobs
+  WHERE queue = $queue AND state IN ('available','scheduled','retryable')
+    AND scheduled_at <= now()
+  ORDER BY priority, scheduled_at, seq
+  LIMIT $n
+  FOR UPDATE SKIP LOCKED
+) c
+WHERE j.id = c.id
+RETURNING j.*;
+```
+
+- **Batching.** A producer claims only when at least `min(MaxWorkers/4, free slots)`
+  slots are free or a short cooldown (20ms by default) has passed. Busy queues are
+  claimed in batches rather than one row at a time, while idle queues still start
+  jobs immediately.
+- **Triggers.** A producer claims when (1) an insert notification or local wake-up
+  arrives, debounced; (2) enough slots free up; (3) the adaptive poll timer fires. That
+  timer is 1s when the queue is idle and becomes continuous while claims come back
+  full. Polling is also the safety net for missed notifications and for jobs whose
+  `scheduled_at` has just arrived.
+- **Pipelining.** When the finalizer has pending results and the producer wants work,
+  both statements are sent in one pgx batch, which is one network round trip.
+- **Expiry.** Rows past `expires_at` are skipped by the claim, and the leader discards
+  them as `expired`.
+- **Limits.** Queues with a `GlobalLimit` or `RateLimit` claim inside a short
+  transaction that locks their `hopper_queues` row (§9). Unlimited queues never touch
+  that row, so they pay nothing for the feature.
+- **Paused queues** skip claiming. Clients learn the pause state from a
+  `hopper_control` notification and re-read it on every lease renewal.
+
+### 7.4 Execute
+- Each queue runs a bounded pool of goroutines. Workers are started only once a slot is
+  free, so there is no unbounded fan-out.
+- Each job gets a context that is cancelled on timeout (the worker's `Timeout()` or the
+  queue default), on `JobCancel`, on lease loss (§7.6), or on a hard stop.
+- A panic is recovered and recorded as an error with its stack trace, then treated as
+  a normal failure.
+- Middleware (`func(ctx, *JobRow, next) error`) wraps execution for logging, metrics,
+  tracing, and custom policy. Insert middleware wraps inserts, for example to inject
+  trace context into `metadata`.
+- `hopper.SetOutput(ctx, v)` records a result, which is stored with the finalized job
+  and returned by `Await` and `JobGet`.
+
+### 7.5 Finalize
+Results are buffered and written by a per-client finalizer. It flushes every 25ms or
+every 500 results, whichever comes first, in **one statement**. Retries and snoozes are
+updated in place. Terminal outcomes are moved to history.
+
+```sql
+WITH r AS (SELECT * FROM unnest($ids, $states, $scheduled_at, $errors, $outputs) AS r(...)),
+retry AS (
+  UPDATE hopper_jobs j SET state = r.state, scheduled_at = r.scheduled_at,
+         attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
+         errors = j.errors || r.error, attempted_by = NULL
+  FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
+    AND j.state = 'running' AND j.attempted_by = $client
+  RETURNING j.id),
+done AS (
+  DELETE FROM hopper_jobs j USING r
+  WHERE j.id = r.id AND r.state IN ('completed','cancelled','discarded')
+    AND j.state = 'running' AND j.attempted_by = $client
+  RETURNING j.*, r.state AS final_state, r.error, r.output)
+INSERT INTO hopper_job_history SELECT … , now() FROM done;
+```
+
+- The `state = 'running' AND attempted_by = $client` condition fences out stale
+  results. If the job was rescued and reclaimed, the result is dropped and logged, so
+  a finalize can never overwrite a newer attempt.
+- Queues with `Archive: false` delete completed jobs without writing history.
+  Cancelled and discarded jobs are always archived, because history is the
+  dead-letter queue (§7.10).
+- Outcomes:
+  - **success:** `completed`.
+  - **error:** `retryable` at `now() + backoff(attempt)`, or `discarded` when
+    `attempt >= max_attempts`.
+  - **`hopper.Snooze(d)`:** `scheduled` at `now() + d`, without using up an attempt.
+  - **`hopper.Cancel(err)`:** `discarded` immediately.
+- `backoff(n) = n^4 + 5s ± 10% jitter`, capped at 24h. It can be overridden per worker
+  with `NextRetry(job) time.Time` or per queue with a `RetryPolicy`.
+- `CompleteTx(ctx, tx, job)` finalizes inside the worker's own transaction, so the work
+  and its completion commit together. It bypasses the buffer.
+- If a job has `await = true`, the finalizer sends `pg_notify('hopper_done', id)`, and
+  `Await` returns as soon as the transaction commits.
+
+### 7.6 Liveness and rescue
+Liveness is tracked **per client, not per job**. Each client holds a lease row in
+`hopper_clients` and renews it every 5s (the TTL is 15s):
+
+```sql
+UPDATE hopper_clients SET expires_at = now() + $ttl WHERE id = $me AND expires_at > now();
+```
+
+A heartbeat therefore costs one row per process regardless of how many jobs it is
+running. Running jobs are never rewritten just to prove they are alive, which removes
+the largest source of write amplification in heartbeat-based designs.
+
+- **Rescue.** The leader's rescuer finds `running` jobs whose `attempted_by` has no
+  unexpired lease and moves them to `retryable` with the error `client lost` (or to
+  `discarded` if they are out of attempts). A crashed pod's jobs run again within about
+  20s.
+- **Fencing.** If a renewal matches zero rows (after a long GC pause or a partition),
+  the client has lost its lease. It cancels every in-flight job context, discards its
+  pending results, and re-registers under a new ID. The rescuer and the old client
+  therefore agree on ownership, and finalize fencing (§7.5) covers the remaining race.
+- **Hung jobs.** A live client with a stuck goroutine is handled by timeouts. An
+  optional `RescueStuckAfter` also rescues jobs that are still running past an absolute
+  age.
+- **Graceful stop** deletes the lease after the finalizer flushes, so nothing needs
+  rescuing.
+
+### 7.7 Cancellation
+`JobCancel` on a waiting job moves it straight to history as `cancelled`. On a
+running job, it sets `cancel_requested_at` and sends
+`pg_notify('hopper_control', 'cancel:<id>')`. The owning client cancels the job's
+context immediately. Each lease renewal also returns any cancel requests for that
+client's running jobs (through the small running index), which covers missed
+notifications. The job finalizes as `cancelled` unless it had already completed.
+
+### 7.8 Leader election
+Leadership is a lease row in `hopper_leader`:
+
+```sql
+INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
+VALUES ('default', $me, now(), now() + $ttl)
+ON CONFLICT (name) DO UPDATE SET client_id = $me, elected_at = now(), expires_at = now() + $ttl
+WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $me
+RETURNING client_id = $me;
+```
+
+- The TTL is 15s, and the leader renews every 5s.
+- On graceful stop the leader deletes its row and sends a `hopper_leader` notification,
+  so a replacement takes over immediately.
+
+A lease table is used instead of `pg_advisory_lock` for three reasons: it works behind
+PgBouncer in transaction mode and behind RDS Proxy, it can be inspected with plain SQL,
+and it doesn't pin a connection. Leader-only duties are idempotent, because two leaders
+can briefly overlap during a partition.
+
+Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
+partitions ahead of time and dropping expired ones, removing stale `hopper_clients`
+rows, and resolving batch and workflow completion.
+
+### 7.9 Periodic jobs
+`hopper.Every(d, …)` and `hopper.Cron(spec, …)` are both available from v0.1. Cron
+supports standard five-field syntax, an optional seconds field, `@hourly`-style
+descriptors, and an IANA time zone per job. The parser is in the core, using only the
+standard library.
+
+On each tick, the leader computes the current slot. In one transaction, it advances
+`hopper_periodic.last_slot` with a conditional
+`UPDATE … WHERE name = $name AND last_slot < $slot`, and inserts the job only if that
+update matched a row. A slot therefore produces at most one job, even if two leaders
+overlap or leadership changes mid-slot, and even after the first job has finished and
+left the live table.
+`RunOnStart` inserts the current slot immediately. Missed slots are skipped by default,
+and `CatchUp: n` back-fills up to n of them.
+
+### 7.10 Retention
+Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.
+Retention is enforced by dropping whole partitions, so there is no `DELETE`, no dead
+tuples and no vacuum work. The leader creates partitions several intervals ahead.
+
+The defaults follow common practice: River, Solid Queue and GoodJob keep successful
+jobs briefly and failures longer, while brokers such as RabbitMQ and SQS delete a
+message once it is acknowledged.
+
+| Outcome | Job queues | Subscription queues |
+| --- | --- | --- |
+| `completed` | archived for 24h | deleted on ack (`Archive: false`) |
+| `cancelled`, `discarded` | archived for 7d (the dead-letter queue) | archived for 7d (the dead-letter queue) |
+
+Both retention periods and `Archive` are configurable per queue. Setting
+`Archive: false` on a job queue gives maximum throughput by skipping the history
+insert.
+
+### 7.11 Notifications
+LISTEN/NOTIFY gives low-latency wake-ups, and hopper keeps it cheap at high insert
+rates:
+- **One notify per queue per transaction**, no matter how many jobs the transaction
+  inserts.
+- **Per-process coalescing.** Each client sends at most one insert notification per
+  queue per `NotifyInterval` (10ms by default). A busy queue's producers are claiming
+  continuously anyway, so extra notifications would add nothing.
+- **One listener connection** per client, multiplexing every channel. It can be pointed
+  at a direct Postgres address (`hopperpgx.Config.ListenConn`) when the pool goes
+  through a transaction pooler.
+- **Polling fallback.** If LISTEN is unavailable or the connection drops, the client
+  polls and keeps working, and it reconnects the listener with backoff.
+
+### 7.12 Shutdown
+`Stop(ctx)` and `Run` (when its context is cancelled) shut down in three steps:
+1. Stop claiming and give up leadership.
+2. Wait for running jobs to finish, then flush the finalizer.
+3. If `ctx` expires first, cancel all job contexts, wait a short grace period, flush
+   whatever finished, release the lease and return `ctx.Err()`. Jobs that are still
+   unfinished are rescued by another client (at-least-once).
+
+### 7.13 Encoding
+Args, outputs and message payloads go through a `Codec`. The default is
+`encoding/json`. Applications can plug in a faster JSON implementation, or wrap the
+codec to encrypt payloads with their own keys, in which case the payload is stored as
+a JSON string. hopper itself never encrypts.
+
+## 8. Performance
+
+### 8.1 Principles
+- **Everything on the hot path is a set operation.** Claim, finalize, insert and lease
+  renewal each cost one statement regardless of how many jobs they cover.
+- **A small live table.** `hopper_jobs` holds only the backlog and running jobs, so the
+  claim index stays in shared buffers and autovacuum finishes quickly.
+- **Per-client liveness.** There are no per-job heartbeat writes (§7.6).
+- **Partition-drop retention.** History never produces dead tuples (§7.10).
+- **Few round trips.** Statements are prepared and cached, finalize and claim are
+  pipelined into one batch, and local wake-ups skip the database.
+- **Pay only for what you use.** Rate limits, global limits, ordering keys and
+  awaitable results cost nothing on queues and jobs that don't use them.
+
+### 8.2 Targets
+These are release gates on reference hardware (Postgres 17, 8 vCPU / 32 GB, NVMe,
+`synchronous_commit = on`, clients on a separate host in the same zone). The results,
+the hardware details and the benchmark harness are published with each release.
+
+| Metric | Target |
+| --- | --- |
+| End-to-end throughput, no-op jobs, 4 clients | ≥ 50,000 jobs/s sustained |
+| Bulk insert (`InsertMany`, COPY path) | ≥ 250,000 jobs/s |
+| Batched insert (`InsertMany`, unique path) | ≥ 100,000 jobs/s |
+| Pickup latency on an idle queue (commit → `Work` called) | p50 < 5 ms, p99 < 25 ms |
+| Pickup latency at 80% of peak throughput | p99 < 100 ms |
+| Publish fan-out cost | one statement, independent of subscriber count |
+| Recovery after a process crash | ≤ 20 s |
+| Throughput with a 10M-row history | within 5% of an empty history |
+
+### 8.3 Benchmark harness
+- `hopperbench` is a command in the repo that drives the scenarios above and prints
+  machine-readable results. It includes mixed-priority, scheduled-heavy, retry-heavy
+  and fan-out workloads, in addition to the no-op baseline.
+- CI runs a reduced benchmark on every PR that touches the insert, claim or finalize
+  paths. A regression of more than 10% fails the check.
+- A soak test runs 24h at 70% of peak on a nightly schedule. It tracks table and index
+  size, autovacuum activity and latency drift.
+
+### 8.4 Scaling further
+- **Vertical:** the tuning guide covers autovacuum settings for `hopper_jobs`
+  (aggressive scale factors, no cost delay), `max_connections`, and pool sizing per
+  client.
+- **Horizontal:** queues can be spread across several databases, with one client per
+  database per process. Clients are cheap, and routing by queue is a configuration
+  choice.
+
+## 9. Flow control
+
+| Feature | Scope | Mechanism |
+| --- | --- | --- |
+| `MaxWorkers` | per client, per queue | Size of the goroutine pool. |
+| `GlobalLimit` | cluster, per queue | The claim locks the queue row, counts the running jobs through the running index, and claims `min(free, limit − running)`. |
+| `RateLimit` | cluster, per queue | Token bucket on the queue row, refilled from `now()` inside the claim transaction. |
+| Partitioned limits (M7) | cluster, per `partition_key` | For example, "at most 5 concurrent and 10/s per customer". The claim ranks candidates with `row_number() OVER (PARTITION BY partition_key)` against per-key running counts. |
+| Priorities | per job | Four levels in the claim order, plus optional aging so low priorities cannot starve. |
+| Pause / resume | cluster, per queue | Row flag with a control notification. |
+
+Limit state lives in the database, so limits hold across any number of replicas and
+survive restarts.
+
+## 10. Messaging
+
+Messaging is modeled on RabbitMQ's topic exchange and built from job primitives. It
+inherits acks, retries, dead-lettering, transactional publish, scheduling and
+observability without new machinery.
+
+- **Subscriptions** are rows: `(name, pattern, kind, queue)`. Patterns use AMQP syntax:
+  `.`-separated words, where `*` matches one word and `#` matches zero or more. `#` alone
+  is a fanout exchange, and a literal topic is a direct exchange.
+- **`PublishTx`** inserts one job per matching subscription in a single
+  `INSERT … SELECT` that matches patterns in SQL, in the publisher's transaction. Each
+  delivery's `metadata` records the topic and a message ID. Fan-out happens at publish
+  time, so a subscription created later does not receive earlier messages, as in
+  RabbitMQ.
+- **Typed consumers.** `Message[T]` carries the payload, topic, message ID, delivery
+  attempt and headers. A subscription that matches several topics with different
+  types can use `Message[hopper.Raw]` and dispatch on `msg.Topic`.
+- **Acks and dead-lettering.** Returning nil acks. An error nacks with backoff. When
+  attempts run out the delivery is dead-lettered in history, where it can be inspected
+  and replayed with `JobRetry` or, for a whole subscription, `ReplayDiscarded`.
+- **Competing consumers** come for free, because every replica claims from the same
+  queue with SKIP LOCKED.
+- **Delayed delivery, TTL and priority** use the standard job fields.
+- **Idempotent publish.** `DedupKey` uses the unique index, so a retried publish
+  inserts nothing while the earlier delivery is still live.
+- **Ordering keys.** Strict FIFO per key, with the same semantics as SQS FIFO message
+  groups, Azure Service Bus sessions and Google Pub/Sub ordering keys:
+  - At most one delivery per `(queue, ordering_key)` runs at a time, oldest first. The
+    claim selects only the oldest live delivery for each key and skips keys with a
+    running job. A partial unique index on running jobs is the backstop.
+  - A failing delivery blocks its key while it retries. Later messages for that key
+    wait until it succeeds or is dead-lettered, and dead-lettering unblocks the key.
+  - Ordered deliveries get a shorter default retry budget (10 attempts, with backoff
+    capped at 5 minutes), so a poison message is dead-lettered within about an hour
+    instead of blocking its key for days. Both values are configurable per subscription.
+  - Keys are independent, so a blocked key never delays other keys. Throughput scales
+    with the number of distinct keys.
+- **Request/reply.** Publish with `Await: true`, and the consumer's
+  `hopper.SetOutput` becomes the reply.
+- **Cross-language producers.** The insert and publish SQL is a documented, versioned
+  contract. `hopper_insert(...)` and `hopper_publish(...)` SQL functions ship with the
+  migrations, so Python, shell or HPC batch scripts can enqueue work with plain SQL,
+  inside their own transactions. This is the supported path for producers not written
+  in Go (§2).
+- **Streams (M8).** An append-only, time-partitioned topic log with consumer groups
+  that track offsets, for replay and late subscribers. Readers only see events below
+  the current snapshot's `xmin` (`pg_snapshot_xmin(pg_current_snapshot())`), so
+  transactions that commit out of order can never make a reader skip an event.
+
+## 11. Batches and workflows
+
+- **Batches (M7).** `hopper_batches (id, pending, failed, on_success, on_failure,
+  on_complete)`. Jobs carry `batch_id`. The finalizer decrements `pending` once per
+  batch per flush, not once per job, which bounds contention on the batch row. The call
+  that reaches zero inserts the callback job in the same statement.
+- **Workflows (M8).** Jobs with dependencies are inserted as `pending`, with edges in
+  `hopper_job_deps`. When a job completes, the same finalize statement promotes
+  dependents whose dependencies are all complete to `available`. Failure policies are
+  `cancel dependents` (the default) and `ignore`. Workflows are inspectable as a DAG in
+  `hopperui`.
+
+## 12. Migrations
+
+- SQL files are embedded in the `hoppermigrate` package, versioned, and forward-only by
+  default. Down migrations exist for development.
+- `hoppermigrate.Up(ctx, driver)` applies them under an advisory lock taken on a
+  dedicated connection, not a pooled one. This avoids the pool-starvation deadlock we
+  hit in pie (see pie#1).
+- `hopper migrate` in the CLI runs the same migrations. The raw SQL files are also
+  published for teams that use goose, atlas or Flyway. `hopper_schema` records the
+  applied version either way.
+- Every schema change ships with an upgrade test that migrates from the previous release
+  while jobs are live. Migrations that touch `hopper_jobs` must not take locks that
+  block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
+  constraints, and so on).
+
+## 13. Observability and operations
+
+- **Logging:** `log/slog` throughout, defaulting to `slog.Default()`.
+- **Events:** `client.Events(ctx, kinds...)` streams job lifecycle, leadership and lease
+  events, for tests and custom metrics.
+- **Stats:** `Stats(ctx)` returns per-queue depth by state, the age of the oldest
+  available job, recent throughput, the running count by client, and the current
+  leader. It is suitable for readiness checks and autoscaling signals, such as
+  scaling replicas on queue latency.
+- **OpenTelemetry (`hopperotel` module):** trace propagation from insert to work
+  (through `metadata`), spans per attempt, and metrics for throughput, latency, queue
+  depth, failures and rescues. Prometheus users export through the OTel exporter.
+- **CLI (`cmd/hopper`, core module):** `migrate`, `jobs list|get|retry|cancel`,
+  `queues list|pause|resume|limit`, `subscriptions list`, `clients list` and `bench`.
+- **Web UI (`hopperui` module):** an embeddable `http.Handler` for browsing queues,
+  jobs, history, subscriptions and workflows, with retry, cancel and pause actions
+  behind an application-supplied authorization hook.
+
+## 14. Testing strategy
+
+| Layer | What |
+| --- | --- |
+| Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
+| Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
+| Driver conformance | `drivertest` runs the full behavioral suite against every driver (`hopperpgx`, `hoppersql`, and future engines). |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
+| Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
+| Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |
+| Test helpers | A `hoppertest` package for users: `RequireInserted[T]`, `RequireNotInserted`, `Work[T]` (run one job inline), a transaction-scoped client, and `synctest`-friendly clocks. |
+
+## 15. Compatibility
+
+- **Postgres:** 14 and later, which covers all current AWS RDS, Aurora, Cloud SQL,
+  AlloyDB, Azure and Neon major versions.
+- **Go:** the two most recent releases, matching Go's own support policy.
+- **Poolers:** PgBouncer in transaction mode (1.21+ for prepared statements) and RDS
+  Proxy work. LISTEN needs a session connection, so it can be given a direct
+  connection (§7.11). Otherwise the client uses adaptive polling and logs that once.
+- **Stability:** API stability starts at v1.0.0. Until then, minor versions may break
+  the API, with changes noted in the CHANGELOG. The SQL insert contract (§10) is
+  versioned separately and changes only with a deprecation window.
+
+## 16. Milestones
+
+The estimates assume one engineer. Each milestone is one or more PRs.
+
+| # | Milestone | Scope | Est. |
+| --- | --- | --- | --- |
+| M0 | Scaffold | go.mod, CI (lint, Postgres test matrix, `fips140=only`), PR-title check, Dependabot, CONTRIBUTING | 0.5d |
+| M1 | Core engine | `Driver` interface and `hopperpgx`, schema v1, `hoppermigrate`, Insert/InsertTx/InsertMany (unnest and COPY), typed workers and `WorkFunc`, batched claim, batched finalize with history move, retries and backoff, `Run`/`Stop` | 5d |
+| M2 | Reliability | Client leases, rescuer and fencing, leader lease, partitioned retention, LISTEN/NOTIFY with coalescing and adaptive polling, unique jobs (skip and replace) | 4d |
+| M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events | 4d |
+| M4 | Performance and release | `hopperbench`, targets met (§8.2), CI perf gate, chaos and upgrade suites, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, **v0.1.0** | 5d |
+| M5 | Adopt in pie | Replace River in pie's `internal/jobs`; drain and drop River's tables | 1d |
+| M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, **v0.2.0** | 5d |
+| M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0** | 5d |
+| M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumer groups, `hopperui` | 2–3w |
+| M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |
+
+M0–M4 take roughly four weeks to a production-ready v0.1.0 that meets its performance
+targets. v1.0.0 follows M8, once the API has been proven in production.
+
+## 17. Risks
+
+| Risk | Mitigation |
+| --- | --- |
+| Subtle concurrency bugs: double execution, lost jobs | Every state transition is a conditional statement that checks the prior state and the owning client. Chaos and concurrency suites run from M1 onward, on every driver. |
+| Vacuum and bloat at sustained peak rates | A small live table, fillfactor 70, partition-drop retention, no per-job heartbeats, batched finalize, a documented autovacuum profile, and the 24h soak test. |
+| NOTIFY contention at high commit rates (Postgres serializes notifying commits) | One notify per queue per transaction, per-process coalescing, and adaptive polling that makes notifications unnecessary on busy queues. |
+| Claim contention with many clients on one hot queue | Batched claims with a cooldown, so each client claims less often but more at a time. Benchmarks cover 1–64 clients. |
+| Postgres assumptions leaking into the driver interface | Operation-level driver methods, and `drivertest` as the contract. A second driver (`hoppersql`) lands before v1.0 to prove the boundary. |
+| Feature breadth diluting the core | Features are layered: each milestone ships only once the core perf and chaos suites pass. Integrations live in separate modules. |
+
+## 18. Open questions
+
+None at the moment. New questions are added here through PRs.
