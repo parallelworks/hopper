@@ -1,22 +1,27 @@
 # hopper
 
-**A Postgres-backed job queue and message broker for Go.**
+**A high-performance job queue and message broker for Go, built on Postgres.**
 
-hopper runs background jobs and delivers messages using only the PostgreSQL
-database your application already has. There's no broker to operate and no
-separate worker service: it is a library that runs inside your process and
-scales out with it.
+hopper runs background jobs and delivers messages using the PostgreSQL database
+your application already has. There's no broker to operate and no separate worker
+service: it is a library that runs inside your process and scales out with it.
+Postgres is the first engine, behind a driver interface designed for more.
 
+- **Fast:** set-based claim, finalize and insert (including `COPY`), a live
+  table that stays small however much history accumulates, and retention by
+  dropping partitions. Throughput and latency targets are release gates.
 - **Transactional enqueue:** jobs and messages commit or roll back with your data.
 - **Scale by adding replicas:** work is claimed with `FOR UPDATE SKIP LOCKED`, and
   periodic jobs and maintenance run on one elected leader.
-- **Reliable:** retries with backoff, dead-lettering, heartbeat-based rescue of
-  jobs from crashed processes, and unique jobs.
-- **Messaging:** topics, subscriptions and fan-out with AMQP-style routing
-  patterns, for the RabbitMQ features application code actually uses.
-- **Small and auditable:** the core depends on the Go standard library and
-  [pgx](https://github.com/jackc/pgx) only. hopper does no cryptography of its
-  own, so it runs under `GODEBUG=fips140=only`.
+- **Reliable:** retries with backoff, dead-lettering and replay, unique jobs, and
+  lease-based rescue of jobs from crashed processes in seconds.
+- **Complete:** priorities, cron with time zones, snooze, cancellation, timeouts,
+  awaitable results, global concurrency and rate limits, batches and workflows.
+- **Messaging:** topics, subscriptions and fan-out with AMQP-style routing,
+  ordering keys, TTLs, idempotent publish and request/reply.
+- **Idiomatic Go:** generic, type-safe workers and messages, `context`, `slog`,
+  and iterators. The core depends only on the standard library and
+  [pgx](https://github.com/jackc/pgx), and it runs under `GODEBUG=fips140=only`.
 
 > **Status: design.** Nothing is implemented yet. The plan of record is
 > [docs/PLAN.md](docs/PLAN.md). Feedback is welcome through issues and PRs.
@@ -32,8 +37,11 @@ err = client.PublishTx(ctx, tx, "allocation.created", payload)   // fans out to 
 applications, and we started with it. hopper exists because we want:
 
 - a permissive, single-license (Apache-2.0) project with no commercial tier;
-- a core small enough to audit line by line;
-- heartbeat-based rescue that recovers from crashed pods in about a minute;
+- a lean core with integrations in separate modules;
+- lease-based rescue that recovers from crashed pods in seconds, with no
+  per-job heartbeat writes;
+- the features of commercial queue tiers (global limits, batches, workflows)
+  in the open-source library;
 - built-in pub/sub messaging, so one dependency replaces both a job framework
   and a broker.
 
