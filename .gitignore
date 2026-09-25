@@ -1,0 +1,10 @@
+# Go
+/bin/
+coverage.out
+*.test
+*.prof
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

@@ -23,8 +23,12 @@ Postgres is the first engine, behind a driver interface designed for more.
   and iterators. The core depends only on the standard library and
   [pgx](https://github.com/jackc/pgx), and it runs under `GODEBUG=fips140=only`.
 
-> **Status: design.** Nothing is implemented yet. The plan of record is
-> [docs/PLAN.md](docs/PLAN.md). Feedback is welcome through issues and PRs.
+> **Status: pre-release.** The core engine is implemented: schema and migrations,
+> the Postgres driver, transactional and bulk inserts, batched claim and finalize,
+> typed workers, retries with backoff, and graceful shutdown. Rescue of jobs from
+> crashed processes, LISTEN/NOTIFY wake-ups, unique jobs, cron, cancellation and
+> messaging follow, in the order laid out in [docs/PLAN.md](docs/PLAN.md), the
+> plan of record. Feedback is welcome through issues and PRs.
 
 ```go
 _, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42}, nil)   // commits with tx

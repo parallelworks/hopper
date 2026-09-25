@@ -10,7 +10,7 @@ RabbitMQ).
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** design. This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 and M1 are implemented (§16). This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -88,7 +88,8 @@ meant to replace a *rabbit*.
 
 ## 4. Public API sketch
 
-This sketch is illustrative. Exact names are settled in the M1 PR.
+This sketch is illustrative. Names in the M1 surface (jobs, workers, client lifecycle,
+inserting) are settled; later sections are still sketches.
 
 ### 4.1 Jobs and workers
 
@@ -377,8 +378,13 @@ CREATE TABLE hopper_job_history (
   finalized_at timestamptz NOT NULL,
   output       jsonb
 ) PARTITION BY LIST (state);
--- hopper_job_history_completed PARTITION BY RANGE (finalized_at)  -- hourly partitions
--- hopper_job_history_failed    PARTITION BY RANGE (finalized_at)  -- daily; cancelled + discarded
+CREATE TABLE hopper_job_history_completed PARTITION OF hopper_job_history
+  FOR VALUES IN ('completed') PARTITION BY RANGE (finalized_at);            -- hourly partitions
+CREATE TABLE hopper_job_history_failed PARTITION OF hopper_job_history
+  FOR VALUES IN ('cancelled', 'discarded') PARTITION BY RANGE (finalized_at); -- daily partitions
+-- Schema v1 gives each a DEFAULT partition so finalize works before the leader
+-- (M2) manages time partitions. The leader creates future time partitions only,
+-- because attaching a partition scans the DEFAULT partition for overlapping rows.
 
 -- Liveness: one lease row per running client process.
 CREATE TABLE hopper_clients (
@@ -548,26 +554,32 @@ every 500 results, whichever comes first, in **one statement**. Retries and snoo
 updated in place. Terminal outcomes are moved to history.
 
 ```sql
-WITH r AS (SELECT * FROM unnest($ids, $states, $scheduled_at, $errors, $outputs) AS r(...)),
+WITH r AS (SELECT * FROM unnest($ids, $attempted_by, $states, $delays, $snoozes, $errors, $outputs, $archives) AS r(...)),
 retry AS (
-  UPDATE hopper_jobs j SET state = r.state, scheduled_at = r.scheduled_at,
+  UPDATE hopper_jobs j SET state = r.state, scheduled_at = now() + r.delay,
          attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
-         errors = j.errors || r.error, attempted_by = NULL
+         errors = j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())), attempted_by = NULL
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
-    AND j.state = 'running' AND j.attempted_by = $client
+    AND j.state = 'running' AND j.attempted_by = r.attempted_by
   RETURNING j.id),
 done AS (
   DELETE FROM hopper_jobs j USING r
   WHERE j.id = r.id AND r.state IN ('completed','cancelled','discarded')
-    AND j.state = 'running' AND j.attempted_by = $client
-  RETURNING j.*, r.state AS final_state, r.error, r.output)
-INSERT INTO hopper_job_history SELECT … , now() FROM done;
+    AND j.state = 'running' AND j.attempted_by = r.attempted_by
+  RETURNING j.*, r.state AS final_state, r.error, r.output, r.archive),
+archived AS (INSERT INTO hopper_job_history SELECT … , now() FROM done WHERE archive)
+SELECT id FROM retry UNION ALL SELECT id FROM done;
 ```
 
-- The `state = 'running' AND attempted_by = $client` condition fences out stale
-  results. If the job was rescued and reclaimed, the result is dropped and logged, so
-  a finalize can never overwrite a newer attempt.
-- Queues with `Archive: false` delete completed jobs without writing history.
+- The `state = 'running' AND attempted_by = r.attempted_by` condition fences out
+  stale results. Each result carries the client ID that claimed its attempt, so a
+  client that re-registered under a new ID still finalizes the attempts it claimed
+  under the old one. If the job was rescued and reclaimed, the result is dropped and
+  logged, so a finalize can never overwrite a newer attempt. The statement returns
+  the IDs it applied; the client logs the rest.
+- Retry delays are sent as durations and applied to database `now()`; error
+  timestamps are set by the database too (§7.1).
+- Queues with `DeleteCompleted: true` delete completed jobs without writing history.
   Cancelled and discarded jobs are always archived, because history is the
   dead-letter queue (§7.10).
 - Outcomes:
@@ -580,6 +592,10 @@ INSERT INTO hopper_job_history SELECT … , now() FROM done;
   with `NextRetry(job) time.Time` or per queue with a `RetryPolicy`.
 - `CompleteTx(ctx, tx, job)` finalizes inside the worker's own transaction, so the work
   and its completion commit together. It bypasses the buffer.
+- The finalizer's write runs on a context the stop signal cannot cancel: a result that
+  reached the finalizer belongs to a job that has finished. While the client is running,
+  a failed flush is retried with backoff and the buffered results apply back-pressure
+  to claiming. Once the client is stopping, each batch gets one more attempt.
 - If a job has `await = true`, the finalizer sends `pg_notify('hopper_done', id)`, and
   `Await` returns as soon as the transaction commits.
 
@@ -667,12 +683,12 @@ message once it is acknowledged.
 
 | Outcome | Job queues | Subscription queues |
 | --- | --- | --- |
-| `completed` | archived for 24h | deleted on ack (`Archive: false`) |
+| `completed` | archived for 24h | deleted on ack (`DeleteCompleted: true`) |
 | `cancelled`, `discarded` | archived for 7d (the dead-letter queue) | archived for 7d (the dead-letter queue) |
 
-Both retention periods and `Archive` are configurable per queue. Setting
-`Archive: false` on a job queue gives maximum throughput by skipping the history
-insert.
+Both retention periods and `DeleteCompleted` are configurable per queue. Setting
+`DeleteCompleted: true` on a job queue gives maximum throughput by skipping the
+history insert.
 
 ### 7.11 Notifications
 LISTEN/NOTIFY gives low-latency wake-ups, and hopper keeps it cheap at high insert
@@ -695,6 +711,11 @@ rates:
 3. If `ctx` expires first, cancel all job contexts, wait a short grace period, flush
    whatever finished, release the lease and return `ctx.Err()`. Jobs that are still
    unfinished are rescued by another client (at-least-once).
+
+A job that returns because its context was cancelled by the stop is finalized as
+`retryable` with no delay, so it runs again immediately on another client. The
+interrupted attempt still counts, as it does for a rescued job. The lease keeps being
+renewed until the finalizer has flushed, so a long drain cannot let it lapse.
 
 ### 7.13 Encoding
 Args, outputs and message payloads go through a `Codec`. The default is
@@ -888,8 +909,8 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 
 | # | Milestone | Scope | Est. |
 | --- | --- | --- | --- |
-| M0 | Scaffold | go.mod, CI (lint, Postgres test matrix, `fips140=only`), PR-title check, Dependabot, CONTRIBUTING | 0.5d |
-| M1 | Core engine | `Driver` interface and `hopperpgx`, schema v1, `hoppermigrate`, Insert/InsertTx/InsertMany (unnest and COPY), typed workers and `WorkFunc`, batched claim, batched finalize with history move, retries and backoff, `Run`/`Stop` | 5d |
+| M0 | Scaffold | go.mod, CI (lint, Postgres test matrix, `fips140=only`), PR-title check, Dependabot, CONTRIBUTING. **Done.** | 0.5d |
+| M1 | Core engine | `Driver` interface and `hopperpgx`, schema v1, `hoppermigrate`, Insert/InsertTx/InsertMany (unnest and COPY), typed workers and `WorkFunc`, batched claim, batched finalize with history move, retries and backoff, `Snooze`/`Cancel` from workers, client lease registration and renewal, `Run`/`Stop`, a first `hopperbench`. **Done.** | 5d |
 | M2 | Reliability | Client leases, rescuer and fencing, leader lease, partitioned retention, LISTEN/NOTIFY with coalescing and adaptive polling, unique jobs (skip and replace) | 4d |
 | M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events | 4d |
 | M4 | Performance and release | `hopperbench`, targets met (§8.2), CI perf gate, chaos and upgrade suites, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, **v0.1.0** | 5d |
