@@ -34,6 +34,11 @@ Or from the shell:
 go run github.com/parallelworks/hopper/cmd/hopper -database-url "$DATABASE_URL" migrate up
 ```
 
+An application that already holds a `*sql.DB` (through pgx's `stdlib` adapter
+or lib/pq) can use `hoppersql.New(db)` in place of `hopperpgx.New(pool)`
+everywhere below; its transactions are then `*sql.Tx`. It polls instead of
+listening, so pickup takes up to `PollInterval` instead of a millisecond.
+
 The SQL files are in `hoppermigrate/migrations` for teams that run migrations
 with their own tool. `hopper_schema` records the applied versions either way.
 

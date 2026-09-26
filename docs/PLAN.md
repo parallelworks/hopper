@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M4, M6 and M7 (except the `hoppersql` driver) are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4, M6 and M7 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -292,11 +292,21 @@ the way that performs best on that engine.
 
 | Package | Engine | Module |
 | --- | --- | --- |
-| `hopper/driver/hopperpgx` | Postgres via pgx v5 (the reference driver) | core |
+| `hopper/driver/hopperpgx` | Postgres via pgx v5 (the reference driver): COPY, LISTEN, pipelined statements | core |
 | `hopper/driver/hoppersql` | Postgres via `database/sql` (lib/pq, pgx stdlib); polling only | core |
 | `hopper/drivertest` | Conformance, concurrency and chaos suite every driver must pass | core |
 | `hoppersqlite` (later) | SQLite: embedded, single-node and local development | separate module |
 | `hoppermongo` (later) | MongoDB (replica set, for transactions) | separate module |
+
+The two Postgres drivers share one implementation of the SQL and the logic around it
+(`driver/internal/pgsql`), written against a five-method transport (`Exec`, `Query`,
+`QueryRow`, `QueryExec`, `Begin`) that carries only portable values: strings, numbers,
+times, plain slices of them, and pointers for NULL; every statement casts its parameters,
+so a transport that cannot encode slices (`database/sql`) renders them as array
+literals instead. Each driver is the adapter from its
+library to that transport, plus what the library alone offers; `hopperpgx` adds COPY,
+LISTEN and pipelining, and `hoppersql` emulates savepoints and buffers a result set
+before the statement that follows it.
 
 An engine needs atomic claims, transactions for transactional enqueue, and a server
 clock. Push notifications are optional, because polling is always available. The two
@@ -995,7 +1005,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M4 | Performance and release | `hopperbench` scenarios and `-compare`, CI perf gate and nightly soak, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, CHANGELOG. **Done**, except the §8.2 run on the reference hardware that gates the **v0.1.0** tag. The upgrade suite starts with the first schema change (there is one schema version so far). | 5d |
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done**; **v0.2.0** follows v0.1.0. | 5d |
-| M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0**. **Done** except `hoppersql`, which lands in its own PR. | 5d |
+| M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0**. **Done.** | 5d |
 | M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumer groups, `hopperui` | 2–3w |
 | M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |
 

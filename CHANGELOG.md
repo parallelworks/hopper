@@ -25,6 +25,14 @@ versions may change the API.
   finalizing statement.
 - Schema v3: queue limit columns, `hopper_batches`, and the partition and
   batch indexes.
+- `hoppersql`, a driver for `database/sql` (pgx's stdlib adapter or lib/pq)
+  that passes the same conformance suite as `hopperpgx`. It polls instead of
+  listening and inserts without COPY.
+
+### Changed
+
+- The Postgres SQL and the logic around it moved to a package shared by both
+  drivers; `hopperpgx` keeps its COPY, LISTEN and pipelining paths.
 
 ## [0.1.0]
 

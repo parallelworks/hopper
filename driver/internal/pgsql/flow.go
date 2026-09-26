@@ -1,27 +1,23 @@
-package hopperpgx
+package pgsql
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
-
 	"github.com/parallelworks/hopper/driver"
 )
 
-// batchAccountingSQL counts finalized jobs off their batches and inserts the
-// callbacks of batches that reached zero, all inside the finalizing
-// statement. It expects a CTE named done whose rows carry batch_id and a
-// text column final_state, and the insert channel as the parameter named by
-// batchAccountingSQLWith. Rows without a batch cost one filtered scan of
-// the CTE and nothing else.
-var batchAccountingSQL = batchAccountingSQLWith("$10")
-
+// batchAccountingSQLWith returns the CTEs that count finalized jobs off
+// their batches and insert the callbacks of batches that reached zero, all
+// inside the finalizing statement. They expect a CTE named done whose rows
+// carry batch_id and a text column final_state, and the insert channel as
+// the given parameter. Rows without a batch cost one filtered scan of the
+// CTE and nothing else.
 func batchAccountingSQLWith(channelParam string) string {
 	return `batches AS (
   UPDATE hopper_batches b
@@ -47,13 +43,13 @@ callbacks AS (
 // every client's claims on a limited queue are serialized and the limits
 // hold exactly: the budget is the smallest of the free slots, what the
 // global limit leaves, and the whole tokens in the rate bucket.
-func (e *executor) claimLimited(ctx context.Context, params driver.JobClaimParams) (driver.JobClaimResult, error) {
+func (e *Executor) claimLimited(ctx context.Context, params driver.JobClaimParams) (driver.JobClaimResult, error) {
 	var res driver.JobClaimResult
-	err := e.withTx(ctx, func(tx pgx.Tx) error {
+	err := e.withTx(ctx, func(tx Tx) error {
 		var (
-			global, burst, partition pgtype.Int4
-			rate, tokens             pgtype.Float8
-			refilled                 pgtype.Timestamptz
+			global, burst, partition sql.NullInt64
+			rate, tokens             sql.NullFloat64
+			refilled                 sql.NullTime
 			now                      time.Time
 			running                  int
 		)
@@ -65,26 +61,26 @@ func (e *executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 			SELECT global_limit, rate_per_sec, rate_burst, tokens, refilled_at, partition_limit
 			FROM hopper_queues WHERE name = $1 FOR UPDATE`, params.Queue,
 		).Scan(&global, &rate, &burst, &tokens, &refilled, &partition)
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, ErrNoRows) {
 			// No row, no limits.
 			jobs, err := claimRows(ctx, tx, jobClaimQuery, params.Queue, params.ClientID, params.Limit)
 			res.Jobs = jobs
 			return err
 		}
 		if err != nil {
-			return fmt.Errorf("hopperpgx: lock queue: %w", err)
+			return fmt.Errorf("hopper: lock queue: %w", err)
 		}
 		if err := tx.QueryRow(ctx, `SELECT now(), (SELECT count(*) FROM hopper_jobs WHERE queue = $1 AND state = 'running')`, params.Queue).Scan(&now, &running); err != nil {
-			return fmt.Errorf("hopperpgx: count running: %w", err)
+			return fmt.Errorf("hopper: count running: %w", err)
 		}
 
 		budget := params.Limit
 		if global.Valid {
-			budget = min(budget, int(global.Int32)-running)
+			budget = min(budget, int(global.Int64)-running)
 		}
 		var available float64
 		if rate.Valid && rate.Float64 > 0 {
-			capacity := float64(burst.Int32)
+			capacity := float64(burst.Int64)
 			if !burst.Valid || capacity <= 0 {
 				capacity = math.Ceil(rate.Float64)
 			}
@@ -105,8 +101,8 @@ func (e *executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 			return nil
 		}
 		var jobs []*driver.JobRow
-		if partition.Valid && partition.Int32 > 0 {
-			jobs, err = claimRows(ctx, tx, jobClaimPartitionedQuery, params.Queue, params.ClientID, budget, partition.Int32)
+		if partition.Valid && partition.Int64 > 0 {
+			jobs, err = claimRows(ctx, tx, jobClaimPartitionedQuery, params.Queue, params.ClientID, budget, partition.Int64)
 		} else {
 			jobs, err = claimRows(ctx, tx, jobClaimQuery, params.Queue, params.ClientID, budget)
 		}
@@ -117,7 +113,7 @@ func (e *executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 		if rate.Valid && rate.Float64 > 0 {
 			if _, err := tx.Exec(ctx, `UPDATE hopper_queues SET tokens = $2, refilled_at = $3 WHERE name = $1`,
 				params.Queue, available-float64(len(jobs)), now); err != nil {
-				return fmt.Errorf("hopperpgx: update rate bucket: %w", err)
+				return fmt.Errorf("hopper: update rate bucket: %w", err)
 			}
 		}
 		return nil
@@ -128,53 +124,24 @@ func (e *executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 	return res, nil
 }
 
-func (e *executor) JobAge(ctx context.Context, queue string, after time.Duration) (int64, error) {
-	if after <= 0 {
-		return 0, nil
-	}
-	// Bumped jobs restart their wait, so a job climbs one level per period.
-	tag, err := e.db.Exec(ctx, `
-		UPDATE hopper_jobs SET priority = priority - 1, scheduled_at = now()
-		WHERE queue = $1 AND state IN ('available', 'scheduled', 'retryable') AND priority > 1
-		  AND scheduled_at <= now() - make_interval(secs => $2)`, queue, after.Seconds())
-	if err != nil {
-		return 0, fmt.Errorf("hopperpgx: age jobs: %w", err)
-	}
-	return tag.RowsAffected(), nil
-}
-
-func (e *executor) QueueSetLimits(ctx context.Context, l driver.QueueLimits) error {
-	nullable := func(v int) pgtype.Int4 { return pgtype.Int4{Int32: int32(v), Valid: v > 0} } //nolint:gosec // limits are small
-	rate := pgtype.Float8{Float64: l.RatePerSec, Valid: l.RatePerSec > 0}
-	_, err := e.db.Exec(ctx, `
-		INSERT INTO hopper_queues (name, global_limit, rate_per_sec, rate_burst, partition_limit, aging_seconds, tokens, refilled_at)
-		VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL)
-		ON CONFLICT (name) DO UPDATE SET global_limit = EXCLUDED.global_limit, rate_per_sec = EXCLUDED.rate_per_sec,
-		  rate_burst = EXCLUDED.rate_burst, partition_limit = EXCLUDED.partition_limit, aging_seconds = EXCLUDED.aging_seconds,
-		  tokens = CASE WHEN hopper_queues.rate_per_sec IS DISTINCT FROM EXCLUDED.rate_per_sec THEN NULL ELSE hopper_queues.tokens END,
-		  updated_at = now()`,
-		l.Name, nullable(l.GlobalLimit), rate, nullable(l.RateBurst), nullable(l.PartitionLimit), nullable(int(l.Aging/time.Second)))
-	if err != nil {
-		return fmt.Errorf("hopperpgx: set queue limits: %w", err)
-	}
-	if _, err := e.db.Exec(ctx, notifySQL, driver.ChannelControl, []string{"limit:" + l.Name}); err != nil {
-		return fmt.Errorf("hopperpgx: set queue limits: notify: %w", err)
-	}
-	return nil
-}
-
 // callbackJSON encodes a batch callback for the batch row.
-func callbackJSON(p *driver.JobInsertParams) ([]byte, error) {
+func callbackJSON(p *driver.JobInsertParams) (*string, error) {
 	if p == nil {
 		return nil, nil
 	}
-	return json.Marshal(map[string]any{
+	b, err := json.Marshal(map[string]any{
 		"kind": p.Kind, "queue": p.Queue, "priority": p.Priority, "max_attempts": p.MaxAttempts,
 		"args": json.RawMessage(jsonOrEmptyObject(p.Args)), "metadata": json.RawMessage(jsonOrEmptyObject(p.Metadata)),
 	})
+	if err != nil {
+		return nil, err
+	}
+	s := string(b)
+	return &s, nil
 }
 
-func (e *executor) BatchInsert(ctx context.Context, params driver.BatchInsertParams) (driver.JobID, error) {
+// BatchInsert implements driver.Executor.
+func (e *Executor) BatchInsert(ctx context.Context, params driver.BatchInsertParams) (driver.JobID, error) {
 	onSuccess, err := callbackJSON(params.OnSuccess)
 	if err != nil {
 		return driver.JobID{}, err
@@ -188,29 +155,32 @@ func (e *executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 		return driver.JobID{}, err
 	}
 	var id driver.JobID
-	err = e.db.QueryRow(ctx, `
+	err = e.Conn.QueryRow(ctx, `
 		INSERT INTO hopper_batches (pending, total, on_success, on_failure, on_complete, metadata)
-		VALUES ($1, $1, $2, $3, $4, $5) RETURNING id`,
+		VALUES ($1, $1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb) RETURNING id`,
 		params.Total, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata)).Scan(&id)
 	if err != nil {
-		return driver.JobID{}, fmt.Errorf("hopperpgx: insert batch: %w", err)
+		return driver.JobID{}, fmt.Errorf("hopper: insert batch: %w", err)
 	}
 	return id, nil
 }
 
-func (e *executor) BatchGet(ctx context.Context, id driver.JobID) (*driver.BatchRow, error) {
+// BatchGet implements driver.Executor.
+func (e *Executor) BatchGet(ctx context.Context, id driver.JobID) (*driver.BatchRow, error) {
 	var (
 		b         driver.BatchRow
-		completed pgtype.Timestamptz
+		completed sql.NullTime
+		metadata  jsonText
 	)
-	err := e.db.QueryRow(ctx, `SELECT id, pending, failed, total, created_at, completed_at, metadata FROM hopper_batches WHERE id = $1`, [16]byte(id)).
-		Scan(&b.ID, &b.Pending, &b.Failed, &b.Total, &b.CreatedAt, &completed, &b.Metadata)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err := e.Conn.QueryRow(ctx, `SELECT id, pending, failed, total, created_at, completed_at, metadata FROM hopper_batches WHERE id = $1`, uuidParam(id)).
+		Scan(&b.ID, &b.Pending, &b.Failed, &b.Total, &b.CreatedAt, &completed, &metadata)
+	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("hopperpgx: get batch: %w", err)
+		return nil, fmt.Errorf("hopper: get batch: %w", err)
 	}
 	b.CompletedAt = completed.Time
+	b.Metadata = metadata.raw()
 	return &b, nil
 }
