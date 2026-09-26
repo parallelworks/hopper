@@ -1,0 +1,48 @@
+name: Soak
+
+# A nightly, longer run of the benchmark harness with a large history, to
+# catch drift that a short PR run would miss: throughput with millions of
+# history rows, and the retry and scheduled workloads at volume. Results are
+# kept as an artifact. The 24-hour soak in docs/PLAN.md §8.3 runs on the
+# release hardware, not here.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: hopper
+          POSTGRES_PASSWORD: hopper
+          POSTGRES_DB: hopper_soak
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hopper -d hopper_soak"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_soak?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Soak
+        run: |
+          for round in 1 2 3; do
+            go run ./cmd/hopperbench -database-url "$DATABASE_URL" \
+              -scenarios throughput,mixed,scheduled,retry,insert,copy,latency \
+              -jobs 200000 -history 5000000 -schema "soak_$round"
+          done | tee soak.jsonl
+      - uses: actions/upload-artifact@v6
+        with:
+          name: soak-${{ github.run_id }}
+          path: soak.jsonl

@@ -21,9 +21,14 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Verify go.mod is tidy
-        run: go mod tidy -diff && (cd tools && go mod tidy -diff)
+        run: |
+          go mod tidy -diff
+          (cd tools && go mod tidy -diff)
+          (cd hopperotel && go mod tidy -diff)
       - name: Lint
-        run: go tool -modfile=tools/go.mod golangci-lint run ./...
+        run: |
+          go tool -modfile=tools/go.mod golangci-lint run ./...
+          (cd hopperotel && go tool -modfile=../tools/go.mod golangci-lint run ./...)
 
   test:
     runs-on: ubuntu-latest
@@ -53,4 +58,6 @@ jobs:
           # so that a future go.mod edit cannot silently drop it.
           GODEBUG: fips140=only
           HOPPER_TEST_DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_test?sslmode=disable
-        run: go test -race -cover -timeout 10m ./...
+        run: |
+          go test -race -cover -timeout 10m ./...
+          (cd hopperotel && go test -race -cover -timeout 10m ./...)

@@ -148,6 +148,8 @@ type Executor interface {
 	// ClientPruneExpired removes lease rows that have expired and returns
 	// how many.
 	ClientPruneExpired(ctx context.Context) (int64, error)
+	// ClientList returns every client lease row, live or expired.
+	ClientList(ctx context.Context) ([]*ClientRow, error)
 
 	// Notify sends a notification per payload on a channel, delivered to
 	// listeners when the surrounding transaction commits. Engines without
@@ -454,6 +456,15 @@ type ClientRegisterParams struct {
 	Hostname string
 	TTL      time.Duration
 	Info     json.RawMessage
+}
+
+// ClientRow is a client process's lease.
+type ClientRow struct {
+	ID        int64
+	Hostname  string
+	StartedAt time.Time
+	ExpiresAt time.Time
+	Info      json.RawMessage
 }
 
 // ClientRenewParams extends a lease.

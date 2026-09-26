@@ -1,0 +1,63 @@
+name: Performance gate
+
+# Runs a reduced benchmark on the PR and on its base, on the same runner,
+# back to back, and fails if the PR is more than 10% slower on any scenario.
+# Hosted runners are noisy, so each side runs several times and the best
+# result counts. The reference numbers in docs/PLAN.md §8.2 come from the
+# release hardware, not from here.
+on:
+  pull_request:
+    paths:
+      - "go.mod"
+      - "*.go"
+      - "driver/**"
+      - "hoppermigrate/**"
+      - "cmd/hopperbench/**"
+      - ".github/workflows/perf.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: hopper
+          POSTGRES_PASSWORD: hopper
+          POSTGRES_DB: hopper_bench
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hopper -d hopper_bench"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_bench?sslmode=disable
+      SCENARIOS: throughput,insert,copy
+      RUNS: "3"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Benchmark the PR
+        run: |
+          for i in $(seq "$RUNS"); do
+            go run ./cmd/hopperbench -database-url "$DATABASE_URL" -scenarios "$SCENARIOS" -jobs 30000 -schema "head_$i"
+          done | tee head.jsonl
+      - name: Benchmark the base
+        run: |
+          git worktree add ../base "origin/${{ github.base_ref }}"
+          cd ../base
+          for i in $(seq "$RUNS"); do
+            go run ./cmd/hopperbench -database-url "$DATABASE_URL" -scenarios "$SCENARIOS" -jobs 30000 -schema "base_$i"
+          done | tee "$GITHUB_WORKSPACE/base.jsonl"
+      - name: Compare
+        run: go run ./cmd/hopperbench -compare base.jsonl,head.jsonl -threshold 0.10

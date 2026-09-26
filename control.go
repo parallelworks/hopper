@@ -67,10 +67,20 @@ const jobsPageSize = 100
 // (which is insertion order). It pages transparently; stop iterating to
 // stop fetching.
 func (c *Client[TTx]) Jobs(ctx context.Context, filter JobFilter) iter.Seq2[*JobRow, error] {
+	return c.jobs(ctx, c.exec, filter)
+}
+
+// JobsTx is Jobs inside the caller's transaction, so that jobs inserted with
+// InsertTx can be listed before the transaction commits.
+func (c *Client[TTx]) JobsTx(ctx context.Context, tx TTx, filter JobFilter) iter.Seq2[*JobRow, error] {
+	return c.jobs(ctx, c.driver.UnwrapTx(tx), filter)
+}
+
+func (c *Client[TTx]) jobs(ctx context.Context, exec driver.Executor, filter JobFilter) iter.Seq2[*JobRow, error] {
 	return func(yield func(*JobRow, error) bool) {
 		var after JobID
 		for {
-			page, err := c.exec.JobList(ctx, driver.JobListParams{
+			page, err := exec.JobList(ctx, driver.JobListParams{
 				Queue: filter.Queue, Kinds: filter.Kinds, States: filter.States, After: after, Limit: jobsPageSize,
 			})
 			if err != nil {
@@ -88,6 +98,15 @@ func (c *Client[TTx]) Jobs(ctx context.Context, filter JobFilter) iter.Seq2[*Job
 			}
 		}
 	}
+}
+
+// ClientRow is a client process's lease.
+type ClientRow = driver.ClientRow
+
+// Clients lists every client lease, live or expired (expired rows are
+// pruned by the leader).
+func (c *Client[TTx]) Clients(ctx context.Context) ([]*ClientRow, error) {
+	return c.exec.ClientList(ctx)
 }
 
 // Stats is a snapshot of queue depths and cluster state.
