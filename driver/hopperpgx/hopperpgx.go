@@ -5,6 +5,10 @@
 // The driver is generic over pgx.Tx, so InsertTx accepts only a pgx
 // transaction. Tables live in the first schema of the connection's
 // search_path; set it on the pool to isolate hopper in its own schema.
+//
+// The SQL and the logic around it are shared with hoppersql; this package
+// adds what pgx alone offers: COPY for bulk inserts, LISTEN, and pipelined
+// statements.
 package hopperpgx
 
 import (
@@ -17,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/driver/internal/pgsql"
 )
 
 // Driver implements driver.Driver[pgx.Tx] on a pgxpool.Pool.
@@ -60,12 +65,12 @@ func (d *Driver) Pool() *pgxpool.Pool { return d.pool }
 
 // Executor implements driver.Driver.
 func (d *Driver) Executor() driver.Executor {
-	return &executor{db: d.pool, pool: d.pool}
+	return &executor{Executor: &pgsql.Executor{Conn: conn{db: d.pool}}, pool: d.pool}
 }
 
 // UnwrapTx implements driver.Driver.
 func (d *Driver) UnwrapTx(tx pgx.Tx) driver.Executor {
-	return &executor{db: tx, tx: tx}
+	return &executor{Executor: &pgsql.Executor{Conn: conn{db: tx}, InTx: true}, tx: tx}
 }
 
 // Capabilities implements driver.Driver.
@@ -79,16 +84,16 @@ func (d *Driver) Listener(ctx context.Context) (driver.Listener, error) {
 	if cfg == nil {
 		cfg = d.pool.Config().ConnConfig
 	}
-	conn, err := pgx.ConnectConfig(ctx, cfg.Copy())
+	c, err := pgx.ConnectConfig(ctx, cfg.Copy())
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: connect listener: %w", err)
 	}
 	// Name the connection so operators (and tests) can tell it apart in
 	// pg_stat_activity: "hopper-listener:<schema>".
-	if _, err := conn.Exec(ctx, "SELECT set_config('application_name', 'hopper-listener:' || current_schema(), false)"); err != nil {
-		return nil, errors.Join(fmt.Errorf("hopperpgx: name listener: %w", err), conn.Close(context.WithoutCancel(ctx)))
+	if _, err := c.Exec(ctx, "SELECT set_config('application_name', 'hopper-listener:' || current_schema(), false)"); err != nil {
+		return nil, errors.Join(fmt.Errorf("hopperpgx: name listener: %w", err), c.Close(context.WithoutCancel(ctx)))
 	}
-	return &listener{conn: conn}, nil
+	return &listener{conn: c}, nil
 }
 
 type listener struct {
@@ -121,17 +126,10 @@ func (d *Driver) Migrator() driver.Migrator {
 	return &migrator{pool: d.pool}
 }
 
-// dbtx is the subset of pgx shared by *pgxpool.Pool and pgx.Tx.
-type dbtx interface {
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
-	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
-}
-
-// executor runs operations on either the pool or a transaction.
+// executor is the shared implementation plus the COPY path, which needs
+// the pool or the transaction itself.
 type executor struct {
-	db dbtx
+	*pgsql.Executor
 	// Exactly one of pool and tx is set.
 	pool *pgxpool.Pool
 	tx   pgx.Tx
@@ -139,8 +137,168 @@ type executor struct {
 
 var _ driver.Executor = (*executor)(nil)
 
-// migrationLockKey is the pg_advisory_lock key held while migrating.
-const migrationLockKey int64 = 0x686f707065725f6d // "hopper_m"
+// dbtx is the subset of pgx shared by *pgxpool.Pool, *pgxpool.Conn,
+// *pgx.Conn and pgx.Tx.
+type dbtx interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// conn adapts a dbtx to pgsql.Conn.
+type conn struct {
+	db dbtx
+}
+
+func (c conn) Exec(ctx context.Context, sql string, args ...any) (int64, error) {
+	tag, err := c.db.Exec(ctx, sql, args...)
+	if err != nil {
+		return 0, wrapErr(err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (c conn) Query(ctx context.Context, sql string, args ...any) (pgsql.Rows, error) {
+	rows, err := c.db.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return pgxRows{rows}, nil
+}
+
+func (c conn) QueryRow(ctx context.Context, sql string, args ...any) pgsql.Row {
+	return pgxRow{c.db.QueryRow(ctx, sql, args...)}
+}
+
+// QueryExec pipelines both statements in one round trip. Outside an
+// explicit transaction a batch runs in an implicit one, so the statement's
+// failure also undoes the query; the rows report it from Err once they are
+// exhausted.
+func (c conn) QueryExec(ctx context.Context, query string, queryArgs []any, exec string, execArgs []any) (pgsql.Rows, error) {
+	b := &pgx.Batch{}
+	b.Queue(query, queryArgs...)
+	b.Queue(exec, execArgs...)
+	br := c.db.SendBatch(ctx, b)
+	rows, err := br.Query()
+	if err != nil {
+		return nil, errors.Join(wrapErr(err), br.Close())
+	}
+	return &batchRows{Rows: rows, br: br}, nil
+}
+
+func (c conn) Begin(ctx context.Context) (pgsql.Tx, error) {
+	tx, err := c.db.Begin(ctx)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return pgxTx{conn: conn{db: tx}, tx: tx}, nil
+}
+
+// pgxTx is a transaction, or a savepoint inside one.
+type pgxTx struct {
+	conn
+	tx pgx.Tx
+}
+
+func (t pgxTx) Commit(ctx context.Context) error { return wrapErr(t.tx.Commit(ctx)) }
+
+func (t pgxTx) Rollback(ctx context.Context) error {
+	err := t.tx.Rollback(ctx)
+	if errors.Is(err, pgx.ErrTxClosed) {
+		return nil
+	}
+	return wrapErr(err)
+}
+
+// pgxRows adapts pgx.Rows.
+type pgxRows struct {
+	pgx.Rows
+}
+
+func (r pgxRows) Scan(dest ...any) error { return wrapErr(r.Rows.Scan(dest...)) }
+func (r pgxRows) Err() error             { return wrapErr(r.Rows.Err()) }
+
+// batchRows is the query result of a batch, which finishes the batch (the
+// trailing statement) once the rows are consumed or closed.
+type batchRows struct {
+	pgx.Rows
+	br   pgx.BatchResults
+	err  error
+	done bool
+}
+
+func (r *batchRows) Next() bool {
+	if r.done {
+		return false
+	}
+	if r.Rows.Next() {
+		return true
+	}
+	r.finish()
+	return false
+}
+
+func (r *batchRows) Scan(dest ...any) error { return wrapErr(r.Rows.Scan(dest...)) }
+
+func (r *batchRows) Err() error {
+	if !r.done {
+		return wrapErr(r.Rows.Err())
+	}
+	return r.err
+}
+
+func (r *batchRows) Close() { r.finish() }
+
+func (r *batchRows) finish() {
+	if r.done {
+		return
+	}
+	r.done = true
+	r.Rows.Close()
+	r.err = wrapErr(r.Rows.Err())
+	if _, err := r.br.Exec(); err != nil && r.err == nil {
+		r.err = wrapErr(err)
+	}
+	if err := r.br.Close(); err != nil && r.err == nil {
+		r.err = wrapErr(err)
+	}
+}
+
+type pgxRow struct {
+	row pgx.Row
+}
+
+func (r pgxRow) Scan(dest ...any) error {
+	err := r.row.Scan(dest...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pgsql.ErrNoRows
+	}
+	return wrapErr(err)
+}
+
+// sqlStateError lets the shared code recognize error classes without
+// knowing pgx.
+type sqlStateError struct {
+	err   error
+	state string
+}
+
+func (e *sqlStateError) Error() string         { return e.err.Error() }
+func (e *sqlStateError) Unwrap() error         { return e.err }
+func (e *sqlStateError) SQLState() string      { return e.state }
+func (e *sqlStateError) UniqueViolation() bool { return e.state == pgerrUniqueViolation }
+
+const pgerrUniqueViolation = "23505"
+
+func wrapErr(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return &sqlStateError{err: err, state: pgErr.Code}
+	}
+	return err
+}
 
 type migrator struct {
 	pool *pgxpool.Pool
@@ -150,14 +308,14 @@ type migrator struct {
 // connection, outside the pool, so processes waiting for the lock cannot
 // starve the migration of pool connections.
 func (m *migrator) Lock(ctx context.Context) (driver.MigrationExecutor, error) {
-	conn, err := pgx.ConnectConfig(ctx, m.pool.Config().ConnConfig.Copy())
+	c, err := pgx.ConnectConfig(ctx, m.pool.Config().ConnConfig.Copy())
 	if err != nil {
 		return nil, fmt.Errorf("connect for migration lock: %w", err)
 	}
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockKey); err != nil {
-		return nil, errors.Join(fmt.Errorf("acquire migration lock: %w", err), conn.Close(context.WithoutCancel(ctx)))
+	if _, err := c.Exec(ctx, "SELECT pg_advisory_lock($1)", pgsql.MigrationLockKey); err != nil {
+		return nil, errors.Join(fmt.Errorf("acquire migration lock: %w", err), c.Close(context.WithoutCancel(ctx)))
 	}
-	return &migrationExecutor{conn: conn}, nil
+	return &migrationExecutor{conn: c}, nil
 }
 
 type migrationExecutor struct {
@@ -165,53 +323,14 @@ type migrationExecutor struct {
 }
 
 func (m *migrationExecutor) Versions(ctx context.Context) ([]int, error) {
-	var exists bool
-	if err := m.conn.QueryRow(ctx, "SELECT to_regclass('hopper_schema') IS NOT NULL").Scan(&exists); err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, nil
-	}
-	rows, err := m.conn.Query(ctx, "SELECT version FROM hopper_schema ORDER BY version")
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, pgx.RowTo[int])
+	return pgsql.MigrationVersions(ctx, conn{db: m.conn})
 }
 
-func (m *migrationExecutor) Apply(ctx context.Context, version int, script string, up bool) (err error) {
-	tx, err := m.conn.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			err = errors.Join(err, tx.Rollback(context.WithoutCancel(ctx)))
-		}
-	}()
-	if up {
-		// Exec without arguments uses the simple protocol, which allows a
-		// multi-statement script.
-		if _, err := tx.Exec(ctx, script); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "INSERT INTO hopper_schema (version) VALUES ($1)", version); err != nil {
-			return err
-		}
-	} else {
-		// The version row goes first: the down script of version 1 drops
-		// hopper_schema itself.
-		if _, err := tx.Exec(ctx, "DELETE FROM hopper_schema WHERE version = $1", version); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, script); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
+func (m *migrationExecutor) Apply(ctx context.Context, version int, script string, up bool) error {
+	return pgsql.MigrationApply(ctx, conn{db: m.conn}, version, script, up)
 }
 
 func (m *migrationExecutor) Close(ctx context.Context) error {
-	_, err := m.conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", migrationLockKey)
+	_, err := m.conn.Exec(ctx, "SELECT pg_advisory_unlock($1)", pgsql.MigrationLockKey)
 	return errors.Join(err, m.conn.Close(ctx))
 }

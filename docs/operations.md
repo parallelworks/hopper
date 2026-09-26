@@ -43,6 +43,11 @@
   session connection: point the listener at a direct address with
   `hopperpgx.Config.ListenConnConfig`, or accept polling (the client logs
   once and polls every `PollInterval`, one second by default).
+- **`database/sql`.** `hoppersql.New(db)` runs hopper on a `*sql.DB` opened
+  with pgx's `stdlib` adapter or lib/pq, for applications that already use
+  one. It has no `LISTEN`, so clients poll every `PollInterval`, and no COPY,
+  so large `InsertMany` calls use the single-statement path. `hopperpgx` is
+  the faster choice when the application can hold a pgx pool.
 - **Isolation.** Set `search_path` on the pool to keep hopper's tables in
   their own schema. Notification channels are per database, so two hopper
   schemas in one database will wake each other up; that is harmless.
