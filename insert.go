@@ -58,6 +58,22 @@ func (c *Client[TTx]) insertMany(ctx context.Context, exec driver.Executor, para
 	if len(params) == 0 {
 		return []*InsertResult{}, nil
 	}
+	next := func(ctx context.Context, params []InsertParams) ([]*InsertResult, error) {
+		return c.insertDirect(ctx, exec, params, inTx)
+	}
+	for i := len(c.cfg.Middleware) - 1; i >= 0; i-- {
+		m, inner := c.cfg.Middleware[i], next
+		next = func(ctx context.Context, params []InsertParams) ([]*InsertResult, error) {
+			return m.Insert(ctx, params, inner)
+		}
+	}
+	return next(ctx, params)
+}
+
+func (c *Client[TTx]) insertDirect(ctx context.Context, exec driver.Executor, params []InsertParams, inTx bool) ([]*InsertResult, error) {
+	if len(params) == 0 {
+		return []*InsertResult{}, nil
+	}
 	now := time.Now()
 	dparams := make([]driver.JobInsertParams, len(params))
 	actions := make([]driver.ConflictAction, len(params))
@@ -179,6 +195,9 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 	if len(opts.Metadata) > 0 && !json.Valid(opts.Metadata) {
 		return driver.JobInsertParams{}, 0, errors.New("hopper: Metadata is not valid JSON")
 	}
+	if opts.TTL < 0 {
+		return driver.JobInsertParams{}, 0, fmt.Errorf("hopper: TTL %s must not be negative", opts.TTL)
+	}
 
 	args, err := c.cfg.Codec.Marshal(p.Args)
 	if err != nil {
@@ -192,6 +211,8 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 		ScheduledAt: opts.ScheduledAt,
 		Args:        args,
 		Metadata:    opts.Metadata,
+		TTL:         opts.TTL,
+		Await:       opts.Await,
 	}
 	action := driver.ConflictSkip
 	if opts.Unique != nil {

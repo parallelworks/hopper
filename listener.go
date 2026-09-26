@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -48,7 +49,7 @@ func (c *Client[TTx]) listenOnce(ctx context.Context) error {
 		return err
 	}
 	defer l.Close(context.WithoutCancel(ctx)) //nolint:errcheck // best effort on a failed connection
-	if err := l.Listen(ctx, driver.ChannelInsert, driver.ChannelLeader); err != nil {
+	if err := l.Listen(ctx, driver.ChannelInsert, driver.ChannelLeader, driver.ChannelControl, driver.ChannelDone); err != nil {
 		return err
 	}
 	c.listening.Store(true)
@@ -63,6 +64,30 @@ func (c *Client[TTx]) listenOnce(ctx context.Context) error {
 			c.wakeQueue(n.Payload)
 		case driver.ChannelLeader:
 			c.pokeLeader()
+		case driver.ChannelControl:
+			c.control(n.Payload)
+		case driver.ChannelDone:
+			if id, err := ParseJobID(n.Payload); err == nil {
+				c.signalDone(id)
+			}
 		}
+	}
+}
+
+// control applies an operator action from ChannelControl.
+func (c *Client[TTx]) control(payload string) {
+	action, arg, ok := strings.Cut(payload, ":")
+	if !ok {
+		return
+	}
+	switch action {
+	case "cancel":
+		if id, err := ParseJobID(arg); err == nil {
+			c.cancelLocal(id)
+		}
+	case "pause":
+		c.setPaused(arg, true)
+	case "resume":
+		c.setPaused(arg, false)
 	}
 }

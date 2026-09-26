@@ -84,13 +84,15 @@ func collectJobs(rows pgx.Rows, history bool) ([]*driver.JobRow, error) {
 const jobInsertSQL = `
 WITH p AS (
   SELECT * FROM unnest(
-    $1::text[], $2::text[], $3::smallint[], $4::smallint[], $5::timestamptz[], $6::jsonb[], $7::jsonb[], $8::text[]
-  ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key)
+    $1::text[], $2::text[], $3::smallint[], $4::smallint[], $5::timestamptz[], $6::jsonb[], $7::jsonb[], $8::text[],
+    $9::float8[], $10::boolean[]
+  ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key, ttl, await)
 )
-INSERT INTO hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key)
+INSERT INTO hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await)
 SELECT p.kind, p.queue,
        CASE WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::hopper_job_state,
-       p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata, p.unique_key
+       p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata, p.unique_key,
+       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await
 FROM p
 ON CONFLICT (kind, unique_key) WHERE unique_key IS NOT NULL DO UPDATE SET ` + "%s" + `
 RETURNING ` + "%s" + `, (xmax <> 0) AS duplicate`
@@ -151,9 +153,13 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 		args        = make([][]byte, n)
 		metadata    = make([][]byte, n)
 		uniqueKeys  = make([]pgtype.Text, n)
+		ttls        = make([]float64, n)
+		awaits      = make([]bool, n)
 	)
 	for i, p := range params {
 		var err error
+		ttls[i] = max(p.TTL, 0).Seconds()
+		awaits[i] = p.Await
 		if priorities[i], err = smallint(p.Priority, "priority"); err != nil {
 			return nil, err
 		}
@@ -171,7 +177,7 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 	if opts.OnConflict == driver.ConflictReplace {
 		query = jobInsertReplaceQuery
 	}
-	queryArgs := []any{kinds, queues, priorities, maxAttempts, scheduledAt, args, metadata, uniqueKeys}
+	queryArgs := []any{kinds, queues, priorities, maxAttempts, scheduledAt, args, metadata, uniqueKeys, ttls, awaits}
 	collect := func(rows pgx.Rows, err error) ([]driver.JobInsertResult, error) {
 		if err != nil {
 			return nil, err
@@ -327,15 +333,21 @@ func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertP
 			Args:        jsonOrEmptyObject(p.Args),
 			Metadata:    jsonOrEmptyObject(p.Metadata),
 			Errors:      []driver.AttemptError{},
+			Await:       p.Await,
 			CreatedAt:   now,
+		}
+		var expiresAt pgtype.Timestamptz
+		if p.TTL > 0 {
+			j.ExpiresAt = now.Add(p.TTL)
+			expiresAt = pgtype.Timestamptz{Time: j.ExpiresAt, Valid: true}
 		}
 		results[i] = driver.JobInsertResult{Job: j}
 		values[i] = []any{
 			[16]byte(j.ID), j.Kind, j.Queue, string(j.State), priority, maxAttempts,
-			j.ScheduledAt, []byte(j.Args), []byte(j.Metadata), j.CreatedAt,
+			j.ScheduledAt, []byte(j.Args), []byte(j.Metadata), expiresAt, j.Await, j.CreatedAt,
 		}
 	}
-	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "created_at"}
+	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "expires_at", "await", "created_at"}
 	copied, err := copier.CopyFrom(ctx, pgx.Identifier{"hopper_jobs"}, columns, pgx.CopyFromRows(values))
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: copy jobs: %w", err)
@@ -395,6 +407,7 @@ WITH claimed AS (
     SELECT id FROM hopper_jobs
     WHERE queue = $1 AND state IN ('available', 'scheduled', 'retryable')
       AND scheduled_at <= now()
+      AND (expires_at IS NULL OR expires_at > now())
     ORDER BY priority, scheduled_at, seq
     LIMIT $3
     FOR UPDATE SKIP LOCKED
@@ -455,7 +468,8 @@ done AS (
     CASE WHEN r.error IS NULL THEN j.errors
          ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END AS errors,
     j.unique_key, j.ordering_key, j.partition_key, j.batch_id, j.expires_at,
-    j.cancel_requested_at, j.await, j.created_at, r.output, r.archive
+    j.cancel_requested_at, j.await, j.created_at, r.output, r.archive,
+    CASE WHEN j.await THEN pg_notify($9, j.id::text) END AS notified
 ),
 archived AS (
   INSERT INTO hopper_job_history (
@@ -511,7 +525,7 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		// dead-letter queue.
 		archives[i] = f.Archive || f.State != driver.JobStateCompleted
 	}
-	rows, err := e.db.Query(ctx, jobFinalizeSQL, ids, attemptedBy, states, delays, snoozes, errs, outputs, archives)
+	rows, err := e.db.Query(ctx, jobFinalizeSQL, ids, attemptedBy, states, delays, snoozes, errs, outputs, archives, driver.ChannelDone)
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: finalize jobs: %w", err)
 	}
@@ -626,16 +640,33 @@ func (e *executor) ClientRegister(ctx context.Context, params driver.ClientRegis
 	return id, nil
 }
 
-func (e *executor) ClientRenew(ctx context.Context, params driver.ClientRenewParams) (bool, error) {
-	tag, err := e.db.Exec(ctx,
-		`UPDATE hopper_clients SET expires_at = now() + make_interval(secs => $2)
-		 WHERE id = $1 AND expires_at > now()`,
-		params.ClientID, params.TTL.Seconds(),
+// clientRenewSQL renews the lease and, in the same round trip, reads the
+// control state the client must apply: cancel requests for its running jobs
+// (through the running index) and paused queues.
+const clientRenewSQL = `
+WITH renewed AS (
+  UPDATE hopper_clients SET expires_at = now() + make_interval(secs => $2)
+  WHERE id = $1 AND expires_at > now()
+  RETURNING id
+)
+SELECT EXISTS (SELECT 1 FROM renewed),
+       (SELECT coalesce(array_agg(id), '{}') FROM hopper_jobs
+         WHERE state = 'running' AND attempted_by = $1 AND cancel_requested_at IS NOT NULL),
+       (SELECT coalesce(array_agg(name), '{}') FROM hopper_queues WHERE paused_at IS NOT NULL)`
+
+func (e *executor) ClientRenew(ctx context.Context, params driver.ClientRenewParams) (driver.ClientRenewResult, error) {
+	var (
+		res     driver.ClientRenewResult
+		cancels [][16]byte
 	)
+	err := e.db.QueryRow(ctx, clientRenewSQL, params.ClientID, params.TTL.Seconds()).Scan(&res.Renewed, &cancels, &res.PausedQueues)
 	if err != nil {
-		return false, fmt.Errorf("hopperpgx: renew client lease: %w", err)
+		return res, fmt.Errorf("hopperpgx: renew client lease: %w", err)
 	}
-	return tag.RowsAffected() == 1, nil
+	for _, id := range cancels {
+		res.CancelRequested = append(res.CancelRequested, driver.JobID(id))
+	}
+	return res, nil
 }
 
 func (e *executor) ClientDelete(ctx context.Context, clientID int64) error {

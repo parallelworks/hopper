@@ -19,6 +19,11 @@ type Config struct {
 	Queues map[string]QueueConfig
 	// Workers is the registry of workers. Required when Queues is set.
 	Workers *Workers
+	// Periodic lists jobs inserted on a schedule by the leader. See Cron
+	// and Every.
+	Periodic []PeriodicJob
+	// Middleware wraps job execution and inserts, outermost first.
+	Middleware []Middleware
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 	// Codec encodes args and outputs. Defaults to JSONCodec.
@@ -133,6 +138,23 @@ func (cfg *Config) withDefaults() (Config, error) {
 	}
 	if out.StrictKinds && out.Workers == nil {
 		return out, errors.New("hopper: Config.StrictKinds requires Workers")
+	}
+	out.Periodic = append([]PeriodicJob(nil), out.Periodic...)
+	names := map[string]struct{}{}
+	for i := range out.Periodic {
+		p := &out.Periodic[i]
+		if err := p.resolve(); err != nil {
+			return out, err
+		}
+		if _, dup := names[p.Name]; dup {
+			return out, fmt.Errorf("hopper: periodic job %q is listed twice; set PeriodicOpts.Name to tell them apart", p.Name)
+		}
+		names[p.Name] = struct{}{}
+	}
+	for i, m := range out.Middleware {
+		if m == nil {
+			return out, fmt.Errorf("hopper: Config.Middleware[%d] is nil", i)
+		}
 	}
 	return out, nil
 }

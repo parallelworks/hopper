@@ -23,6 +23,13 @@ var ErrNotSupported = errors.New("hopper: not supported by this driver")
 // ErrNotFound is returned when a job does not exist, live or in history.
 var ErrNotFound = errors.New("hopper: not found")
 
+// ErrJobRunning is returned by operations that need a job not to be running.
+var ErrJobRunning = errors.New("hopper: job is running")
+
+// ErrUniqueConflict is returned when re-driving a job would violate the
+// uniqueness of a live job with the same key.
+var ErrUniqueConflict = errors.New("hopper: a live job with the same unique key exists")
+
 // Driver binds the core to a storage engine. TTx is the engine's transaction
 // type (pgx.Tx for hopperpgx), so that transactional inserts only accept a
 // transaction from the right engine.
@@ -58,6 +65,12 @@ const (
 	// ChannelLeader is signalled when a leader resigns, so a replacement is
 	// elected without waiting for the lease to expire.
 	ChannelLeader = "hopper_leader"
+	// ChannelControl carries operator actions: "cancel:<job id>",
+	// "pause:<queue>" and "resume:<queue>".
+	ChannelControl = "hopper_control"
+	// ChannelDone carries the ID of a finalized job that was inserted with
+	// Await, so waiters return as soon as the finalize commits.
+	ChannelDone = "hopper_done"
 )
 
 // Listener receives notifications. One listener multiplexes every channel.
@@ -79,6 +92,9 @@ type Notification struct {
 // Executor runs queue operations, either against the pool or inside a
 // caller's transaction.
 type Executor interface {
+	// Now returns the database's clock.
+	Now(ctx context.Context) (time.Time, error)
+
 	// JobInsertMany inserts jobs in one statement and returns one result per
 	// input, in input order. An input whose unique key matches a live job is
 	// not inserted; its result carries the existing job and Duplicate = true.
@@ -99,6 +115,22 @@ type Executor interface {
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
 	// JobGet returns a job by ID, live or from history.
 	JobGet(ctx context.Context, id JobID) (*JobRow, error)
+	// JobList returns jobs matching the filter in ID order, after the cursor.
+	JobList(ctx context.Context, params JobListParams) ([]*JobRow, error)
+	// JobCancel cancels a job. A waiting job moves to history as cancelled.
+	// A running job gets a cancel request that its client picks up through
+	// ChannelControl and on its next lease renewal. A finalized job is
+	// returned unchanged. The job as it is afterwards is returned.
+	JobCancel(ctx context.Context, id JobID) (*JobRow, error)
+	// JobRetry makes a job available now: a cancelled or discarded job is
+	// moved back from history (with one more attempt allowed if it had run
+	// out), and a waiting job has its schedule brought forward. It returns
+	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
+	// holds the same unique key.
+	JobRetry(ctx context.Context, id JobID) (*JobRow, error)
+	// JobDiscardExpired moves waiting jobs whose TTL has passed to history
+	// as discarded, and returns them.
+	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)
 	// JobRescueCandidates returns running jobs whose owning client has no
 	// unexpired lease, plus, if StuckAfter is positive, running jobs claimed
 	// longer ago than that. The caller finalizes them.
@@ -106,9 +138,11 @@ type Executor interface {
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
 	ClientRegister(ctx context.Context, params ClientRegisterParams) (int64, error)
-	// ClientRenew extends an unexpired lease. It returns false if the lease
-	// had already expired, in which case the client has been fenced.
-	ClientRenew(ctx context.Context, params ClientRenewParams) (bool, error)
+	// ClientRenew extends an unexpired lease. Renewed is false if the lease
+	// had already expired, in which case the client has been fenced. The
+	// result also carries control state the client re-reads on every
+	// renewal, in case a notification was missed.
+	ClientRenew(ctx context.Context, params ClientRenewParams) (ClientRenewResult, error)
 	// ClientDelete removes a client's lease row.
 	ClientDelete(ctx context.Context, clientID int64) error
 	// ClientPruneExpired removes lease rows that have expired and returns
@@ -126,6 +160,27 @@ type Executor interface {
 	// LeaderResign gives up leadership if the client holds it, and signals
 	// other clients to elect a replacement.
 	LeaderResign(ctx context.Context, clientID int64) error
+
+	// QueueEnsure records queues a client works, so they are listed even
+	// before any job is inserted.
+	QueueEnsure(ctx context.Context, names []string) error
+	// QueuePause stops every client from claiming from a queue, and
+	// signals them through ChannelControl.
+	QueuePause(ctx context.Context, name string) error
+	// QueueResume undoes QueuePause.
+	QueueResume(ctx context.Context, name string) error
+	// QueueList returns every known queue.
+	QueueList(ctx context.Context) ([]*QueueRow, error)
+
+	// PeriodicInsert inserts the job for a periodic slot if that slot has
+	// not been inserted yet, atomically, and reports whether it did. A slot
+	// therefore produces at most one job across leaders.
+	PeriodicInsert(ctx context.Context, params PeriodicInsertParams) (*JobRow, bool, error)
+	// PeriodicLastSlots returns the last inserted slot per periodic job.
+	PeriodicLastSlots(ctx context.Context) (map[string]time.Time, error)
+
+	// Stats returns queue depths and cluster state.
+	Stats(ctx context.Context) (*Stats, error)
 
 	// HistoryMaintain enforces retention on finalized jobs and prepares
 	// storage for the near future, in whatever way suits the engine (dropping
@@ -238,6 +293,11 @@ type JobInsertParams struct {
 	Metadata    json.RawMessage
 	// UniqueKey is empty for non-unique jobs.
 	UniqueKey string
+	// TTL, if positive, discards the job if it has not started within this
+	// long of database now().
+	TTL time.Duration
+	// Await marks the job so that its finalize is announced on ChannelDone.
+	Await bool
 }
 
 // ConflictAction says what to do when a unique key matches a live job.
@@ -267,6 +327,58 @@ type JobInsertResult struct {
 	// Duplicate is true when a live job with the same unique key already
 	// existed. Job is then that existing job.
 	Duplicate bool
+}
+
+// JobListParams filters a listing. Empty fields match everything.
+type JobListParams struct {
+	Queue  string
+	Kinds  []string
+	States []JobState
+	// After is the cursor: only jobs with a greater ID are returned.
+	After JobID
+	Limit int
+}
+
+// QueueRow is a queue's cluster-wide state.
+type QueueRow struct {
+	Name string
+	// PausedAt is zero when the queue is not paused.
+	PausedAt  time.Time
+	UpdatedAt time.Time
+}
+
+// PeriodicInsertParams identifies a periodic slot and the job to insert
+// for it.
+type PeriodicInsertParams struct {
+	Name string
+	Slot time.Time
+	Job  JobInsertParams
+}
+
+// Stats is a snapshot of queue depths and cluster state.
+type Stats struct {
+	Queues map[string]*QueueStats
+	// LiveClients counts clients with an unexpired lease.
+	LiveClients int
+	// Leader is the leader's client ID, or 0 if the lease is free or
+	// expired.
+	Leader int64
+	// RunningByClient counts running jobs per client ID.
+	RunningByClient map[int64]int
+}
+
+// QueueStats is one queue's depth by state.
+type QueueStats struct {
+	Available int
+	Scheduled int
+	Retryable int
+	Running   int
+	// OldestAvailable is the age of the oldest job that could be claimed
+	// now, or zero.
+	OldestAvailable time.Duration
+	// CompletedLastMinute counts jobs completed in the last minute.
+	CompletedLastMinute int
+	Paused              bool
 }
 
 // JobClaimParams selects jobs to claim.
@@ -348,4 +460,15 @@ type ClientRegisterParams struct {
 type ClientRenewParams struct {
 	ClientID int64
 	TTL      time.Duration
+}
+
+// ClientRenewResult is the outcome of a renewal plus the control state the
+// client should apply.
+type ClientRenewResult struct {
+	Renewed bool
+	// CancelRequested lists the client's running jobs that have a pending
+	// cancel request.
+	CancelRequested []JobID
+	// PausedQueues lists the queues currently paused.
+	PausedQueues []string
 }

@@ -22,6 +22,9 @@ type finalizer struct {
 	// wake is called with the queue of a result that made a job claimable
 	// again right away, so the local producer need not wait for its poll.
 	wake func(queue string)
+	// applied is called for each result that was applied, for events and
+	// local waiters.
+	applied func(job *driver.JobRow, result driver.JobFinalize)
 
 	in   chan pending
 	done chan struct{} // closed when run returns
@@ -31,17 +34,18 @@ type finalizer struct {
 }
 
 type pending struct {
+	job    *driver.JobRow
 	result driver.JobFinalize
-	queue  string
 }
 
-func newFinalizer(exec driver.Executor, logger *slog.Logger, t tuning, wake func(string)) *finalizer {
+func newFinalizer(exec driver.Executor, logger *slog.Logger, t tuning, wake func(string), applied func(*driver.JobRow, driver.JobFinalize)) *finalizer {
 	return &finalizer{
 		exec:     exec,
 		logger:   logger,
 		interval: t.finalizeInterval,
 		maxBatch: t.finalizeBatch,
 		wake:     wake,
+		applied:  applied,
 		in:       make(chan pending, t.finalizeBatch*2),
 		done:     make(chan struct{}),
 	}
@@ -50,9 +54,9 @@ func newFinalizer(exec driver.Executor, logger *slog.Logger, t tuning, wake func
 // submit queues a result. It blocks while the buffer is full. A result
 // submitted after the finalizer has stopped is dropped: the job stays
 // running in the database and is rescued once this client's lease expires.
-func (f *finalizer) submit(queue string, result driver.JobFinalize) {
+func (f *finalizer) submit(job *driver.JobRow, result driver.JobFinalize) {
 	select {
-	case f.in <- pending{result: result, queue: queue}:
+	case f.in <- pending{job: job, result: result}:
 	case <-f.done:
 		f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", result.ID)
 	}
@@ -162,7 +166,8 @@ func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []d
 			}
 		}
 		if p.result.Delay == 0 && !p.result.State.Terminal() {
-			f.wake(p.queue)
+			f.wake(p.job.Queue)
 		}
+		f.applied(p.job, p.result)
 	}
 }

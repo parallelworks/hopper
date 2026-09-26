@@ -510,18 +510,18 @@ func TestClientLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ok, err := exec.ClientRenew(ctx, driver.ClientRenewParams{ClientID: id, TTL: time.Hour})
-	if err != nil || !ok {
-		t.Fatalf("renew = %v, %v", ok, err)
+	res, err := exec.ClientRenew(ctx, driver.ClientRenewParams{ClientID: id, TTL: time.Hour})
+	if err != nil || !res.Renewed {
+		t.Fatalf("renew = %+v, %v", res, err)
 	}
 
 	// Expire it behind the client's back, as a partition would.
 	if _, err := d.Pool().Exec(ctx, "UPDATE hopper_clients SET expires_at = now() - interval '1 second' WHERE id = $1", id); err != nil {
 		t.Fatal(err)
 	}
-	ok, err = exec.ClientRenew(ctx, driver.ClientRenewParams{ClientID: id, TTL: time.Hour})
-	if err != nil || ok {
-		t.Fatalf("renew of expired lease = %v, %v; want false", ok, err)
+	res, err = exec.ClientRenew(ctx, driver.ClientRenewParams{ClientID: id, TTL: time.Hour})
+	if err != nil || res.Renewed {
+		t.Fatalf("renew of expired lease = %+v, %v; want not renewed", res, err)
 	}
 
 	if err := exec.ClientDelete(ctx, id); err != nil {
