@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"time"
+
+	"github.com/parallelworks/hopper/driver"
 )
 
 // QueueDefault is the queue jobs go to when none is given.
@@ -69,7 +71,35 @@ type QueueConfig struct {
 	// history, for maximum throughput. Cancelled and discarded jobs are
 	// always archived, because history is the dead-letter queue.
 	DeleteCompleted bool
+
+	// The limits below are cluster-wide: they are recorded on the queue
+	// row when the client starts and enforced for every client. A client
+	// that declares none leaves the recorded ones alone; change them at
+	// runtime with Queues().SetLimits.
+
+	// GlobalLimit caps the queue's running jobs across all clients.
+	GlobalLimit int
+	// RateLimit caps claims per second across all clients, in a token
+	// bucket of RateBurst tokens (defaulting to one second's worth).
+	RateLimit float64
+	RateBurst int
+	// PartitionLimit caps running jobs per InsertOpts.PartitionKey.
+	PartitionLimit int
+	// PriorityAging raises a waiting job's priority by one level each time
+	// it has waited this long, so low priorities cannot starve.
+	PriorityAging time.Duration
 }
+
+// limits returns the queue's cluster-wide limits.
+func (q QueueConfig) limits(name string) driver.QueueLimits {
+	return driver.QueueLimits{
+		Name: name, GlobalLimit: q.GlobalLimit, RatePerSec: q.RateLimit, RateBurst: q.RateBurst,
+		PartitionLimit: q.PartitionLimit, Aging: q.PriorityAging,
+	}
+}
+
+// PerSecond is a readable RateLimit value.
+func PerSecond(n float64) float64 { return n }
 
 // Defaults for Config fields.
 const (
@@ -134,6 +164,9 @@ func (cfg *Config) withDefaults() (Config, error) {
 		}
 		if q.MaxWorkers <= 0 {
 			return out, fmt.Errorf("hopper: queue %q: MaxWorkers must be positive", name)
+		}
+		if q.GlobalLimit < 0 || q.RateLimit < 0 || q.RateBurst < 0 || q.PartitionLimit < 0 || q.PriorityAging < 0 {
+			return out, fmt.Errorf("hopper: queue %q: limits must not be negative", name)
 		}
 	}
 	if out.StrictKinds && out.Workers == nil {

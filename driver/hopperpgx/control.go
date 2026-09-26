@@ -115,10 +115,11 @@ WHERE id = $1 AND state = 'running'
 RETURNING %s`, jobColumns(""))
 	jobCancelWaitingSQL = fmt.Sprintf(`
 WITH done AS (
-  DELETE FROM hopper_jobs WHERE id = $1 AND state <> 'running' RETURNING *,
+  DELETE FROM hopper_jobs WHERE id = $1 AND state <> 'running' RETURNING *, 'cancelled'::text AS final_state,
     CASE WHEN await THEN pg_notify($2, id::text) END AS notified
-), archived AS (%s RETURNING %s, finalized_at, output)
-SELECT * FROM archived`, historyInsertSQL("cancelled", "hopper: cancelled"), jobColumns(""))
+), archived AS (%s RETURNING %s, finalized_at, output),
+%s
+SELECT * FROM archived`, historyInsertSQL("cancelled", "hopper: cancelled"), jobColumns(""), batchAccountingSQLWith("$3"))
 )
 
 func (e *executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
@@ -142,7 +143,7 @@ func (e *executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 			_, err = tx.Exec(ctx, notifySQL, driver.ChannelControl, []string{"cancel:" + id.String()})
 			return err
 		}
-		job, err = scanJob(tx.QueryRow(ctx, jobCancelWaitingSQL, [16]byte(id), driver.ChannelDone), true)
+		job, err = scanJob(tx.QueryRow(ctx, jobCancelWaitingSQL, [16]byte(id), driver.ChannelDone, driver.ChannelInsert), true)
 		return err
 	})
 	if err != nil {
@@ -214,12 +215,13 @@ WITH done AS (
     WHERE state IN ('available', 'scheduled', 'retryable') AND expires_at <= now()
     LIMIT $1 FOR UPDATE SKIP LOCKED
   )
-  RETURNING j.*, CASE WHEN j.await THEN pg_notify($2, j.id::text) END AS notified
-), archived AS (%s RETURNING %s, finalized_at, output)
-SELECT * FROM archived`, historyInsertSQL("discarded", "hopper: expired"), jobColumns(""))
+  RETURNING j.*, 'discarded'::text AS final_state, CASE WHEN j.await THEN pg_notify($2, j.id::text) END AS notified
+), archived AS (%s RETURNING %s, finalized_at, output),
+%s
+SELECT * FROM archived`, historyInsertSQL("discarded", "hopper: expired"), jobColumns(""), batchAccountingSQLWith("$3"))
 
 func (e *executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.JobRow, error) {
-	rows, err := e.db.Query(ctx, jobDiscardExpiredSQL, max(limit, 1), driver.ChannelDone)
+	rows, err := e.db.Query(ctx, jobDiscardExpiredSQL, max(limit, 1), driver.ChannelDone, driver.ChannelInsert)
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: discard expired jobs: %w", err)
 	}
@@ -284,19 +286,26 @@ func (e *executor) setPaused(ctx context.Context, name string, paused bool) erro
 }
 
 func (e *executor) QueueList(ctx context.Context) ([]*driver.QueueRow, error) {
-	rows, err := e.db.Query(ctx, `SELECT name, paused_at, updated_at FROM hopper_queues ORDER BY name`)
+	rows, err := e.db.Query(ctx, `SELECT name, paused_at, updated_at, global_limit, rate_per_sec, rate_burst, partition_limit, aging_seconds
+		FROM hopper_queues ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: list queues: %w", err)
 	}
 	queues, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*driver.QueueRow, error) {
 		var (
-			q      driver.QueueRow
-			paused pgtype.Timestamptz
+			q                               driver.QueueRow
+			paused                          pgtype.Timestamptz
+			global, burst, partition, aging pgtype.Int4
+			rate                            pgtype.Float8
 		)
-		if err := row.Scan(&q.Name, &paused, &q.UpdatedAt); err != nil {
+		if err := row.Scan(&q.Name, &paused, &q.UpdatedAt, &global, &rate, &burst, &partition, &aging); err != nil {
 			return nil, err
 		}
 		q.PausedAt = paused.Time
+		q.Limits = driver.QueueLimits{
+			Name: q.Name, GlobalLimit: int(global.Int32), RatePerSec: rate.Float64, RateBurst: int(burst.Int32),
+			PartitionLimit: int(partition.Int32), Aging: time.Duration(aging.Int32) * time.Second,
+		}
 		return &q, nil
 	})
 	if err != nil {

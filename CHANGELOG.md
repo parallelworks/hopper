@@ -16,6 +16,15 @@ versions may change the API.
   and the SQL contract functions `hopper_insert` and `hopper_publish`.
 - `TestUpgradeUnderTraffic`, which migrates to the latest schema while a
   client works jobs.
+- Flow control: cluster-wide `GlobalLimit`, `RateLimit`/`RateBurst` and
+  `PartitionLimit` per queue (declared in `QueueConfig` or set at runtime
+  with `Queues().SetLimits` and `hopper queues limit`), `PriorityAging`,
+  and `InsertOpts.PartitionKey`.
+- Batches: `NewBatch`, `Add`, `Insert`/`InsertTx`, `BatchGet`, with
+  `OnSuccess`, `OnFailure` and `OnComplete` callbacks inserted by the
+  finalizing statement.
+- Schema v3: queue limit columns, `hopper_batches`, and the partition and
+  batch indexes.
 
 ## [0.1.0]
 

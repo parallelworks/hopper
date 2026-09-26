@@ -4,6 +4,7 @@
 //	hopper jobs list [-queue Q] [-kind K] [-state S] [-limit N]
 //	hopper jobs get|retry|cancel <id>
 //	hopper queues list|pause|resume [name]
+//	hopper queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]
 //	hopper clients list
 //	hopper stats
 //
@@ -54,6 +55,7 @@ commands:
   jobs get|retry|cancel <id>
   queues list
   queues pause|resume <name>
+  queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]   (omitted limits are removed)
   clients list
   stats
   bench                        (see the hopperbench command)
@@ -252,7 +254,7 @@ func printJob(w io.Writer, j *hopper.JobRow) {
 
 func (c *cli) queues(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("queues: list, pause or resume")
+		return errors.New("queues: list, pause, resume or limit")
 	}
 	switch args[0] {
 	case "list":
@@ -262,16 +264,38 @@ func (c *cli) queues(ctx context.Context, args []string) error {
 		}
 		return c.print(queues, func(w io.Writer) {
 			tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tPAUSED\tUPDATED")
+			fmt.Fprintln(tw, "NAME\tPAUSED\tGLOBAL\tRATE/S\tBURST\tPARTITION\tAGING\tUPDATED")
 			for _, q := range queues {
 				paused := ""
 				if !q.PausedAt.IsZero() {
 					paused = "since " + q.PausedAt.Local().Format(time.RFC3339)
 				}
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", q.Name, paused, q.UpdatedAt.Local().Format(time.RFC3339))
+				l := q.Limits
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", q.Name, paused, orDash(l.GlobalLimit), orDashF(l.RatePerSec),
+					orDash(l.RateBurst), orDash(l.PartitionLimit), orDashD(l.Aging), q.UpdatedAt.Local().Format(time.RFC3339))
 			}
 			tw.Flush()
 		})
+	case "limit":
+		if len(args) < 2 {
+			return errors.New("queues limit: a queue name is required")
+		}
+		fs := flag.NewFlagSet("hopper queues limit", flag.ContinueOnError)
+		fs.SetOutput(c.out)
+		var l hopper.QueueLimits
+		fs.IntVar(&l.GlobalLimit, "global", 0, "max running jobs across all clients")
+		fs.Float64Var(&l.RatePerSec, "rate", 0, "max claims per second across all clients")
+		fs.IntVar(&l.RateBurst, "burst", 0, "token bucket size for -rate")
+		fs.IntVar(&l.PartitionLimit, "partition", 0, "max running jobs per partition key")
+		fs.DurationVar(&l.Aging, "aging", 0, "promote waiting jobs one priority level per this period")
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if err := c.client.Queues().SetLimits(ctx, args[1], l); err != nil {
+			return err
+		}
+		l.Name = args[1]
+		return c.print(l, func(w io.Writer) { fmt.Fprintf(w, "set limits on queue %s\n", args[1]) })
 	case "pause", "resume":
 		if len(args) != 2 {
 			return fmt.Errorf("queues %s: one queue name is required", args[0])
@@ -331,6 +355,27 @@ func (c *cli) stats(ctx context.Context) error {
 		}
 		tw.Flush()
 	})
+}
+
+func orDash(n int) string {
+	if n == 0 {
+		return "-"
+	}
+	return fmt.Sprint(n)
+}
+
+func orDashF(f float64) string {
+	if f == 0 {
+		return "-"
+	}
+	return fmt.Sprint(f)
+}
+
+func orDashD(d time.Duration) string {
+	if d == 0 {
+		return "-"
+	}
+	return d.String()
 }
 
 // print writes v as JSON, or through text when -json is not set.

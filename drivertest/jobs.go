@@ -135,17 +135,18 @@ func testClaimSkipsLocked[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	tx, _, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // cleanup
-	held, err := d.UnwrapTx(tx).JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: a, Limit: 2})
+	heldRes, err := d.UnwrapTx(tx).JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: a, Limit: 2})
+	held := heldRes.Jobs
 	if err != nil || len(held) != 2 {
 		t.Fatalf("held %d, %v", len(held), err)
 	}
 	done := make(chan []*driver.JobRow, 1)
 	go func() {
-		jobs, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: b, Limit: 10})
+		res, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: b, Limit: 10})
 		if err != nil {
 			t.Error(err)
 		}
-		done <- jobs
+		done <- res.Jobs
 	}()
 	select {
 	case jobs := <-done:

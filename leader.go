@@ -42,6 +42,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			}
 			c.rescue(ctx)
 			c.expire(ctx)
+			c.age(ctx)
 			c.pruneClients(ctx)
 			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval {
 				c.maintainHistory(ctx)
@@ -196,6 +197,33 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		}
 		if len(jobs) < c.tuning.rescueBatch {
 			return
+		}
+	}
+}
+
+// age promotes long-waiting jobs on queues with PriorityAging.
+func (c *Client[TTx]) age(ctx context.Context) {
+	queues, err := c.exec.QueueList(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.logger.WarnContext(ctx, "hopper: list queues for aging", "error", err)
+		}
+		return
+	}
+	for _, q := range queues {
+		if q.Limits.Aging <= 0 {
+			continue
+		}
+		n, err := c.exec.JobAge(ctx, q.Name, q.Limits.Aging)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.logger.WarnContext(ctx, "hopper: age jobs", "queue", q.Name, "error", err)
+			}
+			continue
+		}
+		if n > 0 {
+			c.logger.DebugContext(ctx, "hopper: promoted waiting jobs", "queue", q.Name, "count", n)
+			c.wakeQueue(q.Name)
 		}
 	}
 }

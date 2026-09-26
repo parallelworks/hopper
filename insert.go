@@ -204,16 +204,18 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 		return driver.JobInsertParams{}, 0, fmt.Errorf("hopper: encode args for %q: %w", kind, err)
 	}
 	dp := driver.JobInsertParams{
-		Kind:        kind,
-		Queue:       opts.Queue,
-		Priority:    int(opts.Priority),
-		MaxAttempts: opts.MaxAttempts,
-		ScheduledAt: opts.ScheduledAt,
-		Args:        args,
-		Metadata:    opts.Metadata,
-		TTL:         opts.TTL,
-		Await:       opts.Await,
-		OrderingKey: opts.OrderingKey,
+		Kind:         kind,
+		Queue:        opts.Queue,
+		Priority:     int(opts.Priority),
+		MaxAttempts:  opts.MaxAttempts,
+		ScheduledAt:  opts.ScheduledAt,
+		Args:         args,
+		Metadata:     opts.Metadata,
+		TTL:          opts.TTL,
+		Await:        opts.Await,
+		OrderingKey:  opts.OrderingKey,
+		PartitionKey: opts.PartitionKey,
+		BatchID:      p.batchID,
 	}
 	action := driver.ConflictSkip
 	if opts.Unique != nil {

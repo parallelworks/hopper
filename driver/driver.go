@@ -66,7 +66,8 @@ const (
 	// elected without waiting for the lease to expire.
 	ChannelLeader = "hopper_leader"
 	// ChannelControl carries operator actions: "cancel:<job id>",
-	// "pause:<queue>" and "resume:<queue>".
+	// "pause:<queue>", "resume:<queue>" and "limit:<queue>" (limits
+	// changed; the payload does not say how).
 	ChannelControl = "hopper_control"
 	// ChannelDone carries the ID of a finalized job that was inserted with
 	// Await, so waiters return as soon as the finalize commits.
@@ -106,8 +107,14 @@ type Executor interface {
 	// only for batches with no unique keys, and only if Capabilities().Copy.
 	JobInsertCopy(ctx context.Context, params []JobInsertParams, opts JobInsertOpts) ([]JobInsertResult, error)
 	// JobClaim atomically moves up to Limit claimable jobs in a queue to
-	// running, owned by ClientID, and returns them in claim order.
-	JobClaim(ctx context.Context, params JobClaimParams) ([]*JobRow, error)
+	// running, owned by ClientID, and returns them in claim order. With
+	// Limited, the claim runs inside a transaction that locks the queue row
+	// and applies its global, rate and partition limits; the result then
+	// says how long to wait when the rate limit allowed nothing.
+	JobClaim(ctx context.Context, params JobClaimParams) (JobClaimResult, error)
+	// JobAge raises the priority of jobs in a queue that have been claimable
+	// for longer than after, one level per call, and returns how many.
+	JobAge(ctx context.Context, queue string, after time.Duration) (int64, error)
 	// JobFinalizeMany applies a batch of results in one statement. A result is
 	// applied only if its job is still running and owned by the client that
 	// produced it; the IDs that were applied are returned, and the caller
@@ -173,6 +180,15 @@ type Executor interface {
 	QueueResume(ctx context.Context, name string) error
 	// QueueList returns every known queue.
 	QueueList(ctx context.Context) ([]*QueueRow, error)
+	// QueueSetLimits sets a queue's cluster-wide limits, creating the queue
+	// if needed. Zero values remove the corresponding limit.
+	QueueSetLimits(ctx context.Context, limits QueueLimits) error
+
+	// BatchInsert creates a batch expecting Total jobs and returns its ID.
+	// The jobs are inserted separately with their BatchID set.
+	BatchInsert(ctx context.Context, params BatchInsertParams) (JobID, error)
+	// BatchGet returns a batch's progress.
+	BatchGet(ctx context.Context, id JobID) (*BatchRow, error)
 
 	// PeriodicInsert inserts the job for a periodic slot if that slot has
 	// not been inserted yet, atomically, and reports whether it did. A slot
@@ -265,12 +281,15 @@ type JobRow struct {
 	// AttemptedAt is the time of the latest claim, or zero if never claimed.
 	AttemptedAt time.Time
 	// AttemptedBy is the client ID holding the claim, or zero.
-	AttemptedBy int64
-	Args        json.RawMessage
-	Metadata    json.RawMessage
-	Errors      []AttemptError
-	UniqueKey   string
-	OrderingKey string
+	AttemptedBy  int64
+	Args         json.RawMessage
+	Metadata     json.RawMessage
+	Errors       []AttemptError
+	UniqueKey    string
+	OrderingKey  string
+	PartitionKey string
+	// BatchID is the batch the job belongs to, or zero.
+	BatchID JobID
 	// ExpiresAt is the TTL deadline, or zero.
 	ExpiresAt time.Time
 	// CancelRequestedAt is set when JobCancel is called on a running job.
@@ -308,6 +327,10 @@ type JobInsertParams struct {
 	// OrderingKey, if set, serializes the job with others of the same key
 	// in its queue: at most one runs at a time, oldest first.
 	OrderingKey string
+	// PartitionKey groups the job for partitioned limits.
+	PartitionKey string
+	// BatchID, if set, counts the job toward a batch.
+	BatchID JobID
 	// TTL, if positive, discards the job if it has not started within this
 	// long of database now().
 	TTL time.Duration
@@ -360,6 +383,50 @@ type QueueRow struct {
 	// PausedAt is zero when the queue is not paused.
 	PausedAt  time.Time
 	UpdatedAt time.Time
+	Limits    QueueLimits
+}
+
+// QueueLimits are a queue's cluster-wide limits. Zero means unlimited.
+type QueueLimits struct {
+	Name string
+	// GlobalLimit caps running jobs across all clients.
+	GlobalLimit int
+	// RatePerSec caps claims per second across all clients, with a burst
+	// of RateBurst (defaulting to one second's worth).
+	RatePerSec float64
+	RateBurst  int
+	// PartitionLimit caps running jobs per partition key.
+	PartitionLimit int
+	// Aging raises a waiting job's priority by one level each time it has
+	// waited this long, so low priorities cannot starve. Zero disables it.
+	Aging time.Duration
+}
+
+// Limited reports whether any limit that affects claiming is set.
+func (l QueueLimits) Limited() bool {
+	return l.GlobalLimit > 0 || l.RatePerSec > 0 || l.PartitionLimit > 0
+}
+
+// BatchInsertParams describes a batch of jobs with completion callbacks.
+type BatchInsertParams struct {
+	Total int
+	// Callbacks are inserted when the batch completes: OnSuccess if no job
+	// was cancelled or discarded, OnFailure otherwise, and OnComplete
+	// either way. Each callback's Metadata gains a "batch_id".
+	OnSuccess, OnFailure, OnComplete *JobInsertParams
+	Metadata                         json.RawMessage
+}
+
+// BatchRow is a batch's progress.
+type BatchRow struct {
+	ID      JobID
+	Pending int
+	Failed  int
+	Total   int
+	// CompletedAt is set once every job has been finalized.
+	CompletedAt time.Time
+	CreatedAt   time.Time
+	Metadata    json.RawMessage
 }
 
 // PeriodicInsertParams identifies a periodic slot and the job to insert
@@ -401,6 +468,16 @@ type JobClaimParams struct {
 	Queue    string
 	ClientID int64
 	Limit    int
+	// Limited selects the path that locks the queue row and applies its
+	// limits. Unlimited queues never touch the row.
+	Limited bool
+}
+
+// JobClaimResult is the outcome of a claim.
+type JobClaimResult struct {
+	Jobs []*JobRow
+	// Wait, when positive, is how long the rate limit will allow nothing.
+	Wait time.Duration
 }
 
 // JobFinalizeParams is a batch of results to apply.
@@ -531,4 +608,7 @@ type ClientRenewResult struct {
 	CancelRequested []JobID
 	// PausedQueues lists the queues currently paused.
 	PausedQueues []string
+	// LimitedQueues lists the queues with a global, rate or partition
+	// limit, which must be claimed through the limited path.
+	LimitedQueues []string
 }

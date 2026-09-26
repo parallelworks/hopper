@@ -94,6 +94,14 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("queues", "list"); strings.Contains(got, "since") {
 		t.Errorf("queues list after resume = %q", got)
 	}
+	hopperCmd("queues", "limit", "q1", "-global", "5", "-rate", "2.5", "-aging", "1m")
+	if got := hopperCmd("queues", "list"); !strings.Contains(got, "5") || !strings.Contains(got, "2.5") || !strings.Contains(got, "1m0s") {
+		t.Errorf("queues list after limit = %q", got)
+	}
+	hopperCmd("queues", "limit", "q1")
+	if got := hopperCmd("queues", "list"); strings.Contains(got, "2.5") {
+		t.Errorf("queues list after clearing limits = %q", got)
+	}
 	if got := hopperCmd("clients", "list"); !strings.Contains(got, "ID") {
 		t.Errorf("clients list = %q", got)
 	}

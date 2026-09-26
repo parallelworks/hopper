@@ -20,7 +20,7 @@ func jobColumns(prefix string) string {
 	cols := []string{
 		"id", "kind", "queue", "state", "priority", "attempt", "max_attempts",
 		"scheduled_at", "attempted_at", "attempted_by", "args", "metadata", "errors",
-		"unique_key", "ordering_key", "expires_at", "cancel_requested_at", "await", "created_at",
+		"unique_key", "ordering_key", "partition_key", "batch_id", "expires_at", "cancel_requested_at", "await", "created_at",
 	}
 	out := ""
 	for i, c := range cols {
@@ -42,12 +42,13 @@ func scanJob(row pgx.Row, history bool) (*driver.JobRow, error) {
 		attemptedAt, expiresAt, cancelRequested pgtype.Timestamptz
 		finalizedAt                             pgtype.Timestamptz
 		attemptedBy                             pgtype.Int8
-		uniqueKey, orderingKey                  pgtype.Text
+		uniqueKey, orderingKey, partitionKey    pgtype.Text
+		batchID                                 pgtype.UUID
 	)
 	dest := []any{
 		&j.ID, &j.Kind, &j.Queue, &state, &priority, &attempt, &maxAttempts,
 		&j.ScheduledAt, &attemptedAt, &attemptedBy, &j.Args, &j.Metadata, &j.Errors,
-		&uniqueKey, &orderingKey, &expiresAt, &cancelRequested, &j.Await, &j.CreatedAt,
+		&uniqueKey, &orderingKey, &partitionKey, &batchID, &expiresAt, &cancelRequested, &j.Await, &j.CreatedAt,
 	}
 	if history {
 		dest = append(dest, &finalizedAt, &j.Output)
@@ -63,6 +64,10 @@ func scanJob(row pgx.Row, history bool) (*driver.JobRow, error) {
 	j.AttemptedBy = attemptedBy.Int64
 	j.UniqueKey = uniqueKey.String
 	j.OrderingKey = orderingKey.String
+	j.PartitionKey = partitionKey.String
+	if batchID.Valid {
+		j.BatchID = driver.JobID(batchID.Bytes)
+	}
 	j.ExpiresAt = expiresAt.Time
 	j.CancelRequestedAt = cancelRequested.Time
 	j.FinalizedAt = finalizedAt.Time
@@ -85,14 +90,14 @@ const jobInsertSQL = `
 WITH p AS (
   SELECT * FROM unnest(
     $1::text[], $2::text[], $3::smallint[], $4::smallint[], $5::timestamptz[], $6::jsonb[], $7::jsonb[], $8::text[],
-    $9::float8[], $10::boolean[], $11::text[]
-  ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key, ttl, await, ordering_key)
+    $9::float8[], $10::boolean[], $11::text[], $12::text[], $13::uuid[]
+  ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key, ttl, await, ordering_key, partition_key, batch_id)
 )
-INSERT INTO hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await, ordering_key)
+INSERT INTO hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await, ordering_key, partition_key, batch_id)
 SELECT p.kind, p.queue,
        CASE WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::hopper_job_state,
        p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata, p.unique_key,
-       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key
+       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key, p.partition_key, p.batch_id
 FROM p
 ON CONFLICT (kind, unique_key) WHERE unique_key IS NOT NULL DO UPDATE SET ` + "%s" + `
 RETURNING ` + "%s" + `, (xmax <> 0) AS duplicate`
@@ -156,12 +161,16 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 		ttls        = make([]float64, n)
 		awaits      = make([]bool, n)
 		ordering    = make([]pgtype.Text, n)
+		partitions  = make([]pgtype.Text, n)
+		batches     = make([]pgtype.UUID, n)
 	)
 	for i, p := range params {
 		var err error
 		ttls[i] = max(p.TTL, 0).Seconds()
 		awaits[i] = p.Await
 		ordering[i] = pgtype.Text{String: p.OrderingKey, Valid: p.OrderingKey != ""}
+		partitions[i] = pgtype.Text{String: p.PartitionKey, Valid: p.PartitionKey != ""}
+		batches[i] = pgtype.UUID{Bytes: p.BatchID, Valid: !p.BatchID.IsZero()}
 		if priorities[i], err = smallint(p.Priority, "priority"); err != nil {
 			return nil, err
 		}
@@ -179,7 +188,7 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 	if opts.OnConflict == driver.ConflictReplace {
 		query = jobInsertReplaceQuery
 	}
-	queryArgs := []any{kinds, queues, priorities, maxAttempts, scheduledAt, args, metadata, uniqueKeys, ttls, awaits, ordering}
+	queryArgs := []any{kinds, queues, priorities, maxAttempts, scheduledAt, args, metadata, uniqueKeys, ttls, awaits, ordering, partitions, batches}
 	collect := func(rows pgx.Rows, err error) ([]driver.JobInsertResult, error) {
 		if err != nil {
 			return nil, err
@@ -231,13 +240,14 @@ func scanInsertResult(row pgx.Row) (driver.JobInsertResult, error) {
 		priority, attempt, maxAttempts          int16
 		attemptedAt, expiresAt, cancelRequested pgtype.Timestamptz
 		attemptedBy                             pgtype.Int8
-		uniqueKey, orderingKey                  pgtype.Text
+		uniqueKey, orderingKey, partitionKey    pgtype.Text
+		batchID                                 pgtype.UUID
 		duplicate                               bool
 	)
 	err := row.Scan(
 		&j.ID, &j.Kind, &j.Queue, &state, &priority, &attempt, &maxAttempts,
 		&j.ScheduledAt, &attemptedAt, &attemptedBy, &j.Args, &j.Metadata, &j.Errors,
-		&uniqueKey, &orderingKey, &expiresAt, &cancelRequested, &j.Await, &j.CreatedAt,
+		&uniqueKey, &orderingKey, &partitionKey, &batchID, &expiresAt, &cancelRequested, &j.Await, &j.CreatedAt,
 		&duplicate,
 	)
 	if err != nil {
@@ -251,6 +261,10 @@ func scanInsertResult(row pgx.Row) (driver.JobInsertResult, error) {
 	j.AttemptedBy = attemptedBy.Int64
 	j.UniqueKey = uniqueKey.String
 	j.OrderingKey = orderingKey.String
+	j.PartitionKey = partitionKey.String
+	if batchID.Valid {
+		j.BatchID = driver.JobID(batchID.Bytes)
+	}
 	j.ExpiresAt = expiresAt.Time
 	j.CancelRequestedAt = cancelRequested.Time
 	return driver.JobInsertResult{Job: &j, Duplicate: duplicate}, nil
@@ -344,15 +358,17 @@ func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertP
 			expiresAt = pgtype.Timestamptz{Time: j.ExpiresAt, Valid: true}
 		}
 		results[i] = driver.JobInsertResult{Job: j}
-		j.OrderingKey = p.OrderingKey
+		j.OrderingKey, j.PartitionKey, j.BatchID = p.OrderingKey, p.PartitionKey, p.BatchID
 		values[i] = []any{
 			[16]byte(j.ID), j.Kind, j.Queue, string(j.State), priority, maxAttempts,
 			j.ScheduledAt, []byte(j.Args), []byte(j.Metadata), expiresAt, j.Await,
 			pgtype.Text{String: p.OrderingKey, Valid: p.OrderingKey != ""},
+			pgtype.Text{String: p.PartitionKey, Valid: p.PartitionKey != ""},
+			pgtype.UUID{Bytes: p.BatchID, Valid: !p.BatchID.IsZero()},
 			j.CreatedAt,
 		}
 	}
-	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "expires_at", "await", "ordering_key", "created_at"}
+	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "expires_at", "await", "ordering_key", "partition_key", "batch_id", "created_at"}
 	copied, err := copier.CopyFrom(ctx, pgx.Identifier{"hopper_jobs"}, columns, pgx.CopyFromRows(values))
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: copy jobs: %w", err)
@@ -410,13 +426,13 @@ func registerJobState(ctx context.Context, conn *pgx.Conn) error {
 // nothing for the check. The unique index on running ordering keys is the
 // backstop for two clients passing the check at once, in which case one
 // claim fails and is retried.
-const jobClaimSQL = `
-WITH claimed AS (
-  UPDATE hopper_jobs j
-  SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
-  FROM (
-    SELECT cand.id FROM hopper_jobs cand
-    WHERE cand.queue = $1 AND cand.state IN ('available', 'scheduled', 'retryable')
+//
+// With a partition limit, candidates are ranked within their partition key
+// and only those whose rank, counting the key's running jobs, fits under
+// the limit are eligible. That ranking scans the queue's waiting jobs, so
+// only partition-limited queues pay for it.
+const claimEligibleSQL = `
+    cand.queue = $1 AND cand.state IN ('available', 'scheduled', 'retryable')
       AND cand.scheduled_at <= now()
       AND (cand.expires_at IS NULL OR cand.expires_at > now())
       AND (cand.ordering_key IS NULL OR (
@@ -424,7 +440,15 @@ WITH claimed AS (
                     WHERE r.queue = cand.queue AND r.ordering_key = cand.ordering_key AND r.state = 'running')
         AND cand.seq = (SELECT min(o.seq) FROM hopper_jobs o
                         WHERE o.queue = cand.queue AND o.ordering_key = cand.ordering_key
-                          AND o.state IN ('available', 'scheduled', 'retryable'))))
+                          AND o.state IN ('available', 'scheduled', 'retryable'))))`
+
+const jobClaimSQL = `
+WITH claimed AS (
+  UPDATE hopper_jobs j
+  SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
+  FROM (
+    SELECT cand.id FROM hopper_jobs cand
+    WHERE ` + claimEligibleSQL + `
     ORDER BY cand.priority, cand.scheduled_at, cand.seq
     LIMIT $3
     FOR UPDATE SKIP LOCKED
@@ -434,13 +458,51 @@ WITH claimed AS (
 )
 SELECT ` + "%s" + ` FROM claimed ORDER BY priority, scheduled_at, seq`
 
-var jobClaimQuery = fmt.Sprintf(jobClaimSQL, jobColumns("j."), jobColumns(""))
+const jobClaimPartitionedSQL = `
+WITH ranked AS (
+  SELECT cand.id, cand.partition_key,
+    row_number() OVER (PARTITION BY cand.partition_key ORDER BY cand.priority, cand.scheduled_at, cand.seq)
+      + coalesce((SELECT count(*) FROM hopper_jobs pr
+                  WHERE pr.queue = cand.queue AND pr.partition_key = cand.partition_key AND pr.state = 'running'), 0) AS slot
+  FROM hopper_jobs cand
+  WHERE ` + claimEligibleSQL + `
+),
+claimed AS (
+  UPDATE hopper_jobs j
+  SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
+  FROM (
+    SELECT cand.id FROM hopper_jobs cand
+    WHERE cand.id IN (SELECT id FROM ranked WHERE partition_key IS NULL OR slot <= $4)
+    ORDER BY cand.priority, cand.scheduled_at, cand.seq
+    LIMIT $3
+    FOR UPDATE SKIP LOCKED
+  ) c
+  WHERE j.id = c.id
+  RETURNING j.seq, ` + "%s" + `
+)
+SELECT ` + "%s" + ` FROM claimed ORDER BY priority, scheduled_at, seq`
 
-func (e *executor) JobClaim(ctx context.Context, params driver.JobClaimParams) ([]*driver.JobRow, error) {
+var (
+	jobClaimQuery            = fmt.Sprintf(jobClaimSQL, jobColumns("j."), jobColumns(""))
+	jobClaimPartitionedQuery = fmt.Sprintf(jobClaimPartitionedSQL, jobColumns("j."), jobColumns(""))
+)
+
+func (e *executor) JobClaim(ctx context.Context, params driver.JobClaimParams) (driver.JobClaimResult, error) {
 	if params.Limit <= 0 {
-		return nil, nil
+		return driver.JobClaimResult{}, nil
 	}
-	rows, err := e.db.Query(ctx, jobClaimQuery, params.Queue, params.ClientID, params.Limit)
+	if params.Limited {
+		return e.claimLimited(ctx, params)
+	}
+	jobs, err := claimRows(ctx, e.db, jobClaimQuery, params.Queue, params.ClientID, params.Limit)
+	if err != nil {
+		return driver.JobClaimResult{}, err
+	}
+	return driver.JobClaimResult{Jobs: jobs}, nil
+}
+
+func claimRows(ctx context.Context, db dbtx, query string, args ...any) ([]*driver.JobRow, error) {
+	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: claim jobs: %w", err)
 	}
@@ -456,7 +518,7 @@ func (e *executor) JobClaim(ctx context.Context, params driver.JobClaimParams) (
 // stale result from a fenced client never overwrites a newer attempt.
 // Retries and snoozes are updated in place; terminal outcomes are moved to
 // history. Error timestamps come from database time.
-const jobFinalizeSQL = `
+var jobFinalizeSQL = `
 WITH r AS (
   SELECT * FROM unnest(
     $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::boolean[], $6::jsonb[], $7::jsonb[], $8::boolean[]
@@ -485,7 +547,7 @@ done AS (
     CASE WHEN r.error IS NULL THEN j.errors
          ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END AS errors,
     j.unique_key, j.ordering_key, j.partition_key, j.batch_id, j.expires_at,
-    j.cancel_requested_at, j.await, j.created_at, r.output, r.archive,
+    j.cancel_requested_at, j.await, j.created_at, r.output, r.archive, r.state AS final_state,
     CASE WHEN j.await THEN pg_notify($9, j.id::text) END AS notified
 ),
 archived AS (
@@ -498,7 +560,8 @@ archived AS (
     expires_at, cancel_requested_at, await, created_at, now(), output
   FROM done WHERE archive
   RETURNING id
-)
+),
+` + batchAccountingSQL + `
 SELECT id FROM retry UNION ALL SELECT id FROM done`
 
 func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
@@ -542,7 +605,7 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		// dead-letter queue.
 		archives[i] = f.Archive || f.State != driver.JobStateCompleted
 	}
-	rows, err := e.db.Query(ctx, jobFinalizeSQL, ids, attemptedBy, states, delays, snoozes, errs, outputs, archives, driver.ChannelDone)
+	rows, err := e.db.Query(ctx, jobFinalizeSQL, ids, attemptedBy, states, delays, snoozes, errs, outputs, archives, driver.ChannelDone, driver.ChannelInsert)
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: finalize jobs: %w", err)
 	}
@@ -669,14 +732,16 @@ WITH renewed AS (
 SELECT EXISTS (SELECT 1 FROM renewed),
        (SELECT coalesce(array_agg(id), '{}') FROM hopper_jobs
          WHERE state = 'running' AND attempted_by = $1 AND cancel_requested_at IS NOT NULL),
-       (SELECT coalesce(array_agg(name), '{}') FROM hopper_queues WHERE paused_at IS NOT NULL)`
+       (SELECT coalesce(array_agg(name), '{}') FROM hopper_queues WHERE paused_at IS NOT NULL),
+       (SELECT coalesce(array_agg(name), '{}') FROM hopper_queues
+         WHERE global_limit IS NOT NULL OR rate_per_sec IS NOT NULL OR partition_limit IS NOT NULL)`
 
 func (e *executor) ClientRenew(ctx context.Context, params driver.ClientRenewParams) (driver.ClientRenewResult, error) {
 	var (
 		res     driver.ClientRenewResult
 		cancels [][16]byte
 	)
-	err := e.db.QueryRow(ctx, clientRenewSQL, params.ClientID, params.TTL.Seconds()).Scan(&res.Renewed, &cancels, &res.PausedQueues)
+	err := e.db.QueryRow(ctx, clientRenewSQL, params.ClientID, params.TTL.Seconds()).Scan(&res.Renewed, &cancels, &res.PausedQueues, &res.LimitedQueues)
 	if err != nil {
 		return res, fmt.Errorf("hopperpgx: renew client lease: %w", err)
 	}

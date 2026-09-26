@@ -47,6 +47,17 @@
   their own schema. Notification channels are per database, so two hopper
   schemas in one database will wake each other up; that is harmless.
 
+## Limits
+
+`QueueConfig` (or `hopper queues limit`) sets cluster-wide limits that hold
+across every replica: `GlobalLimit` (running jobs), `RateLimit` with
+`RateBurst` (claims per second, as a token bucket), `PartitionLimit`
+(running jobs per `InsertOpts.PartitionKey`, for example per customer) and
+`PriorityAging` (promote waiting jobs so low priorities cannot starve).
+Limited queues claim inside a short transaction that locks the queue row;
+unlimited queues never touch it, so a queue without limits pays nothing.
+`MaxWorkers` remains the per-client bound.
+
 ## Retention
 
 Finalized jobs move to `hopper_job_history`, partitioned by outcome and then

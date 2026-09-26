@@ -159,6 +159,31 @@ func (q *QueueControl[TTx]) List(ctx context.Context) ([]*QueueRow, error) {
 	return q.c.exec.QueueList(ctx)
 }
 
+// QueueLimits are a queue's cluster-wide limits; see QueueConfig.
+type QueueLimits = driver.QueueLimits
+
+// SetLimits replaces a queue's cluster-wide limits. Zero values remove a
+// limit. Clients learn of the change through a notification and on their
+// next lease renewal.
+func (q *QueueControl[TTx]) SetLimits(ctx context.Context, name string, limits QueueLimits) error {
+	if name == "" {
+		return errors.New("hopper: queue name is required")
+	}
+	if limits.GlobalLimit < 0 || limits.RatePerSec < 0 || limits.RateBurst < 0 || limits.PartitionLimit < 0 || limits.Aging < 0 {
+		return errors.New("hopper: limits must not be negative")
+	}
+	limits.Name = name
+	if err := q.c.exec.QueueSetLimits(ctx, limits); err != nil {
+		return err
+	}
+	limited, err := q.c.limitedQueues(ctx)
+	if err != nil {
+		return err
+	}
+	q.c.applyLimited(limited)
+	return nil
+}
+
 // Add starts working a queue on this client at runtime, for example a
 // tenant's queue. The client must be started.
 func (q *QueueControl[TTx]) Add(ctx context.Context, name string, cfg QueueConfig) error {
@@ -177,7 +202,12 @@ func (q *QueueControl[TTx]) Add(ctx context.Context, name string, cfg QueueConfi
 	if err := c.exec.QueueEnsure(ctx, []string{name}); err != nil {
 		return err
 	}
-	c.startProducer(name, cfg)
+	state, err := c.exec.QueueList(ctx)
+	if err != nil {
+		return err
+	}
+	paused, limited := queueState(state, name)
+	c.startProducer(name, cfg, paused, limited)
 	return nil
 }
 

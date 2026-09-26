@@ -82,6 +82,12 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Subscriptions", testSubscriptions[TTx]},
 		{"Publish", testPublish[TTx]},
 		{"OrderingClaim", testOrderingClaim[TTx]},
+		{"QueueLimits", testQueueLimits[TTx]},
+		{"GlobalLimit", testGlobalLimit[TTx]},
+		{"RateLimit", testRateLimit[TTx]},
+		{"PartitionLimit", testPartitionLimit[TTx]},
+		{"Aging", testAging[TTx]},
+		{"Batches", testBatches[TTx]},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -122,11 +128,11 @@ func insert(ctx context.Context, t *testing.T, exec driver.Executor, p []driver.
 
 func claim(ctx context.Context, t *testing.T, exec driver.Executor, clientID int64, limit int) []*driver.JobRow {
 	t.Helper()
-	jobs, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: limit})
+	res, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: limit})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return jobs
+	return res.Jobs
 }
 
 func finalize(ctx context.Context, t *testing.T, exec driver.Executor, jobs ...driver.JobFinalize) []driver.JobID {
