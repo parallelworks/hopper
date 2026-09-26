@@ -115,12 +115,19 @@ func (p *producer) run(ctx context.Context) {
 	}
 }
 
+// claimTimeout bounds one claim statement.
+const claimTimeout = 30 * time.Second
+
 // claimAndStart claims up to limit jobs and starts each on its own
-// goroutine. Jobs returned by a claim are always started, even if ctx was
-// cancelled meanwhile: they are marked running in the database and would
-// otherwise wait for rescue.
+// goroutine. The statement runs on a context that ctx does not cancel: a
+// claim interrupted mid-flight can leave rows marked running that this
+// client never sees, which then wait for rescue, and cancelling a query
+// also costs the pool a connection. Stopping waits for the claim instead,
+// which takes milliseconds, and every claimed job is started.
 func (p *producer) claimAndStart(ctx context.Context, limit int) (int, error) {
-	jobs, err := p.claim(ctx, limit)
+	claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
+	defer cancel()
+	jobs, err := p.claim(claimCtx, limit)
 	for _, job := range jobs {
 		p.start(job)
 	}
