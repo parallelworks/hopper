@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -57,6 +58,7 @@ commands:
   queues pause|resume <name>
   queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]   (omitted limits are removed)
   clients list
+  workflows get <id>
   stats
   bench                        (see the hopperbench command)
 
@@ -111,6 +113,8 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		return c.queues(ctx, rest[1:])
 	case "clients":
 		return c.clients(ctx, rest[1:])
+	case "workflows":
+		return c.workflows(ctx, rest[1:])
 	case "stats":
 		return c.stats(ctx)
 	default:
@@ -334,6 +338,37 @@ func (c *cli) clients(ctx context.Context, args []string) error {
 				lease = "live (" + until.Round(time.Second).String() + ")"
 			}
 			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", cl.ID, cl.Hostname, cl.StartedAt.Local().Format(time.RFC3339), lease, cl.Info)
+		}
+		tw.Flush()
+	})
+}
+
+func (c *cli) workflows(ctx context.Context, args []string) error {
+	if len(args) != 2 || args[0] != "get" {
+		return errors.New("workflows: get <id>")
+	}
+	id, err := hopper.ParseJobID(args[1])
+	if err != nil {
+		return err
+	}
+	wf, err := c.client.WorkflowGet(ctx, id)
+	if err != nil {
+		return err
+	}
+	return c.print(wf, func(w io.Writer) {
+		b := wf.Batch
+		fmt.Fprintf(w, "id:        %s\nname:      %s\nprogress:  %d of %d finished, %d failed\n", b.ID, b.Name, b.Total-b.Pending, b.Total, b.Failed)
+		if !b.CompletedAt.IsZero() {
+			fmt.Fprintf(w, "completed: %s\n", b.CompletedAt.Local().Format(time.RFC3339))
+		}
+		deps := map[hopper.JobID][]string{}
+		for _, e := range wf.Edges {
+			deps[e.Job] = append(deps[e.Job], e.DependsOn.String())
+		}
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tKIND\tQUEUE\tSTATE\tATTEMPT\tAFTER")
+		for _, j := range wf.Jobs {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d/%d\t%s\n", j.ID, j.Kind, j.Queue, j.State, j.Attempt, j.MaxAttempts, strings.Join(deps[j.ID], ","))
 		}
 		tw.Flush()
 	})

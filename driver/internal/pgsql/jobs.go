@@ -312,11 +312,12 @@ func claimRows(ctx context.Context, conn Conn, query string, args ...any) ([]*dr
 // jobFinalizeSQL applies a batch of results in one statement. Every
 // transition checks the prior state (running) and the owning client, so a
 // stale result from a fenced client never overwrites a newer attempt.
-// Retries and snoozes are updated in place; terminal outcomes are moved to
-// history. Error timestamps come from database time, awaited jobs announce
-// themselves on the done channel, and batches are counted down.
+// Retries and snoozes are updated in place; terminal outcomes go through
+// finalizeTailSQL: history, batches, and workflow dependents. Error
+// timestamps come from database time and awaited jobs announce themselves
+// on the done channel.
 var jobFinalizeSQL = `
-WITH r AS (
+WITH RECURSIVE r AS (
   SELECT * FROM unnest(
     $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::boolean[], $6::jsonb[], $7::jsonb[], $8::boolean[]
   ) AS r(id, attempted_by, state, delay, snooze, error, output, archive)
@@ -334,32 +335,16 @@ retry AS (
     AND r.state IN ('retryable', 'scheduled')
   RETURNING j.id
 ),
-done AS (
+finished AS (
   DELETE FROM hopper_jobs j
   USING r
   WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by
     AND r.state IN ('completed', 'cancelled', 'discarded')
-  RETURNING j.id, j.seq, j.kind, j.queue, r.state, j.priority, j.attempt, j.max_attempts,
-    j.scheduled_at, j.attempted_at, j.attempted_by, j.args, j.metadata,
-    CASE WHEN r.error IS NULL THEN j.errors
-         ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END AS errors,
-    j.unique_key, j.ordering_key, j.partition_key, j.batch_id, j.expires_at,
-    j.cancel_requested_at, j.await, j.created_at, r.output, r.archive, r.state AS final_state,
-    CASE WHEN j.await THEN pg_notify($9, j.id::text) END AS notified
+  RETURNING ` + finishedColumns(`CASE WHEN r.error IS NULL THEN j.errors
+         ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END`, "r.output", "r.archive", "r.state", "$9") + `
 ),
-archived AS (
-  INSERT INTO hopper_job_history (
-    id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
-    attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, finalized_at, output)
-  SELECT id, seq, kind, queue, state::hopper_job_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
-    attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, now(), output
-  FROM done WHERE archive
-  RETURNING id
-),
-` + batchAccountingSQLWith("$10") + `
-SELECT id FROM retry UNION ALL SELECT id FROM done`
+` + finalizeTailSQL("$9", "$10") + `
+SELECT id FROM retry UNION ALL SELECT id FROM finished`
 
 // JobFinalizeMany implements driver.Executor.
 func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
@@ -477,34 +462,20 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	return jobs, nil
 }
 
-// historyInsertSQL archives rows from a CTE named done, with the given
-// state and an error appended. The CTE must return hopper_jobs columns.
-func historyInsertSQL(state, errorText string) string {
-	return fmt.Sprintf(`
-INSERT INTO hopper_job_history (
-  id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
-  attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-  expires_at, cancel_requested_at, await, created_at, finalized_at, output)
-SELECT id, seq, kind, queue, '%s', priority, attempt, max_attempts, scheduled_at, attempted_at,
-  attempted_by, args, metadata,
-  errors || jsonb_build_object('at', now(), 'attempt', attempt, 'error', '%s'),
-  unique_key, ordering_key, partition_key, batch_id,
-  expires_at, cancel_requested_at, await, created_at, now(), NULL
-FROM done`, state, errorText)
-}
-
 var (
 	jobCancelRunningSQL = fmt.Sprintf(`
 UPDATE hopper_jobs SET cancel_requested_at = coalesce(cancel_requested_at, now())
 WHERE id = $1 AND state = 'running'
 RETURNING %s`, JobColumns(""))
-	jobCancelWaitingSQL = fmt.Sprintf(`
-WITH done AS (
-  DELETE FROM hopper_jobs WHERE id = $1 AND state <> 'running' RETURNING *, 'cancelled'::text AS final_state,
-    CASE WHEN await THEN pg_notify($2, id::text) END AS notified
-), archived AS (%s RETURNING %s, finalized_at, output),
-%s
-SELECT * FROM archived`, historyInsertSQL("cancelled", "hopper: cancelled"), JobColumns(""), batchAccountingSQLWith("$3"))
+	// jobCancelWaitingSQL finalizes a waiting job as cancelled, with
+	// everything that entails for its batch and its dependents.
+	jobCancelWaitingSQL = `
+WITH RECURSIVE finished AS (
+  DELETE FROM hopper_jobs j WHERE j.id = $1 AND j.state <> 'running'
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: cancelled"), "NULL::jsonb", "true", "'cancelled'::text", "$2") + `
+),
+` + finalizeTailSQL("$2", "$3") + `
+SELECT ` + finishedSelectColumns + ` FROM finished`
 )
 
 // JobCancel implements driver.Executor.
@@ -602,18 +573,18 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 	return job, nil
 }
 
-var jobDiscardExpiredSQL = fmt.Sprintf(`
-WITH done AS (
+var jobDiscardExpiredSQL = `
+WITH RECURSIVE finished AS (
   DELETE FROM hopper_jobs j
   WHERE j.id IN (
     SELECT id FROM hopper_jobs
     WHERE state IN ('available', 'scheduled', 'retryable') AND expires_at <= now()
     LIMIT $1 FOR UPDATE SKIP LOCKED
   )
-  RETURNING j.*, 'discarded'::text AS final_state, CASE WHEN j.await THEN pg_notify($2, j.id::text) END AS notified
-), archived AS (%s RETURNING %s, finalized_at, output),
-%s
-SELECT * FROM archived`, historyInsertSQL("discarded", "hopper: expired"), JobColumns(""), batchAccountingSQLWith("$3"))
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: expired"), "NULL::jsonb", "true", "'discarded'::text", "$2") + `
+),
+` + finalizeTailSQL("$2", "$3") + `
+SELECT ` + finishedSelectColumns + ` FROM finished`
 
 // JobDiscardExpired implements driver.Executor.
 func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.JobRow, error) {

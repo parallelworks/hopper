@@ -28,6 +28,11 @@ versions may change the API.
 - `hoppersql`, a driver for `database/sql` (pgx's stdlib adapter or lib/pq)
   that passes the same conformance suite as `hopperpgx`. It polls instead of
   listening and inserts without COPY.
+- Workflows: `NewWorkflow`, `Add` with `After`, `InsertWorkflow`/
+  `InsertWorkflowTx`, `WorkflowGet` and `hopper workflows get`. Steps with
+  dependencies wait pending and are promoted by the statement that finalizes
+  the last of them; a failed step cancels its dependents unless they opt to
+  `DependencyIgnore`. Schema v4 adds `hopper_job_deps`.
 
 ### Changed
 

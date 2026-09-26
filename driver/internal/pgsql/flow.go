@@ -12,33 +12,6 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
-// batchAccountingSQLWith returns the CTEs that count finalized jobs off
-// their batches and insert the callbacks of batches that reached zero, all
-// inside the finalizing statement. They expect a CTE named done whose rows
-// carry batch_id and a text column final_state, and the insert channel as
-// the given parameter. Rows without a batch cost one filtered scan of the
-// CTE and nothing else.
-func batchAccountingSQLWith(channelParam string) string {
-	return `batches AS (
-  UPDATE hopper_batches b
-  SET pending = b.pending - c.n, failed = b.failed + c.f,
-      completed_at = CASE WHEN b.pending - c.n <= 0 THEN now() ELSE b.completed_at END
-  FROM (SELECT batch_id, count(*) AS n, count(*) FILTER (WHERE final_state IN ('cancelled', 'discarded')) AS f
-        FROM done WHERE batch_id IS NOT NULL GROUP BY batch_id) c
-  WHERE b.id = c.batch_id
-  RETURNING b.id, b.pending, b.failed, b.on_success, b.on_failure, b.on_complete
-),
-callbacks AS (
-  INSERT INTO hopper_jobs (kind, queue, priority, max_attempts, args, metadata)
-  SELECT cb->>'kind', coalesce(cb->>'queue', 'default'), coalesce((cb->>'priority')::smallint, 2),
-    coalesce((cb->>'max_attempts')::smallint, 25), coalesce(cb->'args', '{}'),
-    coalesce(cb->'metadata', '{}') || jsonb_build_object('batch_id', b.id::text, 'batch_failed', b.failed)
-  FROM batches b, LATERAL (VALUES (CASE WHEN b.failed = 0 THEN b.on_success ELSE b.on_failure END), (b.on_complete)) AS v(cb)
-  WHERE b.pending <= 0 AND cb IS NOT NULL
-  RETURNING pg_notify(` + channelParam + `, queue)
-)`
-}
-
 // claimLimited claims inside a transaction that locks the queue row, so that
 // every client's claims on a limited queue are serialized and the limits
 // hold exactly: the budget is the smallest of the free slots, what the
