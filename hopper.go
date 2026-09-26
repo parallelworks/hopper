@@ -57,3 +57,7 @@ type AttemptError = driver.AttemptError
 
 // ErrNotFound is returned when a job does not exist, live or in history.
 var ErrNotFound = driver.ErrNotFound
+
+// ChannelControl and the other channel names are the Postgres NOTIFY
+// channels hopper uses; see the driver package.
+const ChannelControl = driver.ChannelControl

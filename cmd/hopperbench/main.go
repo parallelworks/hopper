@@ -171,6 +171,7 @@ func (b *bench) throughput(ctx context.Context, jobs, clients, workers int) (res
 	if err != nil {
 		return result{}, err
 	}
+	defer inserter.Stop(ctx) //nolint:errcheck // flushes pending notifications
 	params := b.params(jobs)
 	for i := 0; i < len(params); i += 10000 {
 		if _, err := inserter.InsertMany(ctx, params[i:min(i+10000, len(params))]); err != nil {
@@ -237,6 +238,7 @@ func (b *bench) insert(ctx context.Context, jobs, batch int) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
+	defer c.Stop(ctx) //nolint:errcheck // flushes pending notifications
 	params := b.params(jobs)
 	// Eight concurrent inserters, as an application with several replicas would have.
 	const inserters = 8

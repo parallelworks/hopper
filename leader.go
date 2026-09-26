@@ -15,7 +15,14 @@ import (
 func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaderInterval)
 	defer ticker.Stop()
-	defer c.resign(ctx)
+
+	// term is the current leadership: the periodic loop runs under it and
+	// stops when it ends.
+	var term *leaderTerm
+	defer func() {
+		term.end()
+		c.resign(ctx)
+	}()
 
 	var lastMaintenance time.Time
 	for {
@@ -29,9 +36,12 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		case ok:
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", c.clientID.Load())
+				c.emit(EventLeaderElected, nil, "")
 				lastMaintenance = time.Time{}
+				term = c.startTerm(ctx)
 			}
 			c.rescue(ctx)
+			c.expire(ctx)
 			c.pruneClients(ctx)
 			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval {
 				c.maintainHistory(ctx)
@@ -40,6 +50,9 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		default:
 			if c.isLeader.Swap(false) {
 				c.logger.WarnContext(ctx, "hopper: lost leadership", "client_id", c.clientID.Load())
+				c.emit(EventLeaderLost, nil, "")
+				term.end()
+				term = nil
 			}
 		}
 		select {
@@ -49,6 +62,34 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		case <-c.leaderPoke:
 		}
 	}
+}
+
+// leaderTerm is one stretch of leadership. The periodic loop runs for its
+// duration.
+type leaderTerm struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (c *Client[TTx]) startTerm(ctx context.Context) *leaderTerm {
+	termCtx, cancel := context.WithCancel(ctx)
+	t := &leaderTerm{cancel: cancel, done: make(chan struct{})}
+	go func() {
+		defer close(t.done)
+		if len(c.cfg.Periodic) > 0 {
+			c.periodicLoop(termCtx)
+		}
+	}()
+	return t
+}
+
+// end stops the term's loops and waits for them. It is safe on a nil term.
+func (t *leaderTerm) end() {
+	if t == nil {
+		return
+	}
+	t.cancel()
+	<-t.done
 }
 
 // pokeLeader asks the leader loop to attempt an election now, for example
@@ -144,9 +185,37 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			queues[queueOf[id]] = struct{}{}
 		}
 		c.logger.WarnContext(ctx, "hopper: rescued jobs from lost clients", "retried", retried, "discarded", discarded, "dropped", len(jobs)-len(applied))
+		for _, j := range jobs {
+			if f, was := byID[j.ID]; was && slices.Contains(applied, j.ID) {
+				c.emit(EventJobRescued, j, f.Error.Error)
+			}
+		}
 		for q := range queues {
 			c.wakeQueue(q)
 			c.notifier.mark(q)
+		}
+		if len(jobs) < c.tuning.rescueBatch {
+			return
+		}
+	}
+}
+
+// expire dead-letters waiting jobs whose TTL has passed.
+func (c *Client[TTx]) expire(ctx context.Context) {
+	for {
+		jobs, err := c.exec.JobDiscardExpired(ctx, c.tuning.rescueBatch)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.logger.ErrorContext(ctx, "hopper: discard expired jobs", "error", err)
+			}
+			return
+		}
+		for _, j := range jobs {
+			c.emit(EventJobDiscarded, j, "hopper: expired")
+			c.signalDone(j.ID)
+		}
+		if len(jobs) > 0 {
+			c.logger.InfoContext(ctx, "hopper: discarded expired jobs", "count", len(jobs))
 		}
 		if len(jobs) < c.tuning.rescueBatch {
 			return

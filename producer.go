@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -26,14 +27,29 @@ type producer struct {
 
 	claim  func(ctx context.Context, limit int) ([]*driver.JobRow, error)
 	work   func(row *driver.JobRow) driver.JobFinalize
-	submit func(queue string, result driver.JobFinalize)
+	submit func(job *driver.JobRow, result driver.JobFinalize)
 
 	wake  chan struct{} // an insert happened on this client
 	freed chan struct{} // a slot freed up
 
+	// cancel stops the claim loop; done is closed when it has stopped.
+	cancel context.CancelFunc
+	done   chan struct{}
+	paused atomic.Bool
+
 	mu      sync.Mutex
 	running int
 	jobs    sync.WaitGroup // running job goroutines
+}
+
+// setPaused stops or resumes claiming.
+func (p *producer) setPaused(paused bool) {
+	if p.paused.Swap(paused) != paused {
+		p.logger.Info("hopper: queue " + map[bool]string{true: "paused", false: "resumed"}[paused])
+		if !paused {
+			p.wakeUp()
+		}
+	}
 }
 
 func (p *producer) wakeUp() {
@@ -52,11 +68,15 @@ func (p *producer) runningCount() int {
 // run is the claim loop. It returns when ctx is done; jobs started by then
 // keep running and are waited for through p.jobs.
 func (p *producer) run(ctx context.Context) {
+	defer close(p.done)
 	threshold := max(1, p.cfg.MaxWorkers/4)
 	var lastClaim time.Time
 	errBackoff := p.pollInterval
 	for {
 		free := p.cfg.MaxWorkers - p.runningCount()
+		if p.paused.Load() {
+			free = 0
+		}
 		var cooldown <-chan time.Time
 		if free > 0 {
 			since := time.Since(lastClaim)
@@ -117,7 +137,7 @@ func (p *producer) start(job *driver.JobRow) {
 		result := p.work(job)
 		// Submit before freeing the slot, so that a backed-up finalizer
 		// applies back-pressure to claiming instead of piling up results.
-		p.submit(p.queue, result)
+		p.submit(job, result)
 		p.mu.Lock()
 		p.running--
 		p.mu.Unlock()

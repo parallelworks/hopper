@@ -59,6 +59,16 @@ type Client[TTx any] struct {
 	listening  atomic.Bool
 	isLeader   atomic.Bool
 	leaderPoke chan struct{}
+
+	events *eventBus
+
+	// running maps jobs running on this client to their cancel functions.
+	runningMu sync.Mutex
+	running   map[JobID]context.CancelCauseFunc
+
+	// doneWaiters are Await callers by job.
+	doneMu      sync.Mutex
+	doneWaiters map[JobID][]chan struct{}
 }
 
 type clientState int
@@ -80,14 +90,17 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		return nil, err
 	}
 	c := &Client[TTx]{
-		driver:     d,
-		exec:       d.Executor(),
-		caps:       d.Capabilities(),
-		cfg:        resolved,
-		tuning:     defaultTuning,
-		logger:     resolved.Logger,
-		workers:    resolved.Workers,
-		leaderPoke: make(chan struct{}, 1),
+		driver:      d,
+		exec:        d.Executor(),
+		caps:        d.Capabilities(),
+		cfg:         resolved,
+		tuning:      defaultTuning,
+		logger:      resolved.Logger,
+		workers:     resolved.Workers,
+		leaderPoke:  make(chan struct{}, 1),
+		events:      newEventBus(),
+		running:     map[JobID]context.CancelCauseFunc{},
+		doneWaiters: map[JobID][]chan struct{}{},
 	}
 	if c.workers == nil {
 		c.workers = NewWorkers()
@@ -120,6 +133,9 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		return err
 	}
 	c.clientID.Store(id)
+	if err := c.exec.QueueEnsure(ctx, slices.Sorted(maps.Keys(c.cfg.Queues))); err != nil {
+		c.logger.WarnContext(ctx, "hopper: record queues", "error", err)
+	}
 
 	// Each phase has its own context, cancelled in order by Stop.
 	base := context.WithoutCancel(ctx)
@@ -129,27 +145,12 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.bgCtx, c.bgCancel = context.WithCancel(base)       //nolint:gosec // cancelled in Stop
 	c.newGeneration()
 
-	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.wakeQueue)
+	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.wakeQueue, c.finalized)
 	go c.finalizer.run(c.finCtx)
 
 	c.producers = make(map[string]*producer, len(c.cfg.Queues))
 	for name, qcfg := range c.cfg.Queues {
-		p := &producer{
-			queue:        name,
-			cfg:          qcfg,
-			logger:       c.logger.With("queue", name),
-			pollInterval: c.cfg.PollInterval,
-			cooldown:     c.tuning.claimCooldown,
-			claim: func(ctx context.Context, limit int) ([]*driver.JobRow, error) {
-				return c.exec.JobClaim(ctx, driver.JobClaimParams{Queue: name, ClientID: c.clientID.Load(), Limit: limit})
-			},
-			work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.generation(), row, qcfg) },
-			submit: c.finalizer.submit,
-			wake:   make(chan struct{}, 1),
-			freed:  make(chan struct{}, 1),
-		}
-		c.producers[name] = p
-		c.producerWG.Go(func() { p.run(c.claimCtx) })
+		c.startProducer(name, qcfg)
 	}
 	if c.caps.Listen {
 		c.listenWG.Go(func() { c.listenLoop(c.bgCtx) })
@@ -160,6 +161,60 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.state = clientStarted
 	c.logger.InfoContext(ctx, "hopper: client started", "client_id", id, "queues", slices.Sorted(maps.Keys(c.cfg.Queues)))
 	return nil
+}
+
+// startProducer creates and starts the producer for a queue. The caller
+// holds c.mu.
+func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig) {
+	ctx, cancel := context.WithCancel(c.claimCtx)
+	p := &producer{
+		queue:        name,
+		cfg:          qcfg,
+		logger:       c.logger.With("queue", name),
+		pollInterval: c.cfg.PollInterval,
+		cooldown:     c.tuning.claimCooldown,
+		claim: func(ctx context.Context, limit int) ([]*driver.JobRow, error) {
+			return c.exec.JobClaim(ctx, driver.JobClaimParams{Queue: name, ClientID: c.clientID.Load(), Limit: limit})
+		},
+		work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.generation(), row, qcfg) },
+		submit: c.finalizer.submit,
+		wake:   make(chan struct{}, 1),
+		freed:  make(chan struct{}, 1),
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	c.producers[name] = p
+	c.producerWG.Go(func() { p.run(ctx) })
+}
+
+// finalized is called by the finalizer for each applied result: it emits
+// the job event and wakes local Await callers.
+func (c *Client[TTx]) finalized(job *driver.JobRow, result driver.JobFinalize) {
+	var (
+		kind    EventKind
+		errText string
+	)
+	if result.Error != nil {
+		errText = result.Error.Error
+	}
+	switch result.State {
+	case driver.JobStateCompleted:
+		kind = EventJobCompleted
+	case driver.JobStateRetryable:
+		kind = EventJobFailed
+	case driver.JobStateScheduled:
+		kind = EventJobSnoozed
+	case driver.JobStateCancelled:
+		kind = EventJobCancelled
+	case driver.JobStateDiscarded:
+		kind = EventJobDiscarded
+	case driver.JobStatePending, driver.JobStateAvailable, driver.JobStateRunning:
+		return
+	}
+	c.emit(kind, job, errText)
+	if result.State.Terminal() {
+		c.signalDone(job.ID)
+	}
 }
 
 func (c *Client[TTx]) register(ctx context.Context) (int64, error) {
@@ -321,17 +376,23 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 		id := c.clientID.Load()
-		ok, err := c.exec.ClientRenew(ctx, driver.ClientRenewParams{ClientID: id, TTL: c.tuning.leaseTTL})
+		res, err := c.exec.ClientRenew(ctx, driver.ClientRenewParams{ClientID: id, TTL: c.tuning.leaseTTL})
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.WarnContext(ctx, "hopper: renew client lease", "client_id", id, "error", err)
 			}
 			continue
 		}
-		if ok {
+		if !res.Renewed {
+			c.fence(ctx, id)
 			continue
 		}
-		c.fence(ctx, id)
+		// Control state rides along with every renewal, in case a
+		// notification was missed.
+		for _, jobID := range res.CancelRequested {
+			c.cancelLocal(jobID)
+		}
+		c.applyPaused(res.PausedQueues)
 	}
 }
 
@@ -346,6 +407,7 @@ func (c *Client[TTx]) fence(ctx context.Context, id int64) {
 		return
 	}
 	c.logger.ErrorContext(ctx, "hopper: client lease expired; fencing running jobs and re-registering", "client_id", id)
+	c.emit(EventLeaseLost, nil, "")
 	c.genCancel()
 	newID, err := c.register(ctx)
 	if err != nil {

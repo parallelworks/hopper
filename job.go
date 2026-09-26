@@ -58,6 +58,12 @@ type InsertOpts struct {
 	// Unique makes the job unique among live jobs of its kind. See
 	// UniqueOpts.
 	Unique *UniqueOpts
+	// TTL discards the job if it has not started within this long of its
+	// insert. Zero means no limit.
+	TTL time.Duration
+	// Await announces the job's finalize, so that Await returns as soon as
+	// it commits instead of on its next poll.
+	Await bool
 }
 
 // merge returns opts with the non-zero fields of over applied on top.
@@ -79,6 +85,12 @@ func (opts InsertOpts) merge(over InsertOpts) InsertOpts {
 	}
 	if over.Unique != nil {
 		opts.Unique = over.Unique
+	}
+	if over.TTL != 0 {
+		opts.TTL = over.TTL
+	}
+	if over.Await {
+		opts.Await = true
 	}
 	return opts
 }

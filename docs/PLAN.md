@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M2 are implemented (§16). This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M3 are implemented (§16). This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -177,7 +177,8 @@ results, err := client.InsertManyTx(ctx, tx, []hopper.InsertParams{
     {Args: SendEmail{UserID: 1}}, {Args: SendEmail{UserID: 2}},
 })
 
-// Awaitable results (request/reply).
+// Awaitable results (request/reply). Await: true makes the finalize announce
+// itself, so Await returns as soon as it commits rather than on its next poll.
 res, err = client.Insert(ctx, RenderReport{ID: 7}, &hopper.InsertOpts{Await: true})
 report, err := hopper.Await[ReportURL](ctx, client, res.Job.ID) // worker called hopper.SetOutput(ctx, url)
 ```
@@ -532,13 +533,17 @@ RETURNING j.*;
   `scheduled_at` has just arrived.
 - **Pipelining.** When the finalizer has pending results and the producer wants work,
   both statements are sent in one pgx batch, which is one network round trip.
-- **Expiry.** Rows past `expires_at` are skipped by the claim, and the leader discards
-  them as `expired`.
+- **Expiry.** Rows past `expires_at` (set from `InsertOpts.TTL`, as `now() + TTL`) are
+  skipped by the claim, and the leader moves them to history as `discarded` with the
+  error `hopper: expired`.
 - **Limits.** Queues with a `GlobalLimit` or `RateLimit` claim inside a short
   transaction that locks their `hopper_queues` row (§9). Unlimited queues never touch
   that row, so they pay nothing for the feature.
-- **Paused queues** skip claiming. Clients learn the pause state from a
-  `hopper_control` notification and re-read it on every lease renewal.
+- **Paused queues** skip claiming. `Queues().Pause` upserts the queue row and sends
+  `pg_notify('hopper_control', 'pause:<queue>')`; clients apply it at once and re-read
+  the set of paused queues on every lease renewal, in the same round trip as the
+  renewal. `Queues().Add` and `Remove` start and stop working a queue on one client at
+  runtime. Clients record the queues they work in `hopper_queues` on start.
 
 ### 7.4 Execute
 - Each queue runs a bounded pool of goroutines. Workers are started only once a slot is
@@ -547,11 +552,13 @@ RETURNING j.*;
   queue default), on `JobCancel`, on lease loss (§7.6), or on a hard stop.
 - A panic is recovered and recorded as an error with its stack trace, then treated as
   a normal failure.
-- Middleware (`func(ctx, *JobRow, next) error`) wraps execution for logging, metrics,
-  tracing, and custom policy. Insert middleware wraps inserts, for example to inject
-  trace context into `metadata`.
+- `Middleware` (an interface with `Work` and `Insert` methods; `WorkMiddleware` and
+  `InsertMiddleware` wrap a function) wraps execution for logging, metrics, tracing
+  and custom policy, and wraps inserts, for example to inject trace context into
+  `metadata`. Middleware runs in `Config.Middleware` order, outermost first, inside
+  the panic guard.
 - `hopper.SetOutput(ctx, v)` records a result, which is stored with the finalized job
-  and returned by `Await` and `JobGet`.
+  and returned by `Await` and `JobGet`. Output is kept only for archived jobs.
 
 ### 7.5 Finalize
 Results are buffered and written by a per-client finalizer. It flushes every 25ms or
@@ -601,8 +608,10 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure
   to claiming. Once the client is stopping, each batch gets one more attempt.
-- If a job has `await = true`, the finalizer sends `pg_notify('hopper_done', id)`, and
-  `Await` returns as soon as the transaction commits.
+- If a job has `await = true`, the finalize statement sends `pg_notify('hopper_done', id)`
+  from its `RETURNING` clause, and `Await` returns as soon as the transaction commits.
+  `Await` on a client without a listener (one that is not started) polls at
+  `PollInterval`. A cancelled or discarded job surfaces as `*JobFailedError`.
 
 ### 7.6 Liveness and rescue
 Liveness is tracked **per client, not per job**. Each client holds a lease row in
@@ -637,9 +646,13 @@ the largest source of write amplification in heartbeat-based designs.
 `JobCancel` on a waiting job moves it straight to history as `cancelled`. On a
 running job, it sets `cancel_requested_at` and sends
 `pg_notify('hopper_control', 'cancel:<id>')`. The owning client cancels the job's
-context immediately. Each lease renewal also returns any cancel requests for that
-client's running jobs (through the small running index), which covers missed
-notifications. The job finalizes as `cancelled` unless it had already completed.
+context immediately, with cause `hopper.ErrJobCancelled`. Each lease renewal also
+returns any cancel requests for that client's running jobs (through the small running
+index), which covers missed notifications. The job finalizes as `cancelled` if the
+worker returns an error after the request, and as `completed` if it finishes anyway.
+`JobRetry` re-drives a cancelled or discarded job from history (with one more attempt
+allowed if it had run out, and a fresh `seq`) or brings a waiting job forward; it
+refuses a running job and a job whose unique key is held by a live job.
 
 ### 7.8 Leader election
 Leadership is a lease row in `hopper_leader`:
@@ -668,17 +681,21 @@ rows, and resolving batch and workflow completion.
 ### 7.9 Periodic jobs
 `hopper.Every(d, …)` and `hopper.Cron(spec, …)` are both available from v0.1. Cron
 supports standard five-field syntax, an optional seconds field, `@hourly`-style
-descriptors, and an IANA time zone per job. The parser is in the core, using only the
-standard library.
+descriptors, and an IANA time zone per job (a `CRON_TZ=`/`TZ=` prefix or
+`PeriodicOpts.Location`; UTC by default). The parser is in the core, using only the
+standard library. `Every` slots are aligned to the interval, so every leader computes
+the same slots.
 
-On each tick, the leader computes the current slot. In one transaction, it advances
-`hopper_periodic.last_slot` with a conditional
-`UPDATE … WHERE name = $name AND last_slot < $slot`, and inserts the job only if that
-update matched a row. A slot therefore produces at most one job, even if two leaders
-overlap or leadership changes mid-slot, and even after the first job has finished and
-left the live table.
-`RunOnStart` inserts the current slot immediately. Missed slots are skipped by default,
-and `CatchUp: n` back-fills up to n of them.
+The leader runs a periodic loop for the duration of its term. It sleeps until the
+soonest slot, reads the database clock, and for each slot that has come due upserts
+`hopper_periodic.last_slot` with `ON CONFLICT DO UPDATE … WHERE last_slot < $slot` and
+inserts the job in the same transaction only if that upsert returned a row. A slot
+therefore produces at most one job, even if two leaders overlap or leadership changes
+mid-slot, and even after the first job has finished and left the live table.
+`RunOnStart` inserts a job when a leader starts scheduling. Missed slots are skipped by
+default, except slots due since the last recorded one within the last lease TTL, which
+covers a failover; `CatchUp: n` back-fills up to the n most recent missed slots
+instead. A schedule with no recorded slot starts from its next slot.
 
 ### 7.10 Retention
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.
@@ -887,11 +904,14 @@ observability without new machinery.
 
 - **Logging:** `log/slog` throughout, defaulting to `slog.Default()`.
 - **Events:** `client.Events(ctx, kinds...)` streams job lifecycle, leadership and lease
-  events, for tests and custom metrics.
+  events as an `iter.Seq[Event]`, for tests and custom metrics. Delivery is best-effort:
+  a consumer that falls behind by more than a buffer misses events rather than slowing
+  the client.
 - **Stats:** `Stats(ctx)` returns per-queue depth by state, the age of the oldest
-  available job, recent throughput, the running count by client, and the current
-  leader. It is suitable for readiness checks and autoscaling signals, such as
-  scaling replicas on queue latency.
+  claimable job, completions in the last minute (through the `(queue, finalized_at)`
+  history index, per known queue), the running count by client, live clients and the
+  current leader, in one statement. It is suitable for readiness checks and autoscaling
+  signals, such as scaling replicas on queue latency.
 - **OpenTelemetry (`hopperotel` module):** trace propagation from insert to work
   (through `metadata`), spans per attempt, and metrics for throughput, latency, queue
   depth, failures and rescues. Prometheus users export through the OTel exporter.
@@ -935,7 +955,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M0 | Scaffold | go.mod, CI (lint, Postgres test matrix, `fips140=only`), PR-title check, Dependabot, CONTRIBUTING. **Done.** | 0.5d |
 | M1 | Core engine | `Driver` interface and `hopperpgx`, schema v1, `hoppermigrate`, Insert/InsertTx/InsertMany (unnest and COPY), typed workers and `WorkFunc`, batched claim, batched finalize with history move, retries and backoff, `Snooze`/`Cancel` from workers, client lease registration and renewal, `Run`/`Stop`, a first `hopperbench`. **Done.** | 5d |
 | M2 | Reliability | Client leases, rescuer and fencing, leader lease, partitioned retention, LISTEN/NOTIFY with coalescing and adaptive polling, unique jobs (skip and replace), `RescueStuckAfter`. **Done.** | 4d |
-| M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events | 4d |
+| M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events, `Stats`. **Done.** | 4d |
 | M4 | Performance and release | `hopperbench`, targets met (§8.2), CI perf gate, chaos and upgrade suites, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, **v0.1.0** | 5d |
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, **v0.2.0** | 5d |
