@@ -4,8 +4,7 @@ hopper is a high-performance job queue and message broker for Go. It gives
 applications durable background jobs, scheduled and periodic work, and pub/sub
 messaging with transactional guarantees, using the database they already run.
 PostgreSQL is the first engine. One Apache-2.0 library replaces both an
-in-process job framework (such as River) and a separate broker (such as
-RabbitMQ).
+in-process job framework and a separate message broker.
 
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
@@ -45,7 +44,7 @@ meant to replace a *rabbit*.
    backoff, unique jobs and debouncing, snooze, cancellation, timeouts, awaitable
    results, global concurrency and rate limits, batches, workflows, topic-routed
    pub/sub, ordering keys, dead-lettering and replay. These are the features teams
-   reach for in River, Oban, Sidekiq, BullMQ and RabbitMQ, all in one library.
+   reach for in job frameworks and message brokers, all in one library.
 7. **Engine-agnostic by design.** Postgres is the first engine. The core talks to
    storage through a `Driver` interface defined at the level of queue operations, not
    SQL strings, and every engine must pass a shared conformance, concurrency and chaos
@@ -695,9 +694,9 @@ once past retention. Dropping a partition takes a brief `ACCESS EXCLUSIVE` lock 
 parent, once per period. Retention periods are set in `Config` and enforced by the
 leader, so the leader's settings apply cluster-wide.
 
-The defaults follow common practice: River, Solid Queue and GoodJob keep successful
-jobs briefly and failures longer, while brokers such as RabbitMQ and SQS delete a
-message once it is acknowledged.
+The defaults follow common practice: job queues keep successful jobs briefly and
+failures longer, while brokers such as RabbitMQ and SQS delete a message once it is
+acknowledged.
 
 | Outcome | Job queues | Subscription queues |
 | --- | --- | --- |
@@ -874,8 +873,8 @@ observability without new machinery.
 - SQL files are embedded in the `hoppermigrate` package, versioned, and forward-only by
   default. Down migrations exist for development.
 - `hoppermigrate.Up(ctx, driver)` applies them under an advisory lock taken on a
-  dedicated connection, not a pooled one. This avoids the pool-starvation deadlock we
-  hit in pie (see pie#1).
+  dedicated connection, not a pooled one. This avoids a pool-starvation deadlock:
+  processes waiting for the lock must not hold the connections the migration needs.
 - `hopper migrate` in the CLI runs the same migrations. The raw SQL files are also
   published for teams that use goose, atlas or Flyway. `hopper_schema` records the
   applied version either way.
@@ -938,7 +937,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M2 | Reliability | Client leases, rescuer and fencing, leader lease, partitioned retention, LISTEN/NOTIFY with coalescing and adaptive polling, unique jobs (skip and replace), `RescueStuckAfter`. **Done.** | 4d |
 | M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events | 4d |
 | M4 | Performance and release | `hopperbench`, targets met (§8.2), CI perf gate, chaos and upgrade suites, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, **v0.1.0** | 5d |
-| M5 | Adopt in pie | Replace River in pie's `internal/jobs`; drain and drop River's tables | 1d |
+| M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, **v0.2.0** | 5d |
 | M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0** | 5d |
 | M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumer groups, `hopperui` | 2–3w |

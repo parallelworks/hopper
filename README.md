@@ -37,20 +37,6 @@ _, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42}, nil)   // commits with
 err = client.PublishTx(ctx, tx, "allocation.created", payload)   // fans out to subscribers
 ```
 
-## Why another queue?
-
-[River](https://riverqueue.com) showed how well a Postgres-native queue fits Go
-applications, and we started with it. hopper exists because we want:
-
-- a permissive, single-license (Apache-2.0) project with no commercial tier;
-- a lean core with integrations in separate modules;
-- lease-based rescue that recovers from crashed pods in seconds, with no
-  per-job heartbeat writes;
-- the features of commercial queue tiers (global limits, batches, workflows)
-  in the open-source library;
-- built-in pub/sub messaging, so one dependency replaces both a job framework
-  and a broker.
-
 ## The name
 
 A feed hopper releases work into a machine one piece at a time. The name is
