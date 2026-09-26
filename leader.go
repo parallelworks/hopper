@@ -94,10 +94,10 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		if len(jobs) == 0 {
 			return
 		}
-		// Finding our own jobs among the candidates means our lease has
-		// lapsed and the lease loop has not noticed yet. Fence first, so the
-		// jobs stop before they are handed back.
-		if me := c.clientID.Load(); slices.ContainsFunc(jobs, func(j *driver.JobRow) bool { return j.AttemptedBy == me }) {
+		// Finding our own jobs among the candidates, other than as stuck,
+		// means our lease has lapsed and the lease loop has not noticed
+		// yet. Fence first, so the jobs stop before they are handed back.
+		if me := c.clientID.Load(); slices.ContainsFunc(jobs, func(j *driver.JobRow) bool { return j.AttemptedBy == me && !c.stuck(j) }) {
 			c.fence(ctx, me)
 		}
 
@@ -105,7 +105,7 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		queueOf := make(map[JobID]string, len(jobs))
 		for i, j := range jobs {
 			reason := "hopper: client lost"
-			if c.cfg.RescueStuckAfter > 0 && time.Since(j.AttemptedAt) > c.cfg.RescueStuckAfter {
+			if c.stuck(j) {
 				reason = "hopper: job ran longer than RescueStuckAfter"
 			}
 			f := driver.JobFinalize{
@@ -152,6 +152,12 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// stuck reports whether a rescue candidate qualifies by RescueStuckAfter,
+// as opposed to by a lost lease.
+func (c *Client[TTx]) stuck(j *driver.JobRow) bool {
+	return c.cfg.RescueStuckAfter > 0 && time.Since(j.AttemptedAt) >= c.cfg.RescueStuckAfter
 }
 
 func (c *Client[TTx]) pruneClients(ctx context.Context) {
