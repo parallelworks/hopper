@@ -33,6 +33,18 @@ versions may change the API.
   dependencies wait pending and are promoted by the statement that finalizes
   the last of them; a failed step cancels its dependents unless they opt to
   `DependencyIgnore`. Schema v4 adds `hopper_job_deps`.
+- Streams: `Streams().Append`/`AppendTx` write to a retained, time-partitioned
+  log; `hopper.Consume` registers a consumer that delivers matching events as
+  jobs from a position of its own, starting at the earliest or latest event
+  and movable with `Seek`; `Read` pages the log. Consumers read by snapshot
+  deltas, so a late-committing transaction is delivered when it commits and
+  never skipped. `Config.StreamRetention`, `hopper streams consumers|seek`
+  and `hopper subscriptions list`. Schema v5 adds `hopper_stream_events` and
+  `hopper_stream_consumers`.
+- `hopperui`, a separate module: an embeddable web UI for queues, jobs,
+  workflows (as a DAG), subscriptions, stream consumers and clients, with
+  actions behind an `Authorize` hook.
+- `JobFilter.After`, to page job listings.
 
 ### Changed
 

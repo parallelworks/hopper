@@ -108,6 +108,15 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("stats"); !strings.Contains(got, "q1") {
 		t.Errorf("stats = %q", got)
 	}
+	if got := hopperCmd("subscriptions", "list"); !strings.Contains(got, "NAME") {
+		t.Errorf("subscriptions list = %q", got)
+	}
+	if got := hopperCmd("streams", "consumers"); !strings.Contains(got, "NAME") {
+		t.Errorf("streams consumers = %q", got)
+	}
+	if err := run(ctx, []string{"streams", "seek", "nobody", "-earliest"}, new(bytes.Buffer)); err == nil {
+		t.Error("seek of an unknown consumer succeeded")
+	}
 	wf := hopper.NewWorkflow("ingest", nil)
 	first := wf.Add(ping{}, nil)
 	wf.Add(ping{}, hopper.After(first))

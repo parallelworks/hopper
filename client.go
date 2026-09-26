@@ -59,6 +59,7 @@ type Client[TTx any] struct {
 	listening  atomic.Bool
 	isLeader   atomic.Bool
 	leaderPoke chan struct{}
+	streamPoke chan struct{}
 
 	events *eventBus
 
@@ -98,6 +99,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		logger:      resolved.Logger,
 		workers:     resolved.Workers,
 		leaderPoke:  make(chan struct{}, 1),
+		streamPoke:  make(chan struct{}, 1),
 		events:      newEventBus(),
 		running:     map[JobID]context.CancelCauseFunc{},
 		doneWaiters: map[JobID][]chan struct{}{},
@@ -246,8 +248,8 @@ func (c *Client[TTx]) finalized(job *driver.JobRow, result driver.JobFinalize) {
 	}
 }
 
-// declare records what this client works: its queues, subscriptions and
-// declared limits, which take effect cluster-wide.
+// declare records what this client works: its queues, subscriptions,
+// stream consumers and declared limits, which take effect cluster-wide.
 func (c *Client[TTx]) declare(ctx context.Context) error {
 	if err := c.exec.QueueEnsure(ctx, slices.Sorted(maps.Keys(c.cfg.Queues))); err != nil {
 		c.logger.WarnContext(ctx, "hopper: record queues", "error", err)
@@ -255,6 +257,9 @@ func (c *Client[TTx]) declare(ctx context.Context) error {
 	// Subscriptions and limits are declared in code and take effect
 	// cluster-wide once recorded, so a failure here is a startup error.
 	if err := c.exec.SubscriptionUpsert(ctx, c.workers.subscriptionRows()); err != nil {
+		return err
+	}
+	if err := c.exec.StreamConsumerUpsert(ctx, c.workers.consumerRows()); err != nil {
 		return err
 	}
 	for name, q := range c.cfg.Queues {

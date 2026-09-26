@@ -32,6 +32,10 @@ type Message[T any] struct {
 	ID          string
 	Headers     map[string]string
 	OrderingKey string
+	// Stream and Position are set for a consumer's deliveries: the
+	// consumer's name and the event's place in the log.
+	Stream   string
+	Position StreamPosition
 }
 
 // Subscription routes messages whose topic matches Pattern to a queue, as
@@ -118,14 +122,22 @@ type messageMetadata struct {
 	Topic     string            `json:"topic"`
 	MessageID string            `json:"message_id"`
 	Headers   map[string]string `json:"headers"`
+	Stream    string            `json:"stream,omitempty"`
+	Position  string            `json:"position,omitempty"`
 }
 
 func decodeMessage[T any](row *JobRow, codec Codec) (*Message[T], error) {
 	var meta messageMetadata
-	if err := json.Unmarshal(row.Metadata, &meta); err != nil {
+	err := json.Unmarshal(row.Metadata, &meta)
+	if err != nil {
 		return nil, fmt.Errorf("hopper: decode message metadata: %w", err)
 	}
-	msg := &Message[T]{JobRow: row, Topic: meta.Topic, ID: meta.MessageID, Headers: meta.Headers, OrderingKey: row.OrderingKey}
+	msg := &Message[T]{JobRow: row, Topic: meta.Topic, ID: meta.MessageID, Headers: meta.Headers, OrderingKey: row.OrderingKey, Stream: meta.Stream}
+	if meta.Position != "" {
+		if msg.Position, err = ParseStreamPosition(meta.Position); err != nil {
+			return nil, err
+		}
+	}
 	if err := codec.Unmarshal(row.Args, &msg.Payload); err != nil {
 		return nil, fmt.Errorf("hopper: decode message payload: %w", err)
 	}

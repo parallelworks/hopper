@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -59,6 +60,9 @@ commands:
   queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]   (omitted limits are removed)
   clients list
   workflows get <id>
+  subscriptions list
+  streams consumers
+  streams seek <consumer> -earliest|-latest|-time RFC3339|-position xid:seq
   stats
   bench                        (see the hopperbench command)
 
@@ -115,6 +119,10 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		return c.clients(ctx, rest[1:])
 	case "workflows":
 		return c.workflows(ctx, rest[1:])
+	case "subscriptions":
+		return c.subscriptions(ctx, rest[1:])
+	case "streams":
+		return c.streams(ctx, rest[1:])
 	case "stats":
 		return c.stats(ctx)
 	default:
@@ -372,6 +380,92 @@ func (c *cli) workflows(ctx context.Context, args []string) error {
 		}
 		tw.Flush()
 	})
+}
+
+func (c *cli) subscriptions(ctx context.Context, args []string) error {
+	if len(args) != 1 || args[0] != "list" {
+		return errors.New("subscriptions: list")
+	}
+	subs, err := c.client.Subscriptions(ctx)
+	if err != nil {
+		return err
+	}
+	return c.print(subs, func(w io.Writer) {
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "NAME\tPATTERN\tQUEUE\tMAX_ATTEMPTS\tCREATED")
+		for _, s := range subs {
+			attempts := "default"
+			if s.MaxAttempts > 0 {
+				attempts = strconv.Itoa(s.MaxAttempts)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.Pattern, s.Queue, attempts, s.CreatedAt.Local().Format(time.RFC3339))
+		}
+		tw.Flush()
+	})
+}
+
+func (c *cli) streams(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("streams: consumers or seek")
+	}
+	switch args[0] {
+	case "consumers":
+		consumers, err := c.client.Streams().Consumers(ctx)
+		if err != nil {
+			return err
+		}
+		return c.print(consumers, func(w io.Writer) {
+			tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(tw, "NAME\tPATTERN\tQUEUE\tSNAPSHOT\tPOSITION\tDELIVERED")
+			for _, cs := range consumers {
+				delivered := "never"
+				if !cs.DeliveredAt.IsZero() {
+					delivered = cs.DeliveredAt.Local().Format(time.RFC3339)
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", cs.Name, cs.Pattern, cs.Queue, cs.Snapshot, cs.Position, delivered)
+			}
+			tw.Flush()
+		})
+	case "seek":
+		fs := flag.NewFlagSet("hopper streams seek", flag.ContinueOnError)
+		fs.SetOutput(c.out)
+		var opts hopper.SeekOpts
+		var at, position string
+		fs.BoolVar(&opts.Earliest, "earliest", false, "replay every retained event")
+		fs.BoolVar(&opts.Latest, "latest", false, "skip to events appended from now on")
+		fs.StringVar(&at, "time", "", "replay from the first event at or after this RFC3339 time")
+		fs.StringVar(&position, "position", "", "resume after this position (xid:seq)")
+		if len(args) < 2 {
+			return errors.New("streams seek: a consumer name is required")
+		}
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		if at != "" {
+			t, err := time.Parse(time.RFC3339, at)
+			if err != nil {
+				return fmt.Errorf("streams seek: -time: %w", err)
+			}
+			opts.Time = t
+		}
+		if position != "" {
+			p, err := hopper.ParseStreamPosition(position)
+			if err != nil {
+				return err
+			}
+			opts.Position = p
+		}
+		if !opts.Earliest && !opts.Latest && opts.Time.IsZero() && opts.Position.IsZero() {
+			return errors.New("streams seek: one of -earliest, -latest, -time or -position is required")
+		}
+		if err := c.client.Streams().Seek(ctx, args[1], opts); err != nil {
+			return err
+		}
+		fmt.Fprintf(c.out, "consumer %s moved\n", args[1])
+		return nil
+	default:
+		return fmt.Errorf("streams: unknown subcommand %q", args[0])
+	}
 }
 
 func (c *cli) stats(ctx context.Context) error {
