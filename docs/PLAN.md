@@ -231,12 +231,13 @@ b.Add(ProcessShard{Shard: 0}, nil)
 b.Add(ProcessShard{Shard: 1}, nil)
 err = b.InsertTx(ctx, tx)
 
-wf := hopper.NewWorkflow("ingest-9")
-fetch := wf.Add(Fetch{URL: u})
+wf := hopper.NewWorkflow("ingest-9", &hopper.WorkflowOpts{OnFailure: AlertOps{RunID: 9}})
+fetch := wf.Add(Fetch{URL: u}, nil)
 parse := wf.Add(Parse{}, hopper.After(fetch))
 wf.Add(Index{}, hopper.After(parse))
 wf.Add(Notify{}, hopper.After(parse))
-err = client.InsertWorkflowTx(ctx, tx, wf)
+res, err := client.InsertWorkflowTx(ctx, tx, wf)
+row, err := client.WorkflowGet(ctx, res.ID)   // progress, jobs and edges
 ```
 
 ### 4.7 API conventions
@@ -444,7 +445,8 @@ CREATE TABLE hopper_schema (version int PRIMARY KEY, applied_at timestamptz NOT 
 Schema v2 (M6) adds `max_attempts` and `metadata` to `hopper_subscriptions`, the
 ordering-key indexes (§10) and the SQL contract functions. Schema v3 (M7) adds
 `partition_limit` and `aging_seconds` to `hopper_queues`, the partition-key running
-index, `hopper_batches` and the batch index. M8 adds `hopper_job_deps` (§11).
+index, `hopper_batches` and the batch index. Schema v4 (M8) adds `hopper_job_deps`, the
+name and edges of a batch, and a `batch_id` index on history (§11).
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -919,11 +921,23 @@ observability without new machinery.
   failed, `on_failure` otherwise, `on_complete` either way, each with `batch_id` and
   `batch_failed` in its metadata, and notifies their queues. `client.NewBatch(opts)`,
   `Add`, `Insert`/`InsertTx` and `BatchGet` are the API.
-- **Workflows (M8).** Jobs with dependencies are inserted as `pending`, with edges in
-  `hopper_job_deps`. When a job completes, the same finalize statement promotes
-  dependents whose dependencies are all complete to `available`. Failure policies are
-  `cancel dependents` (the default) and `ignore`. Workflows are inspectable as a DAG in
-  `hopperui`.
+- **Workflows (M8).** A workflow is a batch whose jobs depend on each other, so it has
+  a name, the batch's progress and callbacks, and its graph (`hopper_batches.edges`).
+  `NewWorkflow` collects steps; a step can only depend on steps added before it, so the
+  graph is a DAG by construction. `InsertWorkflow` generates the IDs up front and
+  inserts the batch, the jobs (`pending` when they have dependencies, otherwise
+  available) and the edges in one transaction. `hopper_job_deps` is the working set of
+  unsatisfied edges, deleted as dependents finalize, and the statement that finalizes
+  a job is the one that acts on its dependents: it promotes those whose dependencies
+  have all left the live table (including the ones finalized in the same statement)
+  to `available` and notifies their queues, and it cancels, transitively, the
+  dependents of a cancelled or discarded job whose edge says `cancel` (the default;
+  `ignore` lets the dependent run once its dependencies have finished, whatever their
+  outcome). Cancelled dependents go to history with a "dependency failed" error and
+  count as batch failures. Every finalizing statement (the batched finalize,
+  cancelling a waiting job, expiring) ends with the same tail, so batches and
+  dependents behave the same however a job finishes. Workflows are inspectable with
+  `WorkflowGet`, `hopper workflows get` and, as a DAG, in `hopperui`.
 
 ## 12. Migrations
 
@@ -960,8 +974,8 @@ observability without new machinery.
   gauges for queue depth by state, the oldest claimable job's age and live clients from
   `Stats`. Prometheus users export through the OTel exporter.
 - **CLI (`cmd/hopper`, core module):** `migrate up|down|version`, `jobs list|get|retry|cancel`,
-  `queues list|pause|resume`, `clients list` and `stats`, all with `-json`. `queues limit`
-  and `subscriptions list` arrive with M7 and M6. Benchmarks are the separate
+  `queues list|pause|resume|limit`, `clients list`, `workflows get` and `stats`, all with
+  `-json`. `subscriptions list` arrives with M6. Benchmarks are the separate
   `hopperbench` command.
 - **Web UI (`hopperui` module):** an embeddable `http.Handler` for browsing queues,
   jobs, history, subscriptions and workflows, with retry, cancel and pause actions
@@ -1006,7 +1020,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done**; **v0.2.0** follows v0.1.0. | 5d |
 | M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0**. **Done.** | 5d |
-| M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumer groups, `hopperui` | 2–3w |
+| M8 | Workflows, streams, UI | Job dependencies and DAG workflows (**done**), streams with consumer groups, `hopperui`. Each lands in its own PR. | 2–3w |
 | M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |
 
 M0–M4 take roughly four weeks to a production-ready v0.1.0 that meets its performance

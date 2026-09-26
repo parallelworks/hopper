@@ -189,6 +189,13 @@ type Executor interface {
 	BatchInsert(ctx context.Context, params BatchInsertParams) (JobID, error)
 	// BatchGet returns a batch's progress.
 	BatchGet(ctx context.Context, id JobID) (*BatchRow, error)
+	// WorkflowInsert inserts a batch, its jobs and the dependencies between
+	// them atomically. Jobs with dependencies start pending. Results are in
+	// input order.
+	WorkflowInsert(ctx context.Context, params WorkflowInsertParams) (*WorkflowInsertResult, error)
+	// WorkflowGet returns a workflow's progress, its jobs (live and
+	// finished) and its edges.
+	WorkflowGet(ctx context.Context, id JobID) (*WorkflowRow, error)
 
 	// PeriodicInsert inserts the job for a periodic slot if that slot has
 	// not been inserted yet, atomically, and reports whether it did. A slot
@@ -419,7 +426,9 @@ type BatchInsertParams struct {
 
 // BatchRow is a batch's progress.
 type BatchRow struct {
-	ID      JobID
+	ID JobID
+	// Name is set for workflows.
+	Name    string
 	Pending int
 	Failed  int
 	Total   int
@@ -427,6 +436,60 @@ type BatchRow struct {
 	CompletedAt time.Time
 	CreatedAt   time.Time
 	Metadata    json.RawMessage
+}
+
+// DependencyFailure says what happens to a dependent job when the job it
+// depends on is cancelled or discarded.
+type DependencyFailure string
+
+const (
+	// DependencyCancel cancels the dependent, and so on down the graph.
+	DependencyCancel DependencyFailure = "cancel"
+	// DependencyIgnore lets the dependent run once its dependencies have
+	// all finished, whatever their outcome.
+	DependencyIgnore DependencyFailure = "ignore"
+)
+
+// JobDependency is an edge of a workflow: Job waits for DependsOn. Both
+// are indexes into WorkflowInsertParams.Jobs.
+type JobDependency struct {
+	Job, DependsOn int
+	OnFailure      DependencyFailure
+}
+
+// WorkflowInsertParams describes a workflow: a named batch whose jobs
+// depend on each other.
+type WorkflowInsertParams struct {
+	Name string
+	// Jobs must have no unique keys; a skipped job would leave its
+	// dependents waiting forever.
+	Jobs []JobInsertParams
+	Deps []JobDependency
+	// Callbacks and Metadata are the batch's; see BatchInsertParams.
+	OnSuccess, OnFailure, OnComplete *JobInsertParams
+	Metadata                         json.RawMessage
+	// Notify sends insert notifications for the jobs that start
+	// available from inside the statement.
+	Notify bool
+}
+
+// WorkflowInsertResult reports an inserted workflow.
+type WorkflowInsertResult struct {
+	ID   JobID
+	Jobs []JobInsertResult
+}
+
+// JobEdge is an edge of an inserted workflow.
+type JobEdge struct {
+	Job, DependsOn JobID
+}
+
+// WorkflowRow is a workflow's progress, jobs and graph.
+type WorkflowRow struct {
+	Batch BatchRow
+	// Jobs are in insertion order, live and finished alike.
+	Jobs  []*JobRow
+	Edges []JobEdge
 }
 
 // PeriodicInsertParams identifies a periodic slot and the job to insert

@@ -165,6 +165,29 @@ Periodic: []hopper.PeriodicJob{
 
 The leader inserts each slot exactly once, whichever replica is leader.
 
+## Batches and workflows
+
+```go
+b := client.NewBatch(hopper.BatchOpts{OnSuccess: ReportDone{RunID: 9}, OnFailure: AlertOps{RunID: 9}})
+b.Add(ProcessShard{Shard: 0}, nil)
+b.Add(ProcessShard{Shard: 1}, nil)
+res, err := b.InsertTx(ctx, tx)
+
+wf := hopper.NewWorkflow("ingest-9", &hopper.WorkflowOpts{OnFailure: AlertOps{RunID: 9}})
+fetch := wf.Add(Fetch{URL: u}, nil)
+parse := wf.Add(Parse{}, hopper.After(fetch))
+wf.Add(Index{}, hopper.After(parse))
+wf.Add(Notify{}, hopper.After(parse))
+res, err := client.InsertWorkflowTx(ctx, tx, wf)
+```
+
+A batch runs its callbacks when its last job finishes. A workflow's steps
+run as their dependencies finish; a failed step cancels the steps that
+depend on it (set `StepOpts.OnDependencyFailure` to `DependencyIgnore` to run
+anyway), and the workflow is a batch, so it has the same callbacks.
+`client.WorkflowGet(ctx, res.ID)` and `hopper workflows get <id>` show its
+progress and graph.
+
 ## Results and waiting
 
 ```go

@@ -108,6 +108,17 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("stats"); !strings.Contains(got, "q1") {
 		t.Errorf("stats = %q", got)
 	}
+	wf := hopper.NewWorkflow("ingest", nil)
+	first := wf.Add(ping{}, nil)
+	wf.Add(ping{}, hopper.After(first))
+	wres, err := client.InsertWorkflow(ctx, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hopperCmd("workflows", "get", wres.ID.String()); !strings.Contains(got, "name:      ingest") ||
+		!strings.Contains(got, "0 of 2 finished") || !strings.Contains(got, "pending") || !strings.Contains(got, wres.Jobs[0].Job.ID.String()) {
+		t.Errorf("workflows get = %q", got)
+	}
 	if got := hopperCmd("migrate", "down"); !strings.Contains(got, "schema version 0") {
 		t.Errorf("migrate down = %q", got)
 	}
