@@ -1,10 +1,11 @@
 name: Performance gate
 
 # Runs a reduced benchmark on the PR and on its base, on the same runner,
-# back to back, and fails if the PR is more than 10% slower on any scenario.
-# Hosted runners are noisy, so each side runs several times and the best
-# result counts. The reference numbers in docs/PLAN.md §8.2 come from the
-# release hardware, not from here.
+# and fails if the PR is more than 10% slower on any scenario. Hosted
+# runners are noisy and drift over a job, so both benchmark binaries are
+# built first and then run alternately, several rounds each; the best run
+# of each side counts. The reference numbers in docs/PLAN.md §8.2 come from
+# the release hardware, not from here.
 on:
   pull_request:
     paths:
@@ -39,7 +40,7 @@ jobs:
     env:
       DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_bench?sslmode=disable
       SCENARIOS: throughput,insert,copy
-      RUNS: "3"
+      ROUNDS: "5"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -47,17 +48,18 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Benchmark the PR
+      - name: Build both benchmark binaries
         run: |
-          for i in $(seq "$RUNS"); do
-            go run ./cmd/hopperbench -database-url "$DATABASE_URL" -scenarios "$SCENARIOS" -jobs 30000 -schema "head_$i"
-          done | tee head.jsonl
-      - name: Benchmark the base
+          go build -o "$RUNNER_TEMP/bench-head" ./cmd/hopperbench
+          git worktree add "$RUNNER_TEMP/base" "origin/${{ github.base_ref }}"
+          (cd "$RUNNER_TEMP/base" && go build -o "$RUNNER_TEMP/bench-base" ./cmd/hopperbench)
+      - name: Benchmark base and PR alternately
         run: |
-          git worktree add ../base "origin/${{ github.base_ref }}"
-          cd ../base
-          for i in $(seq "$RUNS"); do
-            go run ./cmd/hopperbench -database-url "$DATABASE_URL" -scenarios "$SCENARIOS" -jobs 30000 -schema "base_$i"
-          done | tee "$GITHUB_WORKSPACE/base.jsonl"
+          for i in $(seq "$ROUNDS"); do
+            "$RUNNER_TEMP/bench-base" -database-url "$DATABASE_URL" -scenarios "$SCENARIOS" -jobs 20000 -schema "base_$i" >> base.jsonl
+            "$RUNNER_TEMP/bench-head" -database-url "$DATABASE_URL" -scenarios "$SCENARIOS" -jobs 20000 -schema "head_$i" >> head.jsonl
+          done
+          echo "== base"; cat base.jsonl
+          echo "== head"; cat head.jsonl
       - name: Compare
-        run: go run ./cmd/hopperbench -compare base.jsonl,head.jsonl -threshold 0.10
+        run: "$RUNNER_TEMP/bench-head" -compare base.jsonl,head.jsonl -threshold 0.10
