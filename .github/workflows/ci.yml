@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [canary]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Verify go.mod is tidy
+        run: go mod tidy -diff && (cd tools && go mod tidy -diff)
+      - name: Lint
+        run: go tool -modfile=tools/go.mod golangci-lint run ./...
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "15", "16", "17", "18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: hopper
+          POSTGRES_PASSWORD: hopper
+          POSTGRES_DB: hopper_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hopper -d hopper_test"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test
+        env:
+          # go.mod also sets fips140=only; the environment makes the mode explicit
+          # so that a future go.mod edit cannot silently drop it.
+          GODEBUG: fips140=only
+          HOPPER_TEST_DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_test?sslmode=disable
+        run: go test -race -cover -timeout 10m ./...
