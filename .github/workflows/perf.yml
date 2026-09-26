@@ -62,4 +62,5 @@ jobs:
           echo "== base"; cat base.jsonl
           echo "== head"; cat head.jsonl
       - name: Compare
-        run: "$RUNNER_TEMP/bench-head" -compare base.jsonl,head.jsonl -threshold 0.10
+        run: |
+          "$RUNNER_TEMP/bench-head" -compare base.jsonl,head.jsonl -threshold 0.10
