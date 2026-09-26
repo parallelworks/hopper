@@ -41,6 +41,10 @@ versions may change the API.
   never skipped. `Config.StreamRetention`, `hopper streams consumers|seek`
   and `hopper subscriptions list`. Schema v5 adds `hopper_stream_events` and
   `hopper_stream_consumers`.
+- `hopperui`, a separate module: an embeddable web UI for queues, jobs,
+  workflows (as a DAG), subscriptions, stream consumers and clients, with
+  actions behind an `Authorize` hook.
+- `JobFilter.After`, to page job listings.
 
 ### Changed
 
