@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -72,6 +73,9 @@ const (
 	// ChannelDone carries the ID of a finalized job that was inserted with
 	// Await, so waiters return as soon as the finalize commits.
 	ChannelDone = "hopper_done"
+	// ChannelStream is signalled when events are appended to the stream
+	// log, with the topic as payload, so the leader pumps consumers at once.
+	ChannelStream = "hopper_stream"
 )
 
 // Listener receives notifications. One listener multiplexes every channel.
@@ -216,6 +220,26 @@ type Executor interface {
 	// matches the topic, in one statement, and returns them. A delivery
 	// whose dedup key matches a live one is reported as a duplicate.
 	MessagePublish(ctx context.Context, params MessagePublishParams) ([]JobInsertResult, error)
+
+	// StreamAppend appends one event to the stream log and returns it with
+	// its position.
+	StreamAppend(ctx context.Context, params StreamAppendParams) (*StreamEvent, error)
+	// StreamRead pages through the committed events after a position whose
+	// topic matches a pattern, in position order. It is for browsing; a
+	// consumer is what reads the log without missing late commits.
+	StreamRead(ctx context.Context, params StreamReadParams) ([]*StreamEvent, error)
+	// StreamConsumerUpsert records consumers, updating pattern, queue and
+	// settings of existing ones by name; a new consumer starts at Start.
+	StreamConsumerUpsert(ctx context.Context, consumers []StreamConsumerRow) error
+	// StreamConsumerList returns every consumer with its position.
+	StreamConsumerList(ctx context.Context) ([]*StreamConsumerRow, error)
+	// StreamConsumerSeek moves a consumer's position: events after it are
+	// delivered (again).
+	StreamConsumerSeek(ctx context.Context, name string, params StreamSeekParams) error
+	// StreamPump turns up to limit events after a consumer's position into
+	// delivery jobs and advances the position, atomically. Two leaders
+	// pumping the same consumer serialize on its row.
+	StreamPump(ctx context.Context, name string, limit int) (StreamPumpResult, error)
 
 	// HistoryMaintain enforces retention on finalized jobs and prepares
 	// storage for the near future, in whatever way suits the engine (dropping
@@ -593,6 +617,8 @@ type HistoryMaintainParams struct {
 	CompletedRetention time.Duration
 	// FailedRetention is how long cancelled and discarded jobs are kept.
 	FailedRetention time.Duration
+	// StreamRetention is how long stream events are kept.
+	StreamRetention time.Duration
 }
 
 // HistoryMaintainResult reports what maintenance did.
@@ -638,6 +664,123 @@ type MessagePublishParams struct {
 	Await    bool
 	// Notify wakes workers on the delivery queues once the publish commits.
 	Notify bool
+}
+
+// StreamPosition orders events in the stream log: by the transaction that
+// wrote them, then by sequence within it. The zero position is before every
+// event.
+type StreamPosition struct {
+	Xid uint64
+	Seq int64
+}
+
+// Less reports whether p comes before q.
+func (p StreamPosition) Less(q StreamPosition) bool {
+	return p.Xid < q.Xid || (p.Xid == q.Xid && p.Seq < q.Seq)
+}
+
+// IsZero reports the position before every event.
+func (p StreamPosition) IsZero() bool { return p == StreamPosition{} }
+
+// String formats the position as "xid:seq".
+func (p StreamPosition) String() string { return fmt.Sprintf("%d:%d", p.Xid, p.Seq) }
+
+// ParseStreamPosition parses the String form.
+func ParseStreamPosition(s string) (StreamPosition, error) {
+	var p StreamPosition
+	if _, err := fmt.Sscanf(s, "%d:%d", &p.Xid, &p.Seq); err != nil {
+		return StreamPosition{}, fmt.Errorf("hopper: stream position %q is not xid:seq", s)
+	}
+	return p, nil
+}
+
+// StreamEvent is one event of the stream log.
+type StreamEvent struct {
+	Position StreamPosition
+	Topic    string
+	// Key, if set, becomes the ordering key of the event's deliveries.
+	Key       string
+	Payload   json.RawMessage
+	Headers   map[string]string
+	MessageID string
+	CreatedAt time.Time
+}
+
+// StreamAppendParams describes an event to append.
+type StreamAppendParams struct {
+	Topic   string
+	Key     string
+	Payload json.RawMessage
+	Headers map[string]string
+	// Notify signals ChannelStream from inside the statement.
+	Notify bool
+}
+
+// StreamReadParams selects events.
+type StreamReadParams struct {
+	// Pattern is an AMQP topic pattern; empty matches every topic.
+	Pattern string
+	After   StreamPosition
+	Limit   int
+}
+
+// StreamStart says where a new consumer starts.
+type StreamStart string
+
+const (
+	// StreamStartLatest delivers events appended from now on.
+	StreamStartLatest StreamStart = "latest"
+	// StreamStartEarliest delivers every retained event first.
+	StreamStartEarliest StreamStart = "earliest"
+)
+
+// StreamConsumerRow is a consumer: a named position on the log whose
+// events, matched by pattern, are delivered as jobs of Kind on Queue.
+type StreamConsumerRow struct {
+	Name    string
+	Pattern string
+	Kind    string
+	Queue   string
+	// MaxAttempts is the retry budget of deliveries, or 0 for the default
+	// (25, or 10 for events with a key).
+	MaxAttempts int
+	// Metadata is merged into every delivery's metadata.
+	Metadata json.RawMessage
+	// Start applies when the consumer is created; it defaults to latest.
+	Start StreamStart
+	// Snapshot is the engine's record of what the consumer has read to:
+	// on Postgres, the pg_snapshot every delivered transaction is visible
+	// in.
+	Snapshot string
+	// Position is the last event delivered of the delta being read, or
+	// zero between deltas.
+	Position    StreamPosition
+	DeliveredAt time.Time
+	CreatedAt   time.Time
+}
+
+// StreamSeekParams says where to move a consumer. Exactly one of Position,
+// Time, Earliest and Latest applies, in that order of precedence.
+type StreamSeekParams struct {
+	// Position, if set, becomes the consumer's position: the next event
+	// delivered is the one after it.
+	Position StreamPosition
+	// Time moves the consumer to just before the first event appended at
+	// or after it.
+	Time time.Time
+	// Earliest moves the consumer before every retained event.
+	Earliest bool
+	// Latest moves the consumer past every event appended so far.
+	Latest bool
+}
+
+// StreamPumpResult reports one pump.
+type StreamPumpResult struct {
+	Delivered int
+	// Position is the consumer's position afterwards.
+	Position StreamPosition
+	// Queues received deliveries.
+	Queues []string
 }
 
 // ClientRegisterParams describes a client process taking out a lease.

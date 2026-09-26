@@ -43,6 +43,10 @@
   session connection: point the listener at a direct address with
   `hopperpgx.Config.ListenConnConfig`, or accept polling (the client logs
   once and polls every `PollInterval`, one second by default).
+- **Streams.** The stream log is partitioned by day and dropped after
+  `StreamRetention`, like history. Consumers are delivered by the leader,
+  in transaction-commit order per batch, and a transaction that commits
+  late is delivered when it commits; nothing waits on it.
 - **`database/sql`.** `hoppersql.New(db)` runs hopper on a `*sql.DB` opened
   with pgx's `stdlib` adapter or lib/pq, for applications that already use
   one. It has no `LISTEN`, so clients poll every `PollInterval`, and no COPY,

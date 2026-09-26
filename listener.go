@@ -49,7 +49,7 @@ func (c *Client[TTx]) listenOnce(ctx context.Context) error {
 		return err
 	}
 	defer l.Close(context.WithoutCancel(ctx)) //nolint:errcheck // best effort on a failed connection
-	if err := l.Listen(ctx, driver.ChannelInsert, driver.ChannelLeader, driver.ChannelControl, driver.ChannelDone); err != nil {
+	if err := l.Listen(ctx, driver.ChannelInsert, driver.ChannelLeader, driver.ChannelControl, driver.ChannelDone, driver.ChannelStream); err != nil {
 		return err
 	}
 	c.listening.Store(true)
@@ -70,6 +70,8 @@ func (c *Client[TTx]) listenOnce(ctx context.Context) error {
 			if id, err := ParseJobID(n.Payload); err == nil {
 				c.signalDone(id)
 			}
+		case driver.ChannelStream:
+			c.pokeStreams()
 		}
 	}
 }

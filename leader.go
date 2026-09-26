@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -65,8 +66,8 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	}
 }
 
-// leaderTerm is one stretch of leadership. The periodic loop runs for its
-// duration.
+// leaderTerm is one stretch of leadership. The periodic and stream loops
+// run for its duration.
 type leaderTerm struct {
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -75,11 +76,16 @@ type leaderTerm struct {
 func (c *Client[TTx]) startTerm(ctx context.Context) *leaderTerm {
 	termCtx, cancel := context.WithCancel(ctx)
 	t := &leaderTerm{cancel: cancel, done: make(chan struct{})}
-	go func() {
-		defer close(t.done)
+	var wg sync.WaitGroup
+	wg.Go(func() {
 		if len(c.cfg.Periodic) > 0 {
 			c.periodicLoop(termCtx)
 		}
+	})
+	wg.Go(func() { c.streamLoop(termCtx) })
+	go func() {
+		defer close(t.done)
+		wg.Wait()
 	}()
 	return t
 }
@@ -274,6 +280,7 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) {
 	res, err := c.exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{
 		CompletedRetention: c.cfg.CompletedRetention,
 		FailedRetention:    c.cfg.FailedRetention,
+		StreamRetention:    c.cfg.StreamRetention,
 	})
 	if err != nil {
 		if ctx.Err() == nil {

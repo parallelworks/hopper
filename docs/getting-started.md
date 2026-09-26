@@ -188,6 +188,25 @@ anyway), and the workflow is a batch, so it has the same callbacks.
 `client.WorkflowGet(ctx, res.ID)` and `hopper workflows get <id>` show its
 progress and graph.
 
+## Streams
+
+Messaging fans out at publish time; a stream keeps the events, so a consumer
+can start from the beginning or be moved back.
+
+```go
+hopper.Consume(workers, hopper.Consumer{Name: "audit", Pattern: "#", Start: hopper.StreamStartEarliest},
+    func(ctx context.Context, msg *hopper.Message[hopper.Raw]) error {
+        return record(ctx, msg.Topic, msg.Payload, msg.Position)
+    })
+
+ev, err := client.Streams().AppendTx(ctx, tx, AllocationCreated{ID: 42}, &hopper.AppendOpts{Key: "allocation:42"})
+err = client.Streams().Seek(ctx, "audit", hopper.SeekOpts{Time: time.Now().Add(-time.Hour)})
+```
+
+Events with the same key are handled one at a time, in order. The log keeps
+`Config.StreamRetention` (7 days) of events; `hopper streams consumers` shows
+where each consumer is.
+
 ## Results and waiting
 
 ```go
