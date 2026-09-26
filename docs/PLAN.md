@@ -804,9 +804,10 @@ the hardware details and the benchmark harness are published with each release.
   election creates history partitions, which briefly blocks finalizes. Fan-out arrives
   with messaging (M6).
 - CI runs a reduced benchmark on every PR that touches the insert, claim or finalize
-  paths, on the PR and on its base alternately on the same runner, several rounds each,
-  comparing the median run. `hopperbench -compare` fails the check on a regression of
-  more than 10%.
+  paths, on the PR and on its base alternately on the same runner, scenario by scenario
+  for several rounds, comparing the average of the faster half of each side's runs (noise
+  on a shared runner only slows runs down). `hopperbench -compare` fails the check on a
+  regression of more than 10%.
 - A nightly soak runs the full scenario set at volume with five million history rows
   and keeps the results as an artifact. The 24h soak at 70% of peak, tracking table and
   index size, autovacuum activity and latency drift, runs on the release hardware.

@@ -132,7 +132,8 @@ Every command takes `-json`. The database comes from `-database-url` or
 `cmd/hopperbench` drives the hot paths against a database and prints one
 JSON line per scenario. CI runs it on pull requests that touch the insert,
 claim or finalize paths, alternating the PR and its base for several rounds,
-and fails when the median run is more than 10% slower than the base branch.
+and fails when the faster half of the PR's runs averages more than 10% slower
+than the base branch's.
 Compare two result files yourself with:
 
 ```sh

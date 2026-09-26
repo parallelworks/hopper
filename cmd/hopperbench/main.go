@@ -8,10 +8,12 @@
 // so it can point at any database. Numbers depend on the hardware, the
 // Postgres configuration and the network between them; compare runs made on
 // the same setup, such as a PR branch against canary. The -compare mode does
-// that: it reads two files of results, takes the median run per scenario, and
-// exits non-zero if the second is slower than the first by more than the
-// threshold on any scenario. The median, rather than the best run, keeps one
-// lucky or unlucky run from deciding the outcome on a noisy machine.
+// that: it reads two files of results, averages the faster half of the runs
+// of each scenario, and exits non-zero if the second is slower than the first
+// by more than the threshold on any scenario. Noise on a shared machine only
+// ever slows a run down, so the faster half is the better estimate; averaging
+// it, rather than taking the single best run, keeps one lucky run from
+// deciding the outcome.
 //
 // Scenarios:
 //
@@ -435,7 +437,8 @@ func (b *bench) latency(ctx context.Context, samples int) (result, error) {
 }
 
 // runCompare reads two files of results and fails if head is slower than
-// base by more than threshold on any scenario, using the median run of each.
+// base by more than threshold on any scenario, using the faster half of the
+// runs of each.
 func runCompare(out *os.File, files string, threshold float64) error {
 	names := strings.Split(files, ",")
 	if len(names) != 2 {
@@ -486,8 +489,9 @@ func (r *result) String() string {
 	return fmt.Sprintf("p50 %.2fms p99 %.2fms", r.P50Millis, r.P99Millis)
 }
 
-// readResults keeps the median run per scenario, by the same ordering the
-// comparison uses (throughput, or p99 latency).
+// readResults reduces each scenario's runs to one: the average of the
+// faster half (by throughput, or by p99 latency), which noise on a shared
+// machine, being one-sided, biases the least.
 func readResults(path string) (map[string]*result, error) {
 	f, err := os.Open(path) //nolint:gosec // a result file named on the command line
 	if err != nil {
@@ -513,12 +517,21 @@ func readResults(path string) (map[string]*result, error) {
 	if len(runs) == 0 {
 		return nil, fmt.Errorf("%s: no results", path)
 	}
-	median := map[string]*result{}
+	out := map[string]*result{}
 	for scenario, rs := range runs {
-		// Slowest first, so that the middle element of an even count is the
-		// slower of the two: the comparison errs towards reporting a regression.
-		slices.SortFunc(rs, func(a, b *result) int { return cmp.Compare(a.change(b), 0) })
-		median[scenario] = rs[(len(rs)-1)/2]
+		// Fastest first.
+		slices.SortFunc(rs, func(a, b *result) int { return cmp.Compare(b.change(a), 0) })
+		best := rs[:(len(rs)+1)/2]
+		avg := *best[0]
+		avg.JobsPerSec, avg.Seconds, avg.P50Millis, avg.P99Millis, avg.MaxMillis = 0, 0, 0, 0, 0
+		for _, r := range best {
+			avg.JobsPerSec += r.JobsPerSec / float64(len(best))
+			avg.Seconds += r.Seconds / float64(len(best))
+			avg.P50Millis += r.P50Millis / float64(len(best))
+			avg.P99Millis += r.P99Millis / float64(len(best))
+			avg.MaxMillis += r.MaxMillis / float64(len(best))
+		}
+		out[scenario] = &avg
 	}
-	return median, nil
+	return out, nil
 }
