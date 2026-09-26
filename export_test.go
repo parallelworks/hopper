@@ -33,6 +33,7 @@ func (c *Client[TTx]) SetTuning(t Tuning) {
 		leaderInterval:      t.LeaderInterval,
 		maintenanceInterval: t.Maintenance,
 		rescueBatch:         t.RescueBatch,
+		streamBatch:         defaultTuning.streamBatch,
 	}
 	c.notifier.interval = c.tuning.notifyInterval
 }
