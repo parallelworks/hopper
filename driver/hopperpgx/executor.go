@@ -85,14 +85,14 @@ const jobInsertSQL = `
 WITH p AS (
   SELECT * FROM unnest(
     $1::text[], $2::text[], $3::smallint[], $4::smallint[], $5::timestamptz[], $6::jsonb[], $7::jsonb[], $8::text[],
-    $9::float8[], $10::boolean[]
-  ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key, ttl, await)
+    $9::float8[], $10::boolean[], $11::text[]
+  ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key, ttl, await, ordering_key)
 )
-INSERT INTO hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await)
+INSERT INTO hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await, ordering_key)
 SELECT p.kind, p.queue,
        CASE WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::hopper_job_state,
        p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata, p.unique_key,
-       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await
+       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key
 FROM p
 ON CONFLICT (kind, unique_key) WHERE unique_key IS NOT NULL DO UPDATE SET ` + "%s" + `
 RETURNING ` + "%s" + `, (xmax <> 0) AS duplicate`
@@ -155,11 +155,13 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 		uniqueKeys  = make([]pgtype.Text, n)
 		ttls        = make([]float64, n)
 		awaits      = make([]bool, n)
+		ordering    = make([]pgtype.Text, n)
 	)
 	for i, p := range params {
 		var err error
 		ttls[i] = max(p.TTL, 0).Seconds()
 		awaits[i] = p.Await
+		ordering[i] = pgtype.Text{String: p.OrderingKey, Valid: p.OrderingKey != ""}
 		if priorities[i], err = smallint(p.Priority, "priority"); err != nil {
 			return nil, err
 		}
@@ -177,7 +179,7 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 	if opts.OnConflict == driver.ConflictReplace {
 		query = jobInsertReplaceQuery
 	}
-	queryArgs := []any{kinds, queues, priorities, maxAttempts, scheduledAt, args, metadata, uniqueKeys, ttls, awaits}
+	queryArgs := []any{kinds, queues, priorities, maxAttempts, scheduledAt, args, metadata, uniqueKeys, ttls, awaits, ordering}
 	collect := func(rows pgx.Rows, err error) ([]driver.JobInsertResult, error) {
 		if err != nil {
 			return nil, err
@@ -342,12 +344,15 @@ func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertP
 			expiresAt = pgtype.Timestamptz{Time: j.ExpiresAt, Valid: true}
 		}
 		results[i] = driver.JobInsertResult{Job: j}
+		j.OrderingKey = p.OrderingKey
 		values[i] = []any{
 			[16]byte(j.ID), j.Kind, j.Queue, string(j.State), priority, maxAttempts,
-			j.ScheduledAt, []byte(j.Args), []byte(j.Metadata), expiresAt, j.Await, j.CreatedAt,
+			j.ScheduledAt, []byte(j.Args), []byte(j.Metadata), expiresAt, j.Await,
+			pgtype.Text{String: p.OrderingKey, Valid: p.OrderingKey != ""},
+			j.CreatedAt,
 		}
 	}
-	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "expires_at", "await", "created_at"}
+	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "expires_at", "await", "ordering_key", "created_at"}
 	copied, err := copier.CopyFrom(ctx, pgx.Identifier{"hopper_jobs"}, columns, pgx.CopyFromRows(values))
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: copy jobs: %w", err)
@@ -399,16 +404,28 @@ func registerJobState(ctx context.Context, conn *pgx.Conn) error {
 // claim order and locks its rows, skipping any locked by other clients. The
 // outer SELECT restores claim order, which UPDATE ... RETURNING does not
 // guarantee.
+//
+// A job with an ordering key is claimable only if it is the oldest waiting
+// job of its key and no job of that key is running; jobs without a key pay
+// nothing for the check. The unique index on running ordering keys is the
+// backstop for two clients passing the check at once, in which case one
+// claim fails and is retried.
 const jobClaimSQL = `
 WITH claimed AS (
   UPDATE hopper_jobs j
   SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
   FROM (
-    SELECT id FROM hopper_jobs
-    WHERE queue = $1 AND state IN ('available', 'scheduled', 'retryable')
-      AND scheduled_at <= now()
-      AND (expires_at IS NULL OR expires_at > now())
-    ORDER BY priority, scheduled_at, seq
+    SELECT cand.id FROM hopper_jobs cand
+    WHERE cand.queue = $1 AND cand.state IN ('available', 'scheduled', 'retryable')
+      AND cand.scheduled_at <= now()
+      AND (cand.expires_at IS NULL OR cand.expires_at > now())
+      AND (cand.ordering_key IS NULL OR (
+        NOT EXISTS (SELECT 1 FROM hopper_jobs r
+                    WHERE r.queue = cand.queue AND r.ordering_key = cand.ordering_key AND r.state = 'running')
+        AND cand.seq = (SELECT min(o.seq) FROM hopper_jobs o
+                        WHERE o.queue = cand.queue AND o.ordering_key = cand.ordering_key
+                          AND o.state IN ('available', 'scheduled', 'retryable'))))
+    ORDER BY cand.priority, cand.scheduled_at, cand.seq
     LIMIT $3
     FOR UPDATE SKIP LOCKED
   ) c

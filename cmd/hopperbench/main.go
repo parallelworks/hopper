@@ -8,9 +8,10 @@
 // so it can point at any database. Numbers depend on the hardware, the
 // Postgres configuration and the network between them; compare runs made on
 // the same setup, such as a PR branch against canary. The -compare mode does
-// that: it reads two files of results, takes the best run per scenario, and
+// that: it reads two files of results, takes the median run per scenario, and
 // exits non-zero if the second is slower than the first by more than the
-// threshold on any scenario.
+// threshold on any scenario. The median, rather than the best run, keeps one
+// lucky or unlucky run from deciding the outcome on a noisy machine.
 //
 // Scenarios:
 //
@@ -28,6 +29,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -433,7 +435,7 @@ func (b *bench) latency(ctx context.Context, samples int) (result, error) {
 }
 
 // runCompare reads two files of results and fails if head is slower than
-// base by more than threshold on any scenario, using the best run of each.
+// base by more than threshold on any scenario, using the median run of each.
 func runCompare(out *os.File, files string, threshold float64) error {
 	names := strings.Split(files, ",")
 	if len(names) != 2 {
@@ -484,14 +486,15 @@ func (r *result) String() string {
 	return fmt.Sprintf("p50 %.2fms p99 %.2fms", r.P50Millis, r.P99Millis)
 }
 
-// readResults keeps the best run per scenario.
+// readResults keeps the median run per scenario, by the same ordering the
+// comparison uses (throughput, or p99 latency).
 func readResults(path string) (map[string]*result, error) {
 	f, err := os.Open(path) //nolint:gosec // a result file named on the command line
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	best := map[string]*result{}
+	runs := map[string][]*result{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -502,15 +505,20 @@ func readResults(path string) (map[string]*result, error) {
 		if err := json.Unmarshal([]byte(line), &r); err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
-		if cur := best[r.Scenario]; cur == nil || r.change(cur) > 0 {
-			best[r.Scenario] = &r
-		}
+		runs[r.Scenario] = append(runs[r.Scenario], &r)
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	if len(best) == 0 {
+	if len(runs) == 0 {
 		return nil, fmt.Errorf("%s: no results", path)
 	}
-	return best, nil
+	median := map[string]*result{}
+	for scenario, rs := range runs {
+		// Slowest first, so that the middle element of an even count is the
+		// slower of the two: the comparison errs towards reporting a regression.
+		slices.SortFunc(rs, func(a, b *result) int { return cmp.Compare(a.change(b), 0) })
+		median[scenario] = rs[(len(rs)-1)/2]
+	}
+	return median, nil
 }

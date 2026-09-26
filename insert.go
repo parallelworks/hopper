@@ -213,6 +213,7 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 		Metadata:    opts.Metadata,
 		TTL:         opts.TTL,
 		Await:       opts.Await,
+		OrderingKey: opts.OrderingKey,
 	}
 	action := driver.ConflictSkip
 	if opts.Unique != nil {

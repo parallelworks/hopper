@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M4 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4 and M6 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -215,11 +215,12 @@ hopper.Subscribe(workers, hopper.Subscription{Name: "billing", Pattern: "allocat
         return bill(ctx, msg.Payload.ID) // nil acks; an error nacks with backoff
     })
 
-err = client.PublishTx(ctx, tx, AllocationCreated{ID: 42}, &hopper.PublishOpts{
+res, err := client.PublishTx(ctx, tx, AllocationCreated{ID: 42}, &hopper.PublishOpts{
     OrderingKey: "allocation:42",   // FIFO per key
     DedupKey:    "evt-7f3a",        // idempotent publish
     TTL:         10 * time.Minute,  // expire undelivered
 })
+res.MessageID; res.Deliveries      // one delivery per matching subscription
 ```
 
 ### 4.6 Batches and workflows
@@ -430,8 +431,9 @@ CREATE TABLE hopper_subscriptions (
 CREATE TABLE hopper_schema (version int PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());
 ```
 
-M6 adds the ordering-key index (§10), M7 adds `hopper_batches`, and M8 adds
-`hopper_job_deps`. These are sketched in §10 and §11.
+Schema v2 (M6) adds `max_attempts` and `metadata` to `hopper_subscriptions`, the
+ordering-key indexes (§10) and the SQL contract functions. M7 adds `hopper_batches`,
+and M8 adds `hopper_job_deps`. These are sketched in §10 and §11.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -801,8 +803,9 @@ the hardware details and the benchmark harness are published with each release.
   election creates history partitions, which briefly blocks finalizes. Fan-out arrives
   with messaging (M6).
 - CI runs a reduced benchmark on every PR that touches the insert, claim or finalize
-  paths, on the PR and on its base back to back on the same runner, three runs each,
-  best of three. `hopperbench -compare` fails the check on a regression of more than 10%.
+  paths, on the PR and on its base alternately on the same runner, several rounds each,
+  comparing the median run. `hopperbench -compare` fails the check on a regression of
+  more than 10%.
 - A nightly soak runs the full scenario set at volume with five million history rows
   and keeps the results as an artifact. The 24h soak at 70% of peak, tracking table and
   index size, autovacuum activity and latency drift, runs on the release hardware.
@@ -835,14 +838,20 @@ Messaging is modeled on RabbitMQ's topic exchange and built from job primitives.
 inherits acks, retries, dead-lettering, transactional publish, scheduling and
 observability without new machinery.
 
-- **Subscriptions** are rows: `(name, pattern, kind, queue)`. Patterns use AMQP syntax:
-  `.`-separated words, where `*` matches one word and `#` matches zero or more. `#` alone
-  is a fanout exchange, and a literal topic is a direct exchange.
+- **Subscriptions** are rows: `(name, pattern, kind, queue, max_attempts, metadata)`,
+  upserted by name when a client whose `Workers` declared them starts. The delivery kind
+  is `sub:<name>`. Patterns use AMQP syntax: `.`-separated words, where `*` matches one
+  word and `#` matches zero or more. `#` alone is a fanout exchange, and a literal topic
+  is a direct exchange. `hopper_topic_regex(pattern)` turns a pattern into a regular
+  expression; the match is `topic ~ hopper_topic_regex(pattern)`.
 - **`PublishTx`** inserts one job per matching subscription in a single
   `INSERT … SELECT` that matches patterns in SQL, in the publisher's transaction. Each
-  delivery's `metadata` records the topic and a message ID. Fan-out happens at publish
+  delivery's `metadata` records the topic, a message ID generated once by the database,
+  and the headers, merged with the subscription's metadata. Fan-out happens at publish
   time, so a subscription created later does not receive earlier messages, as in
-  RabbitMQ.
+  RabbitMQ. A topic with no matching subscription inserts nothing. Pool publishes wake
+  local producers and notify through the coalescer; transactional ones notify from the
+  transaction, deriving the queues from the matching subscriptions.
 - **Typed consumers.** `Message[T]` carries the payload, topic, message ID, delivery
   attempt and headers. A subscription that matches several topics with different
   types can use `Message[hopper.Raw]` and dispatch on `msg.Topic`.
@@ -852,27 +861,32 @@ observability without new machinery.
 - **Competing consumers** come for free, because every replica claims from the same
   queue with SKIP LOCKED.
 - **Delayed delivery, TTL and priority** use the standard job fields.
-- **Idempotent publish.** `DedupKey` uses the unique index, so a retried publish
-  inserts nothing while the earlier delivery is still live.
+- **Idempotent publish.** `DedupKey` becomes each delivery's unique key (`msg:<key>`,
+  scoped by kind, so subscriptions deduplicate independently), so a retried publish
+  inserts nothing while the earlier delivery is still live and reports the duplicate.
 - **Ordering keys.** Strict FIFO per key, with the same semantics as SQS FIFO message
   groups, Azure Service Bus sessions and Google Pub/Sub ordering keys:
   - At most one delivery per `(queue, ordering_key)` runs at a time, oldest first. The
-    claim selects only the oldest live delivery for each key and skips keys with a
-    running job. A partial unique index on running jobs is the backstop.
+    claim selects only the oldest live delivery for each key (by `seq`, through an index
+    on `(queue, ordering_key, seq)`) and skips keys with a running job; jobs without a
+    key pay nothing for the check. A partial unique index on running ordering keys is the
+    backstop: if two clients pass the check at once, one claim fails and is retried.
+    Ordering keys are available on plain jobs too, through `InsertOpts.OrderingKey`.
   - A failing delivery blocks its key while it retries. Later messages for that key
     wait until it succeeds or is dead-lettered, and dead-lettering unblocks the key.
   - Ordered deliveries get a shorter default retry budget (10 attempts, with backoff
     capped at 5 minutes), so a poison message is dead-lettered within about an hour
-    instead of blocking its key for days. Both values are configurable per subscription.
+    instead of blocking its key for days. The budget is configurable per subscription
+    (`Subscription.MaxAttempts`).
   - Keys are independent, so a blocked key never delays other keys. Throughput scales
     with the number of distinct keys.
 - **Request/reply.** Publish with `Await: true`, and the consumer's
   `hopper.SetOutput` becomes the reply.
 - **Cross-language producers.** The insert and publish SQL is a documented, versioned
-  contract. `hopper_insert(...)` and `hopper_publish(...)` SQL functions ship with the
-  migrations, so Python, shell or HPC batch scripts can enqueue work with plain SQL,
-  inside their own transactions. This is the supported path for producers not written
-  in Go (§2).
+  contract ([docs/sql-contract.md](sql-contract.md)). `hopper_insert(kind, args, opts)`
+  and `hopper_publish(topic, payload, opts)` SQL functions ship with schema v2, so
+  Python, shell or HPC batch scripts can enqueue work with plain SQL, inside their own
+  transactions. This is the supported path for producers not written in Go (§2).
 - **Streams (M8).** An append-only, time-partitioned topic log with consumer groups
   that track offsets, for replay and late subscribers. Readers only see events below
   the current snapshot's `xmin` (`pg_snapshot_xmin(pg_current_snapshot())`), so
@@ -900,8 +914,9 @@ observability without new machinery.
 - `hopper migrate` in the CLI runs the same migrations. The raw SQL files are also
   published for teams that use goose, atlas or Flyway. `hopper_schema` records the
   applied version either way.
-- Every schema change ships with an upgrade test that migrates from the previous release
-  while jobs are live. Migrations that touch `hopper_jobs` must not take locks that
+- Every schema change ships with an upgrade test that migrates from the previous version
+  to the latest while a client works jobs in every state and inserts keep arriving
+  (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that
   block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
   constraints, and so on).
 
@@ -968,7 +983,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events, `Stats`. **Done.** | 4d |
 | M4 | Performance and release | `hopperbench` scenarios and `-compare`, CI perf gate and nightly soak, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, CHANGELOG. **Done**, except the §8.2 run on the reference hardware that gates the **v0.1.0** tag. The upgrade suite starts with the first schema change (there is one schema version so far). | 5d |
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
-| M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, **v0.2.0** | 5d |
+| M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done**; **v0.2.0** follows v0.1.0. | 5d |
 | M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0** | 5d |
 | M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumer groups, `hopperui` | 2–3w |
 | M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |

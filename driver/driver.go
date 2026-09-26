@@ -184,6 +184,16 @@ type Executor interface {
 	// Stats returns queue depths and cluster state.
 	Stats(ctx context.Context) (*Stats, error)
 
+	// SubscriptionUpsert records subscriptions, updating pattern, queue and
+	// settings of existing ones by name.
+	SubscriptionUpsert(ctx context.Context, subs []SubscriptionRow) error
+	// SubscriptionList returns every subscription.
+	SubscriptionList(ctx context.Context) ([]*SubscriptionRow, error)
+	// MessagePublish inserts one delivery per subscription whose pattern
+	// matches the topic, in one statement, and returns them. A delivery
+	// whose dedup key matches a live one is reported as a duplicate.
+	MessagePublish(ctx context.Context, params MessagePublishParams) ([]JobInsertResult, error)
+
 	// HistoryMaintain enforces retention on finalized jobs and prepares
 	// storage for the near future, in whatever way suits the engine (dropping
 	// time partitions on Postgres). It is idempotent and may run on two
@@ -295,6 +305,9 @@ type JobInsertParams struct {
 	Metadata    json.RawMessage
 	// UniqueKey is empty for non-unique jobs.
 	UniqueKey string
+	// OrderingKey, if set, serializes the job with others of the same key
+	// in its queue: at most one runs at a time, oldest first.
+	OrderingKey string
 	// TTL, if positive, discards the job if it has not started within this
 	// long of database now().
 	TTL time.Duration
@@ -449,6 +462,42 @@ type HistoryMaintainResult struct {
 	Dropped []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64
+}
+
+// SubscriptionRow is a topic subscription: messages published to a topic
+// matching Pattern are delivered as jobs of Kind on Queue.
+type SubscriptionRow struct {
+	Name    string
+	Pattern string
+	Kind    string
+	Queue   string
+	// MaxAttempts is the retry budget of deliveries, or 0 for the default
+	// (25, or 10 for deliveries with an ordering key).
+	MaxAttempts int
+	// Metadata is merged into every delivery's metadata.
+	Metadata  json.RawMessage
+	CreatedAt time.Time
+}
+
+// MessagePublishParams describes a message to fan out.
+type MessagePublishParams struct {
+	Topic   string
+	Payload json.RawMessage
+	// Headers are stored in each delivery's metadata.
+	Headers map[string]string
+	// OrderingKey serializes deliveries with the same key per queue.
+	OrderingKey string
+	// DedupKey makes the publish idempotent while an earlier delivery is
+	// live: it becomes each delivery's unique key.
+	DedupKey string
+	// Delay schedules the deliveries for later.
+	Delay time.Duration
+	// TTL discards deliveries not started within this long.
+	TTL      time.Duration
+	Priority int
+	Await    bool
+	// Notify wakes workers on the delivery queues once the publish commits.
+	Notify bool
 }
 
 // ClientRegisterParams describes a client process taking out a lease.
