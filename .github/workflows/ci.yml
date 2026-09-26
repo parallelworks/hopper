@@ -25,10 +25,12 @@ jobs:
           go mod tidy -diff
           (cd tools && go mod tidy -diff)
           (cd hopperotel && go mod tidy -diff)
+          (cd hopperui && go mod tidy -diff)
       - name: Lint
         run: |
           go tool -modfile=tools/go.mod golangci-lint run ./...
           (cd hopperotel && go tool -modfile=../tools/go.mod golangci-lint run ./...)
+          (cd hopperui && go tool -modfile=../tools/go.mod golangci-lint run ./...)
 
   test:
     runs-on: ubuntu-latest
@@ -61,3 +63,4 @@ jobs:
         run: |
           go test -race -cover -timeout 10m ./...
           (cd hopperotel && go test -race -cover -timeout 10m ./...)
+          (cd hopperui && go test -race -cover -timeout 10m ./...)

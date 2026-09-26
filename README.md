@@ -30,11 +30,13 @@ Postgres is the first engine, behind a driver interface designed for more.
 > LISTEN/NOTIFY wake-ups, unique jobs, cron and interval schedules, cancellation,
 > retry from the dead-letter queue, TTLs, pause and runtime queues, middleware,
 > awaitable results, listing, events and stats, plus the `hopper` CLI,
-> `hoppertest`, `hopperotel` and the `drivertest` conformance suite. So is
-> messaging: subscriptions with topic patterns, fan-out, dedup and ordering
-> keys, and a SQL contract for producers in other languages. Flow control,
-> batches and workflows follow, in the order laid out in
-> [docs/PLAN.md](docs/PLAN.md), the plan of record. Start with
+> `hoppertest`, `hopperotel`, the `hopperui` web UI and the `drivertest`
+> conformance suite. So are messaging (subscriptions with topic patterns,
+> fan-out, dedup and ordering keys, a SQL contract for producers in other
+> languages, streams with consumers), flow control (global, rate and
+> partitioned limits, priority aging), batches and workflows, and a
+> `database/sql` driver, in the order laid out in [docs/PLAN.md](docs/PLAN.md),
+> the plan of record. Start with
 > [docs/getting-started.md](docs/getting-started.md). Feedback is welcome
 > through issues and PRs.
 

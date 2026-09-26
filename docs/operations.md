@@ -119,6 +119,11 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
   process.
 - The `hopperotel` module adds OpenTelemetry tracing (insert to work, through
   job metadata) and metrics.
+- The `hopperui` module is a web UI: mount `hopperui.New(client, cfg)` under a
+  path of your application (`http.StripPrefix`) to browse queues, jobs,
+  workflows, subscriptions, consumers and clients. Pass `Config.Authorize` to
+  enable retry, cancel, pause, resume and seek; without it the UI is
+  read-only.
 - `pg_stat_activity` shows the listener connection as
   `hopper-listener:<schema>`.
 

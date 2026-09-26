@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M4, M6 and M7 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4 and M6 through M8 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -1007,9 +1007,16 @@ observability without new machinery.
   `queues list|pause|resume|limit`, `clients list`, `workflows get`, `subscriptions list`,
   `streams consumers|seek` and `stats`, all with `-json`. Benchmarks are the separate
   `hopperbench` command.
-- **Web UI (`hopperui` module):** an embeddable `http.Handler` for browsing queues,
-  jobs, history, subscriptions and workflows, with retry, cancel and pause actions
-  behind an application-supplied authorization hook.
+- **Web UI (`hopperui` module):** `hopperui.New(client, cfg)` is an embeddable
+  `http.Handler`, mounted under a prefix with `http.StripPrefix`, for browsing queues
+  (depths, limits, paused state), jobs and history (filtered by queue, state and kind,
+  paged by ID), a job's args, metadata, output and errors, workflows as a DAG (SVG, laid
+  out by dependency depth), subscriptions, stream consumers and clients. Retry, cancel,
+  pause, resume and seek are offered only when the application supplies
+  `Config.Authorize`, which is asked before every action; without it the UI is
+  read-only. It is server-rendered HTML with no scripts and no external assets, so it
+  works behind any proxy and needs no build step. The client it is given need not be
+  started.
 
 ## 14. Testing strategy
 
@@ -1050,7 +1057,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done**; **v0.2.0** follows v0.1.0. | 5d |
 | M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0**. **Done.** | 5d |
-| M8 | Workflows, streams, UI | Job dependencies and DAG workflows (**done**), streams with consumers (**done**), `hopperui`. Each lands in its own PR. | 2–3w |
+| M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumers, `hopperui`. **Done**, one PR each. | 2–3w |
 | M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |
 
 M0–M4 take roughly four weeks to a production-ready v0.1.0 that meets its performance

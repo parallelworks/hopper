@@ -58,6 +58,9 @@ type JobFilter struct {
 	Queue  string
 	Kinds  []string
 	States []JobState
+	// After starts the listing after the given job, for paging: pass the
+	// last ID of one page to get the next.
+	After JobID
 }
 
 // jobsPageSize is how many jobs Jobs fetches at a time.
@@ -78,7 +81,7 @@ func (c *Client[TTx]) JobsTx(ctx context.Context, tx TTx, filter JobFilter) iter
 
 func (c *Client[TTx]) jobs(ctx context.Context, exec driver.Executor, filter JobFilter) iter.Seq2[*JobRow, error] {
 	return func(yield func(*JobRow, error) bool) {
-		var after JobID
+		after := filter.After
 		for {
 			page, err := exec.JobList(ctx, driver.JobListParams{
 				Queue: filter.Queue, Kinds: filter.Kinds, States: filter.States, After: after, Limit: jobsPageSize,
