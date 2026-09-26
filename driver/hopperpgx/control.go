@@ -230,6 +230,22 @@ func (e *executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 	return jobs, nil
 }
 
+func (e *executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) {
+	rows, err := e.db.Query(ctx, `SELECT id, hostname, started_at, expires_at, info FROM hopper_clients ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("hopperpgx: list clients: %w", err)
+	}
+	clients, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*driver.ClientRow, error) {
+		var c driver.ClientRow
+		err := row.Scan(&c.ID, &c.Hostname, &c.StartedAt, &c.ExpiresAt, &c.Info)
+		return &c, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hopperpgx: list clients: %w", err)
+	}
+	return clients, nil
+}
+
 func (e *executor) QueueEnsure(ctx context.Context, names []string) error {
 	if len(names) == 0 {
 		return nil

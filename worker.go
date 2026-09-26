@@ -100,6 +100,30 @@ func (w *Workers) add(info *workerInfo) {
 	w.kinds[info.kind] = info
 }
 
+// Work runs the registered worker for job.Kind inline, decoding job.Args
+// with codec and honoring the worker's Timeout. It exists for tests (see the
+// hoppertest package): nothing is claimed or finalized, and middleware does
+// not run. It returns an UnknownKindError for an unregistered kind.
+func (w *Workers) Work(ctx context.Context, job *JobRow, codec Codec) error {
+	info, ok := w.lookup(job.Kind)
+	if !ok {
+		return &UnknownKindError{Kind: job.Kind}
+	}
+	if codec == nil {
+		codec = JSONCodec{}
+	}
+	unit, err := info.newUnit(job, codec)
+	if err != nil {
+		return fmt.Errorf("hopper: decode args for %q: %w", job.Kind, err)
+	}
+	if timeout := unit.Timeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeoutCause(ctx, timeout, ErrJobTimeout)
+		defer cancel()
+	}
+	return unit.Work(ctx)
+}
+
 func (w *Workers) lookup(kind string) (*workerInfo, bool) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()

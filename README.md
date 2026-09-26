@@ -29,10 +29,12 @@ Postgres is the first engine, behind a driver interface designed for more.
 > jobs from crashed processes, leader election, partition-drop retention,
 > LISTEN/NOTIFY wake-ups, unique jobs, cron and interval schedules, cancellation,
 > retry from the dead-letter queue, TTLs, pause and runtime queues, middleware,
-> awaitable results, listing, events and stats. The benchmark harness, the
-> release gate, the CLI and then messaging follow, in the order laid out in
-> [docs/PLAN.md](docs/PLAN.md), the plan of record. Feedback is welcome through
-> issues and PRs.
+> awaitable results, listing, events and stats, plus the `hopper` CLI,
+> `hoppertest`, `hopperotel` and the `drivertest` conformance suite.
+> Messaging and flow control follow, in the order laid out in
+> [docs/PLAN.md](docs/PLAN.md), the plan of record. Start with
+> [docs/getting-started.md](docs/getting-started.md). Feedback is welcome
+> through issues and PRs.
 
 ```go
 _, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42}, nil)   // commits with tx

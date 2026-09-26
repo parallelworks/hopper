@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M3 are implemented (§16). This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -795,12 +795,17 @@ the hardware details and the benchmark harness are published with each release.
 
 ### 8.3 Benchmark harness
 - `hopperbench` is a command in the repo that drives the scenarios above and prints
-  machine-readable results. It includes mixed-priority, scheduled-heavy, retry-heavy
-  and fan-out workloads, in addition to the no-op baseline.
+  one JSON line per scenario. It has the no-op baseline, mixed-priority, scheduled-heavy
+  and retry-heavy workloads, the two insert paths and pickup latency, and `-history N`
+  to preload history rows. It warms up before measuring, because the first leader
+  election creates history partitions, which briefly blocks finalizes. Fan-out arrives
+  with messaging (M6).
 - CI runs a reduced benchmark on every PR that touches the insert, claim or finalize
-  paths. A regression of more than 10% fails the check.
-- A soak test runs 24h at 70% of peak on a nightly schedule. It tracks table and index
-  size, autovacuum activity and latency drift.
+  paths, on the PR and on its base back to back on the same runner, three runs each,
+  best of three. `hopperbench -compare` fails the check on a regression of more than 10%.
+- A nightly soak runs the full scenario set at volume with five million history rows
+  and keeps the results as an artifact. The 24h soak at 70% of peak, tracking table and
+  index size, autovacuum activity and latency drift, runs on the release hardware.
 
 ### 8.4 Scaling further
 - **Vertical:** the tuning guide covers autovacuum settings for `hopper_jobs`
@@ -912,11 +917,16 @@ observability without new machinery.
   history index, per known queue), the running count by client, live clients and the
   current leader, in one statement. It is suitable for readiness checks and autoscaling
   signals, such as scaling replicas on queue latency.
-- **OpenTelemetry (`hopperotel` module):** trace propagation from insert to work
-  (through `metadata`), spans per attempt, and metrics for throughput, latency, queue
-  depth, failures and rescues. Prometheus users export through the OTel exporter.
-- **CLI (`cmd/hopper`, core module):** `migrate`, `jobs list|get|retry|cancel`,
-  `queues list|pause|resume|limit`, `subscriptions list`, `clients list` and `bench`.
+- **OpenTelemetry (`hopperotel` module):** `hopperotel.New` (or `Middleware(tp)`) is a
+  `hopper.Middleware` that propagates trace context from insert to work through
+  `metadata`, records a producer span per insert batch and a consumer span per attempt,
+  and counts attempts by outcome and their duration. `RegisterStats` adds observable
+  gauges for queue depth by state, the oldest claimable job's age and live clients from
+  `Stats`. Prometheus users export through the OTel exporter.
+- **CLI (`cmd/hopper`, core module):** `migrate up|down|version`, `jobs list|get|retry|cancel`,
+  `queues list|pause|resume`, `clients list` and `stats`, all with `-json`. `queues limit`
+  and `subscriptions list` arrive with M7 and M6. Benchmarks are the separate
+  `hopperbench` command.
 - **Web UI (`hopperui` module):** an embeddable `http.Handler` for browsing queues,
   jobs, history, subscriptions and workflows, with retry, cancel and pause actions
   behind an application-supplied authorization hook.
@@ -927,12 +937,12 @@ observability without new machinery.
 | --- | --- |
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
-| Driver conformance | `drivertest` runs the full behavioral suite against every driver (`hopperpgx`, `hoppersql`, and future engines). |
+| Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease, backdate an attempt, count rows). Engine internals such as partition management stay in the driver's own tests. |
 | Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |
-| Test helpers | A `hoppertest` package for users: `RequireInserted[T]`, `RequireNotInserted`, `Work[T]` (run one job inline), a transaction-scoped client, and `synctest`-friendly clocks. |
+| Test helpers | The `hoppertest` package: `RequireInserted[T]`, `RequireManyInserted[T]`, `RequireNotInserted[T]` and their `Tx` variants (which look inside the caller's transaction), and `Work[T]`, which runs a worker inline on a synthetic job with no database round trip. |
 
 ## 15. Compatibility
 
@@ -956,7 +966,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M1 | Core engine | `Driver` interface and `hopperpgx`, schema v1, `hoppermigrate`, Insert/InsertTx/InsertMany (unnest and COPY), typed workers and `WorkFunc`, batched claim, batched finalize with history move, retries and backoff, `Snooze`/`Cancel` from workers, client lease registration and renewal, `Run`/`Stop`, a first `hopperbench`. **Done.** | 5d |
 | M2 | Reliability | Client leases, rescuer and fencing, leader lease, partitioned retention, LISTEN/NOTIFY with coalescing and adaptive polling, unique jobs (skip and replace), `RescueStuckAfter`. **Done.** | 4d |
 | M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events, `Stats`. **Done.** | 4d |
-| M4 | Performance and release | `hopperbench`, targets met (§8.2), CI perf gate, chaos and upgrade suites, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, **v0.1.0** | 5d |
+| M4 | Performance and release | `hopperbench` scenarios and `-compare`, CI perf gate and nightly soak, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, CHANGELOG. **Done**, except the §8.2 run on the reference hardware that gates the **v0.1.0** tag. The upgrade suite starts with the first schema change (there is one schema version so far). | 5d |
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, **v0.2.0** | 5d |
 | M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0** | 5d |

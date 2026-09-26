@@ -38,6 +38,7 @@ check: lint test ## Run all linters and tests
 .PHONY: lint
 lint: ## Lint Go code
 	$(GOTOOL) golangci-lint run ./...
+	cd hopperotel && go tool -modfile=../tools/go.mod golangci-lint run ./...
 
 .PHONY: fmt
 fmt: ## Format Go code
@@ -46,6 +47,7 @@ fmt: ## Format Go code
 .PHONY: test
 test: ## Run tests (integration tests need `make pg` or HOPPER_TEST_DATABASE_URL)
 	go test -race -cover -timeout 10m ./...
+	cd hopperotel && go test -race -cover -timeout 10m ./...
 
 .PHONY: bench
 bench: ## Run the benchmark harness against the test database

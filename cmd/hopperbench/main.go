@@ -2,19 +2,40 @@
 // prints machine-readable results, one JSON object per scenario.
 //
 //	hopperbench -database-url postgres://... [-scenarios throughput,insert,copy,latency] [-jobs 50000] [-clients 4]
+//	hopperbench -compare base.jsonl,head.jsonl [-threshold 0.10]
 //
 // It works in a schema of its own ("hopperbench"), which it creates and drops,
 // so it can point at any database. Numbers depend on the hardware, the
 // Postgres configuration and the network between them; compare runs made on
-// the same setup, such as a PR branch against canary.
+// the same setup, such as a PR branch against canary. The -compare mode does
+// that: it reads two files of results, takes the best run per scenario, and
+// exits non-zero if the second is slower than the first by more than the
+// threshold on any scenario.
+//
+// Scenarios:
+//
+//	throughput  no-op jobs preloaded, then drained by -clients clients
+//	mixed       as throughput, with all four priorities interleaved
+//	scheduled   as throughput, with jobs scheduled up to 500ms in the future
+//	retry       as throughput, with every job failing its first attempt
+//	insert      InsertMany in batches of 100 (the unnest statement)
+//	copy        InsertMany in batches of 5000 (the COPY path)
+//	latency     commit-to-Work on an idle queue, local wake-up
+//
+// -history preloads that many rows of history first, to measure the live
+// table's independence from accumulated history.
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"maps"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"slices"
@@ -41,6 +62,7 @@ type result struct {
 	Jobs       int     `json:"jobs"`
 	Clients    int     `json:"clients,omitempty"`
 	Workers    int     `json:"workers_per_client,omitempty"`
+	History    int     `json:"history_rows,omitempty"`
 	Seconds    float64 `json:"seconds"`
 	JobsPerSec float64 `json:"jobs_per_sec,omitempty"`
 	P50Millis  float64 `json:"p50_ms,omitempty"`
@@ -53,18 +75,30 @@ func main() {
 		url       = flag.String("database-url", os.Getenv("HOPPER_TEST_DATABASE_URL"), "Postgres URL (default $HOPPER_TEST_DATABASE_URL)")
 		scenarios = flag.String("scenarios", "throughput,insert,copy,latency", "comma-separated scenarios to run")
 		jobs      = flag.Int("jobs", 50000, "jobs per throughput scenario")
-		clients   = flag.Int("clients", 4, "clients working the throughput scenario")
+		clients   = flag.Int("clients", 4, "clients working the throughput scenarios")
 		workers   = flag.Int("workers", 100, "MaxWorkers per client")
 		samples   = flag.Int("samples", 200, "latency samples")
+		history   = flag.Int("history", 0, "rows of history to preload")
 		schema    = flag.String("schema", "hopperbench", "schema to create, use and drop")
+		compare   = flag.String("compare", "", "compare two result files, base,head, instead of running")
+		threshold = flag.Float64("threshold", 0.10, "with -compare: the fraction by which head may be slower than base")
 	)
 	flag.Parse()
+	if *compare != "" {
+		if err := runCompare(os.Stdout, *compare, *threshold); err != nil {
+			fmt.Fprintln(os.Stderr, "hopperbench:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *url == "" {
 		fmt.Fprintln(os.Stderr, "hopperbench: -database-url or HOPPER_TEST_DATABASE_URL is required")
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	err := run(ctx, *url, *schema, strings.Split(*scenarios, ","), *jobs, *clients, *workers, *samples)
+	err := run(ctx, *url, *schema, strings.Split(*scenarios, ","), options{
+		jobs: *jobs, clients: *clients, workers: *workers, samples: *samples, history: *history,
+	})
 	stop()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "hopperbench:", err)
@@ -72,7 +106,11 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, url, schema string, scenarios []string, jobs, clients, workers, samples int) error {
+type options struct {
+	jobs, clients, workers, samples, history int
+}
+
+func run(ctx context.Context, url, schema string, scenarios []string, opts options) error {
 	pool, cleanup, err := openSchema(ctx, url, schema)
 	if err != nil {
 		return err
@@ -82,7 +120,14 @@ func run(ctx context.Context, url, schema string, scenarios []string, jobs, clie
 	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}); err != nil {
 		return err
 	}
-	b := &bench{pool: pool, d: d, logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+	b := &bench{pool: pool, d: d, opts: opts, logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))}
+
+	// The first clients to start elect a leader that creates the history
+	// partitions, which briefly blocks finalizes; warm up so no measured
+	// scenario pays for it.
+	if _, err := b.drain(ctx, "warmup", b.params(2000, nil), noopWorker); err != nil {
+		return fmt.Errorf("warmup: %w", err)
+	}
 
 	for _, s := range scenarios {
 		var (
@@ -91,19 +136,31 @@ func run(ctx context.Context, url, schema string, scenarios []string, jobs, clie
 		)
 		switch strings.TrimSpace(s) {
 		case "throughput":
-			r, err = b.throughput(ctx, jobs, clients, workers)
+			r, err = b.drain(ctx, "throughput", b.params(opts.jobs, nil), noopWorker)
+		case "mixed":
+			r, err = b.drain(ctx, "mixed", b.params(opts.jobs, func(i int, o *hopper.InsertOpts) {
+				o.Priority = hopper.Priority(i%4 + 1)
+			}), noopWorker)
+		case "scheduled":
+			start := time.Now()
+			r, err = b.drain(ctx, "scheduled", b.params(opts.jobs, func(_ int, o *hopper.InsertOpts) {
+				o.ScheduledAt = start.Add(time.Duration(rand.IntN(500)) * time.Millisecond)
+			}), noopWorker)
+		case "retry":
+			r, err = b.drain(ctx, "retry", b.params(opts.jobs, nil), failOnceWorker)
 		case "insert":
-			r, err = b.insert(ctx, jobs, 100)
+			r, err = b.insert(ctx, opts.jobs, 100)
 		case "copy":
-			r, err = b.insert(ctx, jobs, 5000)
+			r, err = b.insert(ctx, opts.jobs, 5000)
 		case "latency":
-			r, err = b.latency(ctx, samples)
+			r, err = b.latency(ctx, opts.samples)
 		default:
 			return fmt.Errorf("unknown scenario %q", s)
 		}
 		if err != nil {
 			return fmt.Errorf("%s: %w", s, err)
 		}
+		r.History = opts.history
 		if err := json.NewEncoder(os.Stdout).Encode(r); err != nil {
 			return err
 		}
@@ -145,26 +202,85 @@ func openSchema(ctx context.Context, url, schema string) (*pgxpool.Pool, func(),
 type bench struct {
 	pool   *pgxpool.Pool
 	d      *hopperpgx.Driver
+	opts   options
 	logger *slog.Logger
 }
 
-func (b *bench) truncate(ctx context.Context) error {
-	_, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_clients")
-	return err
+// reset empties the tables and preloads -history rows of history, spread
+// over the last day into hourly partitions as a running system would have
+// them, so finalizes during the run land in the current hour's small
+// partition rather than in a large DEFAULT one.
+func (b *bench) reset(ctx context.Context) error {
+	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_clients, hopper_leader, hopper_periodic"); err != nil {
+		return err
+	}
+	if b.opts.history > 0 {
+		if _, err := b.pool.Exec(ctx, `
+			DO $$
+			DECLARE h int; start timestamptz;
+			BEGIN
+			  FOR h IN 0..24 LOOP
+			    start := (date_trunc('hour', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - make_interval(hours => h);
+			    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF hopper_job_history_completed FOR VALUES FROM (%L) TO (%L)',
+			      'hopper_job_history_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDDHH24'), start, start + interval '1 hour');
+			  END LOOP;
+			END $$`); err != nil {
+			return fmt.Errorf("preload partitions: %w", err)
+		}
+		_, err := b.pool.Exec(ctx, `
+			INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at,
+			  attempted_at, attempted_by, args, metadata, errors, await, created_at, finalized_at)
+			SELECT hopper_uuidv7(), i, 'preloaded', 'default', 'completed', 2, 1, 25, now(), now(), -1, '{}', '{}', '[]', false, now(),
+			  now() - (random() * interval '23 hours')
+			FROM generate_series(1, $1) AS i`, b.opts.history)
+		if err != nil {
+			return fmt.Errorf("preload history: %w", err)
+		}
+	}
+	return nil
 }
 
-func (b *bench) params(n int) []hopper.InsertParams {
+func (b *bench) params(n int, customize func(i int, o *hopper.InsertOpts)) []hopper.InsertParams {
 	params := make([]hopper.InsertParams, n)
 	for i := range params {
 		params[i] = hopper.InsertParams{Args: benchArgs{N: i}}
+		if customize != nil {
+			opts := &hopper.InsertOpts{}
+			customize(i, opts)
+			params[i].Opts = opts
+		}
 	}
 	return params
 }
 
-// throughput preloads jobs, then measures how long `clients` clients with
-// no-op workers take to drain the queue.
-func (b *bench) throughput(ctx context.Context, jobs, clients, workers int) (result, error) {
-	if err := b.truncate(ctx); err != nil {
+func noopWorker(context.Context, *hopper.Job[benchArgs]) error { return nil }
+
+var errFirstAttempt = errors.New("first attempt")
+
+// failOnceWorker fails every first attempt, so each job is finalized twice.
+func failOnceWorker(_ context.Context, job *hopper.Job[benchArgs]) error {
+	if job.Attempt == 1 {
+		return errFirstAttempt
+	}
+	return nil
+}
+
+// immediateRetry is a worker whose failed attempts retry at once.
+type immediateRetry struct {
+	hopper.WorkerDefaults[benchArgs]
+	fn func(context.Context, *hopper.Job[benchArgs]) error
+}
+
+func (w immediateRetry) Work(ctx context.Context, job *hopper.Job[benchArgs]) error {
+	return w.fn(ctx, job)
+}
+
+func (immediateRetry) NextRetry(*hopper.Job[benchArgs]) time.Time { return time.Now() }
+
+// drain preloads jobs, then measures how long -clients clients take to
+// empty the queue.
+func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertParams, work func(context.Context, *hopper.Job[benchArgs]) error) (result, error) {
+	if err := b.reset(ctx); err != nil {
 		return result{}, err
 	}
 	inserter, err := hopper.NewClient(b.d, &hopper.Config{Logger: b.logger})
@@ -172,7 +288,6 @@ func (b *bench) throughput(ctx context.Context, jobs, clients, workers int) (res
 		return result{}, err
 	}
 	defer inserter.Stop(ctx) //nolint:errcheck // flushes pending notifications
-	params := b.params(jobs)
 	for i := 0; i < len(params); i += 10000 {
 		if _, err := inserter.InsertMany(ctx, params[i:min(i+10000, len(params))]); err != nil {
 			return result{}, err
@@ -180,11 +295,11 @@ func (b *bench) throughput(ctx context.Context, jobs, clients, workers int) (res
 	}
 
 	ws := hopper.NewWorkers()
-	hopper.AddWorkFunc(ws, func(context.Context, *hopper.Job[benchArgs]) error { return nil })
-	cs := make([]*hopper.Client[pgx.Tx], clients)
+	hopper.AddWorker(ws, immediateRetry{fn: work})
+	cs := make([]*hopper.Client[pgx.Tx], b.opts.clients)
 	for i := range cs {
 		c, err := hopper.NewClient(b.d, &hopper.Config{
-			Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: workers}},
+			Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: b.opts.workers}},
 			Workers: ws,
 			Logger:  b.logger,
 		})
@@ -216,22 +331,22 @@ func (b *bench) throughput(ctx context.Context, jobs, clients, workers int) (res
 		}
 	}
 	var done int
-	if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_job_history WHERE state = 'completed'").Scan(&done); err != nil {
+	if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_job_history WHERE state = 'completed' AND kind = 'bench'").Scan(&done); err != nil {
 		return result{}, err
 	}
-	if done != jobs {
-		return result{}, fmt.Errorf("%d of %d jobs completed", done, jobs)
+	if done != len(params) {
+		return result{}, fmt.Errorf("%d of %d jobs completed", done, len(params))
 	}
 	return result{
-		Scenario: "throughput", Jobs: jobs, Clients: clients, Workers: workers,
-		Seconds: elapsed.Seconds(), JobsPerSec: float64(jobs) / elapsed.Seconds(),
+		Scenario: name, Jobs: len(params), Clients: b.opts.clients, Workers: b.opts.workers,
+		Seconds: elapsed.Seconds(), JobsPerSec: float64(len(params)) / elapsed.Seconds(),
 	}, nil
 }
 
 // insert measures InsertMany in batches of the given size: below the COPY
 // threshold that is the unnest statement, above it the COPY path.
 func (b *bench) insert(ctx context.Context, jobs, batch int) (result, error) {
-	if err := b.truncate(ctx); err != nil {
+	if err := b.reset(ctx); err != nil {
 		return result{}, err
 	}
 	c, err := hopper.NewClient(b.d, &hopper.Config{Logger: b.logger})
@@ -239,7 +354,7 @@ func (b *bench) insert(ctx context.Context, jobs, batch int) (result, error) {
 		return result{}, err
 	}
 	defer c.Stop(ctx) //nolint:errcheck // flushes pending notifications
-	params := b.params(jobs)
+	params := b.params(jobs, nil)
 	// Eight concurrent inserters, as an application with several replicas would have.
 	const inserters = 8
 	var wg sync.WaitGroup
@@ -270,11 +385,9 @@ func (b *bench) insert(ctx context.Context, jobs, batch int) (result, error) {
 }
 
 // latency measures commit-to-Work on an idle queue, with the insert coming
-// from the working client itself (local wake-up). Inserts from other
-// processes rely on notifications, which land with M2; until then they are
-// bounded by the poll interval.
+// from the working client itself (local wake-up).
 func (b *bench) latency(ctx context.Context, samples int) (result, error) {
-	if err := b.truncate(ctx); err != nil {
+	if err := b.reset(ctx); err != nil {
 		return result{}, err
 	}
 	started := make(chan time.Time, 1)
@@ -317,4 +430,87 @@ func (b *bench) latency(ctx context.Context, samples int) (result, error) {
 		Scenario: "latency", Jobs: samples, Seconds: time.Since(begin).Seconds(),
 		P50Millis: ms(lat[len(lat)/2]), P99Millis: ms(lat[len(lat)*99/100]), MaxMillis: ms(lat[len(lat)-1]),
 	}, nil
+}
+
+// runCompare reads two files of results and fails if head is slower than
+// base by more than threshold on any scenario, using the best run of each.
+func runCompare(out *os.File, files string, threshold float64) error {
+	names := strings.Split(files, ",")
+	if len(names) != 2 {
+		return errors.New("-compare takes two files: base,head")
+	}
+	base, err := readResults(names[0])
+	if err != nil {
+		return err
+	}
+	head, err := readResults(names[1])
+	if err != nil {
+		return err
+	}
+	var failed []string
+	for _, scenario := range slices.Sorted(maps.Keys(base)) {
+		b, h := base[scenario], head[scenario]
+		if h == nil {
+			fmt.Fprintf(out, "%-12s base %s; head: missing\n", scenario, b)
+			continue
+		}
+		change := h.change(b)
+		verdict := "ok"
+		if change < -threshold {
+			verdict = "REGRESSION"
+			failed = append(failed, scenario)
+		}
+		fmt.Fprintf(out, "%-12s base %s -> head %s (%+.1f%%) %s\n", scenario, b, h, change*100, verdict)
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("slower than base by more than %.0f%%: %s", threshold*100, strings.Join(failed, ", "))
+	}
+	return nil
+}
+
+// change is the relative improvement of r over base: positive is faster.
+func (r *result) change(base *result) float64 {
+	if r.JobsPerSec > 0 {
+		return r.JobsPerSec/base.JobsPerSec - 1
+	}
+	// Latency: lower is better.
+	return base.P99Millis/r.P99Millis - 1
+}
+
+func (r *result) String() string {
+	if r.JobsPerSec > 0 {
+		return fmt.Sprintf("%.0f jobs/s", r.JobsPerSec)
+	}
+	return fmt.Sprintf("p50 %.2fms p99 %.2fms", r.P50Millis, r.P99Millis)
+}
+
+// readResults keeps the best run per scenario.
+func readResults(path string) (map[string]*result, error) {
+	f, err := os.Open(path) //nolint:gosec // a result file named on the command line
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	best := map[string]*result{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var r result
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		if cur := best[r.Scenario]; cur == nil || r.change(cur) > 0 {
+			best[r.Scenario] = &r
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if len(best) == 0 {
+		return nil, fmt.Errorf("%s: no results", path)
+	}
+	return best, nil
 }
