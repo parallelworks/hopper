@@ -64,6 +64,10 @@ type InsertOpts struct {
 	// Await announces the job's finalize, so that Await returns as soon as
 	// it commits instead of on its next poll.
 	Await bool
+	// OrderingKey serializes the job with others of the same key in its
+	// queue: at most one runs at a time, oldest first, and a failing job
+	// blocks its key while it retries. See PublishOpts.OrderingKey.
+	OrderingKey string
 }
 
 // merge returns opts with the non-zero fields of over applied on top.
@@ -91,6 +95,9 @@ func (opts InsertOpts) merge(over InsertOpts) InsertOpts {
 	}
 	if over.Await {
 		opts.Await = true
+	}
+	if over.OrderingKey != "" {
+		opts.OrderingKey = over.OrderingKey
 	}
 	return opts
 }

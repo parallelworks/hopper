@@ -6,6 +6,17 @@ versions may change the API.
 
 ## [Unreleased]
 
+### Added
+
+- Messaging: `Subscribe` with AMQP topic patterns, typed `Message[T]`,
+  `Publish`/`PublishTx` fan-out in one statement, dedup keys, ordering keys
+  (also on plain jobs through `InsertOpts.OrderingKey`), request/reply, and
+  `ReplayDiscarded`.
+- Schema v2: subscription retry budgets and metadata, ordering-key indexes,
+  and the SQL contract functions `hopper_insert` and `hopper_publish`.
+- `TestUpgradeUnderTraffic`, which migrates to the latest schema while a
+  client works jobs.
+
 ## [0.1.0]
 
 The first release: a complete job queue on PostgreSQL.

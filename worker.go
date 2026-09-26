@@ -37,8 +37,9 @@ func (WorkerDefaults[T]) NextRetry(*Job[T]) time.Time { return time.Time{} }
 // Workers is a registry of workers by kind. Register at startup with
 // AddWorker and AddWorkFunc, then pass it to NewClient.
 type Workers struct {
-	mu    sync.RWMutex
-	kinds map[string]*workerInfo
+	mu            sync.RWMutex
+	kinds         map[string]*workerInfo
+	subscriptions []Subscription
 }
 
 // NewWorkers returns an empty registry.

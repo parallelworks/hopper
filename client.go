@@ -136,6 +136,11 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	if err := c.exec.QueueEnsure(ctx, slices.Sorted(maps.Keys(c.cfg.Queues))); err != nil {
 		c.logger.WarnContext(ctx, "hopper: record queues", "error", err)
 	}
+	// Subscriptions are declared in code and take effect cluster-wide once
+	// recorded, so a failure here is a startup error, not a warning.
+	if err := c.exec.SubscriptionUpsert(ctx, c.workers.subscriptionRows()); err != nil {
+		return err
+	}
 
 	// Each phase has its own context, cancelled in order by Stop.
 	base := context.WithoutCancel(ctx)

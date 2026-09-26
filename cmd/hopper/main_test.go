@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/parallelworks/hopper"
+	"github.com/parallelworks/hopper/hoppermigrate"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
 
@@ -44,11 +46,12 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("migrate", "version"); !strings.Contains(got, "schema version 0") {
 		t.Errorf("version before migrate = %q", got)
 	}
-	if got := hopperCmd("migrate", "up"); !strings.Contains(got, "schema version 1") {
+	latest := fmt.Sprintf("schema version %d", hoppermigrate.Latest())
+	if got := hopperCmd("migrate", "up"); !strings.Contains(got, latest) {
 		t.Errorf("migrate up = %q", got)
 	}
 	var version map[string]int
-	if err := json.Unmarshal([]byte(hopperCmd("-json", "migrate", "version")), &version); err != nil || version["version"] != 1 {
+	if err := json.Unmarshal([]byte(hopperCmd("-json", "migrate", "version")), &version); err != nil || version["version"] != hoppermigrate.Latest() {
 		t.Errorf("json version = %v, %v", version, err)
 	}
 

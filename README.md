@@ -30,15 +30,17 @@ Postgres is the first engine, behind a driver interface designed for more.
 > LISTEN/NOTIFY wake-ups, unique jobs, cron and interval schedules, cancellation,
 > retry from the dead-letter queue, TTLs, pause and runtime queues, middleware,
 > awaitable results, listing, events and stats, plus the `hopper` CLI,
-> `hoppertest`, `hopperotel` and the `drivertest` conformance suite.
-> Messaging and flow control follow, in the order laid out in
+> `hoppertest`, `hopperotel` and the `drivertest` conformance suite. So is
+> messaging: subscriptions with topic patterns, fan-out, dedup and ordering
+> keys, and a SQL contract for producers in other languages. Flow control,
+> batches and workflows follow, in the order laid out in
 > [docs/PLAN.md](docs/PLAN.md), the plan of record. Start with
 > [docs/getting-started.md](docs/getting-started.md). Feedback is welcome
 > through issues and PRs.
 
 ```go
-_, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42}, nil)   // commits with tx
-err = client.PublishTx(ctx, tx, "allocation.created", payload)   // fans out to subscribers
+_, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42}, nil)        // commits with tx
+_, err = client.PublishTx(ctx, tx, AllocationCreated{ID: 42}, nil)  // fans out to subscribers
 ```
 
 ## The name

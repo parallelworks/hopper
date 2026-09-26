@@ -79,6 +79,9 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Notify", testNotify[TTx]},
 		{"HistoryMaintain", testHistoryMaintain[TTx]},
 		{"Now", testNow[TTx]},
+		{"Subscriptions", testSubscriptions[TTx]},
+		{"Publish", testPublish[TTx]},
+		{"OrderingClaim", testOrderingClaim[TTx]},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
