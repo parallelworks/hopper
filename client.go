@@ -20,13 +20,14 @@ import (
 // jobs, and holds a liveness lease while running. TTx is the engine's
 // transaction type, fixed by the driver.
 type Client[TTx any] struct {
-	driver  driver.Driver[TTx]
-	exec    driver.Executor
-	caps    driver.Capabilities
-	cfg     Config
-	tuning  tuning
-	logger  *slog.Logger
-	workers *Workers
+	driver   driver.Driver[TTx]
+	exec     driver.Executor
+	caps     driver.Capabilities
+	cfg      Config
+	tuning   tuning
+	logger   *slog.Logger
+	workers  *Workers
+	notifier *notifier
 
 	// clientID is the lease row ID while running. It changes if the lease is
 	// lost and re-registered.
@@ -40,10 +41,24 @@ type Client[TTx any] struct {
 	claimCtx, workCtx, finCtx, bgCtx             context.Context
 	claimCancel, workCancel, finCancel, bgCancel context.CancelFunc
 
+	// gen is the lease generation: jobs run under a context that is
+	// cancelled when the lease is lost, so a fenced client stops its work.
+	genMu     sync.Mutex
+	genCtx    context.Context
+	genCancel context.CancelFunc
+
 	producers map[string]*producer
 	finalizer *finalizer
-	loops     sync.WaitGroup // producer loops
-	lease     sync.WaitGroup // the lease loop
+	// Loops by the phase that stops them: producers and the leader stop
+	// with claiming; the listener and the lease loop run until the end.
+	producerWG sync.WaitGroup
+	leaderWG   sync.WaitGroup
+	listenWG   sync.WaitGroup
+	leaseWG    sync.WaitGroup
+
+	listening  atomic.Bool
+	isLeader   atomic.Bool
+	leaderPoke chan struct{}
 }
 
 type clientState int
@@ -65,17 +80,19 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		return nil, err
 	}
 	c := &Client[TTx]{
-		driver:  d,
-		exec:    d.Executor(),
-		caps:    d.Capabilities(),
-		cfg:     resolved,
-		tuning:  defaultTuning,
-		logger:  resolved.Logger,
-		workers: resolved.Workers,
+		driver:     d,
+		exec:       d.Executor(),
+		caps:       d.Capabilities(),
+		cfg:        resolved,
+		tuning:     defaultTuning,
+		logger:     resolved.Logger,
+		workers:    resolved.Workers,
+		leaderPoke: make(chan struct{}, 1),
 	}
 	if c.workers == nil {
 		c.workers = NewWorkers()
 	}
+	c.notifier = newNotifier(c.exec, c.logger, c.tuning.notifyInterval)
 	return c, nil
 }
 
@@ -110,6 +127,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.workCtx, c.workCancel = context.WithCancel(base)   //nolint:gosec // cancelled in Stop
 	c.finCtx, c.finCancel = context.WithCancel(base)     //nolint:gosec // cancelled in Stop
 	c.bgCtx, c.bgCancel = context.WithCancel(base)       //nolint:gosec // cancelled in Stop
+	c.newGeneration()
 
 	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.wakeQueue)
 	go c.finalizer.run(c.finCtx)
@@ -125,15 +143,19 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 			claim: func(ctx context.Context, limit int) ([]*driver.JobRow, error) {
 				return c.exec.JobClaim(ctx, driver.JobClaimParams{Queue: name, ClientID: c.clientID.Load(), Limit: limit})
 			},
-			work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.workCtx, row, qcfg) },
+			work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.generation(), row, qcfg) },
 			submit: c.finalizer.submit,
 			wake:   make(chan struct{}, 1),
 			freed:  make(chan struct{}, 1),
 		}
 		c.producers[name] = p
-		c.loops.Go(func() { p.run(c.claimCtx) })
+		c.producerWG.Go(func() { p.run(c.claimCtx) })
 	}
-	c.lease.Go(func() { c.leaseLoop(c.bgCtx) })
+	if c.caps.Listen {
+		c.listenWG.Go(func() { c.listenLoop(c.bgCtx) })
+	}
+	c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
+	c.leaseWG.Go(func() { c.leaseLoop(c.bgCtx) })
 
 	c.state = clientStarted
 	c.logger.InfoContext(ctx, "hopper: client started", "client_id", id, "queues", slices.Sorted(maps.Keys(c.cfg.Queues)))
@@ -156,17 +178,33 @@ func (c *Client[TTx]) register(ctx context.Context) (int64, error) {
 	return id, nil
 }
 
-// Stop shuts the client down in three steps: stop claiming; wait for running
-// jobs to finish and flush their results; release the lease. If ctx expires
-// during the wait, every job's context is cancelled, whatever finishes within
-// a short grace period is flushed, and ctx's error is returned. Jobs still
-// running then are rescued by another client once this one's lease expires.
+// newGeneration starts a lease generation under workCtx.
+func (c *Client[TTx]) newGeneration() {
+	c.genMu.Lock()
+	defer c.genMu.Unlock()
+	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // cancelled by fence or Stop
+}
+
+// generation returns the context jobs run under.
+func (c *Client[TTx]) generation() context.Context {
+	c.genMu.Lock()
+	defer c.genMu.Unlock()
+	return c.genCtx
+}
+
+// Stop shuts the client down in three steps: stop claiming and give up
+// leadership; wait for running jobs to finish and flush their results;
+// release the lease. If ctx expires during the wait, every job's context is
+// cancelled, whatever finishes within a short grace period is flushed, and
+// ctx's error is returned. Jobs still running then are rescued by another
+// client once this one's lease expires.
 func (c *Client[TTx]) Stop(ctx context.Context) error {
 	c.mu.Lock()
 	switch c.state {
 	case clientIdle, clientStopped:
 		c.state = clientStopped
 		c.mu.Unlock()
+		c.notifier.flushNow()
 		return nil
 	case clientStopping:
 		c.mu.Unlock()
@@ -178,16 +216,19 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 
 	if c.producers == nil {
 		// Insert-only client.
+		c.notifier.flushNow()
 		c.mu.Lock()
 		c.state = clientStopped
 		c.mu.Unlock()
 		return nil
 	}
 
-	// 1. Stop claiming. Producer loops exit once any in-flight claim returns,
-	// and the jobs from that claim are started, so nothing claimed is lost.
+	// 1. Stop claiming and give up leadership. Producer loops exit once any
+	// in-flight claim returns, and the jobs from that claim are started, so
+	// nothing claimed is lost.
 	c.claimCancel()
-	c.loops.Wait()
+	c.producerWG.Wait()
+	c.leaderWG.Wait()
 
 	// 2. Wait for running jobs. The lease keeps being renewed meanwhile, so
 	// a long drain cannot let it lapse.
@@ -202,11 +243,13 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	}
 	c.finCancel()
 	<-c.finalizer.done
+	c.notifier.flushNow()
 
 	// 3. Release the lease.
 	c.workCancel()
 	c.bgCancel()
-	c.lease.Wait()
+	c.listenWG.Wait()
+	c.leaseWG.Wait()
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := c.exec.ClientDelete(releaseCtx, c.clientID.Load()); err != nil {
@@ -262,7 +305,12 @@ func (c *Client[TTx]) wakeQueue(queue string) {
 }
 
 // leaseLoop renews the client's lease. A renewal that matches no row means
-// the lease expired, so the client re-registers under a new ID.
+// the lease expired while this process was not renewing it (a long pause or
+// a partition), so the leader may already have rescued its jobs. The client
+// fences itself: it cancels every running job and re-registers under a new
+// ID. Results still in flight are submitted anyway; the finalize statement
+// rejects any whose job was rescued meanwhile and applies the rest, which is
+// equivalent to a rescue.
 func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaseRenew)
 	defer ticker.Stop()
@@ -283,12 +331,30 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		if ok {
 			continue
 		}
-		c.logger.ErrorContext(ctx, "hopper: client lease expired; re-registering", "client_id", id)
-		newID, err := c.register(ctx)
-		if err != nil {
-			c.logger.ErrorContext(ctx, "hopper: re-register client", "error", err)
-			continue
-		}
-		c.clientID.Store(newID)
+		c.fence(ctx, id)
 	}
+}
+
+// fence handles the loss of lease id: it cancels every job running under
+// it and re-registers under a new ID. It is a no-op if the client has
+// already moved on from id, so the lease loop and the rescuer can both call
+// it.
+func (c *Client[TTx]) fence(ctx context.Context, id int64) {
+	c.genMu.Lock()
+	defer c.genMu.Unlock()
+	if c.clientID.Load() != id {
+		return
+	}
+	c.logger.ErrorContext(ctx, "hopper: client lease expired; fencing running jobs and re-registering", "client_id", id)
+	c.genCancel()
+	newID, err := c.register(ctx)
+	if err != nil {
+		// Keep the cancelled generation: nothing runs until the next
+		// renewal attempt succeeds in registering.
+		c.logger.ErrorContext(ctx, "hopper: re-register client", "error", err)
+		return
+	}
+	c.clientID.Store(newID)
+	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // cancelled by fence or Stop
+	c.pokeLeader()
 }

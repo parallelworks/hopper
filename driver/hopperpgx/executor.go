@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/parallelworks/hopper/driver"
@@ -74,10 +75,12 @@ func collectJobs(rows pgx.Rows, history bool) ([]*driver.JobRow, error) {
 	})
 }
 
-// jobInsertSQL inserts a batch in one statement. A no-op DO UPDATE (rather
-// than DO NOTHING) makes RETURNING include the existing row when a unique key
-// conflicts, and xmax <> 0 marks those rows as duplicates. RETURNING emits
-// rows in the order the SELECT produced them, which is input order.
+// jobInsertSQL inserts a batch in one statement. On a unique-key conflict a
+// DO UPDATE (rather than DO NOTHING) makes RETURNING include the existing
+// row, and xmax <> 0 marks those rows as duplicates. For ConflictSkip the
+// update is a no-op; for ConflictReplace it replaces the job unless it is
+// running. RETURNING emits rows in the order the SELECT produced them, which
+// is input order.
 const jobInsertSQL = `
 WITH p AS (
   SELECT * FROM unnest(
@@ -89,12 +92,52 @@ SELECT p.kind, p.queue,
        CASE WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::hopper_job_state,
        p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata, p.unique_key
 FROM p
-ON CONFLICT (kind, unique_key) WHERE unique_key IS NOT NULL DO UPDATE SET kind = EXCLUDED.kind
+ON CONFLICT (kind, unique_key) WHERE unique_key IS NOT NULL DO UPDATE SET ` + "%s" + `
 RETURNING ` + "%s" + `, (xmax <> 0) AS duplicate`
 
-var jobInsertQuery = fmt.Sprintf(jobInsertSQL, jobColumns(""))
+const (
+	conflictSkipSet    = `kind = EXCLUDED.kind`
+	conflictReplaceSet = `
+  args         = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.args         ELSE EXCLUDED.args         END,
+  metadata     = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.metadata     ELSE EXCLUDED.metadata     END,
+  priority     = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.priority     ELSE EXCLUDED.priority     END,
+  max_attempts = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.max_attempts ELSE EXCLUDED.max_attempts END,
+  scheduled_at = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.scheduled_at ELSE EXCLUDED.scheduled_at END,
+  state        = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.state        ELSE EXCLUDED.state        END`
+)
 
-func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
+var (
+	jobInsertSkipQuery    = fmt.Sprintf(jobInsertSQL, conflictSkipSet, jobColumns(""))
+	jobInsertReplaceQuery = fmt.Sprintf(jobInsertSQL, conflictReplaceSet, jobColumns(""))
+)
+
+// notifySQL sends one notification per payload. Postgres delivers them on
+// commit and collapses identical ones within a transaction.
+const notifySQL = `SELECT pg_notify($1, p) FROM unnest($2::text[]) AS p`
+
+func (e *executor) Notify(ctx context.Context, channel string, payloads []string) error {
+	if len(payloads) == 0 {
+		return nil
+	}
+	if _, err := e.db.Exec(ctx, notifySQL, channel, payloads); err != nil {
+		return fmt.Errorf("hopperpgx: notify: %w", err)
+	}
+	return nil
+}
+
+func distinctQueues(params []driver.JobInsertParams) []string {
+	seen := make(map[string]struct{}, 4)
+	var out []string
+	for _, p := range params {
+		if _, ok := seen[p.Queue]; !ok {
+			seen[p.Queue] = struct{}{}
+			out = append(out, p.Queue)
+		}
+	}
+	return out
+}
+
+func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertParams, opts driver.JobInsertOpts) ([]driver.JobInsertResult, error) {
 	if len(params) == 0 {
 		return nil, nil
 	}
@@ -124,15 +167,47 @@ func (e *executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 		metadata[i] = jsonOrEmptyObject(p.Metadata)
 		uniqueKeys[i] = pgtype.Text{String: p.UniqueKey, Valid: p.UniqueKey != ""}
 	}
-	rows, err := e.db.Query(ctx, jobInsertQuery, kinds, queues, priorities, maxAttempts, scheduledAt, args, metadata, uniqueKeys)
-	if err != nil {
-		return nil, fmt.Errorf("hopperpgx: insert jobs: %w", err)
+	query := jobInsertSkipQuery
+	if opts.OnConflict == driver.ConflictReplace {
+		query = jobInsertReplaceQuery
 	}
-	results, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (driver.JobInsertResult, error) {
-		return scanInsertResult(row)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("hopperpgx: insert jobs: %w", err)
+	queryArgs := []any{kinds, queues, priorities, maxAttempts, scheduledAt, args, metadata, uniqueKeys}
+	collect := func(rows pgx.Rows, err error) ([]driver.JobInsertResult, error) {
+		if err != nil {
+			return nil, err
+		}
+		return pgx.CollectRows(rows, func(row pgx.CollectableRow) (driver.JobInsertResult, error) {
+			return scanInsertResult(row)
+		})
+	}
+
+	var results []driver.JobInsertResult
+	if !opts.Notify {
+		var err error
+		if results, err = collect(e.db.Query(ctx, query, queryArgs...)); err != nil {
+			return nil, fmt.Errorf("hopperpgx: insert jobs: %w", err)
+		}
+	} else {
+		// The notify rides in the same pipelined batch, so the insert and
+		// its notification cost one round trip and commit together.
+		b := &pgx.Batch{}
+		b.Queue(query, queryArgs...)
+		b.Queue(notifySQL, driver.ChannelInsert, distinctQueues(params))
+		br := e.db.SendBatch(ctx, b)
+		results, err := collect(br.Query())
+		if err == nil {
+			_, err = br.Exec()
+		}
+		if cerr := br.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, fmt.Errorf("hopperpgx: insert jobs: %w", err)
+		}
+		if len(results) != n {
+			return nil, fmt.Errorf("hopperpgx: insert jobs: inserted %d rows for %d inputs", len(results), n)
+		}
+		return results, nil
 	}
 	if len(results) != n {
 		return nil, fmt.Errorf("hopperpgx: insert jobs: inserted %d rows for %d inputs", len(results), n)
@@ -191,7 +266,7 @@ func jsonOrEmptyObject(b []byte) []byte {
 // JobInsertCopy loads a batch with COPY. IDs and the insert time come from
 // the database first, so that results are complete and IDs are generated
 // the same way as on every other path.
-func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertParams) ([]driver.JobInsertResult, error) {
+func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertParams, opts driver.JobInsertOpts) ([]driver.JobInsertResult, error) {
 	if len(params) == 0 {
 		return nil, nil
 	}
@@ -268,11 +343,17 @@ func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertP
 	if copied != int64(n) {
 		return nil, fmt.Errorf("hopperpgx: copy jobs: copied %d rows for %d inputs", copied, n)
 	}
+	if opts.Notify {
+		if _, err := copier.Exec(ctx, notifySQL, driver.ChannelInsert, distinctQueues(params)); err != nil {
+			return nil, fmt.Errorf("hopperpgx: copy jobs: notify: %w", err)
+		}
+	}
 	return results, nil
 }
 
 type copyFromer interface {
 	CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error)
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 }
 
 // copyConn returns a single connection to run a COPY on, and the object to
@@ -460,6 +541,76 @@ func (e *executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow,
 		return nil, fmt.Errorf("hopperpgx: get job: %w", err)
 	}
 	return job, nil
+}
+
+// jobRescueSQL finds running jobs whose client has no live lease, plus jobs
+// running longer than a stuck threshold. It walks the running index, which is
+// bounded by total concurrency.
+var jobRescueQuery = fmt.Sprintf(`
+SELECT %s FROM hopper_jobs j
+WHERE j.state = 'running'
+  AND (NOT EXISTS (SELECT 1 FROM hopper_clients c WHERE c.id = j.attempted_by AND c.expires_at > now())
+       OR ($1::float8 > 0 AND j.attempted_at < now() - make_interval(secs => $1)))
+ORDER BY j.attempted_at
+LIMIT $2`, jobColumns("j."))
+
+func (e *executor) JobRescueCandidates(ctx context.Context, params driver.JobRescueParams) ([]*driver.JobRow, error) {
+	rows, err := e.db.Query(ctx, jobRescueQuery, max(params.StuckAfter, 0).Seconds(), params.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("hopperpgx: rescue candidates: %w", err)
+	}
+	jobs, err := collectJobs(rows, false)
+	if err != nil {
+		return nil, fmt.Errorf("hopperpgx: rescue candidates: %w", err)
+	}
+	return jobs, nil
+}
+
+func (e *executor) ClientPruneExpired(ctx context.Context) (int64, error) {
+	tag, err := e.db.Exec(ctx, `DELETE FROM hopper_clients WHERE expires_at < now()`)
+	if err != nil {
+		return 0, fmt.Errorf("hopperpgx: prune clients: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// leaderSQL takes the lease if it is free or expired, or renews it for the
+// holder. No row is returned when another client holds it.
+const leaderSQL = `
+INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
+VALUES ('default', $1, now(), now() + make_interval(secs => $2))
+ON CONFLICT (name) DO UPDATE SET
+  client_id  = EXCLUDED.client_id,
+  elected_at = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.elected_at ELSE now() END,
+  expires_at = EXCLUDED.expires_at
+WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = EXCLUDED.client_id
+RETURNING client_id`
+
+func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (bool, error) {
+	var id int64
+	err := e.db.QueryRow(ctx, leaderSQL, params.ClientID, params.TTL.Seconds()).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("hopperpgx: leader attempt: %w", err)
+	}
+	return id == params.ClientID, nil
+}
+
+// leaderResignSQL deletes the lease if this client holds it and, only then,
+// signals other clients to elect a replacement.
+const leaderResignSQL = `
+WITH resigned AS (
+  DELETE FROM hopper_leader WHERE name = 'default' AND client_id = $1 RETURNING client_id
+)
+SELECT pg_notify($2, 'resigned') FROM resigned`
+
+func (e *executor) LeaderResign(ctx context.Context, clientID int64) error {
+	if _, err := e.db.Exec(ctx, leaderResignSQL, clientID, driver.ChannelLeader); err != nil {
+		return fmt.Errorf("hopperpgx: leader resign: %w", err)
+	}
+	return nil
 }
 
 func (e *executor) ClientRegister(ctx context.Context, params driver.ClientRegisterParams) (int64, error) {

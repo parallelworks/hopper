@@ -4,13 +4,12 @@ hopper is a high-performance job queue and message broker for Go. It gives
 applications durable background jobs, scheduled and periodic work, and pub/sub
 messaging with transactional guarantees, using the database they already run.
 PostgreSQL is the first engine. One Apache-2.0 library replaces both an
-in-process job framework (such as River) and a separate broker (such as
-RabbitMQ).
+in-process job framework and a separate message broker.
 
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 and M1 are implemented (§16). This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M2 are implemented (§16). This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -45,7 +44,7 @@ meant to replace a *rabbit*.
    backoff, unique jobs and debouncing, snooze, cancellation, timeouts, awaitable
    results, global concurrency and rate limits, batches, workflows, topic-routed
    pub/sub, ordering keys, dead-lettering and replay. These are the features teams
-   reach for in River, Oban, Sidekiq, BullMQ and RabbitMQ, all in one library.
+   reach for in job frameworks and message brokers, all in one library.
 7. **Engine-agnostic by design.** Postgres is the first engine. The core talks to
    storage through a `Driver` interface defined at the level of queue operations, not
    SQL strings, and every engine must pass a shared conformance, concurrency and chaos
@@ -169,7 +168,7 @@ err = client.Stop(ctx) // stop claiming, drain, flush; when ctx expires, cancel 
 res, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42, Tmpl: "welcome"}, &hopper.InsertOpts{
     Priority:    hopper.PriorityHigh,
     ScheduledAt: time.Now().Add(time.Hour),
-    Unique:      &hopper.UniqueOpts{ByPeriod: 24 * time.Hour, OnConflict: hopper.UniqueReplace},
+    Unique:      &hopper.UniqueOpts{ByArgs: true, ByPeriod: 24 * time.Hour, OnConflict: hopper.UniqueReplace},
 })
 res.Job.ID; res.Duplicate
 
@@ -486,17 +485,23 @@ skew between pods cannot cause early or duplicate execution.
   `Duplicate: true`. Any batch size costs one round trip.
 - **Bulk:** `InsertMany` switches to `COPY` for batches of non-unique jobs above a
   threshold (256 by default). This is the fastest way to load rows into Postgres.
-- **Unique jobs:** the key is built from the kind, the fields tagged `hopper:"unique"`
-  (or the whole args), and optionally the queue and a time period. It is stored as
-  canonical text, with no hashing, so it is FIPS-clean and readable in SQL. Keys over
-  1 KiB are rejected at insert. Uniqueness covers live jobs, meaning those not yet
-  finalized. `UniqueReplace` updates the args and `scheduled_at` of
-  a non-running duplicate, which gives debouncing.
-- **Wake-up:** after the insert, `pg_notify('hopper_insert', queue)` fires once per queue
-  per transaction. Postgres delivers notifications only on commit, so no worker wakes
-  for an uncommitted job (§7.11). When the inserting client also works that queue and
-  the insert is not inside a caller's transaction, it wakes its local producer
-  directly, with no database round trip.
+- **Unique jobs:** a job with `UniqueOpts` is unique among live jobs (those not yet
+  finalized) of its kind. The key is built from the parts the options select: the args
+  (`ByArgs`: the fields tagged `hopper:"unique"`, or the whole args if none is tagged),
+  the queue (`ByQueue`) and a time period (`ByPeriod`). The zero `UniqueOpts` is unique
+  by kind alone. The key is stored as canonical text, with no hashing, so it is
+  FIPS-clean and readable in SQL. Keys over 1 KiB are rejected at insert. The insert
+  statement's `ON CONFLICT ... DO UPDATE` returns the existing job for a duplicate;
+  `UniqueReplace` updates the args, metadata, priority, attempts and `scheduled_at` of a
+  non-running duplicate, which gives debouncing. Within one batch, later inputs with the
+  same key resolve to the first.
+- **Wake-up:** an insert inside a caller's transaction sends
+  `pg_notify('hopper_insert', queue)` in the same pipelined batch as the insert, once
+  per queue. Postgres delivers notifications only on commit and collapses identical
+  ones within a transaction, so no worker wakes for an uncommitted job (§7.11). An
+  insert outside a transaction is committed when it returns; the client then wakes its
+  local producer directly, with no database round trip, and notifies other processes
+  through a per-process coalescer (§7.11).
 
 ### 7.3 Claim
 Each queue has a producer. The claim is a single statement:
@@ -616,9 +621,12 @@ the largest source of write amplification in heartbeat-based designs.
   `discarded` if they are out of attempts). A crashed pod's jobs run again within about
   20s.
 - **Fencing.** If a renewal matches zero rows (after a long GC pause or a partition),
-  the client has lost its lease. It cancels every in-flight job context, discards its
-  pending results, and re-registers under a new ID. The rescuer and the old client
-  therefore agree on ownership, and finalize fencing (§7.5) covers the remaining race.
+  the client has lost its lease. It cancels every in-flight job context and re-registers
+  under a new ID. Results still in flight are submitted anyway: the finalize fence (§7.5)
+  rejects any whose job was rescued meanwhile and applies the rest, which is equivalent
+  to a rescue. A leader that finds its own jobs among the rescue candidates fences
+  itself first, so it does not re-claim them under the lapsed ID before its lease loop
+  notices.
 - **Hung jobs.** A live client with a stuck goroutine is handled by timeouts. An
   optional `RescueStuckAfter` also rescues jobs that are still running past an absolute
   age.
@@ -675,34 +683,49 @@ and `CatchUp: n` back-fills up to n of them.
 ### 7.10 Retention
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.
 Retention is enforced by dropping whole partitions, so there is no `DELETE`, no dead
-tuples and no vacuum work. The leader creates partitions several intervals ahead.
+tuples and no vacuum work. The leader creates partitions several intervals ahead
+(three hours for `completed`, two days for `failed`), on election and every five
+minutes. A partition is created standalone and then attached, which takes only a
+`SHARE UPDATE EXCLUSIVE` lock on the parent, so finalizes are never blocked by
+maintenance. Only future periods are created and no row is ever moved: rows finalized
+before their period's partition existed (the first period after installation, or
+after a long leader outage) land in a `DEFAULT` partition and are deleted individually
+once past retention. Dropping a partition takes a brief `ACCESS EXCLUSIVE` lock on the
+parent, once per period. Retention periods are set in `Config` and enforced by the
+leader, so the leader's settings apply cluster-wide.
 
-The defaults follow common practice: River, Solid Queue and GoodJob keep successful
-jobs briefly and failures longer, while brokers such as RabbitMQ and SQS delete a
-message once it is acknowledged.
+The defaults follow common practice: job queues keep successful jobs briefly and
+failures longer, while brokers such as RabbitMQ and SQS delete a message once it is
+acknowledged.
 
 | Outcome | Job queues | Subscription queues |
 | --- | --- | --- |
 | `completed` | archived for 24h | deleted on ack (`DeleteCompleted: true`) |
 | `cancelled`, `discarded` | archived for 7d (the dead-letter queue) | archived for 7d (the dead-letter queue) |
 
-Both retention periods and `DeleteCompleted` are configurable per queue. Setting
-`DeleteCompleted: true` on a job queue gives maximum throughput by skipping the
-history insert.
+`DeleteCompleted` is configurable per queue; the two retention periods
+(`CompletedRetention`, `FailedRetention`) are per cluster, because partitions are cut
+by time, not by queue. Setting `DeleteCompleted: true` on a job queue gives maximum
+throughput by skipping the history insert.
 
 ### 7.11 Notifications
 LISTEN/NOTIFY gives low-latency wake-ups, and hopper keeps it cheap at high insert
 rates:
 - **One notify per queue per transaction**, no matter how many jobs the transaction
   inserts.
-- **Per-process coalescing.** Each client sends at most one insert notification per
-  queue per `NotifyInterval` (10ms by default). A busy queue's producers are claiming
-  continuously anyway, so extra notifications would add nothing.
+- **Per-process coalescing** for inserts outside a caller's transaction. Each client
+  sends at most one insert notification per queue per 10ms, on the trailing edge of
+  the window, after the window's inserts have committed, so a woken worker always
+  finds the jobs. A busy queue's producers are claiming continuously anyway, so extra
+  notifications would add nothing.
 - **One listener connection** per client, multiplexing every channel. It can be pointed
   at a direct Postgres address (`hopperpgx.Config.ListenConn`) when the pool goes
   through a transaction pooler.
 - **Polling fallback.** If LISTEN is unavailable or the connection drops, the client
-  polls and keeps working, and it reconnects the listener with backoff.
+  polls and keeps working, and it reconnects the listener with backoff. The listener
+  connection is named `hopper-listener:<schema>` in `pg_stat_activity`.
+- **Channels are per database**, not per schema. Two hopper schemas in one database
+  see each other's notifications, which only causes spurious wake-ups.
 
 ### 7.12 Shutdown
 `Stop(ctx)` and `Run` (when its context is cancelled) shut down in three steps:
@@ -850,8 +873,8 @@ observability without new machinery.
 - SQL files are embedded in the `hoppermigrate` package, versioned, and forward-only by
   default. Down migrations exist for development.
 - `hoppermigrate.Up(ctx, driver)` applies them under an advisory lock taken on a
-  dedicated connection, not a pooled one. This avoids the pool-starvation deadlock we
-  hit in pie (see pie#1).
+  dedicated connection, not a pooled one. This avoids a pool-starvation deadlock:
+  processes waiting for the lock must not hold the connections the migration needs.
 - `hopper migrate` in the CLI runs the same migrations. The raw SQL files are also
   published for teams that use goose, atlas or Flyway. `hopper_schema` records the
   applied version either way.
@@ -911,10 +934,10 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | --- | --- | --- | --- |
 | M0 | Scaffold | go.mod, CI (lint, Postgres test matrix, `fips140=only`), PR-title check, Dependabot, CONTRIBUTING. **Done.** | 0.5d |
 | M1 | Core engine | `Driver` interface and `hopperpgx`, schema v1, `hoppermigrate`, Insert/InsertTx/InsertMany (unnest and COPY), typed workers and `WorkFunc`, batched claim, batched finalize with history move, retries and backoff, `Snooze`/`Cancel` from workers, client lease registration and renewal, `Run`/`Stop`, a first `hopperbench`. **Done.** | 5d |
-| M2 | Reliability | Client leases, rescuer and fencing, leader lease, partitioned retention, LISTEN/NOTIFY with coalescing and adaptive polling, unique jobs (skip and replace) | 4d |
+| M2 | Reliability | Client leases, rescuer and fencing, leader lease, partitioned retention, LISTEN/NOTIFY with coalescing and adaptive polling, unique jobs (skip and replace), `RescueStuckAfter`. **Done.** | 4d |
 | M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events | 4d |
 | M4 | Performance and release | `hopperbench`, targets met (§8.2), CI perf gate, chaos and upgrade suites, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, **v0.1.0** | 5d |
-| M5 | Adopt in pie | Replace River in pie's `internal/jobs`; drain and drop River's tables | 1d |
+| M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, **v0.2.0** | 5d |
 | M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0** | 5d |
 | M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumer groups, `hopperui` | 2–3w |

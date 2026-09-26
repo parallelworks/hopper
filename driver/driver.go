@@ -35,6 +35,9 @@ type Driver[TTx any] interface {
 	Capabilities() Capabilities
 	// Migrator returns the engine's schema migrator.
 	Migrator() Migrator
+	// Listener opens a connection for push notifications. Engines without
+	// them return ErrNotSupported, and the core polls instead.
+	Listener(ctx context.Context) (Listener, error)
 }
 
 // Capabilities describes optional strategies an engine supports. The core
@@ -43,6 +46,34 @@ type Driver[TTx any] interface {
 type Capabilities struct {
 	// Copy reports whether JobInsertCopy is implemented (COPY on Postgres).
 	Copy bool
+	// Listen reports whether Listener is implemented (LISTEN/NOTIFY on
+	// Postgres).
+	Listen bool
+}
+
+// Notification channels. Payloads are documented on each.
+const (
+	// ChannelInsert carries the queue name of a committed insert.
+	ChannelInsert = "hopper_insert"
+	// ChannelLeader is signalled when a leader resigns, so a replacement is
+	// elected without waiting for the lease to expire.
+	ChannelLeader = "hopper_leader"
+)
+
+// Listener receives notifications. One listener multiplexes every channel.
+type Listener interface {
+	// Listen subscribes to channels.
+	Listen(ctx context.Context, channels ...string) error
+	// Next blocks until a notification arrives or ctx is done.
+	Next(ctx context.Context) (Notification, error)
+	// Close releases the connection.
+	Close(ctx context.Context) error
+}
+
+// Notification is one message from a channel.
+type Notification struct {
+	Channel string
+	Payload string
 }
 
 // Executor runs queue operations, either against the pool or inside a
@@ -51,11 +82,13 @@ type Executor interface {
 	// JobInsertMany inserts jobs in one statement and returns one result per
 	// input, in input order. An input whose unique key matches a live job is
 	// not inserted; its result carries the existing job and Duplicate = true.
-	// Inputs are already deduplicated by unique key within the batch.
-	JobInsertMany(ctx context.Context, params []JobInsertParams) ([]JobInsertResult, error)
+	// With ConflictReplace, the existing job's args, metadata, priority,
+	// max attempts and schedule are replaced unless it is running. Inputs are
+	// already deduplicated by unique key within the batch.
+	JobInsertMany(ctx context.Context, params []JobInsertParams, opts JobInsertOpts) ([]JobInsertResult, error)
 	// JobInsertCopy bulk-loads jobs without conflict handling. Callers use it
 	// only for batches with no unique keys, and only if Capabilities().Copy.
-	JobInsertCopy(ctx context.Context, params []JobInsertParams) ([]JobInsertResult, error)
+	JobInsertCopy(ctx context.Context, params []JobInsertParams, opts JobInsertOpts) ([]JobInsertResult, error)
 	// JobClaim atomically moves up to Limit claimable jobs in a queue to
 	// running, owned by ClientID, and returns them in claim order.
 	JobClaim(ctx context.Context, params JobClaimParams) ([]*JobRow, error)
@@ -66,6 +99,10 @@ type Executor interface {
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
 	// JobGet returns a job by ID, live or from history.
 	JobGet(ctx context.Context, id JobID) (*JobRow, error)
+	// JobRescueCandidates returns running jobs whose owning client has no
+	// unexpired lease, plus, if StuckAfter is positive, running jobs claimed
+	// longer ago than that. The caller finalizes them.
+	JobRescueCandidates(ctx context.Context, params JobRescueParams) ([]*JobRow, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
 	ClientRegister(ctx context.Context, params ClientRegisterParams) (int64, error)
@@ -74,6 +111,27 @@ type Executor interface {
 	ClientRenew(ctx context.Context, params ClientRenewParams) (bool, error)
 	// ClientDelete removes a client's lease row.
 	ClientDelete(ctx context.Context, clientID int64) error
+	// ClientPruneExpired removes lease rows that have expired and returns
+	// how many.
+	ClientPruneExpired(ctx context.Context) (int64, error)
+
+	// Notify sends a notification per payload on a channel, delivered to
+	// listeners when the surrounding transaction commits. Engines without
+	// notifications return nil.
+	Notify(ctx context.Context, channel string, payloads []string) error
+
+	// LeaderAttempt takes or renews the leader lease for a client. It
+	// returns true if the client is the leader afterwards.
+	LeaderAttempt(ctx context.Context, params LeaderParams) (bool, error)
+	// LeaderResign gives up leadership if the client holds it, and signals
+	// other clients to elect a replacement.
+	LeaderResign(ctx context.Context, clientID int64) error
+
+	// HistoryMaintain enforces retention on finalized jobs and prepares
+	// storage for the near future, in whatever way suits the engine (dropping
+	// time partitions on Postgres). It is idempotent and may run on two
+	// leaders at once.
+	HistoryMaintain(ctx context.Context, params HistoryMaintainParams) (HistoryMaintainResult, error)
 }
 
 // Migrator applies schema migrations. Migrations are held by the
@@ -182,6 +240,27 @@ type JobInsertParams struct {
 	UniqueKey string
 }
 
+// ConflictAction says what to do when a unique key matches a live job.
+type ConflictAction int
+
+// Conflict actions.
+const (
+	// ConflictSkip keeps the existing job and reports it as a duplicate.
+	ConflictSkip ConflictAction = iota
+	// ConflictReplace updates the existing job's args, metadata, priority,
+	// max attempts and schedule, unless it is running. It is still reported
+	// as a duplicate.
+	ConflictReplace
+)
+
+// JobInsertOpts applies to a whole insert batch.
+type JobInsertOpts struct {
+	// Notify wakes workers on the inserted queues once the insert commits.
+	Notify bool
+	// OnConflict applies to inputs with a unique key.
+	OnConflict ConflictAction
+}
+
 // JobInsertResult is the outcome of inserting one job.
 type JobInsertResult struct {
 	Job *JobRow
@@ -225,6 +304,37 @@ type JobFinalize struct {
 	// Archive controls whether a terminal job is written to history. Cancelled
 	// and discarded jobs are always archived; completed jobs may skip it.
 	Archive bool
+}
+
+// JobRescueParams selects jobs to rescue.
+type JobRescueParams struct {
+	// StuckAfter, if positive, also selects running jobs claimed longer ago
+	// than this, whatever the state of their client's lease.
+	StuckAfter time.Duration
+	Limit      int
+}
+
+// LeaderParams describes a leadership attempt.
+type LeaderParams struct {
+	ClientID int64
+	TTL      time.Duration
+}
+
+// HistoryMaintainParams sets retention per outcome.
+type HistoryMaintainParams struct {
+	// CompletedRetention is how long completed jobs are kept.
+	CompletedRetention time.Duration
+	// FailedRetention is how long cancelled and discarded jobs are kept.
+	FailedRetention time.Duration
+}
+
+// HistoryMaintainResult reports what maintenance did.
+type HistoryMaintainResult struct {
+	// Created and Dropped name storage units (partitions on Postgres).
+	Created []string
+	Dropped []string
+	// Pruned counts rows deleted individually, outside partition drops.
+	Pruned int64
 }
 
 // ClientRegisterParams describes a client process taking out a lease.

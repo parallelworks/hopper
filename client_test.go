@@ -28,6 +28,11 @@ var fastTuning = hopper.Tuning{
 	FinalizeBatch:    500,
 	StopGrace:        500 * time.Millisecond,
 	CopyThreshold:    256,
+	NotifyInterval:   5 * time.Millisecond,
+	LeaderTTL:        2 * time.Second,
+	LeaderInterval:   200 * time.Millisecond,
+	Maintenance:      time.Minute,
+	RescueBatch:      1000,
 }
 
 func testLogger() *slog.Logger {
@@ -425,8 +430,12 @@ func TestRetryUntilDiscarded(t *testing.T) {
 			t.Errorf("error %d = %+v", i, e)
 		}
 	}
-	if job.FinalizedAt.IsZero() || h.count("SELECT count(*) FROM hopper_job_history_failed") != 1 {
-		t.Error("discarded job not in the failed history partition")
+	if job.FinalizedAt.IsZero() {
+		t.Error("discarded job has no finalized_at")
+	}
+	if n := h.count("SELECT count(*) FROM hopper_job_history_failed"); n != 1 {
+		t.Errorf("failed history rows = %d, want 1 (default partition has %d, whole history has %d)", n,
+			h.count("SELECT count(*) FROM hopper_job_history_failed_default"), h.count("SELECT count(*) FROM hopper_job_history"))
 	}
 }
 

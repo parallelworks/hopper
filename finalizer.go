@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -24,6 +25,9 @@ type finalizer struct {
 
 	in   chan pending
 	done chan struct{} // closed when run returns
+	// crashed makes run exit without its final flush, to simulate a crash
+	// in tests.
+	crashed atomic.Bool
 }
 
 type pending struct {
@@ -76,6 +80,9 @@ func (f *finalizer) run(ctx context.Context) {
 			f.flush(ctx, batch)
 			batch, timer = nil, nil
 		case <-ctx.Done():
+			if f.crashed.Load() {
+				return
+			}
 			// Drain what job goroutines have already submitted, then write
 			// it with one attempt per batch.
 			for {

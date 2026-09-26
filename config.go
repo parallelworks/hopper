@@ -41,6 +41,18 @@ type Config struct {
 	// Hostname identifies this process in the clients table. Defaults to
 	// os.Hostname().
 	Hostname string
+	// CompletedRetention is how long completed jobs stay in history.
+	// Defaults to 24 hours; negative keeps them forever. Retention is
+	// enforced by the leader, so the leader's setting applies cluster-wide.
+	CompletedRetention time.Duration
+	// FailedRetention is how long cancelled and discarded jobs stay in
+	// history, which is the dead-letter queue. Defaults to 7 days; negative
+	// keeps them forever.
+	FailedRetention time.Duration
+	// RescueStuckAfter, if set, rescues jobs that have been running longer
+	// than this even though their client's lease is live, for workers that
+	// ignore their context. Off by default; timeouts cover most cases.
+	RescueStuckAfter time.Duration
 }
 
 // QueueConfig configures one queue on a client.
@@ -56,10 +68,12 @@ type QueueConfig struct {
 
 // Defaults for Config fields.
 const (
-	DefaultJobTimeout   = time.Minute
-	DefaultMaxAttempts  = 25
-	DefaultStopTimeout  = 30 * time.Second
-	DefaultPollInterval = time.Second
+	DefaultJobTimeout         = time.Minute
+	DefaultMaxAttempts        = 25
+	DefaultStopTimeout        = 30 * time.Second
+	DefaultPollInterval       = time.Second
+	DefaultCompletedRetention = 24 * time.Hour
+	DefaultFailedRetention    = 7 * 24 * time.Hour
 )
 
 // withDefaults validates cfg and fills in defaults. It does not modify cfg.
@@ -86,6 +100,12 @@ func (cfg *Config) withDefaults() (Config, error) {
 	if out.PollInterval == 0 {
 		out.PollInterval = DefaultPollInterval
 	}
+	if out.CompletedRetention == 0 {
+		out.CompletedRetention = DefaultCompletedRetention
+	}
+	if out.FailedRetention == 0 {
+		out.FailedRetention = DefaultFailedRetention
+	}
 	if out.Hostname == "" {
 		host, err := os.Hostname()
 		if err != nil || host == "" {
@@ -97,7 +117,7 @@ func (cfg *Config) withDefaults() (Config, error) {
 	if out.MaxAttempts < 0 {
 		return out, errors.New("hopper: Config.MaxAttempts must be positive")
 	}
-	if out.JobTimeout < 0 || out.StopTimeout < 0 || out.PollInterval < 0 {
+	if out.JobTimeout < 0 || out.StopTimeout < 0 || out.PollInterval < 0 || out.RescueStuckAfter < 0 {
 		return out, errors.New("hopper: Config durations must be positive")
 	}
 	if len(out.Queues) > 0 && out.Workers == nil {
@@ -131,14 +151,29 @@ type tuning struct {
 	// copyThreshold is the InsertMany batch size from which the COPY path
 	// is used for batches without unique keys.
 	copyThreshold int
+	// notifyInterval coalesces insert notifications from this process.
+	notifyInterval time.Duration
+	leaderTTL      time.Duration
+	// leaderInterval is how often the leader renews and runs its duties,
+	// and how often other clients try for the lease.
+	leaderInterval time.Duration
+	// maintenanceInterval is how often the leader maintains history
+	// partitions and retention.
+	maintenanceInterval time.Duration
+	rescueBatch         int
 }
 
 var defaultTuning = tuning{
-	leaseTTL:         15 * time.Second,
-	leaseRenew:       5 * time.Second,
-	claimCooldown:    20 * time.Millisecond,
-	finalizeInterval: 25 * time.Millisecond,
-	finalizeBatch:    500,
-	stopGrace:        2 * time.Second,
-	copyThreshold:    256,
+	leaseTTL:            15 * time.Second,
+	leaseRenew:          5 * time.Second,
+	claimCooldown:       20 * time.Millisecond,
+	finalizeInterval:    25 * time.Millisecond,
+	finalizeBatch:       500,
+	stopGrace:           2 * time.Second,
+	copyThreshold:       256,
+	notifyInterval:      10 * time.Millisecond,
+	leaderTTL:           15 * time.Second,
+	leaderInterval:      5 * time.Second,
+	maintenanceInterval: 5 * time.Minute,
+	rescueBatch:         1000,
 }

@@ -49,7 +49,7 @@ func TestJobInsertManyReturnsInputOrder(t *testing.T) {
 	for i := range params {
 		params[i].Queue = fmt.Sprintf("q%d", i%3)
 	}
-	results, err := exec.JobInsertMany(ctx, params)
+	results, err := exec.JobInsertMany(ctx, params, driver.JobInsertOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestJobInsertManySchedulesFutureJobs(t *testing.T) {
 	future := time.Now().Add(time.Hour)
 	params := insertParams("sched", 2)
 	params[1].ScheduledAt = future
-	results, err := exec.JobInsertMany(ctx, params)
+	results, err := exec.JobInsertMany(ctx, params, driver.JobInsertOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestJobInsertManyUniqueKey(t *testing.T) {
 
 	first, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{
 		{Kind: "u", Queue: "default", Priority: 2, MaxAttempts: 1, UniqueKey: "k1", Args: json.RawMessage(`{"v":1}`)},
-	})
+	}, driver.JobInsertOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestJobInsertManyUniqueKey(t *testing.T) {
 		{Kind: "u", Queue: "default", Priority: 2, MaxAttempts: 1, UniqueKey: "k1", Args: json.RawMessage(`{"v":2}`)},
 		{Kind: "u", Queue: "default", Priority: 2, MaxAttempts: 1, UniqueKey: "k2", Args: json.RawMessage(`{"v":3}`)},
 		{Kind: "other", Queue: "default", Priority: 2, MaxAttempts: 1, UniqueKey: "k1", Args: json.RawMessage(`{"v":4}`)},
-	})
+	}, driver.JobInsertOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestJobInsertManyUniqueKey(t *testing.T) {
 	}
 	third, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{
 		{Kind: "u", Queue: "default", Priority: 2, MaxAttempts: 1, UniqueKey: "k1"},
-	})
+	}, driver.JobInsertOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestJobInsertCopy(t *testing.T) {
 
 	params := insertParams("copy", 1000)
 	params[5].ScheduledAt = time.Now().Add(time.Hour)
-	results, err := exec.JobInsertCopy(ctx, params)
+	results, err := exec.JobInsertCopy(ctx, params, driver.JobInsertOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestJobInsertCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.UnwrapTx(tx).JobInsertCopy(ctx, insertParams("copytx", 300)); err != nil {
+	if _, err := d.UnwrapTx(tx).JobInsertCopy(ctx, insertParams("copytx", 300), driver.JobInsertOpts{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
@@ -222,7 +222,7 @@ func TestJobClaimOrderAndOwnership(t *testing.T) {
 		{Kind: "k", Queue: "default", Priority: 1, MaxAttempts: 1, Args: json.RawMessage(`"high-2"`)},
 		{Kind: "k", Queue: "other", Priority: 1, MaxAttempts: 1, Args: json.RawMessage(`"other queue"`)},
 	}
-	if _, err := exec.JobInsertMany(ctx, params); err != nil {
+	if _, err := exec.JobInsertMany(ctx, params, driver.JobInsertOpts{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -264,7 +264,7 @@ func TestJobClaimOrderAndOwnership(t *testing.T) {
 func TestJobClaimSkipsLockedRows(t *testing.T) {
 	t.Parallel()
 	ctx, d, exec := setup(t)
-	if _, err := exec.JobInsertMany(ctx, insertParams("k", 4)); err != nil {
+	if _, err := exec.JobInsertMany(ctx, insertParams("k", 4), driver.JobInsertOpts{}); err != nil {
 		t.Fatal(err)
 	}
 	a := register(t, ctx, exec)
@@ -314,7 +314,7 @@ func TestJobFinalizeManyTransitions(t *testing.T) {
 	t.Parallel()
 	ctx, d, exec := setup(t)
 	params := insertParams("k", 6)
-	inserted, err := exec.JobInsertMany(ctx, params)
+	inserted, err := exec.JobInsertMany(ctx, params, driver.JobInsertOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +436,7 @@ func TestJobFinalizeManyTransitions(t *testing.T) {
 func TestJobFinalizeManyFencesStaleOwner(t *testing.T) {
 	t.Parallel()
 	ctx, _, exec := setup(t)
-	if _, err := exec.JobInsertMany(ctx, insertParams("k", 1)); err != nil {
+	if _, err := exec.JobInsertMany(ctx, insertParams("k", 1), driver.JobInsertOpts{}); err != nil {
 		t.Fatal(err)
 	}
 	a := register(t, ctx, exec)
@@ -552,7 +552,7 @@ func TestInsertInTransactionRollsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := d.UnwrapTx(tx).JobInsertMany(ctx, insertParams("tx", 1))
+	res, err := d.UnwrapTx(tx).JobInsertMany(ctx, insertParams("tx", 1), driver.JobInsertOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
