@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M4 and M6 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4, M6 and M7 (except the `hoppersql` driver) are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -432,8 +432,9 @@ CREATE TABLE hopper_schema (version int PRIMARY KEY, applied_at timestamptz NOT 
 ```
 
 Schema v2 (M6) adds `max_attempts` and `metadata` to `hopper_subscriptions`, the
-ordering-key indexes (§10) and the SQL contract functions. M7 adds `hopper_batches`,
-and M8 adds `hopper_job_deps`. These are sketched in §10 and §11.
+ordering-key indexes (§10) and the SQL contract functions. Schema v3 (M7) adds
+`partition_limit` and `aging_seconds` to `hopper_queues`, the partition-key running
+index, `hopper_batches` and the batch index. M8 adds `hopper_job_deps` (§11).
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -803,9 +804,10 @@ the hardware details and the benchmark harness are published with each release.
   election creates history partitions, which briefly blocks finalizes. Fan-out arrives
   with messaging (M6).
 - CI runs a reduced benchmark on every PR that touches the insert, claim or finalize
-  paths, on the PR and on its base alternately on the same runner, several rounds each,
-  comparing the median run. `hopperbench -compare` fails the check on a regression of
-  more than 10%.
+  paths, on the PR and on its base alternately on the same runner, scenario by scenario
+  for several rounds, comparing the average of the faster half of each side's runs (noise
+  on a shared runner only slows runs down). `hopperbench -compare` fails the check on a
+  regression of more than 10%.
 - A nightly soak runs the full scenario set at volume with five million history rows
   and keeps the results as an artifact. The 24h soak at 70% of peak, tracking table and
   index size, autovacuum activity and latency drift, runs on the release hardware.
@@ -823,14 +825,18 @@ the hardware details and the benchmark harness are published with each release.
 | Feature | Scope | Mechanism |
 | --- | --- | --- |
 | `MaxWorkers` | per client, per queue | Size of the goroutine pool. |
-| `GlobalLimit` | cluster, per queue | The claim locks the queue row, counts the running jobs through the running index, and claims `min(free, limit − running)`. |
-| `RateLimit` | cluster, per queue | Token bucket on the queue row, refilled from `now()` inside the claim transaction. |
-| Partitioned limits (M7) | cluster, per `partition_key` | For example, "at most 5 concurrent and 10/s per customer". The claim ranks candidates with `row_number() OVER (PARTITION BY partition_key)` against per-key running counts. |
-| Priorities | per job | Four levels in the claim order, plus optional aging so low priorities cannot starve. |
+| `GlobalLimit` | cluster, per queue | The claim locks the queue row, then counts the running jobs through the running index in a second statement (a statement that waited for the lock keeps the snapshot it started with, so the count must come after), and claims `min(free, limit − running)`. |
+| `RateLimit` | cluster, per queue | Token bucket on the queue row (`tokens`, `refilled_at`), refilled from `now()` inside the claim transaction. When the bucket is empty the claim returns how long until the next token, and the producer sleeps that long instead of polling. `RateBurst` is the bucket size, one second's worth by default. |
+| `PartitionLimit` | cluster, per `partition_key` | For example, "at most 5 concurrent per customer". The claim ranks candidates with `row_number() OVER (PARTITION BY partition_key)` plus the key's running count, and admits those that fit. The ranking scans the queue's waiting jobs, so only partition-limited queues pay for it. A per-key rate is not implemented. |
+| Priorities | per job | Four levels in the claim order. `PriorityAging` makes the leader promote a waiting job one level each time it has waited that long (`JobAge`), so low priorities cannot starve; the claim order itself stays index-only. |
 | Pause / resume | cluster, per queue | Row flag with a control notification. |
 
 Limit state lives in the database, so limits hold across any number of replicas and
-survive restarts.
+survive restarts. Limits declared in `QueueConfig` are recorded on the queue row when the
+client starts; `Queues().SetLimits` (and `hopper queues limit`) change them at runtime,
+announced on `hopper_control` and re-read on every lease renewal. Producers start with
+the recorded pause and limit state, so a paused or limited queue is never claimed freely
+in the window before the first renewal. Unlimited queues never touch the queue row.
 
 ## 10. Messaging
 
@@ -894,10 +900,15 @@ observability without new machinery.
 
 ## 11. Batches and workflows
 
-- **Batches (M7).** `hopper_batches (id, pending, failed, on_success, on_failure,
-  on_complete)`. Jobs carry `batch_id`. The finalizer decrements `pending` once per
-  batch per flush, not once per job, which bounds contention on the batch row. The call
-  that reaches zero inserts the callback job in the same statement.
+- **Batches (M7).** `hopper_batches (id, pending, failed, total, on_success, on_failure,
+  on_complete, metadata, completed_at)`. Jobs carry `batch_id`. Every statement that
+  finalizes jobs (the batched finalize, cancelling a waiting job, expiring) decrements
+  `pending` once per batch per statement, not once per job, which bounds contention on
+  the batch row, and counts cancelled and discarded jobs as failures. The statement that
+  reaches zero inserts the callbacks in the same statement: `on_success` when nothing
+  failed, `on_failure` otherwise, `on_complete` either way, each with `batch_id` and
+  `batch_failed` in its metadata, and notifies their queues. `client.NewBatch(opts)`,
+  `Add`, `Insert`/`InsertTx` and `BatchGet` are the API.
 - **Workflows (M8).** Jobs with dependencies are inserted as `pending`, with edges in
   `hopper_job_deps`. When a job completes, the same finalize statement promotes
   dependents whose dependencies are all complete to `available`. Failure policies are
@@ -984,7 +995,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M4 | Performance and release | `hopperbench` scenarios and `-compare`, CI perf gate and nightly soak, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, CHANGELOG. **Done**, except the §8.2 run on the reference hardware that gates the **v0.1.0** tag. The upgrade suite starts with the first schema change (there is one schema version so far). | 5d |
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done**; **v0.2.0** follows v0.1.0. | 5d |
-| M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0** | 5d |
+| M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0**. **Done** except `hoppersql`, which lands in its own PR. | 5d |
 | M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumer groups, `hopperui` | 2–3w |
 | M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |
 

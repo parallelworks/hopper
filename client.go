@@ -133,12 +133,14 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		return err
 	}
 	c.clientID.Store(id)
-	if err := c.exec.QueueEnsure(ctx, slices.Sorted(maps.Keys(c.cfg.Queues))); err != nil {
-		c.logger.WarnContext(ctx, "hopper: record queues", "error", err)
-	}
-	// Subscriptions are declared in code and take effect cluster-wide once
-	// recorded, so a failure here is a startup error, not a warning.
-	if err := c.exec.SubscriptionUpsert(ctx, c.workers.subscriptionRows()); err != nil {
+	if err := c.declare(ctx); err != nil {
+		// Leave nothing behind: the lease row would otherwise wait for the
+		// leader to prune it.
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if derr := c.exec.ClientDelete(releaseCtx, id); derr != nil {
+			c.logger.WarnContext(ctx, "hopper: release client lease after failed start", "error", derr)
+		}
 		return err
 	}
 
@@ -153,9 +155,19 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.wakeQueue, c.finalized)
 	go c.finalizer.run(c.finCtx)
 
+	// Producers start with the cluster's current pause and limit state, so
+	// a paused or limited queue is never claimed freely in the window
+	// before the first renewal.
+	state, err := c.exec.QueueList(ctx)
+	if err != nil {
+		// Older schemas have no limit columns; the renewal path applies
+		// the state once the schema is upgraded.
+		c.logger.WarnContext(ctx, "hopper: read queue state", "error", err)
+	}
 	c.producers = make(map[string]*producer, len(c.cfg.Queues))
 	for name, qcfg := range c.cfg.Queues {
-		c.startProducer(name, qcfg)
+		paused, limited := queueState(state, name)
+		c.startProducer(name, qcfg, paused, limited)
 	}
 	if c.caps.Listen {
 		c.listenWG.Go(func() { c.listenLoop(c.bgCtx) })
@@ -168,9 +180,19 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	return nil
 }
 
-// startProducer creates and starts the producer for a queue. The caller
-// holds c.mu.
-func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig) {
+// queueState returns a queue's pause and limit flags from a listing.
+func queueState(queues []*driver.QueueRow, name string) (paused, limited bool) {
+	for _, q := range queues {
+		if q.Name == name {
+			return !q.PausedAt.IsZero(), q.Limits.Limited()
+		}
+	}
+	return false, false
+}
+
+// startProducer creates and starts the producer for a queue with its
+// initial pause and limit state. The caller holds c.mu.
+func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig, paused, limited bool) {
 	ctx, cancel := context.WithCancel(c.claimCtx)
 	p := &producer{
 		queue:        name,
@@ -178,8 +200,8 @@ func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig) {
 		logger:       c.logger.With("queue", name),
 		pollInterval: c.cfg.PollInterval,
 		cooldown:     c.tuning.claimCooldown,
-		claim: func(ctx context.Context, limit int) ([]*driver.JobRow, error) {
-			return c.exec.JobClaim(ctx, driver.JobClaimParams{Queue: name, ClientID: c.clientID.Load(), Limit: limit})
+		claim: func(ctx context.Context, limit int, limited bool) (driver.JobClaimResult, error) {
+			return c.exec.JobClaim(ctx, driver.JobClaimParams{Queue: name, ClientID: c.clientID.Load(), Limit: limit, Limited: limited})
 		},
 		work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.generation(), row, qcfg) },
 		submit: c.finalizer.submit,
@@ -188,6 +210,8 @@ func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig) {
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
+	p.paused.Store(paused)
+	p.limited.Store(limited)
 	c.producers[name] = p
 	c.producerWG.Go(func() { p.run(ctx) })
 }
@@ -220,6 +244,27 @@ func (c *Client[TTx]) finalized(job *driver.JobRow, result driver.JobFinalize) {
 	if result.State.Terminal() {
 		c.signalDone(job.ID)
 	}
+}
+
+// declare records what this client works: its queues, subscriptions and
+// declared limits, which take effect cluster-wide.
+func (c *Client[TTx]) declare(ctx context.Context) error {
+	if err := c.exec.QueueEnsure(ctx, slices.Sorted(maps.Keys(c.cfg.Queues))); err != nil {
+		c.logger.WarnContext(ctx, "hopper: record queues", "error", err)
+	}
+	// Subscriptions and limits are declared in code and take effect
+	// cluster-wide once recorded, so a failure here is a startup error.
+	if err := c.exec.SubscriptionUpsert(ctx, c.workers.subscriptionRows()); err != nil {
+		return err
+	}
+	for name, q := range c.cfg.Queues {
+		if l := q.limits(name); l.Limited() || l.Aging > 0 {
+			if err := c.exec.QueueSetLimits(ctx, l); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Client[TTx]) register(ctx context.Context) (int64, error) {
@@ -346,6 +391,10 @@ func (c *Client[TTx]) waitForJobs(ctx context.Context) bool {
 // clean drain, so it fits errgroup.
 func (c *Client[TTx]) Run(ctx context.Context) error {
 	if err := c.Start(ctx); err != nil {
+		if ctx.Err() != nil {
+			// Cancelled during startup: a clean stop, nothing to drain.
+			return nil
+		}
 		return err
 	}
 	<-ctx.Done()
@@ -398,6 +447,42 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 			c.cancelLocal(jobID)
 		}
 		c.applyPaused(res.PausedQueues)
+		c.applyLimited(res.LimitedQueues)
+	}
+}
+
+// limitedQueues reads which queues have limits.
+func (c *Client[TTx]) limitedQueues(ctx context.Context) ([]string, error) {
+	queues, err := c.exec.QueueList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var limited []string
+	for _, q := range queues {
+		if q.Limits.Limited() {
+			limited = append(limited, q.Name)
+		}
+	}
+	return limited, nil
+}
+
+// applyLimited sets every local producer's claim path from the list of
+// limited queues.
+func (c *Client[TTx]) applyLimited(limited []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.setLimited(limited)
+}
+
+// setLimited is applyLimited for a caller holding c.mu.
+func (c *Client[TTx]) setLimited(limited []string) {
+	set := make(map[string]struct{}, len(limited))
+	for _, q := range limited {
+		set[q] = struct{}{}
+	}
+	for name, p := range c.producers {
+		_, isLimited := set[name]
+		p.limited.Store(isLimited)
 	}
 }
 

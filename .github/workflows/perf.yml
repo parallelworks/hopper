@@ -3,10 +3,10 @@ name: Performance gate
 # Runs a reduced benchmark on the PR and on its base, on the same runner,
 # and fails if the PR is more than 10% slower on any scenario. Hosted
 # runners are noisy and drift over a job, so both benchmark binaries are
-# built first and then run alternately, several rounds each, with enough
-# jobs per run to last a few seconds; the median run of each side counts.
-# The reference numbers in docs/PLAN.md §8.2 come from the release hardware,
-# not from here.
+# built first and then run alternately, scenario by scenario, for several
+# rounds; noise only ever slows a run down, so the faster half of each
+# side's runs, averaged, is what is compared. The reference numbers in
+# docs/PLAN.md §8.2 come from the release hardware, not from here.
 on:
   pull_request:
     paths:
@@ -41,7 +41,7 @@ jobs:
     env:
       DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_bench?sslmode=disable
       SCENARIOS: throughput,insert,copy
-      ROUNDS: "7"
+      ROUNDS: "10"
       JOBS: "60000"
     steps:
       - uses: actions/checkout@v7
@@ -58,8 +58,10 @@ jobs:
       - name: Benchmark base and PR alternately
         run: |
           for i in $(seq "$ROUNDS"); do
-            "$RUNNER_TEMP/bench-base" -database-url "$DATABASE_URL" -scenarios "$SCENARIOS" -jobs "$JOBS" -schema "base_$i" >> base.jsonl
-            "$RUNNER_TEMP/bench-head" -database-url "$DATABASE_URL" -scenarios "$SCENARIOS" -jobs "$JOBS" -schema "head_$i" >> head.jsonl
+            for s in ${SCENARIOS//,/ }; do
+              "$RUNNER_TEMP/bench-base" -database-url "$DATABASE_URL" -scenarios "$s" -jobs "$JOBS" -schema "base_$i" >> base.jsonl
+              "$RUNNER_TEMP/bench-head" -database-url "$DATABASE_URL" -scenarios "$s" -jobs "$JOBS" -schema "head_$i" >> head.jsonl
+            done
           done
           echo "== base"; cat base.jsonl
           echo "== head"; cat head.jsonl

@@ -25,7 +25,7 @@ type producer struct {
 	pollInterval time.Duration
 	cooldown     time.Duration
 
-	claim  func(ctx context.Context, limit int) ([]*driver.JobRow, error)
+	claim  func(ctx context.Context, limit int, limited bool) (driver.JobClaimResult, error)
 	work   func(row *driver.JobRow) driver.JobFinalize
 	submit func(job *driver.JobRow, result driver.JobFinalize)
 
@@ -36,6 +36,8 @@ type producer struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 	paused atomic.Bool
+	// limited selects the claim path that applies the queue's limits.
+	limited atomic.Bool
 
 	mu      sync.Mutex
 	running int
@@ -81,7 +83,7 @@ func (p *producer) run(ctx context.Context) {
 		if free > 0 {
 			since := time.Since(lastClaim)
 			if free >= threshold || since >= p.cooldown {
-				n, err := p.claimAndStart(ctx, free)
+				n, wait, err := p.claimAndStart(ctx, free)
 				lastClaim = time.Now()
 				if ctx.Err() != nil {
 					return
@@ -92,6 +94,16 @@ func (p *producer) run(ctx context.Context) {
 					case <-ctx.Done():
 						return
 					case <-time.After(errBackoff):
+					}
+					continue
+				}
+				if wait > 0 {
+					// The rate limit allowed nothing yet; there is no point
+					// in asking again before a token is due.
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(min(wait, p.pollInterval)):
 					}
 					continue
 				}
@@ -124,14 +136,14 @@ const claimTimeout = 30 * time.Second
 // client never sees, which then wait for rescue, and cancelling a query
 // also costs the pool a connection. Stopping waits for the claim instead,
 // which takes milliseconds, and every claimed job is started.
-func (p *producer) claimAndStart(ctx context.Context, limit int) (int, error) {
+func (p *producer) claimAndStart(ctx context.Context, limit int) (int, time.Duration, error) {
 	claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
 	defer cancel()
-	jobs, err := p.claim(claimCtx, limit)
-	for _, job := range jobs {
+	res, err := p.claim(claimCtx, limit, p.limited.Load())
+	for _, job := range res.Jobs {
 		p.start(job)
 	}
-	return len(jobs), err
+	return len(res.Jobs), res.Wait, err
 }
 
 func (p *producer) start(job *driver.JobRow) {

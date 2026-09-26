@@ -68,6 +68,9 @@ type InsertOpts struct {
 	// queue: at most one runs at a time, oldest first, and a failing job
 	// blocks its key while it retries. See PublishOpts.OrderingKey.
 	OrderingKey string
+	// PartitionKey groups the job for the queue's PartitionLimit, for
+	// example a customer ID.
+	PartitionKey string
 }
 
 // merge returns opts with the non-zero fields of over applied on top.
@@ -99,6 +102,9 @@ func (opts InsertOpts) merge(over InsertOpts) InsertOpts {
 	if over.OrderingKey != "" {
 		opts.OrderingKey = over.OrderingKey
 	}
+	if over.PartitionKey != "" {
+		opts.PartitionKey = over.PartitionKey
+	}
 	return opts
 }
 
@@ -106,6 +112,8 @@ func (opts InsertOpts) merge(over InsertOpts) InsertOpts {
 type InsertParams struct {
 	Args JobArgs
 	Opts *InsertOpts
+
+	batchID JobID
 }
 
 // InsertResult is the outcome of inserting one job.

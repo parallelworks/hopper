@@ -54,7 +54,8 @@ func TestHistoryMaintain(t *testing.T) {
 		t.Fatal(err)
 	}
 	clientID := register(t, ctx, exec)
-	jobs, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 2})
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 2})
+	jobs := claimed.Jobs
 	if err != nil || len(jobs) != 2 {
 		t.Fatalf("claim: %v, %d", err, len(jobs))
 	}

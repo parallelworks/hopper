@@ -698,7 +698,7 @@ func TestRunStopsOnContextCancel(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
 
-	waitFor(t, func() bool { return h.count("SELECT count(*) FROM hopper_clients") == 1 })
+	waitFor(t, c.IsLeader)
 	cancel()
 	select {
 	case err := <-done:

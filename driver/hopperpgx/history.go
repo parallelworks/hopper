@@ -25,8 +25,9 @@ type historyGroup struct {
 }
 
 // historyLockKey is the pg_advisory_xact_lock key that serializes partition
-// creation between overlapping leaders.
-const historyLockKey int64 = 0x686f707065725f68 // "hopper_h"
+// creation between overlapping leaders. It is combined with the schema, so
+// installations sharing a database do not queue behind each other.
+const historyLockKey int32 = 0x686f7068 // "hoph"
 
 var historyGroups = []historyGroup{
 	{parent: "hopper_job_history_completed", period: time.Hour, ahead: 3, format: "2006010215"},
@@ -160,7 +161,7 @@ func createPartition(ctx context.Context, pool *pgxpool.Pool, g historyGroup, na
 	// Two leaders can overlap briefly; serialize them on an advisory lock
 	// held for this transaction, then check whether the other one has
 	// already created the partition.
-	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", historyLockKey); err != nil {
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)", historyLockKey); err != nil {
 		return false, fmt.Errorf("hopperpgx: lock history maintenance: %w", err)
 	}
 	var exists bool
