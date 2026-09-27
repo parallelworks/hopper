@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M4, M6 and M7 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4 and M6 through M8 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -221,6 +221,12 @@ res, err := client.PublishTx(ctx, tx, AllocationCreated{ID: 42}, &hopper.Publish
     TTL:         10 * time.Minute,  // expire undelivered
 })
 res.MessageID; res.Deliveries      // one delivery per matching subscription
+
+// Streams: the retained log. A consumer reads from a position of its own.
+hopper.Consume(workers, hopper.Consumer{Name: "audit", Pattern: "#", Start: hopper.StreamStartEarliest},
+    func(ctx context.Context, msg *hopper.Message[hopper.Raw]) error { return audit(ctx, msg) })
+ev, err := client.Streams().AppendTx(ctx, tx, AllocationCreated{ID: 42}, &hopper.AppendOpts{Key: "allocation:42"})
+err = client.Streams().Seek(ctx, "audit", hopper.SeekOpts{Time: yesterday})   // replay
 ```
 
 ### 4.6 Batches and workflows
@@ -446,7 +452,9 @@ Schema v2 (M6) adds `max_attempts` and `metadata` to `hopper_subscriptions`, the
 ordering-key indexes (§10) and the SQL contract functions. Schema v3 (M7) adds
 `partition_limit` and `aging_seconds` to `hopper_queues`, the partition-key running
 index, `hopper_batches` and the batch index. Schema v4 (M8) adds `hopper_job_deps`, the
-name and edges of a batch, and a `batch_id` index on history (§11).
+name and edges of a batch, and a `batch_id` index on history (§11). Schema v5 (M8) adds
+the stream log `hopper_stream_events` (partitioned by day) and `hopper_stream_consumers`
+(§10).
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -735,9 +743,9 @@ acknowledged.
 | `completed` | archived for 24h | deleted on ack (`DeleteCompleted: true`) |
 | `cancelled`, `discarded` | archived for 7d (the dead-letter queue) | archived for 7d (the dead-letter queue) |
 
-`DeleteCompleted` is configurable per queue; the two retention periods
-(`CompletedRetention`, `FailedRetention`) are per cluster, because partitions are cut
-by time, not by queue. Setting `DeleteCompleted: true` on a job queue gives maximum
+`DeleteCompleted` is configurable per queue; the retention periods
+(`CompletedRetention`, `FailedRetention`, and `StreamRetention` for the stream log,
+7 days by default) are per cluster, because partitions are cut by time, not by queue. Setting `DeleteCompleted: true` on a job queue gives maximum
 throughput by skipping the history insert.
 
 ### 7.11 Notifications
@@ -905,10 +913,32 @@ observability without new machinery.
   and `hopper_publish(topic, payload, opts)` SQL functions ship with schema v2, so
   Python, shell or HPC batch scripts can enqueue work with plain SQL, inside their own
   transactions. This is the supported path for producers not written in Go (§2).
-- **Streams (M8).** An append-only, time-partitioned topic log with consumer groups
-  that track offsets, for replay and late subscribers. Readers only see events below
-  the current snapshot's `xmin` (`pg_snapshot_xmin(pg_current_snapshot())`), so
-  transactions that commit out of order can never make a reader skip an event.
+- **Streams (M8).** `hopper_stream_events` is an append-only, time-partitioned log:
+  `Streams().Append`/`AppendTx` write one event (topic, optional key, payload, headers,
+  message ID) and consumers read it. An event is identified by `(xid, seq)`, the
+  transaction that wrote it and the event within it. A **consumer** (`hopper.Consume`)
+  is a named position on the log plus a topic pattern; the leader turns the events
+  after its position into delivery jobs of kind `stream:<name>` (with the event's key
+  as ordering key), so a consumer inherits everything a subscription has: typed
+  handlers, retries, dead-lettering, competing workers. Unlike a subscription, which is
+  fanned out to at publish time, a consumer can start at the earliest retained event
+  (`StreamStartEarliest`) and be moved (`Seek` to a position, a time, the start or
+  now), so late subscribers and replays see past events.
+  - **Reads never skip a late commit.** A consumer's row records the `pg_snapshot` it
+    has read to. A pump takes a fresh snapshot and delivers the events of the
+    transactions visible in the new one but not in the old (`pg_visible_in_snapshot`),
+    in `(xid, seq)` order, then stores the new snapshot; a pump that stops part way
+    through keeps both snapshots and the last event delivered, and continues the same
+    delta next time. An event whose transaction commits late is delivered when it
+    commits, whatever its xid, and a long-running transaction holds nothing back. Events
+    of one transaction are delivered together; across transactions the order is commit
+    order per delta, which is the only order two overlapping transactions have.
+  - Pool appends notify `hopper_stream` through the coalescer and poke the local
+    leader; transactional ones notify from the transaction. The leader also pumps every
+    `PollInterval`, for clients without a listener. Two leaders pumping the same consumer
+    serialize on its row.
+  - `Streams().Read` pages the committed log by position, for browsing and the UI.
+  - Retention drops daily partitions after `StreamRetention` (§7.10).
 
 ## 11. Batches and workflows
 
@@ -974,12 +1004,19 @@ observability without new machinery.
   gauges for queue depth by state, the oldest claimable job's age and live clients from
   `Stats`. Prometheus users export through the OTel exporter.
 - **CLI (`cmd/hopper`, core module):** `migrate up|down|version`, `jobs list|get|retry|cancel`,
-  `queues list|pause|resume|limit`, `clients list`, `workflows get` and `stats`, all with
-  `-json`. `subscriptions list` arrives with M6. Benchmarks are the separate
+  `queues list|pause|resume|limit`, `clients list`, `workflows get`, `subscriptions list`,
+  `streams consumers|seek` and `stats`, all with `-json`. Benchmarks are the separate
   `hopperbench` command.
-- **Web UI (`hopperui` module):** an embeddable `http.Handler` for browsing queues,
-  jobs, history, subscriptions and workflows, with retry, cancel and pause actions
-  behind an application-supplied authorization hook.
+- **Web UI (`hopperui` module):** `hopperui.New(client, cfg)` is an embeddable
+  `http.Handler`, mounted under a prefix with `http.StripPrefix`, for browsing queues
+  (depths, limits, paused state), jobs and history (filtered by queue, state and kind,
+  paged by ID), a job's args, metadata, output and errors, workflows as a DAG (SVG, laid
+  out by dependency depth), subscriptions, stream consumers and clients. Retry, cancel,
+  pause, resume and seek are offered only when the application supplies
+  `Config.Authorize`, which is asked before every action; without it the UI is
+  read-only. It is server-rendered HTML with no scripts and no external assets, so it
+  works behind any proxy and needs no build step. The client it is given need not be
+  started.
 
 ## 14. Testing strategy
 
@@ -1020,7 +1057,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done**; **v0.2.0** follows v0.1.0. | 5d |
 | M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0**. **Done.** | 5d |
-| M8 | Workflows, streams, UI | Job dependencies and DAG workflows (**done**), streams with consumer groups, `hopperui`. Each lands in its own PR. | 2–3w |
+| M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumers, `hopperui`. **Done**, one PR each. | 2–3w |
 | M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |
 
 M0–M4 take roughly four weeks to a production-ready v0.1.0 that meets its performance

@@ -95,8 +95,9 @@ func TestHistoryMaintain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 3 hourly and 2 daily periods ahead of the current ones.
-	if len(res.Created) != 3+2 {
+	// 3 hourly and 2 daily periods ahead of the current ones, and 2 daily
+	// stream partitions.
+	if len(res.Created) != 3+2+2 {
 		t.Errorf("created = %v", res.Created)
 	}
 	next := "hopper_job_history_completed_" + time.Now().UTC().Add(time.Hour).Format("2006010215")

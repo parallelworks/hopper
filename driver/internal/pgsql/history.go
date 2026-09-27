@@ -10,11 +10,16 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
-// historyGroup describes one outcome partition of hopper_job_history and how
-// it is split by time.
+// historyGroup describes one time-partitioned table: an outcome partition
+// of hopper_job_history, or the stream log.
 type historyGroup struct {
-	parent string
-	period time.Duration
+	// root is the table whose shape new partitions copy; parent is the
+	// partitioned table they attach to (the same, except for history's
+	// outcome partitions).
+	root, parent string
+	// timeColumn is the range key.
+	timeColumn string
+	period     time.Duration
 	// ahead is how many future periods to keep ready, beyond the current one.
 	ahead int
 	// format names a partition by its period start (in UTC).
@@ -27,8 +32,9 @@ type historyGroup struct {
 const HistoryLockKey int32 = 0x686f7068 // "hoph"
 
 var historyGroups = []historyGroup{
-	{parent: "hopper_job_history_completed", period: time.Hour, ahead: 3, format: "2006010215"},
-	{parent: "hopper_job_history_failed", period: 24 * time.Hour, ahead: 2, format: "20060102"},
+	{root: "hopper_job_history", parent: "hopper_job_history_completed", timeColumn: "finalized_at", period: time.Hour, ahead: 3, format: "2006010215"},
+	{root: "hopper_job_history", parent: "hopper_job_history_failed", timeColumn: "finalized_at", period: 24 * time.Hour, ahead: 2, format: "20060102"},
+	{root: "hopper_stream_events", parent: "hopper_stream_events", timeColumn: "created_at", period: 24 * time.Hour, ahead: 2, format: "20060102"},
 }
 
 func (g historyGroup) name(start time.Time) string {
@@ -67,6 +73,7 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 	retention := map[string]time.Duration{
 		"hopper_job_history_completed": params.CompletedRetention,
 		"hopper_job_history_failed":    params.FailedRetention,
+		"hopper_stream_events":         params.StreamRetention,
 	}
 	for _, g := range historyGroups {
 		existing, err := e.partitionsOf(ctx, g.parent)
@@ -111,7 +118,7 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 			}
 			// Rows in the DEFAULT partition cannot be dropped by period.
 			n, err := e.Conn.Exec(ctx,
-				fmt.Sprintf("DELETE FROM %s_default WHERE finalized_at < now() - make_interval(secs => $1::float8)", g.parent),
+				fmt.Sprintf("DELETE FROM %s_default WHERE %s < now() - make_interval(secs => $1::float8)", g.parent, g.timeColumn),
 				keep.Seconds())
 			if err != nil {
 				return res, fmt.Errorf("hopper: prune %s_default: %w", g.parent, err)
@@ -172,7 +179,7 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// SHARE UPDATE EXCLUSIVE on it. ATTACH does scan the DEFAULT partition
 	// for rows belonging to the new period, under an exclusive lock on that
 	// small table alone; the period is in the future, so it finds none.
-	if _, err = tx.Exec(ctx, "CREATE TABLE "+ident+" (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"); err != nil {
+	if _, err = tx.Exec(ctx, "CREATE TABLE "+ident+" (LIKE "+quoteIdent(g.root)+" INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"); err != nil {
 		return false, fmt.Errorf("hopper: create partition %s: %w", name, err)
 	}
 	if _, err = tx.Exec(ctx, fmt.Sprintf("ALTER TABLE %s ATTACH PARTITION %s FOR VALUES FROM (%s) TO (%s)", parent, ident, fromLit, toLit)); err != nil {

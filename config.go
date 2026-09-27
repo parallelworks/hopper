@@ -56,6 +56,10 @@ type Config struct {
 	// history, which is the dead-letter queue. Defaults to 7 days; negative
 	// keeps them forever.
 	FailedRetention time.Duration
+	// StreamRetention is how long stream events stay in the log, for
+	// consumers that start from the earliest event or are moved back.
+	// Defaults to 7 days; negative keeps them forever.
+	StreamRetention time.Duration
 	// RescueStuckAfter, if set, rescues jobs that have been running longer
 	// than this even though their client's lease is live, for workers that
 	// ignore their context. Off by default; timeouts cover most cases.
@@ -109,6 +113,7 @@ const (
 	DefaultPollInterval       = time.Second
 	DefaultCompletedRetention = 24 * time.Hour
 	DefaultFailedRetention    = 7 * 24 * time.Hour
+	DefaultStreamRetention    = 7 * 24 * time.Hour
 )
 
 // withDefaults validates cfg and fills in defaults. It does not modify cfg.
@@ -140,6 +145,9 @@ func (cfg *Config) withDefaults() (Config, error) {
 	}
 	if out.FailedRetention == 0 {
 		out.FailedRetention = DefaultFailedRetention
+	}
+	if out.StreamRetention == 0 {
+		out.StreamRetention = DefaultStreamRetention
 	}
 	if out.Hostname == "" {
 		host, err := os.Hostname()
@@ -216,6 +224,8 @@ type tuning struct {
 	// partitions and retention.
 	maintenanceInterval time.Duration
 	rescueBatch         int
+	// streamBatch is how many events one pump delivers per consumer.
+	streamBatch int
 }
 
 var defaultTuning = tuning{
@@ -231,4 +241,5 @@ var defaultTuning = tuning{
 	leaderInterval:      5 * time.Second,
 	maintenanceInterval: 5 * time.Minute,
 	rescueBatch:         1000,
+	streamBatch:         500,
 }

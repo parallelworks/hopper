@@ -40,6 +40,7 @@ type Workers struct {
 	mu            sync.RWMutex
 	kinds         map[string]*workerInfo
 	subscriptions []Subscription
+	consumers     []Consumer
 }
 
 // NewWorkers returns an empty registry.

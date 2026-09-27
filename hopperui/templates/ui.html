@@ -1,0 +1,233 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · {{.Page}}</title>
+<link rel="stylesheet" href="{{.Prefix}}/static/style.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="{{.Prefix}}/">{{.Title}}</a>
+  <nav>
+    <a href="{{.Prefix}}/queues"{{if eq .Page "queues"}} class="on"{{end}}>queues</a>
+    <a href="{{.Prefix}}/jobs"{{if eq .Page "jobs"}} class="on"{{end}}>jobs</a>
+    <a href="{{.Prefix}}/subscriptions"{{if eq .Page "subscriptions"}} class="on"{{end}}>subscriptions</a>
+    <a href="{{.Prefix}}/consumers"{{if eq .Page "consumers"}} class="on"{{end}}>consumers</a>
+    <a href="{{.Prefix}}/clients"{{if eq .Page "clients"}} class="on"{{end}}>clients</a>
+  </nav>
+  {{if not .CanAct}}<span class="ro" title="No Authorize hook: actions are disabled">read-only</span>{{end}}
+</header>
+<main>
+{{if .Message}}<p class="msg">{{.Message}}</p>{{end}}
+{{if eq .Page "index"}}{{template "index" .}}
+{{else if eq .Page "queues"}}{{template "queues" .}}
+{{else if eq .Page "jobs"}}{{template "jobs" .}}
+{{else if eq .Page "job"}}{{template "job" .}}
+{{else if eq .Page "workflow"}}{{template "workflow" .}}
+{{else if eq .Page "subscriptions"}}{{template "subscriptions" .}}
+{{else if eq .Page "consumers"}}{{template "consumers" .}}
+{{else if eq .Page "clients"}}{{template "clients" .}}
+{{end}}
+</main>
+</body>
+</html>{{end}}
+
+{{define "queuetable"}}
+<table>
+<thead><tr><th>queue</th><th class="n">available</th><th class="n">scheduled</th><th class="n">retryable</th><th class="n">running</th><th>oldest waiting</th><th class="n">completed/min</th><th>limits</th><th>state</th>{{if $.CanAct}}<th></th>{{end}}</tr></thead>
+<tbody>
+{{range .Data.Queues}}
+<tr>
+  <td><a href="{{$.Prefix}}/jobs?queue={{.Name}}">{{.Name}}</a></td>
+  <td class="n">{{.Stats.Available}}</td><td class="n">{{.Stats.Scheduled}}</td><td class="n">{{.Stats.Retryable}}</td><td class="n">{{.Stats.Running}}</td>
+  <td>{{if .Stats.OldestAvailable}}{{dur .Stats.OldestAvailable}}{{else}}–{{end}}</td>
+  <td class="n">{{.Stats.CompletedLastMinute}}</td>
+  <td class="dim">{{with .Row}}{{if .Limits.GlobalLimit}}global {{.Limits.GlobalLimit}} {{end}}{{if .Limits.RatePerSec}}rate {{.Limits.RatePerSec}}/s {{end}}{{if .Limits.PartitionLimit}}partition {{.Limits.PartitionLimit}} {{end}}{{if .Limits.Aging}}aging {{dur .Limits.Aging}}{{end}}{{end}}</td>
+  <td>{{if .Paused}}<span class="state paused">paused</span>{{else}}<span class="state ok">active</span>{{end}}</td>
+  {{if $.CanAct}}<td>
+    {{if .Paused}}<form method="post" action="{{$.Prefix}}/queues/{{.Name}}/resume"><button>resume</button></form>
+    {{else}}<form method="post" action="{{$.Prefix}}/queues/{{.Name}}/pause"><button>pause</button></form>{{end}}
+  </td>{{end}}
+</tr>
+{{else}}<tr><td colspan="10" class="dim">no queues yet</td></tr>{{end}}
+</tbody>
+</table>
+{{end}}
+
+{{define "index"}}
+<h1>Overview</h1>
+<p class="kv">
+  <span>leader <b>{{if .Data.Stats.Leader}}client {{.Data.Stats.Leader}}{{else}}none{{end}}</b></span>
+  <span>live clients <b>{{.Data.Stats.LiveClients}}</b></span>
+</p>
+{{template "queuetable" .}}
+{{end}}
+
+{{define "queues"}}
+<h1>Queues</h1>
+{{template "queuetable" .}}
+{{end}}
+
+{{define "jobs"}}
+<h1>Jobs</h1>
+<form method="get" action="{{.Prefix}}/jobs" class="filters">
+  <label>queue
+    <select name="queue">
+      <option value="">any</option>
+      {{range .Data.Queues}}<option value="{{.}}"{{if eq . $.Data.Filter.Queue}} selected{{end}}>{{.}}</option>{{end}}
+    </select>
+  </label>
+  <label>state
+    <select name="state">
+      <option value="">any</option>
+      {{range .Data.States}}<option value="{{.}}"{{if eq (print .) $.Data.State}} selected{{end}}>{{.}}</option>{{end}}
+    </select>
+  </label>
+  <label>kind <input name="kind" value="{{.Data.Kind}}" placeholder="any"></label>
+  <button>filter</button>
+</form>
+<table>
+<thead><tr><th>id</th><th>kind</th><th>queue</th><th>state</th><th class="n">attempt</th><th>scheduled</th><th>created</th><th>finalized</th></tr></thead>
+<tbody>
+{{range .Data.Jobs}}
+<tr>
+  <td><a href="{{$.Prefix}}/jobs/{{.ID}}"><code>{{.ID}}</code></a></td>
+  <td>{{.Kind}}</td><td>{{.Queue}}</td>
+  <td><span class="state {{.State}}">{{.State}}</span></td>
+  <td class="n">{{.Attempt}}/{{.MaxAttempts}}</td>
+  <td title="{{ts .ScheduledAt}}">{{since .ScheduledAt}}</td>
+  <td title="{{ts .CreatedAt}}">{{since .CreatedAt}}</td>
+  <td title="{{ts .FinalizedAt}}">{{since .FinalizedAt}}</td>
+</tr>
+{{else}}<tr><td colspan="8" class="dim">no jobs match</td></tr>{{end}}
+</tbody>
+</table>
+{{if .Data.Next}}<p><a href="{{.Data.Next}}">next page →</a></p>{{end}}
+{{end}}
+
+{{define "job"}}
+{{with .Data.Job}}
+<h1>Job <code>{{.ID}}</code></h1>
+<p class="kv">
+  <span>kind <b>{{.Kind}}</b></span>
+  <span>queue <b><a href="{{$.Prefix}}/jobs?queue={{.Queue}}">{{.Queue}}</a></b></span>
+  <span>state <span class="state {{.State}}">{{.State}}</span></span>
+  <span>priority <b>{{.Priority}}</b></span>
+  <span>attempt <b>{{.Attempt}}/{{.MaxAttempts}}</b></span>
+</p>
+{{if $.CanAct}}<p class="actions">
+  {{if $.Data.Live}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/cancel"><button>cancel</button></form>{{end}}
+  {{if ne (print .State) "running"}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/retry"><button>{{if $.Data.Live}}run now{{else}}retry{{end}}</button></form>{{end}}
+</p>{{end}}
+<dl>
+  <dt>created</dt><dd>{{ts .CreatedAt}}</dd>
+  <dt>scheduled</dt><dd>{{ts .ScheduledAt}}</dd>
+  {{if not .AttemptedAt.IsZero}}<dt>attempted</dt><dd>{{ts .AttemptedAt}} by client {{.AttemptedBy}}</dd>{{end}}
+  {{if not .FinalizedAt.IsZero}}<dt>finalized</dt><dd>{{ts .FinalizedAt}}</dd>{{end}}
+  {{if not .ExpiresAt.IsZero}}<dt>expires</dt><dd>{{ts .ExpiresAt}}</dd>{{end}}
+  {{if not .CancelRequestedAt.IsZero}}<dt>cancel requested</dt><dd>{{ts .CancelRequestedAt}}</dd>{{end}}
+  {{if .UniqueKey}}<dt>unique key</dt><dd><code>{{.UniqueKey}}</code></dd>{{end}}
+  {{if .OrderingKey}}<dt>ordering key</dt><dd><code>{{.OrderingKey}}</code></dd>{{end}}
+  {{if .PartitionKey}}<dt>partition key</dt><dd><code>{{.PartitionKey}}</code></dd>{{end}}
+  {{if not .BatchID.IsZero}}<dt>batch</dt><dd><a href="{{$.Prefix}}/workflows/{{.BatchID}}"><code>{{.BatchID}}</code></a></dd>{{end}}
+</dl>
+<h2>Args</h2><pre>{{pretty .Args}}</pre>
+<h2>Metadata</h2><pre>{{pretty .Metadata}}</pre>
+{{if .Output}}<h2>Output</h2><pre>{{pretty .Output}}</pre>{{end}}
+{{if .Errors}}<h2>Errors</h2>
+<table><thead><tr><th class="n">attempt</th><th>at</th><th>error</th></tr></thead><tbody>
+{{range .Errors}}<tr><td class="n">{{.Attempt}}</td><td>{{ts .At}}</td><td><pre class="err">{{.Error}}{{if .Trace}}
+
+{{.Trace}}{{end}}</pre></td></tr>{{end}}
+</tbody></table>{{end}}
+{{end}}
+{{end}}
+
+{{define "workflow"}}
+{{with .Data.Workflow.Batch}}
+<h1>{{if .Name}}Workflow {{.Name}}{{else}}Batch{{end}} <code>{{.ID}}</code></h1>
+<p class="kv">
+  <span>jobs <b>{{.Total}}</b></span>
+  <span>unfinished <b>{{.Pending}}</b></span>
+  <span>failed <b>{{.Failed}}</b></span>
+  <span>created <b>{{ts .CreatedAt}}</b></span>
+  {{if not .CompletedAt.IsZero}}<span>completed <b>{{ts .CompletedAt}}</b></span>{{end}}
+</p>
+{{end}}
+{{if .Data.Edges}}
+<svg class="dag" width="{{.Data.Width}}" height="{{.Data.Height}}" viewBox="0 0 {{.Data.Width}} {{.Data.Height}}">
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker></defs>
+  {{range .Data.Edges}}<line x1="{{.X1}}" y1="{{.Y1}}" x2="{{.X2}}" y2="{{.Y2}}" marker-end="url(#arrow)"/>{{end}}
+  {{range .Data.Nodes}}
+  <a href="{{$.Prefix}}/jobs/{{.Job.ID}}"><g class="node {{.Job.State}}" transform="translate({{.X}},{{.Y}})">
+    <title>{{.Job.Kind}} {{printf "%s" .Job.Args}}</title>
+    <rect width="220" height="44" rx="6"/>
+    <text x="10" y="18">{{.Job.Kind}} <tspan class="sub">{{short .Job.Args}}</tspan></text>
+    <text x="10" y="35" class="sub">{{.Job.State}}</text>
+  </g></a>
+  {{end}}
+</svg>
+{{end}}
+<table>
+<thead><tr><th>id</th><th>kind</th><th>queue</th><th>state</th><th class="n">attempt</th><th>created</th><th>finalized</th></tr></thead>
+<tbody>
+{{range .Data.Workflow.Jobs}}
+<tr>
+  <td><a href="{{$.Prefix}}/jobs/{{.ID}}"><code>{{.ID}}</code></a></td>
+  <td>{{.Kind}}</td><td>{{.Queue}}</td>
+  <td><span class="state {{.State}}">{{.State}}</span></td>
+  <td class="n">{{.Attempt}}/{{.MaxAttempts}}</td>
+  <td title="{{ts .CreatedAt}}">{{since .CreatedAt}}</td>
+  <td title="{{ts .FinalizedAt}}">{{since .FinalizedAt}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+
+{{define "subscriptions"}}
+<h1>Subscriptions</h1>
+<table>
+<thead><tr><th>name</th><th>pattern</th><th>queue</th><th>kind</th><th class="n">max attempts</th><th>created</th></tr></thead>
+<tbody>
+{{range .Data}}
+<tr><td>{{.Name}}</td><td><code>{{.Pattern}}</code></td><td><a href="{{$.Prefix}}/jobs?queue={{.Queue}}&kind={{.Kind}}">{{.Queue}}</a></td><td><code>{{.Kind}}</code></td><td class="n">{{if .MaxAttempts}}{{.MaxAttempts}}{{else}}default{{end}}</td><td>{{ts .CreatedAt}}</td></tr>
+{{else}}<tr><td colspan="6" class="dim">no subscriptions</td></tr>{{end}}
+</tbody>
+</table>
+{{end}}
+
+{{define "consumers"}}
+<h1>Stream consumers</h1>
+<table>
+<thead><tr><th>name</th><th>pattern</th><th>queue</th><th>snapshot</th><th>position</th><th>last delivery</th>{{if .CanAct}}<th>seek</th>{{end}}</tr></thead>
+<tbody>
+{{range .Data}}
+<tr>
+  <td>{{.Name}}</td><td><code>{{.Pattern}}</code></td>
+  <td><a href="{{$.Prefix}}/jobs?queue={{.Queue}}&kind={{.Kind}}">{{.Queue}}</a></td>
+  <td><code>{{.Snapshot}}</code></td><td><code>{{.Position}}</code></td>
+  <td title="{{ts .DeliveredAt}}">{{if .DeliveredAt.IsZero}}never{{else}}{{since .DeliveredAt}}{{end}}</td>
+  {{if $.CanAct}}<td class="seek">
+    <form method="post" action="{{$.Prefix}}/consumers/{{.Name}}/seek"><input type="hidden" name="to" value="earliest"><button>earliest</button></form>
+    <form method="post" action="{{$.Prefix}}/consumers/{{.Name}}/seek"><input type="hidden" name="to" value="latest"><button>latest</button></form>
+    <form method="post" action="{{$.Prefix}}/consumers/{{.Name}}/seek"><input type="hidden" name="to" value="time"><input type="datetime-local" name="time" required><button>from time</button></form>
+  </td>{{end}}
+</tr>
+{{else}}<tr><td colspan="7" class="dim">no consumers</td></tr>{{end}}
+</tbody>
+</table>
+{{end}}
+
+{{define "clients"}}
+<h1>Clients</h1>
+<table>
+<thead><tr><th class="n">id</th><th>host</th><th>started</th><th>lease</th><th>info</th></tr></thead>
+<tbody>
+{{range .Data}}
+<tr><td class="n">{{.ID}}</td><td>{{.Hostname}}</td><td title="{{ts .StartedAt}}">{{since .StartedAt}}</td><td>{{if .ExpiresAt.After now}}<span class="state ok">live</span>{{else}}<span class="state discarded">expired</span>{{end}}</td><td><code>{{printf "%s" .Info}}</code></td></tr>
+{{else}}<tr><td colspan="5" class="dim">no clients</td></tr>{{end}}
+</tbody>
+</table>
+{{end}}
