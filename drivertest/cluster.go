@@ -424,11 +424,16 @@ func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("vacuumed with nothing dead: %+v", res)
 	}
 	if res.Analyzed {
-		if res, err := exec.JobsMaintain(ctx); err != nil || res.Analyzed {
-			t.Errorf("maintenance right after = %+v, %v", res, err)
+		// Once the counters have caught up with the analyze, there is
+		// nothing more to do.
+		res = waitMaintain(ctx, t, exec, func(r driver.JobsMaintainResult) bool { return r == driver.JobsMaintainResult{} })
+		if res != (driver.JobsMaintainResult{}) {
+			t.Errorf("maintenance keeps repeating: %+v", res)
 		}
 	}
-	// Finishing the burst leaves as many dead rows, which is worth a vacuum.
+	// A burst that has run and left is worth a vacuum only once its dead
+	// rows number in the hundreds of thousands, so finishing this one is
+	// not.
 	clientID := register(ctx, t, exec)
 	running := claim(ctx, t, exec, clientID, 6000)
 	fin := make([]driver.JobFinalize, len(running))
@@ -436,9 +441,9 @@ func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted}
 	}
 	finalize(ctx, t, exec, fin...)
-	res = waitMaintain(ctx, t, exec, func(r driver.JobsMaintainResult) bool { return r.Vacuumed })
-	if !res.Vacuumed {
-		t.Skip("engine keeps no table statistics")
+	time.Sleep(time.Second)
+	if res, err := exec.JobsMaintain(ctx); err != nil || res.Vacuumed {
+		t.Errorf("vacuumed after a small burst: %+v, %v", res, err)
 	}
 }
 

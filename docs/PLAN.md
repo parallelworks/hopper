@@ -563,8 +563,10 @@ RETURNING j.*;
   within a minute. Autovacuum looks only every `autovacuum_naptime` (a minute by
   default), so the leader keeps the table fit itself, in a loop of its own since a pass
   over a large backlog takes seconds: every leader interval it vacuums `hopper_jobs`
-  once a fifth of it is dead (`VACUUM (SKIP_LOCKED, ANALYZE)`) and refreshes statistics
-  once a tenth has changed, never waiting for a lock. Schema v6 also sets the table's
+  once a hundred thousand dead rows have accumulated (`VACUUM (SKIP_LOCKED, ANALYZE)`;
+  what matters is their number, about five hundred index pages, not their share of the
+  table, so a short burst never triggers one) and refreshes statistics once a tenth of
+  the table has changed, never waiting for a lock. Schema v6 also sets the table's
   autovacuum thresholds low with no cost delay.
 
 - **Batching.** A producer claims only when at least `min(MaxWorkers/4, free slots)`

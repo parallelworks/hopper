@@ -248,8 +248,9 @@ type Executor interface {
 	HistoryMaintain(ctx context.Context, params HistoryMaintainParams) (HistoryMaintainResult, error)
 	// JobsMaintain keeps the live table fit between the engine's own
 	// maintenance passes: it reclaims the space and index entries of jobs
-	// that have run and left when enough have accumulated, and refreshes
-	// planner statistics when a large share of the table has changed. It
+	// that have run and left once enough have accumulated (a hundred
+	// thousand on Postgres), and refreshes planner statistics when a large
+	// share of the table has changed. It
 	// never waits for a lock, so it costs nothing while the engine's own
 	// pass is running. The live table churns at the job rate, and on
 	// Postgres every claim walks the claim index past the entries of jobs

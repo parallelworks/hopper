@@ -24,9 +24,10 @@
   with vacuum, so pickup latency grows between passes: on the reference
   hardware at 30,000 jobs/s it climbed from 10 ms to seconds over a minute
   without one. Autovacuum looks only every `autovacuum_naptime` (60 s by
-  default), so the leader vacuums the live table itself once a fifth of it
-  is dead and refreshes its statistics once a tenth has changed, every few
-  seconds, skipping when autovacuum already holds the table. Nothing needs
+  default), so the leader vacuums the live table itself once a hundred
+  thousand dead rows have accumulated and refreshes its statistics once a
+  tenth of it has changed, every few seconds, skipping when autovacuum
+  already holds the table. Nothing needs
   configuring; the schema also sets the table's own autovacuum thresholds
   low with no cost delay, so the server's pass, when it comes, is quick.
   History never needs vacuuming for retention: expired data is dropped by

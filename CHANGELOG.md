@@ -46,9 +46,9 @@ versions may change the API.
   actions behind an `Authorize` hook.
 - `JobFilter.After`, to page job listings.
 - The leader maintains the live table (`driver.Executor.JobsMaintain`):
-  it vacuums `hopper_jobs` once a fifth of it is dead and refreshes its
-  statistics once a tenth has changed, every leader interval, without
-  waiting for autovacuum's lock. Every claim walks the claim index past the
+  it vacuums `hopper_jobs` once a hundred thousand dead rows have
+  accumulated and refreshes its statistics once a tenth of it has changed,
+  every leader interval, without waiting for autovacuum's lock. Every claim walks the claim index past the
   entries of finished jobs until a vacuum removes them, and autovacuum
   looks only every minute by default: on the reference hardware pickup
   latency at 30,000 jobs/s climbed from 10 ms to seconds within a minute.

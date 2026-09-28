@@ -370,13 +370,20 @@ func (e *Executor) Stats(ctx context.Context) (*driver.Stats, error) {
 	return stats, nil
 }
 
+// vacuumDeadRows is how many dead rows the live table may accumulate
+// before the leader vacuums it.
+const vacuumDeadRows = 100000
+
 // JobsMaintain implements driver.Executor. A vacuum of the live table
-// reclaims the index entries every claim would otherwise walk past, and
-// takes milliseconds to seconds; it runs once a fifth of the table (and at
-// least five thousand rows) is dead. ANALYZE runs once a tenth of the table
-// has changed, so that plans are never made from statistics that say the
-// table is tiny when it is not. Both skip, rather than wait, when
-// autovacuum holds the lock, since that pass does the same work.
+// reclaims the index entries every claim would otherwise walk past. What
+// matters is their number, not their share of the table: a hundred
+// thousand dead entries are about five hundred index pages, well under a
+// millisecond per claim, so the vacuum runs once that many have
+// accumulated, and a short burst never triggers one. ANALYZE runs once a
+// tenth of the table has changed, so that plans are never made from
+// statistics that say the table is tiny when it is not. Both skip, rather
+// than wait, when autovacuum holds the lock, since that pass does the same
+// work.
 func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
 	var res driver.JobsMaintainResult
 	if e.InTx {
@@ -391,7 +398,7 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 		return res, fmt.Errorf("hopper: live table statistics: %w", err)
 	}
 	switch {
-	case dead >= 5000 && dead*5 >= live:
+	case dead >= vacuumDeadRows:
 		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, ANALYZE) hopper_jobs"); err != nil {
 			return res, fmt.Errorf("hopper: vacuum live table: %w", err)
 		}
