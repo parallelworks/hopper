@@ -554,8 +554,8 @@ RETURNING j.*;
   it. The candidates are therefore a `MATERIALIZED` CTE, evaluated exactly once
   whatever the join order, which bounds a stale plan to one scan of the table per
   claim; and the leader's live-table maintenance (below) refreshes the table's
-  statistics as soon as a tenth of it has changed, which invalidates cached plans
-  cluster-wide within one leader interval. Planning every execution afresh instead
+  statistics as soon as the planner's row count is an order of magnitude off, which
+  invalidates cached plans cluster-wide within one leader interval. Planning every execution afresh instead
   (pgx's cache-describe mode) was measured at 40% of throughput and rejected.
 - **Live-table maintenance.** Every claim walks the claim index past the entries of
   jobs that have run and left, which only a vacuum removes, so pickup latency climbs
@@ -565,8 +565,10 @@ RETURNING j.*;
   over a large backlog takes seconds: every leader interval it vacuums `hopper_jobs`
   once a hundred thousand dead rows have accumulated (`VACUUM (SKIP_LOCKED, ANALYZE)`;
   what matters is their number, about five hundred index pages, not their share of the
-  table, so a short burst never triggers one) and refreshes statistics once a tenth of
-  the table has changed, never waiting for a lock. Schema v6 also sets the table's
+  table, so a short burst never triggers one) and re-analyzes it, with a small sample,
+  only when the row count the planner holds is ten times off the live count: an analyze
+  in the middle of a burst cost a CPU-starved server a fifth of its throughput, so it is
+  not done on churn alone. It never waits for a lock. Schema v6 also sets the table's
   autovacuum thresholds low with no cost delay.
 
 - **Batching.** A producer claims only when at least `min(MaxWorkers/4, free slots)`

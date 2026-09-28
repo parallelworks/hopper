@@ -25,9 +25,9 @@
   hardware at 30,000 jobs/s it climbed from 10 ms to seconds over a minute
   without one. Autovacuum looks only every `autovacuum_naptime` (60 s by
   default), so the leader vacuums the live table itself once a hundred
-  thousand dead rows have accumulated and refreshes its statistics once a
-  tenth of it has changed, every few seconds, skipping when autovacuum
-  already holds the table. Nothing needs
+  thousand dead rows have accumulated, and re-analyzes it when the
+  planner's row count is an order of magnitude off the live count, every
+  few seconds, skipping when autovacuum already holds the table. Nothing needs
   configuring; the schema also sets the table's own autovacuum thresholds
   low with no cost delay, so the server's pass, when it comes, is quick.
   History never needs vacuuming for retention: expired data is dropped by

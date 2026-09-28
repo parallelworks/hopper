@@ -416,8 +416,12 @@ func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 	if res, err := exec.JobsMaintain(ctx); err != nil || res != (driver.JobsMaintainResult{}) {
 		t.Fatalf("maintenance of a fresh table = %+v, %v", res, err)
 	}
-	// A burst of inserts is worth fresh statistics; the engine's counters
-	// may lag by a second or so.
+	// A burst of inserts into a table the planner believes empty is worth
+	// fresh statistics; the engine's counters may lag by a second or so.
+	if _, err := exec.JobsMaintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	analyzeEmpty(ctx, t, exec)
 	insert(ctx, t, exec, params("burst", 6000))
 	res := waitMaintain(ctx, t, exec, func(r driver.JobsMaintainResult) bool { return r.Analyzed })
 	if res.Vacuumed {
@@ -444,6 +448,17 @@ func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 	time.Sleep(time.Second)
 	if res, err := exec.JobsMaintain(ctx); err != nil || res.Vacuumed {
 		t.Errorf("vacuumed after a small burst: %+v, %v", res, err)
+	}
+}
+
+// analyzeEmpty gives the engine statistics that say the live table is
+// empty, as an idle installation has, through the Fixture when it can.
+func analyzeEmpty(ctx context.Context, t *testing.T, exec driver.Executor) {
+	t.Helper()
+	if a, ok := exec.(interface{ AnalyzeForTest(context.Context) error }); ok {
+		if err := a.AnalyzeForTest(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
