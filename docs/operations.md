@@ -18,17 +18,17 @@
 
 - **Version:** 14 or later. Job IDs use `uuidv7()` on 18 and a compatible
   SQL function on 14–17.
-- **Autovacuum.** `hopper_jobs` is small (only the backlog and running jobs)
-  but churns fast. Let autovacuum run often on it:
-
-  ```sql
-  ALTER TABLE hopper_jobs SET (
-    autovacuum_vacuum_scale_factor = 0.01,
-    autovacuum_vacuum_cost_delay = 0,
-    autovacuum_analyze_scale_factor = 0.02
-  );
-  ```
-
+- **Vacuum.** `hopper_jobs` is small (only the backlog and running jobs)
+  but churns at the job rate, and every claim walks the claim index past
+  the entries of jobs that have since run and left. Those entries go away
+  with vacuum, so pickup latency grows between passes: on the reference
+  hardware at 30,000 jobs/s it climbed from 10 ms to seconds over a minute
+  without one. Autovacuum looks only every `autovacuum_naptime` (60 s by
+  default), so the leader vacuums the live table itself once a fifth of it
+  is dead and refreshes its statistics once a tenth has changed, every few
+  seconds, skipping when autovacuum already holds the table. Nothing needs
+  configuring; the schema also sets the table's own autovacuum thresholds
+  low with no cost delay, so the server's pass, when it comes, is quick.
   History never needs vacuuming for retention: expired data is dropped by
   partition.
 - **`shared_buffers`.** Keep the live table, its indexes and the current

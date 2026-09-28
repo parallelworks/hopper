@@ -83,6 +83,7 @@ func (c *Client[TTx]) startTerm(ctx context.Context) *leaderTerm {
 		}
 	})
 	wg.Go(func() { c.streamLoop(termCtx) })
+	wg.Go(func() { c.liveLoop(termCtx) })
 	go func() {
 		defer close(t.done)
 		wg.Wait()
@@ -273,6 +274,30 @@ func (c *Client[TTx]) pruneClients(ctx context.Context) {
 	}
 	if n > 0 {
 		c.logger.InfoContext(ctx, "hopper: pruned expired clients", "count", n)
+	}
+}
+
+// liveLoop runs on the leader, apart from its other duties since a pass
+// over a large backlog can take seconds: it keeps the live table vacuumed
+// and its statistics fresh, because a burst can make both stale within
+// seconds while the engine's own schedule may not look for a minute.
+func (c *Client[TTx]) liveLoop(ctx context.Context) {
+	ticker := time.NewTicker(c.tuning.leaderInterval)
+	defer ticker.Stop()
+	for {
+		res, err := c.exec.JobsMaintain(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.logger.WarnContext(ctx, "hopper: maintain live table", "error", err)
+			}
+		} else if res.Vacuumed || res.Analyzed {
+			c.logger.DebugContext(ctx, "hopper: maintained live table", "vacuumed", res.Vacuumed, "analyzed", res.Analyzed)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 

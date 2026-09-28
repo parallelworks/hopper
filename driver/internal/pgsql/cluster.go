@@ -369,3 +369,38 @@ func (e *Executor) Stats(ctx context.Context) (*driver.Stats, error) {
 	}
 	return stats, nil
 }
+
+// JobsMaintain implements driver.Executor. A vacuum of the live table
+// reclaims the index entries every claim would otherwise walk past, and
+// takes milliseconds to seconds; it runs once a fifth of the table (and at
+// least five thousand rows) is dead. ANALYZE runs once a tenth of the table
+// has changed, so that plans are never made from statistics that say the
+// table is tiny when it is not. Both skip, rather than wait, when
+// autovacuum holds the lock, since that pass does the same work.
+func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
+	var res driver.JobsMaintainResult
+	if e.InTx {
+		return res, errors.New("hopper: live table maintenance must run on the pool, not in a transaction")
+	}
+	var dead, modified, live int64
+	err := e.Conn.QueryRow(ctx, `SELECT n_dead_tup, n_mod_since_analyze, n_live_tup FROM pg_stat_user_tables WHERE relid = 'hopper_jobs'::regclass`).Scan(&dead, &modified, &live)
+	if errors.Is(err, ErrNoRows) {
+		return res, nil
+	}
+	if err != nil {
+		return res, fmt.Errorf("hopper: live table statistics: %w", err)
+	}
+	switch {
+	case dead >= 5000 && dead*5 >= live:
+		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, ANALYZE) hopper_jobs"); err != nil {
+			return res, fmt.Errorf("hopper: vacuum live table: %w", err)
+		}
+		res.Vacuumed, res.Analyzed = true, true
+	case modified >= 1000 && modified*10 >= live:
+		if _, err := e.Conn.Exec(ctx, "ANALYZE (SKIP_LOCKED) hopper_jobs"); err != nil {
+			return res, fmt.Errorf("hopper: analyze live table: %w", err)
+		}
+		res.Analyzed = true
+	}
+	return res, nil
+}

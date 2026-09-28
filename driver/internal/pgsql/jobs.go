@@ -233,21 +233,25 @@ const claimEligibleSQL = `
                         WHERE o.queue = cand.queue AND o.ordering_key = cand.ordering_key
                           AND o.state IN ('available', 'scheduled', 'retryable'))))`
 
-// jobClaimSQL is the hot path. The inner SELECT walks the claim index in
-// claim order and locks its rows, skipping any locked by other clients. The
-// outer SELECT restores claim order, which UPDATE ... RETURNING does not
-// guarantee.
+// jobClaimSQL is the hot path. The candidate CTE walks the claim index in
+// claim order and locks its rows, skipping any locked by other clients. It
+// is MATERIALIZED so that it runs exactly once however the planner joins
+// it to the update: as a plain subquery the planner may put it on the
+// inner side of a nested loop and re-execute it, locks and all, for every
+// row of the table it thinks is empty. The outer SELECT restores claim
+// order, which UPDATE ... RETURNING does not guarantee.
 const jobClaimSQL = `
-WITH claimed AS (
+WITH c AS MATERIALIZED (
+  SELECT cand.id FROM hopper_jobs cand
+  WHERE ` + claimEligibleSQL + `
+  ORDER BY cand.priority, cand.scheduled_at, cand.seq
+  LIMIT $3
+  FOR UPDATE SKIP LOCKED
+),
+claimed AS (
   UPDATE hopper_jobs j
   SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
-  FROM (
-    SELECT cand.id FROM hopper_jobs cand
-    WHERE ` + claimEligibleSQL + `
-    ORDER BY cand.priority, cand.scheduled_at, cand.seq
-    LIMIT $3
-    FOR UPDATE SKIP LOCKED
-  ) c
+  FROM c
   WHERE j.id = c.id
   RETURNING j.seq, ` + "%s" + `
 )
@@ -258,7 +262,7 @@ SELECT ` + "%s" + ` FROM claimed ORDER BY priority, scheduled_at, seq`
 // the limit. The ranking scans the queue's waiting jobs, so only
 // partition-limited queues pay for it.
 const jobClaimPartitionedSQL = `
-WITH ranked AS (
+WITH ranked AS MATERIALIZED (
   SELECT cand.id, cand.partition_key,
     row_number() OVER (PARTITION BY cand.partition_key ORDER BY cand.priority, cand.scheduled_at, cand.seq)
       + coalesce((SELECT count(*) FROM hopper_jobs pr
@@ -266,16 +270,17 @@ WITH ranked AS (
   FROM hopper_jobs cand
   WHERE ` + claimEligibleSQL + `
 ),
+c AS MATERIALIZED (
+  SELECT cand.id FROM hopper_jobs cand
+  WHERE cand.id IN (SELECT id FROM ranked WHERE partition_key IS NULL OR slot <= $4)
+  ORDER BY cand.priority, cand.scheduled_at, cand.seq
+  LIMIT $3
+  FOR UPDATE SKIP LOCKED
+),
 claimed AS (
   UPDATE hopper_jobs j
   SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
-  FROM (
-    SELECT cand.id FROM hopper_jobs cand
-    WHERE cand.id IN (SELECT id FROM ranked WHERE partition_key IS NULL OR slot <= $4)
-    ORDER BY cand.priority, cand.scheduled_at, cand.seq
-    LIMIT $3
-    FOR UPDATE SKIP LOCKED
-  ) c
+  FROM c
   WHERE j.id = c.id
   RETURNING j.seq, ` + "%s" + `
 )

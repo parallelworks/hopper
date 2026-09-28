@@ -90,6 +90,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Batches", testBatches[TTx]},
 		{"Workflows", testWorkflows[TTx]},
 		{"Streams", testStreams[TTx]},
+		{"Maintain", testMaintain[TTx]},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
