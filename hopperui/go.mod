@@ -6,7 +6,7 @@ godebug fips140=only
 
 require (
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/parallelworks/hopper v0.0.0
+	github.com/parallelworks/hopper v0.1.0
 )
 
 require (
