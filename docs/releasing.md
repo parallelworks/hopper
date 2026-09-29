@@ -37,14 +37,14 @@ merged.
 
 ## Setup
 
-- **`RELEASE_PLEASE_TOKEN`** (repository secret): a fine-grained personal
-  access token with *Contents: write* and *Pull requests: write* on this
-  repository. With it, CI runs on the release PR like on any other. Without
-  it the workflow falls back to `GITHUB_TOKEN`, which cannot trigger
-  workflows on a PR it opened, so the release PR would show no checks.
-- The release workflow needs `contents: write` and `pull-requests: write`,
-  which it declares; the ruleset's commit-message pattern allows
-  release-please's `chore(canary): release X.Y.Z`.
+No secrets. The workflow runs with the default `GITHUB_TOKEN` and declares
+the permissions it needs (`contents`, `pull-requests` and `actions: write`).
+GitHub does not start workflows for a pull request that token opened, so
+after release-please has created or updated its PR the workflow dispatches
+`ci.yml` on the PR's branch (`gh workflow run`); that run appears among the
+PR's checks like any other. The PR-title check does not run on the release
+PR; its title, `chore(canary): release X.Y.Z`, is release-please's own and
+passes the ruleset's commit-message pattern.
 
 ## Steering a release
 
