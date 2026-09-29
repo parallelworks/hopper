@@ -374,6 +374,10 @@ func (e *Executor) Stats(ctx context.Context) (*driver.Stats, error) {
 // before the leader vacuums it.
 const vacuumDeadRows = 100000
 
+// analyzeEvery is the least time between statistics refreshes driven by
+// churn alone.
+const analyzeEvery = 30 * time.Second
+
 // JobsMaintain implements driver.Executor. A vacuum of the live table
 // reclaims the index entries every claim would otherwise walk past. What
 // matters is their number, not their share of the table: a hundred
@@ -381,28 +385,29 @@ const vacuumDeadRows = 100000
 // millisecond per claim, so the vacuum runs once that many have
 // accumulated, and a short burst never triggers one.
 //
-// ANALYZE exists for one reason: plans made, and cached, while the
-// planner believed the table to be a different size by an order of
-// magnitude. It runs only then, comparing the row count the planner has
-// (pg_class.reltuples, from the last analyze or vacuum) with the live
-// count, since an analyze in the middle of a burst costs a CPU-starved
-// server a fifth of its throughput and, with plans invalidated, every
-// connection's replanning on top. A table never analyzed is left alone:
-// the planner sizes it from its file. The sample is kept small; the
-// statistics that matter here are the row count and the state mix.
-// Both skip, rather than wait, when autovacuum holds the lock, since that
-// pass does the same work.
+// ANALYZE keeps two things current that the planner needs: the row count,
+// which a plan cached while the table was empty gets wrong by orders of
+// magnitude, and the mix of states, which decides how the finalize joins
+// its parameter list to the running rows (with a stale mix that says
+// almost nothing is running, it probes the list once per running row).
+// So it runs at once when the planner's row count is ten times off, and
+// otherwise once a tenth of the table has changed but no more than every
+// thirty seconds, since an analyze invalidates every connection's cached
+// plans and a CPU-starved server feels the replanning. The sample is kept
+// small; nothing here needs fine histograms. Both skip, rather than wait,
+// when autovacuum holds the lock, since that pass does the same work.
 func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
 	var res driver.JobsMaintainResult
 	if e.InTx {
 		return res, errors.New("hopper: live table maintenance must run on the pool, not in a transaction")
 	}
-	var dead, live int64
-	var believed float64
+	var dead, live, modified int64
+	var believed, sinceAnalyze float64
 	err := e.Conn.QueryRow(ctx, `
-		SELECT s.n_dead_tup, s.n_live_tup, c.reltuples
+		SELECT s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, c.reltuples,
+		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
 		FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
-		WHERE s.relid = 'hopper_jobs'::regclass`).Scan(&dead, &live, &believed)
+		WHERE s.relid = 'hopper_jobs'::regclass`).Scan(&dead, &live, &modified, &believed, &sinceAnalyze)
 	if errors.Is(err, ErrNoRows) {
 		return res, nil
 	}
@@ -410,17 +415,21 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 		return res, fmt.Errorf("hopper: live table statistics: %w", err)
 	}
 	if dead >= vacuumDeadRows {
-		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED) hopper_jobs"); err != nil {
+		// TRUNCATE false: a vacuum otherwise ends by trying, for up to five
+		// seconds, to take an exclusive lock to give back empty trailing
+		// pages, and whenever it briefly gets one every claim and finalize
+		// waits behind it. A churning live table reuses those pages within
+		// seconds anyway.
+		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, TRUNCATE false) hopper_jobs"); err != nil {
 			return res, fmt.Errorf("hopper: vacuum live table: %w", err)
 		}
 		res.Vacuumed = true
 		return res, nil
 	}
-	if believed < 0 {
-		return res, nil // never analyzed: the planner sizes it from its file
-	}
 	floor := func(v float64) float64 { return max(v, 100) }
-	if float64(live) < 10*floor(believed) && believed < 10*floor(float64(live)) {
+	sizeOff := believed >= 0 && (float64(live) >= 10*floor(believed) || believed >= 10*floor(float64(live)))
+	churned := modified >= 1000 && modified*10 >= live && sinceAnalyze >= analyzeEvery.Seconds()
+	if !sizeOff && !churned {
 		return res, nil
 	}
 	err = e.withTx(ctx, func(tx Tx) error {

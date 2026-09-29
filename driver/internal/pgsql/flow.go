@@ -36,7 +36,8 @@ func (e *Executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 		).Scan(&global, &rate, &burst, &tokens, &refilled, &partition)
 		if errors.Is(err, ErrNoRows) {
 			// No row, no limits.
-			jobs, err := claimRows(ctx, tx, jobClaimQuery, params.Queue, params.ClientID, params.Limit)
+			query, limit := claimQuery(jobClaimQueries, params.Limit)
+			jobs, err := claimRows(ctx, tx, query, params.Queue, params.ClientID, limit)
 			res.Jobs = jobs
 			return err
 		}
@@ -75,9 +76,11 @@ func (e *Executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 		}
 		var jobs []*driver.JobRow
 		if partition.Valid && partition.Int64 > 0 {
-			jobs, err = claimRows(ctx, tx, jobClaimPartitionedQuery, params.Queue, params.ClientID, budget, partition.Int64)
+			query, limit := claimQuery(jobClaimPartitionedQueries, budget)
+			jobs, err = claimRows(ctx, tx, query, params.Queue, params.ClientID, limit, partition.Int64)
 		} else {
-			jobs, err = claimRows(ctx, tx, jobClaimQuery, params.Queue, params.ClientID, budget)
+			query, limit := claimQuery(jobClaimQueries, budget)
+			jobs, err = claimRows(ctx, tx, query, params.Queue, params.ClientID, limit)
 		}
 		if err != nil {
 			return err

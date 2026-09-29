@@ -6,6 +6,25 @@ versions may change the API.
 
 ## [Unreleased]
 
+### Fixed
+
+- The leader re-analyzes the live table on churn again (rate-limited to
+  every 30 s, with a small sample): with statistics refreshed only on a
+  tenfold size change, the planner's picture of the state mix went stale
+  and the finalize drifted back onto its slow join order within minutes at
+  43,000 jobs/s.
+- Vacuums of the live table no longer truncate its heap (schema v7 sets
+  `vacuum_truncate = false`; the leader passes `TRUNCATE false`): the
+  truncation retried an exclusive lock for five seconds per pass and
+  stalled every claim behind it whenever it got one, which showed as
+  pickup-latency spikes of one to two seconds.
+- The claim's `LIMIT` is a constant (one statement per bucket, 1 to 512,
+  with the count applied through row numbers) instead of a bind parameter,
+  whose generic plan scanned the whole table per claim; a claim returns at
+  most 512 jobs.
+- `hopperbench loaded -report N` prints per-window latency and rate lines
+  for soaks.
+
 ## [0.1.0] - 2026-09-28
 
 The first release: a job queue and message broker on PostgreSQL, with the

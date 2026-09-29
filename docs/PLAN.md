@@ -532,16 +532,18 @@ Each queue has a producer. The claim is a single statement:
 
 ```sql
 WITH c AS MATERIALIZED (
-  SELECT id FROM hopper_jobs
-  WHERE queue = $queue AND state IN ('available','scheduled','retryable')
-    AND scheduled_at <= now()
-  ORDER BY priority, scheduled_at, seq
-  LIMIT $n
-  FOR UPDATE SKIP LOCKED
+  SELECT id, row_number() OVER (ORDER BY priority, scheduled_at, seq) AS n FROM (
+    SELECT id, priority, scheduled_at, seq FROM hopper_jobs
+    WHERE queue = $queue AND state IN ('available','scheduled','retryable')
+      AND scheduled_at <= now()
+    ORDER BY priority, scheduled_at, seq
+    LIMIT 64                      -- a constant: one statement per bucket 1, 2, 4 … 512
+    FOR UPDATE SKIP LOCKED
+  ) cand
 )
 UPDATE hopper_jobs j
 SET state = 'running', attempt = attempt + 1, attempted_at = now(), attempted_by = $client
-FROM c WHERE j.id = c.id
+FROM c WHERE j.id = c.id AND c.n <= $n
 RETURNING j.*;
 ```
 
@@ -556,14 +558,23 @@ RETURNING j.*;
   claim; and the leader's live-table maintenance (below) refreshes the table's
   statistics as soon as the planner's row count is an order of magnitude off, which
   invalidates cached plans cluster-wide within one leader interval. Planning every execution afresh instead
-  (pgx's cache-describe mode) was measured at 40% of throughput and rejected.
+  (pgx's cache-describe mode) was measured at 40% of throughput and rejected. The claim's LIMIT is a constant for the same reason, one prepared statement per bucket
+  (1, 2, 4 … 512) with the count applied through row numbers: with the limit as a
+  parameter the planner's generic plan assumes it selects a tenth of the table and joins
+  the update to it with a sequential scan and a hash, so every claim scanned the table
+  (a 94% loss under `force_generic_plan`), and in the automatic mode the planner rejected
+  that plan and replanned every execution instead (−27% on the CI runner). Rows locked
+  beyond the count are released when the statement ends.
 - **Live-table maintenance.** Every claim walks the claim index past the entries of
   jobs that have run and left, which only a vacuum removes, so pickup latency climbs
   between vacuums: at 30,000 jobs/s on the reference hardware, from 10 ms to seconds
   within a minute. Autovacuum looks only every `autovacuum_naptime` (a minute by
   default), so the leader keeps the table fit itself, in a loop of its own since a pass
   over a large backlog takes seconds: every leader interval it vacuums `hopper_jobs`
-  once a hundred thousand dead rows have accumulated (`VACUUM (SKIP_LOCKED, ANALYZE)`;
+  once a hundred thousand dead rows have accumulated (`VACUUM (SKIP_LOCKED, TRUNCATE
+  false)`: heap truncation needs an exclusive lock the vacuum retries for five seconds,
+  and every claim waits behind it whenever it briefly succeeds, so schema v7 disables it
+  on the live table for autovacuum too;
   what matters is their number, about five hundred index pages, not their share of the
   table, so a short burst never triggers one) and re-analyzes it, with a small sample,
   only when the row count the planner holds is ten times off the live count: an analyze
