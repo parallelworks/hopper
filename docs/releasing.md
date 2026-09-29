@@ -2,50 +2,75 @@
 
 hopper is three Go modules in one repository: the core module at the root,
 `hopperotel` and `hopperui`. A release is one version across all three, cut
-as three tags on the same commit of `canary`. Until v1.0.0, minor versions may
-change the API; patch versions do not.
+as three tags on the same commit of `canary`: `vX.Y.Z`, `hopperotel/vX.Y.Z`
+and `hopperui/vX.Y.Z`. Until v1.0.0, minor versions may change the API;
+patch versions do not.
 
-## Before tagging
+Releases are automated with [release-please](https://github.com/googleapis/release-please)
+and [goreleaser](https://goreleaser.com) (`.github/workflows/release.yml`).
 
-1. Every change is on `canary` through a merged PR, and CI is green there.
-2. The `[Unreleased]` section of [CHANGELOG.md](../CHANGELOG.md) has become
-   `[X.Y.Z] - YYYY-MM-DD`, with the link references at the bottom updated.
-3. For a minor release, the §8.2 targets in [PLAN.md](PLAN.md) have been run
-   on the reference hardware and the results table there is current
-   (`hopperbench` on a separate host, Postgres 17 on 8 vCPU / 32 GB / NVMe,
-   `synchronous_commit = on`).
-4. `hopperotel/go.mod` and `hopperui/go.mod` require
-   `github.com/parallelworks/hopper` at the version about to be tagged. They
-   keep their `replace ... => ../` directives, which apply only inside this
-   repository: consumers resolve the required version from the tag.
+## How a release happens
 
-## Tagging
+1. Every merge to `canary` is a squash commit whose title is a Conventional
+   Commit (enforced by the PR-title check). release-please reads those titles
+   and keeps **one release PR** open, titled `chore(canary): release X.Y.Z`,
+   that holds the next version's changelog entry. `fix` and `perf` bump the
+   patch version, `feat` the minor version, and a `!` (breaking change) also
+   bumps the minor version before v1.0.0 (`bump-minor-pre-major`). The
+   three modules always move together (`linked-versions`).
+2. The release PR updates `CHANGELOG.md` in each module, the manifest
+   (`.release-please-manifest.json`), and the sub-modules' `go.mod`
+   requirement on the core module, through the `// x-release-please-version`
+   annotation on that line. The `replace ... => ../` directives stay: they
+   apply only inside this repository, and consumers resolve the tag.
+3. Merging the release PR (with `gh pr merge --squash --admin`, since the
+   `canary` ruleset asks for two reviews) creates the three tags and a
+   GitHub release per module; the root one carries the changelog entry.
+   goreleaser then builds `hopper`, `hopperbench` and `hopperui` for Linux
+   and macOS (amd64, arm64), and attaches the archives and checksums to the
+   root release.
 
-On the release commit of `canary`:
+Nothing else is needed for a normal release. A minor release should still
+have the §8.2 targets re-run on the reference hardware and the results
+table in [PLAN.md](PLAN.md) brought up to date before the release PR is
+merged.
+
+## Setup
+
+No secrets. The workflow runs with the default `GITHUB_TOKEN` and grants
+permissions per job: `contents`, `pull-requests` and `actions: write` to the
+release-please job, `contents: write` alone to the goreleaser job. Every
+action in `.github/workflows` is pinned to a commit SHA, with the version as
+a trailing comment; Dependabot bumps both.
+GitHub does not start workflows for a pull request that token opened, so
+after release-please has created or updated its PR the workflow dispatches
+`ci.yml` on the PR's branch (`gh workflow run`); that run appears among the
+PR's checks like any other. The PR-title check does not run on the release
+PR; its title, `chore(canary): release X.Y.Z`, is release-please's own and
+passes the ruleset's commit-message pattern.
+
+## Steering a release
+
+- **Force a version:** add a footer `Release-As: X.Y.Z` to a squash commit's
+  body (the PR description), and the release PR proposes that version.
+- **Hold a change out of the changelog:** only `feat`, `fix`, `perf` and
+  `revert` appear; `docs`, `test`, `ci`, `build`, `chore` and `refactor`
+  are hidden.
+- **Hotfix:** merge the fix to `canary` as `fix(...)`; the release PR updates
+  itself. hopper has no long-lived release branches before v1.0.0.
+
+## Verify
+
+After the tags exist, from an empty module:
 
 ```sh
-git tag -a v0.1.0 -m "hopper v0.1.0"
-git tag -a hopperotel/v0.1.0 -m "hopperotel v0.1.0"
-git tag -a hopperui/v0.1.0 -m "hopperui v0.1.0"
-git push origin v0.1.0 hopperotel/v0.1.0 hopperui/v0.1.0
+cd "$(mktemp -d)" && go mod init check && go get github.com/parallelworks/hopper@vX.Y.Z \
+  github.com/parallelworks/hopper/hopperotel@vX.Y.Z github.com/parallelworks/hopper/hopperui@vX.Y.Z
 ```
 
-The core tag goes first so that the sub-module tags, which require it, can be
-resolved the moment they are pushed. Nested-module tags carry the module's
-directory as a prefix; that is how the Go tool finds a version of a module
-that is not at the repository root.
+## History
 
-Then create the GitHub release from the `v0.1.0` tag with the changelog
-section as its notes, and verify from an empty module:
-
-```sh
-cd "$(mktemp -d)" && go mod init check && go get github.com/parallelworks/hopper@v0.1.0 \
-  github.com/parallelworks/hopper/hopperotel@v0.1.0 github.com/parallelworks/hopper/hopperui@v0.1.0
-```
-
-## After tagging
-
-- Open a `[Unreleased]` section in the changelog.
-- The plan of record's status line names the released version.
-- The `canary` ruleset requires two approving reviews; a maintainer merging a
-  release-prep PR alone uses `gh pr merge --squash --admin`.
+v0.1.0 and v0.1.1 were tagged by hand, as this document described then:
+annotated tags for the three modules on the release commit, core first, and
+the GitHub release created from the changelog section. release-please
+starts from the manifest at 0.1.1.
