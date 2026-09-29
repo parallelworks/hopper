@@ -18,6 +18,10 @@ versions may change the API.
   truncation retried an exclusive lock for five seconds per pass and
   stalled every claim behind it whenever it got one, which showed as
   pickup-latency spikes of one to two seconds.
+- The claim's `LIMIT` is a constant (one statement per bucket, 1 to 512,
+  with the count applied through row numbers) instead of a bind parameter,
+  whose generic plan scanned the whole table per claim; a claim returns at
+  most 512 jobs.
 - `hopperbench loaded -report N` prints per-window latency and rate lines
   for soaks.
 

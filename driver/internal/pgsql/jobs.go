@@ -240,19 +240,30 @@ const claimEligibleSQL = `
 // inner side of a nested loop and re-execute it, locks and all, for every
 // row of the table it thinks is empty. The outer SELECT restores claim
 // order, which UPDATE ... RETURNING does not guarantee.
+//
+// The LIMIT is a constant, one statement per bucket (claimBuckets), and
+// the count asked for is applied afterwards through row numbers. With the
+// limit as a parameter the planner's generic plan assumes it selects a
+// tenth of the table and joins the update to it with a sequential scan
+// and a hash: every claim then scans the whole table, or, in the automatic
+// plan cache mode, the planner rejects that plan and replans every
+// execution instead, which costs a fifth of a small server's throughput.
+// Rows locked beyond the count are released when the statement ends.
 const jobClaimSQL = `
 WITH c AS MATERIALIZED (
-  SELECT cand.id FROM hopper_jobs cand
-  WHERE ` + claimEligibleSQL + `
-  ORDER BY cand.priority, cand.scheduled_at, cand.seq
-  LIMIT $3
-  FOR UPDATE SKIP LOCKED
+  SELECT cand.id, row_number() OVER (ORDER BY cand.priority, cand.scheduled_at, cand.seq) AS n FROM (
+    SELECT cand.id, cand.priority, cand.scheduled_at, cand.seq FROM hopper_jobs cand
+    WHERE ` + claimEligibleSQL + `
+    ORDER BY cand.priority, cand.scheduled_at, cand.seq
+    LIMIT %d
+    FOR UPDATE SKIP LOCKED
+  ) cand
 ),
 claimed AS (
   UPDATE hopper_jobs j
   SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
   FROM c
-  WHERE j.id = c.id
+  WHERE j.id = c.id AND c.n <= $3
   RETURNING j.seq, ` + "%s" + `
 )
 SELECT ` + "%s" + ` FROM claimed ORDER BY priority, scheduled_at, seq`
@@ -271,25 +282,56 @@ WITH ranked AS MATERIALIZED (
   WHERE ` + claimEligibleSQL + `
 ),
 c AS MATERIALIZED (
-  SELECT cand.id FROM hopper_jobs cand
-  WHERE cand.id IN (SELECT id FROM ranked WHERE partition_key IS NULL OR slot <= $4)
-  ORDER BY cand.priority, cand.scheduled_at, cand.seq
-  LIMIT $3
-  FOR UPDATE SKIP LOCKED
+  SELECT cand.id, row_number() OVER (ORDER BY cand.priority, cand.scheduled_at, cand.seq) AS n FROM (
+    SELECT cand.id, cand.priority, cand.scheduled_at, cand.seq FROM hopper_jobs cand
+    WHERE cand.id IN (SELECT id FROM ranked WHERE partition_key IS NULL OR slot <= $4)
+    ORDER BY cand.priority, cand.scheduled_at, cand.seq
+    LIMIT %d
+    FOR UPDATE SKIP LOCKED
+  ) cand
 ),
 claimed AS (
   UPDATE hopper_jobs j
   SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
   FROM c
-  WHERE j.id = c.id
+  WHERE j.id = c.id AND c.n <= $3
   RETURNING j.seq, ` + "%s" + `
 )
 SELECT ` + "%s" + ` FROM claimed ORDER BY priority, scheduled_at, seq`
 
+// claimBuckets are the LIMIT constants the claim statements are built
+// with; a claim uses the smallest bucket that covers its count, and locks
+// at most that many rows. ClaimMax is the largest count a claim can ask
+// for.
+var claimBuckets = []int{1, 2, 4, 8, 16, 32, 64, 128, 256, 512}
+
+// ClaimMax is the most jobs one claim statement returns.
+const ClaimMax = 512
+
 var (
-	jobClaimQuery            = fmt.Sprintf(jobClaimSQL, JobColumns("j."), JobColumns(""))
-	jobClaimPartitionedQuery = fmt.Sprintf(jobClaimPartitionedSQL, JobColumns("j."), JobColumns(""))
+	jobClaimQueries            = claimQueries(jobClaimSQL)
+	jobClaimPartitionedQueries = claimQueries(jobClaimPartitionedSQL)
 )
+
+func claimQueries(format string) map[int]string {
+	out := make(map[int]string, len(claimBuckets))
+	for _, b := range claimBuckets {
+		out[b] = fmt.Sprintf(format, b, JobColumns("j."), JobColumns(""))
+	}
+	return out
+}
+
+// claimQuery returns the statement for a count and the count clamped to
+// ClaimMax.
+func claimQuery(queries map[int]string, limit int) (string, int) {
+	limit = min(max(limit, 1), ClaimMax)
+	for _, b := range claimBuckets {
+		if limit <= b {
+			return queries[b], limit
+		}
+	}
+	return queries[ClaimMax], ClaimMax
+}
 
 // JobClaim implements driver.Executor.
 func (e *Executor) JobClaim(ctx context.Context, params driver.JobClaimParams) (driver.JobClaimResult, error) {
@@ -299,7 +341,8 @@ func (e *Executor) JobClaim(ctx context.Context, params driver.JobClaimParams) (
 	if params.Limited {
 		return e.claimLimited(ctx, params)
 	}
-	jobs, err := claimRows(ctx, e.Conn, jobClaimQuery, params.Queue, params.ClientID, params.Limit)
+	query, limit := claimQuery(jobClaimQueries, params.Limit)
+	jobs, err := claimRows(ctx, e.Conn, query, params.Queue, params.ClientID, limit)
 	if err != nil {
 		return driver.JobClaimResult{}, err
 	}
