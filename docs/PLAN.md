@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M4 and M6 through M8 are implemented (§16), the §8.2 targets have been run on the reference hardware, and everything ships together as **v0.1.0**: one version across the core module, `hopperotel` and `hopperui` ([docs/releasing.md](releasing.md)). This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4 and M6 through M8 are implemented (§16), the §8.2 targets have been run on the reference hardware, and everything ships together as one version across the core module, `hopperotel` and `hopperui` ([docs/releasing.md](releasing.md)); **v0.1.1** is current. This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something

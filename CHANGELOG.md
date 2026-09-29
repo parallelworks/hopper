@@ -6,6 +6,13 @@ versions may change the API.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-29
+
+The first soak on the reference hardware found three defects in the live
+table's upkeep that only show under sustained load; all three are fixed here
+and the soak results are in [docs/PLAN.md](docs/PLAN.md) §8.2. Upgrading
+applies schema v7 (one `ALTER TABLE`).
+
 ### Fixed
 
 - The leader re-analyzes the live table on churn again (rate-limited to
@@ -115,5 +122,6 @@ there.
   workflows (as a DAG), subscriptions, stream consumers and clients, with
   actions behind an `Authorize` hook, and a standalone `hopperui` server.
 
-[Unreleased]: https://github.com/parallelworks/hopper/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/parallelworks/hopper/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/parallelworks/hopper/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/parallelworks/hopper/releases/tag/v0.1.0
