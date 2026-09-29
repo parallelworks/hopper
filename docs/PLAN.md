@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M4 and M6 through M8 are implemented (§16) and the §8.2 targets have been run on the reference hardware. This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4 and M6 through M8 are implemented (§16), the §8.2 targets have been run on the reference hardware, and everything ships together as **v0.1.0**: one version across the core module, `hopperotel` and `hopperui` ([docs/releasing.md](releasing.md)). This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -1103,14 +1103,14 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M1 | Core engine | `Driver` interface and `hopperpgx`, schema v1, `hoppermigrate`, Insert/InsertTx/InsertMany (unnest and COPY), typed workers and `WorkFunc`, batched claim, batched finalize with history move, retries and backoff, `Snooze`/`Cancel` from workers, client lease registration and renewal, `Run`/`Stop`, a first `hopperbench`. **Done.** | 5d |
 | M2 | Reliability | Client leases, rescuer and fencing, leader lease, partitioned retention, LISTEN/NOTIFY with coalescing and adaptive polling, unique jobs (skip and replace), `RescueStuckAfter`. **Done.** | 4d |
 | M3 | Control | Cron and `Every` with time zones, Snooze, Cancel (in-flight), JobRetry, TTL, pause, runtime queues, timeouts, middleware, `SetOutput`/`Await`, `Jobs` iterator, events, `Stats`. **Done.** | 4d |
-| M4 | Performance and release | `hopperbench` scenarios and `-compare`, CI perf gate and nightly soak, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, CHANGELOG. **Done**, except the §8.2 run on the reference hardware that gates the **v0.1.0** tag. The upgrade suite starts with the first schema change (there is one schema version so far). | 5d |
+| M4 | Performance and release | `hopperbench` scenarios and `-compare`, CI perf gate and nightly soak, `drivertest`, `hoppertest`, CLI, `hopperotel`, docs and examples, CHANGELOG. **Done**, including the §8.2 run on the reference hardware. | 5d |
 | M5 | First adoption | Move an internal service's `internal/jobs` package to hopper; drain and drop its old queue tables | 1d |
-| M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done**; **v0.2.0** follows v0.1.0. | 5d |
-| M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver, **v0.3.0**. **Done.** | 5d |
+| M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done.** | 5d |
+| M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver. **Done.** | 5d |
 | M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumers, `hopperui`. **Done**, one PR each. | 2–3w |
 | M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |
 
-M0–M4 take roughly four weeks to a production-ready v0.1.0 that meets its performance
+M0–M4 take roughly four weeks to a production-ready job queue that meets its performance
 targets. v1.0.0 follows M8, once the API has been proven in production.
 
 ## 17. Risks

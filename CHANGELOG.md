@@ -6,70 +6,15 @@ versions may change the API.
 
 ## [Unreleased]
 
-### Added
+## [0.1.0] - 2026-09-28
 
-- Messaging: `Subscribe` with AMQP topic patterns, typed `Message[T]`,
-  `Publish`/`PublishTx` fan-out in one statement, dedup keys, ordering keys
-  (also on plain jobs through `InsertOpts.OrderingKey`), request/reply, and
-  `ReplayDiscarded`.
-- Schema v2: subscription retry budgets and metadata, ordering-key indexes,
-  and the SQL contract functions `hopper_insert` and `hopper_publish`.
-- `TestUpgradeUnderTraffic`, which migrates to the latest schema while a
-  client works jobs.
-- Flow control: cluster-wide `GlobalLimit`, `RateLimit`/`RateBurst` and
-  `PartitionLimit` per queue (declared in `QueueConfig` or set at runtime
-  with `Queues().SetLimits` and `hopper queues limit`), `PriorityAging`,
-  and `InsertOpts.PartitionKey`.
-- Batches: `NewBatch`, `Add`, `Insert`/`InsertTx`, `BatchGet`, with
-  `OnSuccess`, `OnFailure` and `OnComplete` callbacks inserted by the
-  finalizing statement.
-- Schema v3: queue limit columns, `hopper_batches`, and the partition and
-  batch indexes.
-- `hoppersql`, a driver for `database/sql` (pgx's stdlib adapter or lib/pq)
-  that passes the same conformance suite as `hopperpgx`. It polls instead of
-  listening and inserts without COPY.
-- Workflows: `NewWorkflow`, `Add` with `After`, `InsertWorkflow`/
-  `InsertWorkflowTx`, `WorkflowGet` and `hopper workflows get`. Steps with
-  dependencies wait pending and are promoted by the statement that finalizes
-  the last of them; a failed step cancels its dependents unless they opt to
-  `DependencyIgnore`. Schema v4 adds `hopper_job_deps`.
-- Streams: `Streams().Append`/`AppendTx` write to a retained, time-partitioned
-  log; `hopper.Consume` registers a consumer that delivers matching events as
-  jobs from a position of its own, starting at the earliest or latest event
-  and movable with `Seek`; `Read` pages the log. Consumers read by snapshot
-  deltas, so a late-committing transaction is delivered when it commits and
-  never skipped. `Config.StreamRetention`, `hopper streams consumers|seek`
-  and `hopper subscriptions list`. Schema v5 adds `hopper_stream_events` and
-  `hopper_stream_consumers`.
-- `hopperui`, a separate module: an embeddable web UI for queues, jobs,
-  workflows (as a DAG), subscriptions, stream consumers and clients, with
-  actions behind an `Authorize` hook.
-- `JobFilter.After`, to page job listings.
-- The leader maintains the live table (`driver.Executor.JobsMaintain`):
-  it vacuums `hopper_jobs` once a hundred thousand dead rows have
-  accumulated and re-analyzes it when the planner's row count is an order
-  of magnitude off, every leader interval, without waiting for autovacuum's
-  lock. Every claim walks the claim index past the
-  entries of finished jobs until a vacuum removes them, and autovacuum
-  looks only every minute by default: on the reference hardware pickup
-  latency at 30,000 jobs/s climbed from 10 ms to seconds within a minute.
-- The claim's candidate subquery is a `MATERIALIZED` CTE. A plan cached
-  while `hopper_jobs` was empty otherwise re-executed the locking subquery
-  once per row of the table after a burst: a single claim ran for 20-30
-  seconds holding locks, with every finalizer queued behind it.
-- Schema v6 sets aggressive autovacuum thresholds on `hopper_jobs`.
-- `hopperbench loaded`: pickup latency under a paced insert load.
+The first release: a job queue and message broker on PostgreSQL, with the
+`hopperotel` and `hopperui` modules released alongside it at the same
+version. The §8.2 performance targets in [docs/PLAN.md](docs/PLAN.md) were
+run on the reference hardware before tagging; the results are recorded
+there.
 
-### Changed
-
-- The Postgres SQL and the logic around it moved to a package shared by both
-  drivers; `hopperpgx` keeps its COPY, LISTEN and pipelining paths.
-
-## [0.1.0]
-
-The first release: a complete job queue on PostgreSQL.
-
-### Added
+### Jobs
 
 - Core engine: typed workers, `Insert`/`InsertTx`/`InsertMany` (one statement,
   or `COPY` for large batches), batched `FOR UPDATE SKIP LOCKED` claims,
@@ -83,13 +28,73 @@ The first release: a complete job queue on PostgreSQL.
 - Control: cron and interval periodic jobs with time zones, in-flight
   cancellation, retry from the dead-letter queue, TTLs, queue pause and
   resume, runtime queues, middleware, `SetOutput`/`Await`, the `Jobs`
-  iterator, events and `Stats`.
+  iterator (paged with `JobFilter.After`), events and `Stats`.
+- Flow control: cluster-wide `GlobalLimit`, `RateLimit`/`RateBurst` and
+  `PartitionLimit` per queue (declared in `QueueConfig` or set at runtime
+  with `Queues().SetLimits` and `hopper queues limit`), `PriorityAging`,
+  and `InsertOpts.PartitionKey`.
+- Batches: `NewBatch`, `Add`, `Insert`/`InsertTx`, `BatchGet`, with
+  `OnSuccess`, `OnFailure` and `OnComplete` callbacks inserted by the
+  finalizing statement.
+- Workflows: `NewWorkflow`, `Add` with `After`, `InsertWorkflow`/
+  `InsertWorkflowTx`, `WorkflowGet` and `hopper workflows get`. Steps with
+  dependencies wait pending and are promoted by the statement that finalizes
+  the last of them; a failed step cancels its dependents unless they opt to
+  `DependencyIgnore`.
+
+### Messaging
+
+- Subscriptions: `Subscribe` with AMQP topic patterns, typed `Message[T]`,
+  `Publish`/`PublishTx` fan-out in one statement, dedup keys, ordering keys
+  (also on plain jobs through `InsertOpts.OrderingKey`), request/reply, and
+  `ReplayDiscarded`.
+- Streams: `Streams().Append`/`AppendTx` write to a retained, time-partitioned
+  log; `hopper.Consume` registers a consumer that delivers matching events as
+  jobs from a position of its own, starting at the earliest or latest event
+  and movable with `Seek`; `Read` pages the log. Consumers read by snapshot
+  deltas, so a late-committing transaction is delivered when it commits and
+  never skipped. `Config.StreamRetention`, `hopper streams consumers|seek`
+  and `hopper subscriptions list`.
+- The SQL contract functions `hopper_insert` and `hopper_publish`, for
+  producers in other languages ([docs/sql-contract.md](docs/sql-contract.md)).
+
+### Drivers and schema
+
+- `hopperpgx`: the pgx v5 driver, with COPY, LISTEN and pipelined statements.
+- `hoppersql`: a driver for `database/sql` (pgx's stdlib adapter or lib/pq)
+  that passes the same conformance suite; it polls instead of listening and
+  inserts without COPY. Both drivers share one implementation of the SQL.
 - `hoppermigrate`: embedded, versioned migrations under a cross-process lock.
-- `hopperpgx`: the pgx v5 driver.
+  Schema versions 1 through 6: the job tables and history partitions,
+  messaging, flow control and batches, workflows, streams, and the live
+  table's autovacuum settings.
+- `drivertest`: the conformance, concurrency and chaos suite every driver
+  must pass, including `TestUpgradeUnderTraffic`, which migrates to the
+  latest schema while a client works jobs.
+
+### Operations
+
+- The leader maintains the live table (`driver.Executor.JobsMaintain`):
+  it vacuums `hopper_jobs` once a hundred thousand dead rows have
+  accumulated and re-analyzes it when the planner's row count is an order
+  of magnitude off, every leader interval, without waiting for autovacuum's
+  lock. Every claim walks the claim index past the
+  entries of finished jobs until a vacuum removes them, and autovacuum
+  looks only every minute by default: on the reference hardware pickup
+  latency at 30,000 jobs/s climbed from 10 ms to seconds within a minute.
+- The claim's candidate subquery is a `MATERIALIZED` CTE. A plan cached
+  while `hopper_jobs` was empty otherwise re-executed the locking subquery
+  once per row of the table after a burst: a single claim ran for 20-30
+  seconds holding locks, with every finalizer queued behind it.
+- `cmd/hopper`: migrations, jobs, queues, clients, workflows, subscriptions,
+  stream consumers and stats from the shell.
+- `cmd/hopperbench`: the benchmark harness (including `loaded`, pickup
+  latency under a paced insert load) and the CI performance gate.
 - `hoppertest`: test helpers for code that uses hopper.
 - `hopperotel` (separate module): OpenTelemetry tracing and metrics.
-- `cmd/hopper`: migrations, jobs, queues, clients and stats from the shell.
-- `cmd/hopperbench`: the benchmark harness and CI performance gate.
+- `hopperui` (separate module): an embeddable web UI for queues, jobs,
+  workflows (as a DAG), subscriptions, stream consumers and clients, with
+  actions behind an `Authorize` hook, and a standalone `hopperui` server.
 
 [Unreleased]: https://github.com/parallelworks/hopper/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/parallelworks/hopper/releases/tag/v0.1.0

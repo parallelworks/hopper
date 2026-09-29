@@ -23,21 +23,20 @@ Postgres is the first engine, behind a driver interface designed for more.
   and iterators. The core depends only on the standard library and
   [pgx](https://github.com/jackc/pgx), and it runs under `GODEBUG=fips140=only`.
 
-> **Status: pre-release.** The job queue is implemented: schema and migrations,
-> the Postgres driver, transactional and bulk inserts, batched claim and finalize,
-> typed workers, retries with backoff, graceful shutdown, lease-based rescue of
-> jobs from crashed processes, leader election, partition-drop retention,
-> LISTEN/NOTIFY wake-ups, unique jobs, cron and interval schedules, cancellation,
-> retry from the dead-letter queue, TTLs, pause and runtime queues, middleware,
-> awaitable results, listing, events and stats, plus the `hopper` CLI,
+> **Status: v0.1.0.** The first release covers the job queue (schema and
+> migrations, the pgx and `database/sql` drivers, transactional and bulk
+> inserts, batched claim and finalize, typed workers, retries with backoff,
+> graceful shutdown, lease-based rescue of jobs from crashed processes, leader
+> election, partition-drop retention, LISTEN/NOTIFY wake-ups, unique jobs, cron
+> and interval schedules, cancellation, retry from the dead-letter queue, TTLs,
+> pause and runtime queues, middleware, awaitable results, listing, events and
+> stats), messaging (subscriptions with topic patterns, fan-out, dedup and
+> ordering keys, streams with consumers, a SQL contract for producers in other
+> languages), flow control, batches and workflows, plus the `hopper` CLI,
 > `hoppertest`, `hopperotel`, the `hopperui` web UI and the `drivertest`
-> conformance suite. So are messaging (subscriptions with topic patterns,
-> fan-out, dedup and ordering keys, a SQL contract for producers in other
-> languages, streams with consumers), flow control (global, rate and
-> partitioned limits, priority aging), batches and workflows, and a
-> `database/sql` driver, in the order laid out in [docs/PLAN.md](docs/PLAN.md),
-> the plan of record. Start with
-> [docs/getting-started.md](docs/getting-started.md). Feedback is welcome
+> conformance suite. [docs/PLAN.md](docs/PLAN.md) is the plan of record and
+> [docs/getting-started.md](docs/getting-started.md) the place to start.
+> Until v1.0.0, minor versions may change the API. Feedback is welcome
 > through issues and PRs.
 
 ```go
