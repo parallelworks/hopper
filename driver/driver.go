@@ -246,6 +246,24 @@ type Executor interface {
 	// time partitions on Postgres). It is idempotent and may run on two
 	// leaders at once.
 	HistoryMaintain(ctx context.Context, params HistoryMaintainParams) (HistoryMaintainResult, error)
+	// JobsMaintain keeps the live table fit between the engine's own
+	// maintenance passes: it reclaims the space and index entries of jobs
+	// that have run and left once enough have accumulated (a hundred
+	// thousand on Postgres), and refreshes planner statistics when the
+	// planner's idea of the table's size is off by an order of magnitude. It
+	// never waits for a lock, so it costs nothing while the engine's own
+	// pass is running. The live table churns at the job rate, and on
+	// Postgres every claim walks the claim index past the entries of jobs
+	// that have left, so pickup latency climbs between vacuums; autovacuum
+	// looks only every autovacuum_naptime (a minute by default). Engines
+	// without such maintenance return zero values.
+	JobsMaintain(ctx context.Context) (JobsMaintainResult, error)
+}
+
+// JobsMaintainResult reports what JobsMaintain did.
+type JobsMaintainResult struct {
+	Vacuumed bool
+	Analyzed bool
 }
 
 // Migrator applies schema migrations. Migrations are held by the

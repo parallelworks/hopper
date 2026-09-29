@@ -45,6 +45,20 @@ versions may change the API.
   workflows (as a DAG), subscriptions, stream consumers and clients, with
   actions behind an `Authorize` hook.
 - `JobFilter.After`, to page job listings.
+- The leader maintains the live table (`driver.Executor.JobsMaintain`):
+  it vacuums `hopper_jobs` once a hundred thousand dead rows have
+  accumulated and re-analyzes it when the planner's row count is an order
+  of magnitude off, every leader interval, without waiting for autovacuum's
+  lock. Every claim walks the claim index past the
+  entries of finished jobs until a vacuum removes them, and autovacuum
+  looks only every minute by default: on the reference hardware pickup
+  latency at 30,000 jobs/s climbed from 10 ms to seconds within a minute.
+- The claim's candidate subquery is a `MATERIALIZED` CTE. A plan cached
+  while `hopper_jobs` was empty otherwise re-executed the locking subquery
+  once per row of the table after a burst: a single claim ran for 20-30
+  seconds holding locks, with every finalizer queued behind it.
+- Schema v6 sets aggressive autovacuum thresholds on `hopper_jobs`.
+- `hopperbench loaded`: pickup latency under a paced insert load.
 
 ### Changed
 

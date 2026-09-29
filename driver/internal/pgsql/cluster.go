@@ -369,3 +369,77 @@ func (e *Executor) Stats(ctx context.Context) (*driver.Stats, error) {
 	}
 	return stats, nil
 }
+
+// vacuumDeadRows is how many dead rows the live table may accumulate
+// before the leader vacuums it.
+const vacuumDeadRows = 100000
+
+// JobsMaintain implements driver.Executor. A vacuum of the live table
+// reclaims the index entries every claim would otherwise walk past. What
+// matters is their number, not their share of the table: a hundred
+// thousand dead entries are about five hundred index pages, well under a
+// millisecond per claim, so the vacuum runs once that many have
+// accumulated, and a short burst never triggers one.
+//
+// ANALYZE exists for one reason: plans made, and cached, while the
+// planner believed the table to be a different size by an order of
+// magnitude. It runs only then, comparing the row count the planner has
+// (pg_class.reltuples, from the last analyze or vacuum) with the live
+// count, since an analyze in the middle of a burst costs a CPU-starved
+// server a fifth of its throughput and, with plans invalidated, every
+// connection's replanning on top. A table never analyzed is left alone:
+// the planner sizes it from its file. The sample is kept small; the
+// statistics that matter here are the row count and the state mix.
+// Both skip, rather than wait, when autovacuum holds the lock, since that
+// pass does the same work.
+func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
+	var res driver.JobsMaintainResult
+	if e.InTx {
+		return res, errors.New("hopper: live table maintenance must run on the pool, not in a transaction")
+	}
+	var dead, live int64
+	var believed float64
+	err := e.Conn.QueryRow(ctx, `
+		SELECT s.n_dead_tup, s.n_live_tup, c.reltuples
+		FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+		WHERE s.relid = 'hopper_jobs'::regclass`).Scan(&dead, &live, &believed)
+	if errors.Is(err, ErrNoRows) {
+		return res, nil
+	}
+	if err != nil {
+		return res, fmt.Errorf("hopper: live table statistics: %w", err)
+	}
+	if dead >= vacuumDeadRows {
+		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED) hopper_jobs"); err != nil {
+			return res, fmt.Errorf("hopper: vacuum live table: %w", err)
+		}
+		res.Vacuumed = true
+		return res, nil
+	}
+	if believed < 0 {
+		return res, nil // never analyzed: the planner sizes it from its file
+	}
+	floor := func(v float64) float64 { return max(v, 100) }
+	if float64(live) < 10*floor(believed) && believed < 10*floor(float64(live)) {
+		return res, nil
+	}
+	err = e.withTx(ctx, func(tx Tx) error {
+		if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = 10"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, "ANALYZE (SKIP_LOCKED) hopper_jobs")
+		return err
+	})
+	if err != nil {
+		return res, fmt.Errorf("hopper: analyze live table: %w", err)
+	}
+	res.Analyzed = true
+	return res, nil
+}
+
+// AnalyzeForTest analyzes the live table as it is, for the conformance
+// suite to give the planner statistics of a known state.
+func (e *Executor) AnalyzeForTest(ctx context.Context) error {
+	_, err := e.Conn.Exec(ctx, "ANALYZE hopper_jobs")
+	return err
+}

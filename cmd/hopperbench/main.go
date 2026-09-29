@@ -24,6 +24,7 @@
 //	insert      InsertMany in batches of 100 (the unnest statement)
 //	copy        InsertMany in batches of 5000 (the COPY path)
 //	latency     commit-to-Work on an idle queue, local wake-up
+//	loaded      commit-to-Work while -clients clients work a stream of inserts at -rate jobs/s for -seconds
 //
 // -history preloads that many rows of history first, to measure the live
 // table's independence from accumulated history.
@@ -83,6 +84,8 @@ func main() {
 		workers   = flag.Int("workers", 100, "MaxWorkers per client")
 		samples   = flag.Int("samples", 200, "latency samples")
 		history   = flag.Int("history", 0, "rows of history to preload")
+		rate      = flag.Int("rate", 40000, "insert rate of the loaded scenario, jobs/s")
+		seconds   = flag.Int("seconds", 10, "duration of the loaded scenario")
 		schema    = flag.String("schema", "hopperbench", "schema to create, use and drop")
 		compare   = flag.String("compare", "", "compare two result files, base,head, instead of running")
 		threshold = flag.Float64("threshold", 0.10, "with -compare: the fraction by which head may be slower than base")
@@ -101,7 +104,7 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	err := run(ctx, *url, *schema, strings.Split(*scenarios, ","), options{
-		jobs: *jobs, clients: *clients, workers: *workers, samples: *samples, history: *history,
+		jobs: *jobs, clients: *clients, workers: *workers, samples: *samples, history: *history, rate: *rate, seconds: *seconds,
 	})
 	stop()
 	if err != nil {
@@ -111,7 +114,7 @@ func main() {
 }
 
 type options struct {
-	jobs, clients, workers, samples, history int
+	jobs, clients, workers, samples, history, rate, seconds int
 }
 
 func run(ctx context.Context, url, schema string, scenarios []string, opts options) error {
@@ -158,6 +161,8 @@ func run(ctx context.Context, url, schema string, scenarios []string, opts optio
 			r, err = b.insert(ctx, opts.jobs, 5000)
 		case "latency":
 			r, err = b.latency(ctx, opts.samples)
+		case "loaded":
+			r, err = b.loaded(ctx, opts.rate, time.Duration(opts.seconds)*time.Second)
 		default:
 			return fmt.Errorf("unknown scenario %q", s)
 		}
@@ -433,6 +438,127 @@ func (b *bench) latency(ctx context.Context, samples int) (result, error) {
 	return result{
 		Scenario: "latency", Jobs: samples, Seconds: time.Since(begin).Seconds(),
 		P50Millis: ms(lat[len(lat)/2]), P99Millis: ms(lat[len(lat)*99/100]), MaxMillis: ms(lat[len(lat)-1]),
+	}, nil
+}
+
+// loaded measures commit-to-Work while the clients work a steady stream of
+// inserts at the given rate, with every thousandth job sampled. Inserts go
+// in batches of 100 from a separate inserter; a sample's clock starts before
+// its batch is sent, so the figure includes the batch insert itself.
+func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (result, error) {
+	if err := b.reset(ctx); err != nil {
+		return result{}, err
+	}
+	const batch, every = 100, 1000
+	var (
+		mu      sync.Mutex
+		sent    = map[int]time.Time{}
+		lat     []time.Duration
+		worked  int
+		samples int
+	)
+	ws := hopper.NewWorkers()
+	hopper.AddWorkFunc(ws, func(_ context.Context, job *hopper.Job[benchArgs]) error {
+		if job.Args.N%every != 0 {
+			return nil
+		}
+		t1 := time.Now()
+		mu.Lock()
+		defer mu.Unlock()
+		if t0, ok := sent[job.Args.N]; ok {
+			lat = append(lat, t1.Sub(t0))
+			delete(sent, job.Args.N)
+		}
+		return nil
+	})
+	cs := make([]*hopper.Client[pgx.Tx], b.opts.clients)
+	for i := range cs {
+		c, err := hopper.NewClient(b.d, &hopper.Config{
+			Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: b.opts.workers}},
+			Workers: ws,
+			Logger:  b.logger,
+		})
+		if err != nil {
+			return result{}, err
+		}
+		if err := c.Start(ctx); err != nil {
+			return result{}, err
+		}
+		defer c.Stop(ctx) //nolint:errcheck // best effort
+		cs[i] = c
+	}
+	inserter, err := hopper.NewClient(b.d, &hopper.Config{Logger: b.logger})
+	if err != nil {
+		return result{}, err
+	}
+	defer inserter.Stop(ctx) //nolint:errcheck // flushes pending notifications
+
+	// Pace batches with a ticker; several inserters share the schedule so
+	// one slow batch does not stall the stream.
+	interval := time.Duration(float64(time.Second) * batch / float64(rate))
+	ticks := make(chan int, 64)
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	for w := range errs {
+		wg.Go(func() {
+			for n := range ticks {
+				params := b.params(batch, nil)
+				for i := range params {
+					params[i].Args = benchArgs{N: n + i}
+				}
+				if n%every == 0 {
+					mu.Lock()
+					sent[n] = time.Now()
+					mu.Unlock()
+				}
+				if _, err := inserter.InsertMany(ctx, params); err != nil {
+					errs[w] = err
+					return
+				}
+				mu.Lock()
+				worked += batch
+				mu.Unlock()
+			}
+		})
+	}
+	start := time.Now()
+	ticker := time.NewTicker(interval)
+	for n := 0; time.Since(start) < duration; n += batch {
+		<-ticker.C
+		ticks <- n
+	}
+	ticker.Stop()
+	close(ticks)
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return result{}, err
+		}
+	}
+	// Let the backlog drain before reading the samples.
+	for {
+		var live int
+		if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_jobs").Scan(&live); err != nil {
+			return result{}, err
+		}
+		if live == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	mu.Lock()
+	defer mu.Unlock()
+	samples = len(lat)
+	if samples == 0 {
+		return result{}, errors.New("no latency samples")
+	}
+	slices.Sort(lat)
+	ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+	return result{
+		Scenario: "loaded", Jobs: worked, Clients: b.opts.clients, Workers: b.opts.workers,
+		Seconds: elapsed.Seconds(), JobsPerSec: float64(worked) / elapsed.Seconds(),
+		P50Millis: ms(lat[samples/2]), P99Millis: ms(lat[samples*99/100]), MaxMillis: ms(lat[samples-1]),
 	}, nil
 }
 

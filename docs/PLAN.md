@@ -9,7 +9,7 @@ in-process job framework and a separate message broker.
 - **Module:** `github.com/parallelworks/hopper`
 - **License:** Apache-2.0
 - **Dependencies:** the Go standard library and `github.com/jackc/pgx/v5`. Nothing else in the core module.
-- **Status:** M0 through M4 and M6 through M8 are implemented (§16); the §8.2 targets still need a run on the reference hardware before v0.1.0 is tagged. This document is the plan of record, and changes to it go through PRs.
+- **Status:** M0 through M4 and M6 through M8 are implemented (§16) and the §8.2 targets have been run on the reference hardware. This document is the plan of record, and changes to it go through PRs.
 
 The name refers to a feed hopper, which releases work into a machine one piece
 at a time, and to RADM Grace Hopper. It is also a fitting name for something
@@ -531,19 +531,45 @@ skew between pods cannot cause early or duplicate execution.
 Each queue has a producer. The claim is a single statement:
 
 ```sql
-UPDATE hopper_jobs j
-SET state = 'running', attempt = attempt + 1, attempted_at = now(), attempted_by = $client
-FROM (
+WITH c AS MATERIALIZED (
   SELECT id FROM hopper_jobs
   WHERE queue = $queue AND state IN ('available','scheduled','retryable')
     AND scheduled_at <= now()
   ORDER BY priority, scheduled_at, seq
   LIMIT $n
   FOR UPDATE SKIP LOCKED
-) c
-WHERE j.id = c.id
+)
+UPDATE hopper_jobs j
+SET state = 'running', attempt = attempt + 1, attempted_at = now(), attempted_by = $client
+FROM c WHERE j.id = c.id
 RETURNING j.*;
 ```
+
+- **Plan stability.** Drivers cache prepared statements, and Postgres keeps a
+  statement's generic plan until something invalidates it. A plan made while
+  `hopper_jobs` was empty (an idle queue, drained and vacuumed to zero pages) costs every
+  scan at zero, and with the candidates as a plain subquery the planner nested them
+  inside a scan of the table and re-executed the locking subquery once per row: after a
+  burst, one claim ran for minutes holding locks while every finalizer queued behind
+  it. The candidates are therefore a `MATERIALIZED` CTE, evaluated exactly once
+  whatever the join order, which bounds a stale plan to one scan of the table per
+  claim; and the leader's live-table maintenance (below) refreshes the table's
+  statistics as soon as the planner's row count is an order of magnitude off, which
+  invalidates cached plans cluster-wide within one leader interval. Planning every execution afresh instead
+  (pgx's cache-describe mode) was measured at 40% of throughput and rejected.
+- **Live-table maintenance.** Every claim walks the claim index past the entries of
+  jobs that have run and left, which only a vacuum removes, so pickup latency climbs
+  between vacuums: at 30,000 jobs/s on the reference hardware, from 10 ms to seconds
+  within a minute. Autovacuum looks only every `autovacuum_naptime` (a minute by
+  default), so the leader keeps the table fit itself, in a loop of its own since a pass
+  over a large backlog takes seconds: every leader interval it vacuums `hopper_jobs`
+  once a hundred thousand dead rows have accumulated (`VACUUM (SKIP_LOCKED, ANALYZE)`;
+  what matters is their number, about five hundred index pages, not their share of the
+  table, so a short burst never triggers one) and re-analyzes it, with a small sample,
+  only when the row count the planner holds is ten times off the live count: an analyze
+  in the middle of a burst cost a CPU-starved server a fifth of its throughput, so it is
+  not done on churn alone. It never waits for a lock. Schema v6 also sets the table's
+  autovacuum thresholds low with no cost delay.
 
 - **Batching.** A producer claims only when at least `min(MaxWorkers/4, free slots)`
   slots are free or a short cooldown (20ms by default) has passed. Busy queues are
@@ -816,11 +842,35 @@ the hardware details and the benchmark harness are published with each release.
 | Recovery after a process crash | ≤ 20 s |
 | Throughput with a 10M-row history | within 5% of an empty history |
 
+**Results (2026-09-28, the v0.1.0 run).** Postgres 17.11 in a container capped to 8 vCPU
+and 32 GB on an NVMe host (`shared_buffers` 8 GB, `synchronous_commit = on`, default
+autovacuum settings), clients on an 8-vCPU host 1.8 ms away, `hopperbench` at
+`-jobs 300000` with four clients:
+
+| Metric | Result |
+| --- | --- |
+| End-to-end throughput, no-op jobs, 4 clients | 48,700 jobs/s at 100 workers per client; **62,000 jobs/s** at 200 |
+| Mixed priorities / scheduled / retry-heavy (100 workers) | 50,900 / 48,800 / 25,000 jobs/s |
+| Bulk insert (COPY path) | **496,000 jobs/s** |
+| Batched insert (unnest path) | **173,000 jobs/s** |
+| Pickup latency, idle queue | **p50 3.3 ms, p99 3.9 ms** |
+| Pickup latency at 80% of peak (49,000 jobs/s, 200 workers, 60 s) | **p50 10 ms, p99 53 ms** |
+| Publish fan-out cost | one statement (§10) |
+| Recovery after a process crash | lease TTL 15 s plus one leader interval, ≤ 20 s (§7.6; `drivertest` Rescue) |
+| Throughput with a 10M-row history | 47,800 jobs/s, **−1.9%** |
+
+A 3,000,000-job backlog drains at 30,600 jobs/s: the leader's vacuum passes over a
+large live table (§7.3) cost throughput there, by design, to keep the claim index
+short. The 100-worker throughput figure is bound by the client's concurrency, not the
+database, so the default per-client `MaxWorkers` for a queue meant to saturate a
+database of this size is 200.
+
 ### 8.3 Benchmark harness
 - `hopperbench` is a command in the repo that drives the scenarios above and prints
   one JSON line per scenario. It has the no-op baseline, mixed-priority, scheduled-heavy
-  and retry-heavy workloads, the two insert paths and pickup latency, and `-history N`
-  to preload history rows. It warms up before measuring, because the first leader
+  and retry-heavy workloads, the two insert paths, pickup latency on an idle queue and
+  under a paced load (`loaded`, at `-rate` jobs/s), and `-history N` to preload history
+  rows. It warms up before measuring, because the first leader
   election creates history partitions, which briefly blocks finalizes. Fan-out arrives
   with messaging (M6).
 - CI runs a reduced benchmark on every PR that touches the insert, claim or finalize

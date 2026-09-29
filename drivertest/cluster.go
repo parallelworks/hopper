@@ -408,3 +408,74 @@ func testNow[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("Now = %s, %v", now, err)
 	}
 }
+
+func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	exec := f.NewDriver(t).Executor()
+	// Nothing has changed: nothing to do.
+	if res, err := exec.JobsMaintain(ctx); err != nil || res != (driver.JobsMaintainResult{}) {
+		t.Fatalf("maintenance of a fresh table = %+v, %v", res, err)
+	}
+	// A burst of inserts into a table the planner believes empty is worth
+	// fresh statistics; the engine's counters may lag by a second or so.
+	if _, err := exec.JobsMaintain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	analyzeEmpty(ctx, t, exec)
+	insert(ctx, t, exec, params("burst", 6000))
+	res := waitMaintain(ctx, t, exec, func(r driver.JobsMaintainResult) bool { return r.Analyzed })
+	if res.Vacuumed {
+		t.Errorf("vacuumed with nothing dead: %+v", res)
+	}
+	if res.Analyzed {
+		// Once the counters have caught up with the analyze, there is
+		// nothing more to do.
+		res = waitMaintain(ctx, t, exec, func(r driver.JobsMaintainResult) bool { return r == driver.JobsMaintainResult{} })
+		if res != (driver.JobsMaintainResult{}) {
+			t.Errorf("maintenance keeps repeating: %+v", res)
+		}
+	}
+	// A burst that has run and left is worth a vacuum only once its dead
+	// rows number in the hundreds of thousands, so finishing this one is
+	// not.
+	clientID := register(ctx, t, exec)
+	running := claim(ctx, t, exec, clientID, 6000)
+	fin := make([]driver.JobFinalize, len(running))
+	for i, j := range running {
+		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted}
+	}
+	finalize(ctx, t, exec, fin...)
+	time.Sleep(time.Second)
+	if res, err := exec.JobsMaintain(ctx); err != nil || res.Vacuumed {
+		t.Errorf("vacuumed after a small burst: %+v, %v", res, err)
+	}
+}
+
+// analyzeEmpty gives the engine statistics that say the live table is
+// empty, as an idle installation has, through the Fixture when it can.
+func analyzeEmpty(ctx context.Context, t *testing.T, exec driver.Executor) {
+	t.Helper()
+	if a, ok := exec.(interface{ AnalyzeForTest(context.Context) error }); ok {
+		if err := a.AnalyzeForTest(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// waitMaintain calls JobsMaintain until done reports what it waited for,
+// or ten seconds pass.
+func waitMaintain(ctx context.Context, t *testing.T, exec driver.Executor, done func(driver.JobsMaintainResult) bool) driver.JobsMaintainResult {
+	t.Helper()
+	var res driver.JobsMaintainResult
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		var err error
+		if res, err = exec.JobsMaintain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if done(res) {
+			return res
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return res
+}
