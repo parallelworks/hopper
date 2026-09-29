@@ -13,7 +13,7 @@ and [goreleaser](https://goreleaser.com) (`.github/workflows/release.yml`).
 
 1. Every merge to `canary` is a squash commit whose title is a Conventional
    Commit (enforced by the PR-title check). release-please reads those titles
-   and keeps **one release PR** open, titled `chore(canary): release X.Y.Z`,
+   and keeps **one release PR** open, titled `chore: release canary`,
    that holds the next version's changelog entry. `fix` and `perf` bump the
    patch version, `feat` the minor version, and a `!` (breaking change) also
    bumps the minor version before v1.0.0 (`bump-minor-pre-major`). The
@@ -46,8 +46,8 @@ GitHub does not start workflows for a pull request that token opened, so
 after release-please has created or updated its PR the workflow dispatches
 `ci.yml` on the PR's branch (`gh workflow run`); that run appears among the
 PR's checks like any other. The PR-title check does not run on the release
-PR; its title, `chore(canary): release X.Y.Z`, is release-please's own and
-passes the ruleset's commit-message pattern.
+PR; its title, `chore: release canary`, is release-please's own and passes
+the ruleset's commit-message pattern.
 
 ## Steering a release
 

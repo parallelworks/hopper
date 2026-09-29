@@ -34,12 +34,14 @@ jobs:
         with:
           target-branch: canary
       - name: Run CI on the release PR
-        if: steps.release.outputs.pr
+        # The env block is evaluated even when the step is skipped, so the
+        # PR JSON is parsed in the shell rather than with fromJSON here.
+        if: steps.release.outputs.pr != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
-        run: gh workflow run ci.yml --ref "$BRANCH"
+          PR: ${{ steps.release.outputs.pr }}
+        run: gh workflow run ci.yml --ref "$(jq -r .headBranchName <<<"$PR")"
 
   binaries:
     needs: release-please
