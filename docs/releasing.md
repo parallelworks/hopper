@@ -37,8 +37,11 @@ merged.
 
 ## Setup
 
-No secrets. The workflow runs with the default `GITHUB_TOKEN` and declares
-the permissions it needs (`contents`, `pull-requests` and `actions: write`).
+No secrets. The workflow runs with the default `GITHUB_TOKEN` and grants
+permissions per job: `contents`, `pull-requests` and `actions: write` to the
+release-please job, `contents: write` alone to the goreleaser job. Every
+action in `.github/workflows` is pinned to a commit SHA, with the version as
+a trailing comment; Dependabot bumps both.
 GitHub does not start workflows for a pull request that token opened, so
 after release-please has created or updated its PR the workflow dispatches
 `ci.yml` on the PR's branch (`gh workflow run`); that run appears among the
