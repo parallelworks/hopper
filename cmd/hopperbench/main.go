@@ -24,7 +24,8 @@
 //	insert      InsertMany in batches of 100 (the unnest statement)
 //	copy        InsertMany in batches of 5000 (the COPY path)
 //	latency     commit-to-Work on an idle queue, local wake-up
-//	loaded      commit-to-Work while -clients clients work a stream of inserts at -rate jobs/s for -seconds
+//	loaded      commit-to-Work while -clients clients work a stream of inserts at -rate jobs/s for -seconds;
+//	            with -report N it also prints one "loaded-window" line every N seconds (for soaks)
 //
 // -history preloads that many rows of history first, to measure the live
 // table's independence from accumulated history.
@@ -86,6 +87,7 @@ func main() {
 		history   = flag.Int("history", 0, "rows of history to preload")
 		rate      = flag.Int("rate", 40000, "insert rate of the loaded scenario, jobs/s")
 		seconds   = flag.Int("seconds", 10, "duration of the loaded scenario")
+		report    = flag.Int("report", 0, "with loaded: print a latency and rate line every N seconds (0 = off)")
 		schema    = flag.String("schema", "hopperbench", "schema to create, use and drop")
 		compare   = flag.String("compare", "", "compare two result files, base,head, instead of running")
 		threshold = flag.Float64("threshold", 0.10, "with -compare: the fraction by which head may be slower than base")
@@ -104,7 +106,7 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	err := run(ctx, *url, *schema, strings.Split(*scenarios, ","), options{
-		jobs: *jobs, clients: *clients, workers: *workers, samples: *samples, history: *history, rate: *rate, seconds: *seconds,
+		jobs: *jobs, clients: *clients, workers: *workers, samples: *samples, history: *history, rate: *rate, seconds: *seconds, report: *report,
 	})
 	stop()
 	if err != nil {
@@ -114,7 +116,7 @@ func main() {
 }
 
 type options struct {
-	jobs, clients, workers, samples, history, rate, seconds int
+	jobs, clients, workers, samples, history, rate, seconds, report int
 }
 
 func run(ctx context.Context, url, schema string, scenarios []string, opts options) error {
@@ -497,6 +499,7 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 	// one slow batch does not stall the stream.
 	interval := time.Duration(float64(time.Second) * batch / float64(rate))
 	ticks := make(chan int, 64)
+	ticks2 := make(chan struct{}) // closed when inserting is done, ends reporting
 	var wg sync.WaitGroup
 	errs := make([]error, 4)
 	for w := range errs {
@@ -522,6 +525,42 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 		})
 	}
 	start := time.Now()
+	// Windowed reporting for long runs: the samples and jobs since the
+	// last report, so drift over hours shows up as it happens.
+	reportDone := make(chan struct{})
+	if b.opts.report > 0 {
+		go func() {
+			defer close(reportDone)
+			t := time.NewTicker(time.Duration(b.opts.report) * time.Second)
+			defer t.Stop()
+			seen, workedAt, last := 0, 0, time.Now()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticks2:
+					return
+				case now := <-t.C:
+					mu.Lock()
+					window := slices.Clone(lat[seen:])
+					seen = len(lat)
+					n := worked - workedAt
+					workedAt = worked
+					mu.Unlock()
+					r := result{Scenario: "loaded-window", Jobs: n, Seconds: now.Sub(last).Seconds(), JobsPerSec: float64(n) / now.Sub(last).Seconds()}
+					last = now
+					if len(window) > 0 {
+						slices.Sort(window)
+						ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+						r.P50Millis, r.P99Millis, r.MaxMillis = ms(window[len(window)/2]), ms(window[len(window)*99/100]), ms(window[len(window)-1])
+					}
+					_ = json.NewEncoder(os.Stdout).Encode(r)
+				}
+			}
+		}()
+	} else {
+		close(reportDone)
+	}
 	ticker := time.NewTicker(interval)
 	for n := 0; time.Since(start) < duration; n += batch {
 		<-ticker.C
@@ -530,6 +569,8 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 	ticker.Stop()
 	close(ticks)
 	wg.Wait()
+	close(ticks2)
+	<-reportDone
 	for _, err := range errs {
 		if err != nil {
 			return result{}, err
