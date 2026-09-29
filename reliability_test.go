@@ -233,12 +233,18 @@ func TestFencedClientCancelsJobsAndReregisters(t *testing.T) {
 	})
 	waitFor(t, func() bool { w.rec.mu.Lock(); defer w.rec.mu.Unlock(); return w.rec.seen[res.Job.ID] >= 2 })
 	close(w.release)
-	// The job completes under the new lease. On a slow machine the producer
-	// may re-claim it under the lapsing ID before the fence, and the leader
-	// then rescues that attempt too, so the attempt count is at least two.
+	// The job completes on its second or later attempt with one error per
+	// earlier one. Which client ID finishes it depends on timing: the leader
+	// rescues attempt 1 (its lease expired), and the re-claim may happen
+	// under the new lease, or under the lapsing ID before this client
+	// notices, which fencing allows since that attempt still owns the row;
+	// in the latter case the leader may rescue once more first.
 	job := waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted)
-	if job.AttemptedBy != c.ClientID() || job.Attempt < 2 || len(job.Errors) < 1 || len(job.Errors) != job.Attempt-1 {
+	if (job.AttemptedBy != c.ClientID() && job.AttemptedBy != oldID) || job.Attempt < 2 || len(job.Errors) < 1 || len(job.Errors) != job.Attempt-1 {
 		t.Errorf("job after fencing = %+v", job)
+	}
+	if job.Errors[0].Error != "hopper: client lost" {
+		t.Errorf("first error = %q, want the rescue", job.Errors[0].Error)
 	}
 }
 
