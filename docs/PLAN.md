@@ -563,7 +563,10 @@ RETURNING j.*;
   within a minute. Autovacuum looks only every `autovacuum_naptime` (a minute by
   default), so the leader keeps the table fit itself, in a loop of its own since a pass
   over a large backlog takes seconds: every leader interval it vacuums `hopper_jobs`
-  once a hundred thousand dead rows have accumulated (`VACUUM (SKIP_LOCKED, ANALYZE)`;
+  once a hundred thousand dead rows have accumulated (`VACUUM (SKIP_LOCKED, TRUNCATE
+  false)`: heap truncation needs an exclusive lock the vacuum retries for five seconds,
+  and every claim waits behind it whenever it briefly succeeds, so schema v7 disables it
+  on the live table for autovacuum too;
   what matters is their number, about five hundred index pages, not their share of the
   table, so a short burst never triggers one) and re-analyzes it, with a small sample,
   only when the row count the planner holds is ten times off the live count: an analyze

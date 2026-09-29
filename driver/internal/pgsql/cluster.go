@@ -415,7 +415,12 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 		return res, fmt.Errorf("hopper: live table statistics: %w", err)
 	}
 	if dead >= vacuumDeadRows {
-		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED) hopper_jobs"); err != nil {
+		// TRUNCATE false: a vacuum otherwise ends by trying, for up to five
+		// seconds, to take an exclusive lock to give back empty trailing
+		// pages, and whenever it briefly gets one every claim and finalize
+		// waits behind it. A churning live table reuses those pages within
+		// seconds anyway.
+		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, TRUNCATE false) hopper_jobs"); err != nil {
 			return res, fmt.Errorf("hopper: vacuum live table: %w", err)
 		}
 		res.Vacuumed = true
