@@ -42,7 +42,7 @@ jobs:
               -scenarios throughput,mixed,scheduled,retry,insert,copy,latency \
               -jobs 200000 -history 5000000 -schema "soak_$round"
           done | tee soak.jsonl
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: soak-${{ github.run_id }}
           path: soak.jsonl
