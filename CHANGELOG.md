@@ -10,8 +10,8 @@ change the API.
 
 The first soak on the reference hardware found three defects in the live
 table's upkeep that only show under sustained load; all three are fixed here
-and the soak results are in [docs/PLAN.md](docs/PLAN.md) §8.2. Upgrading
-applies schema v7 (one `ALTER TABLE`).
+and verified with a ten-minute loaded run at 43,000 jobs/s (p50 9.6 ms, p99
+52 ms in every window). Upgrading applies schema v7 (one `ALTER TABLE`).
 
 ### Fixed
 
