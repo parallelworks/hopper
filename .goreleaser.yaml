@@ -1,0 +1,46 @@
+# Builds the command-line binaries for a release and attaches them to the
+# GitHub release that release-please created (see .github/workflows/release.yml).
+version: 2
+project_name: hopper
+
+builds:
+  - id: hopper
+    main: ./cmd/hopper
+    binary: hopper
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags: ["-s -w"]
+  - id: hopperbench
+    main: ./cmd/hopperbench
+    binary: hopperbench
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags: ["-s -w"]
+  - id: hopperui
+    # The web UI is its own module; goreleaser builds it from that directory.
+    dir: hopperui
+    main: ./cmd/hopperui
+    binary: hopperui
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags: ["-s -w"]
+
+archives:
+  - id: default
+    ids: [hopper, hopperbench, hopperui]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  # release-please writes the release notes.
+  disable: true
+
+release:
+  # Attach to the release release-please made; keep its notes.
+  mode: keep-existing

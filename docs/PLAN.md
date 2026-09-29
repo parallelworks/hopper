@@ -1101,7 +1101,9 @@ observability without new machinery.
   Proxy work. LISTEN needs a session connection, so it can be given a direct
   connection (§7.11). Otherwise the client uses adaptive polling and logs that once.
 - **Stability:** API stability starts at v1.0.0. Until then, minor versions may break
-  the API, with changes noted in the CHANGELOG. The SQL insert contract (§10) is
+  the API, with changes noted in the CHANGELOG. Releases are cut by release-please from
+  the Conventional Commit titles of merged PRs, one version across the three modules,
+  with goreleaser attaching the CLI binaries ([docs/releasing.md](releasing.md)). The SQL insert contract (§10) is
   versioned separately and changes only with a deprecation window.
 
 ## 16. Milestones
