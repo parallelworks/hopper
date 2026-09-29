@@ -6,6 +6,31 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.2.0](https://github.com/parallelworks/hopper/compare/v0.1.1...v0.2.0) (2026-09-29)
+
+
+### Features
+
+* **core:** control layer (M3) ([#4](https://github.com/parallelworks/hopper/issues/4)) ([7415230](https://github.com/parallelworks/hopper/commit/7415230d71577de9a9592f9ac8c3333cb8892031))
+* **core:** flow control and batches (M7) ([#7](https://github.com/parallelworks/hopper/issues/7)) ([2e80c18](https://github.com/parallelworks/hopper/commit/2e80c18b61ee70a4d6997046a1e2d603e981c331))
+* **core:** reliability layer (M2) ([#3](https://github.com/parallelworks/hopper/issues/3)) ([ada1c65](https://github.com/parallelworks/hopper/commit/ada1c654a86254c114307693780d5ed689c269b3))
+* **core:** scaffold and core engine (M0, M1) ([#2](https://github.com/parallelworks/hopper/issues/2)) ([226ef25](https://github.com/parallelworks/hopper/commit/226ef25b37e702189b19970c918fbe3118cee2d4))
+* **core:** streams with consumers and the hopperui module (M8) ([#10](https://github.com/parallelworks/hopper/issues/10)) ([842d522](https://github.com/parallelworks/hopper/commit/842d522f1e87459dc1adec9ae3b7c7f5b9f9cf8b))
+* **core:** workflows with job dependencies (M8) ([#9](https://github.com/parallelworks/hopper/issues/9)) ([9473b66](https://github.com/parallelworks/hopper/commit/9473b6697fa8f36dec92cc7d25ac4cb757f3cfa4))
+* **driver:** database/sql driver (hoppersql) ([#8](https://github.com/parallelworks/hopper/issues/8)) ([32170ef](https://github.com/parallelworks/hopper/commit/32170ef8249a8197e7f1609d48ca0d405aa45c47))
+* **messaging:** subscriptions, publish fan-out, ordering keys and the SQL contract (M6) ([#6](https://github.com/parallelworks/hopper/issues/6)) ([5d486c8](https://github.com/parallelworks/hopper/commit/5d486c87cb802d31539c1f23aeae1805c90921f3))
+* performance and release tooling (M4) ([#5](https://github.com/parallelworks/hopper/issues/5)) ([9bb7c19](https://github.com/parallelworks/hopper/commit/9bb7c19711a1c3a64075ad95b7c096df6f1cf215))
+
+
+### Bug fixes
+
+* **core:** refresh the live table's statistics on churn again, rate-limited ([#16](https://github.com/parallelworks/hopper/issues/16)) ([569afb2](https://github.com/parallelworks/hopper/commit/569afb236f4fe1749188edbeb501b568f4cb6824))
+
+
+### Performance
+
+* **core:** live-table maintenance, plan-stable claim, and the reference benchmark run ([#13](https://github.com/parallelworks/hopper/issues/13)) ([fb74d3c](https://github.com/parallelworks/hopper/commit/fb74d3cf9ebf4d534cade481917e7947e8d84427))
+
 ## [0.1.1] - 2026-09-29
 
 The first soak on the reference hardware found three defects in the live
