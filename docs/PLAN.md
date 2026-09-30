@@ -854,9 +854,9 @@ the hardware details and the benchmark harness are published with each release.
 | Throughput with a 10M-row history | within 5% of an empty history |
 
 **Results (2026-09-28, the v0.1.0 run).** Postgres 17.11 in a container capped to 8 vCPU
-and 32 GB on an NVMe host (`shared_buffers` 8 GB, `synchronous_commit = on`, default
-autovacuum settings), clients on an 8-vCPU host 1.8 ms away, `hopperbench` at
-`-jobs 300000` with four clients:
+and 32 GB on a cloud VM whose data disk is a network-attached persistent disk, not local
+NVMe (`shared_buffers` 8 GB, `synchronous_commit = on`, default autovacuum settings),
+clients on an 8-vCPU host 1.8 ms away, `hopperbench` at `-jobs 300000` with four clients:
 
 | Metric | Result |
 | --- | --- |
@@ -875,6 +875,40 @@ large live table (§7.3) cost throughput there, by design, to keep the claim ind
 short. The 100-worker throughput figure is bound by the client's concurrency, not the
 database, so the default per-client `MaxWorkers` for a queue meant to saturate a
 database of this size is 200.
+
+**Soak (2026-09-30, v0.1.1, 3 hours).** Run on a different machine, a Kubernetes node
+with a 96-core AMD EPYC 9655P and local NVMe in RAID 1 (md, XFS): Postgres 17.11 with
+the settings above, pinned to 8 physical cores (16 threads) and 32 GB, the bench client
+on the same node, four clients of 200 workers and the paced inserter at 43,000 jobs/s
+(70% of peak) for 10,800 s: 381,900,000 jobs, no errors, no lease loss, no rescue. The
+run had two regimes. For the first 30 minutes the inserter held 42,700 jobs/s with p50
+5 ms and a **p99 of 1.1–2.4 s** in every window: on this node the four clients'
+finalizers convoy on the history partition's extension lock and the WAL-write lock
+every few seconds, a 500-row flush then exceeds its 47 ms budget, the finalizer's
+two-batch buffer fills, all 200 workers block on submit and the client stops claiming
+until the convoy breaks. Splitting the samples shows the insert call at p99 10 ms and
+the commit-to-`Work` wait at p99 1.4–1.7 s; a shorter poll interval changes nothing,
+removing the leader's vacuum collapses the run within two minutes, and a 20-batch
+buffer roughly halves the tail (issue #20; the fix is a finalizer that keeps claiming
+while results queue, or several flushes in flight). From minute 31 the inserter fell to
+32,000–36,000 jobs/s and stayed there: its in-flight transactions waited 14–50 ms on
+the WAL-write lock, and the harness's four inserter goroutines cannot exceed that rate
+at such a commit latency, although WAL writes averaged 0.2 ms, syncs 0.04 ms and the
+WAL writer was 17% busy. With the queue shallow, the remaining 150 minutes ran at **p50
+3.1 ms and a median window p99 of 150–180 ms**, hour three within 5% of hour two, so
+no drift. Table sizes stayed bounded: the live heap was 116–133 MB and the claim index
+23–26 MB for the first 90 minutes, dead tuples between the leader's passes (one every
+4.7 s) were 200,000 at the median and 453,000 at most, autovacuum's 180 passes on the
+live table took at most 0.06 s each, the 108 checkpoints wrote a median 114,000
+buffers over 90 s, and the 79 GB, 381,000,000-row history had no measurable effect on
+the live table. One window at 02:25 UTC had a 17 s stall caused by the measurement
+itself, a 15 s fdatasync latency probe on the data volume at 9,000 syncs/s; the
+198,000-row backlog it left tripled the live heap to 313 MB and the claim index to
+59 MB, which by design (no truncation, §7.3) stayed that size for the remaining
+90 minutes without any effect on throughput or latency. A first attempt used an
+`emptyDir` with a `sizeLimit`, which the kubelet enforces with an XFS project quota;
+quota accounting made 8 KB appends 27 times slower and serialised the finalizers on
+the partition's extension lock, so the data volume has no size limit.
 
 ### 8.3 Benchmark harness
 - `hopperbench` is a command in the repo that drives the scenarios above and prints
