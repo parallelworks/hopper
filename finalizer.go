@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -11,11 +12,16 @@ import (
 
 // finalizer buffers results and writes them in one statement per flush. It
 // flushes every finalizeInterval or every finalizeBatch results, whichever
-// comes first. A flush that fails is retried with backoff while the results
-// stay buffered, which in turn blocks job goroutines on submit and so stops
-// the producers from claiming more.
+// comes first. Results wait in a buffer of finalizeBuffer, many batches
+// deep, so a commit that is slow for a while is absorbed while the client
+// keeps claiming; only when the buffer is full do job goroutines block on
+// submit, which stops the producers. A flush that fails is retried with
+// backoff while its results stay buffered, so a database that cannot take
+// results fills the buffer and stops the claims. A flush that times out is
+// retried in halves, so one statement the database cannot finish in time
+// degrades into smaller ones instead of being sent again as it was.
 type finalizer struct {
-	exec     driver.Executor
+	exec     finalizeExecutor
 	logger   *slog.Logger
 	interval time.Duration
 	maxBatch int
@@ -33,12 +39,17 @@ type finalizer struct {
 	crashed atomic.Bool
 }
 
+// finalizeExecutor is the part of driver.Executor the finalizer uses.
+type finalizeExecutor interface {
+	JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error)
+}
+
 type pending struct {
 	job    *driver.JobRow
 	result driver.JobFinalize
 }
 
-func newFinalizer(exec driver.Executor, logger *slog.Logger, t tuning, wake func(string), applied func(*driver.JobRow, driver.JobFinalize)) *finalizer {
+func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, wake func(string), applied func(*driver.JobRow, driver.JobFinalize)) *finalizer {
 	return &finalizer{
 		exec:     exec,
 		logger:   logger,
@@ -46,7 +57,7 @@ func newFinalizer(exec driver.Executor, logger *slog.Logger, t tuning, wake func
 		maxBatch: t.finalizeBatch,
 		wake:     wake,
 		applied:  applied,
-		in:       make(chan pending, t.finalizeBatch*2),
+		in:       make(chan pending, max(t.finalizeBuffer, 2*t.finalizeBatch)),
 		done:     make(chan struct{}),
 	}
 }
@@ -112,9 +123,10 @@ func (f *finalizer) run(ctx context.Context) {
 const flushTimeout = 30 * time.Second
 
 // flush writes one batch. While ctx is live it retries with backoff until
-// the write succeeds. Once ctx is done (the client is stopping) it makes one
-// more attempt and then gives the results up; their jobs stay running in
-// the database and are rescued when this client's lease expires.
+// the write succeeds; a statement that timed out is retried as two halves.
+// Once ctx is done (the client is stopping) it makes one more attempt and
+// then gives the results up; their jobs stay running in the database and
+// are rescued when this client's lease expires.
 //
 // The statement itself runs on a context that ctx does not cancel: a result
 // that reached the finalizer belongs to a job that has finished, and the
@@ -146,6 +158,12 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, 5*time.Second)
+		if errors.Is(err, context.DeadlineExceeded) && len(batch) > 1 {
+			half := len(batch) / 2
+			f.flush(ctx, batch[:half])
+			f.flush(ctx, batch[half:])
+			return
+		}
 	}
 }
 

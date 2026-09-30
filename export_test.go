@@ -1,6 +1,9 @@
 package hopper
 
-import "time"
+import (
+	"cmp"
+	"time"
+)
 
 // Tuning exposes internal timings to tests in package hopper_test.
 type Tuning struct {
@@ -9,6 +12,7 @@ type Tuning struct {
 	ClaimCooldown    time.Duration
 	FinalizeInterval time.Duration
 	FinalizeBatch    int
+	FinalizeBuffer   int // 0: 20 * FinalizeBatch
 	StopGrace        time.Duration
 	CopyThreshold    int
 	NotifyInterval   time.Duration
@@ -26,6 +30,7 @@ func (c *Client[TTx]) SetTuning(t Tuning) {
 		claimCooldown:       t.ClaimCooldown,
 		finalizeInterval:    t.FinalizeInterval,
 		finalizeBatch:       t.FinalizeBatch,
+		finalizeBuffer:      cmp.Or(t.FinalizeBuffer, 20*t.FinalizeBatch),
 		stopGrace:           t.StopGrace,
 		copyThreshold:       t.CopyThreshold,
 		notifyInterval:      t.NotifyInterval,

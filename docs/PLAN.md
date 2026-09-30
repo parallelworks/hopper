@@ -622,7 +622,12 @@ RETURNING j.*;
 
 ### 7.5 Finalize
 Results are buffered and written by a per-client finalizer. It flushes every 25ms or
-every 500 results, whichever comes first, in **one statement**. Retries and snoozes are
+every 500 results, whichever comes first, in **one statement**. Up to 10,000 results
+wait in the buffer, so a commit that is slow for a while is absorbed while the client
+keeps claiming; only when the buffer is full do job goroutines block on submit, which
+stops the producers. A flush that hits its 30 s timeout is retried as two halves,
+down to single results, so one statement the database cannot finish in time degrades
+into smaller ones instead of being sent again as it was. Retries and snoozes are
 updated in place. Terminal outcomes are moved to history.
 
 ```sql
@@ -667,7 +672,15 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure
-  to claiming. Once the client is stopping, each batch gets one more attempt.
+  to claiming once the buffer is full. Once the client is stopping, each batch gets one
+  more attempt.
+- The deep buffer exists because of the v0.1.1 soak (§8.2): with a two-batch buffer,
+  four clients' finalizers convoyed on the history partition's extension lock and the
+  WAL-write lock, a flush then exceeded its 47 ms budget at 10,700 results/s per
+  client, every worker blocked on submit, and the client stopped claiming for one to
+  three seconds at a time (issue #20). Larger flushes do not help: the convoy's cost
+  is per row, a 2,000-row statement held the locks four times longer and could hit
+  the flush timeout, and a timed-out statement retried whole livelocked the client.
 - If a job has `await = true`, the finalize statement sends `pg_notify('hopper_done', id)`
   from its `RETURNING` clause, and `Await` returns as soon as the transaction commits.
   `Await` on a client without a listener (one that is not started) polls at
