@@ -5,7 +5,7 @@ go 1.27.0
 godebug fips140=only
 
 require (
-	github.com/parallelworks/hopper v0.1.2 // x-release-please-version
+	github.com/parallelworks/hopper v0.2.0 // x-release-please-version
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/metric v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
