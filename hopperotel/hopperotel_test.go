@@ -15,7 +15,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/parallelworks/hopper"
-	"github.com/parallelworks/hopper/driver/hopperpgx"
 	"github.com/parallelworks/hopper/hopperotel"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
@@ -44,7 +43,7 @@ func TestMiddlewareTracesAndMeasures(t *testing.T) {
 		}
 		return nil
 	})
-	client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{
+	client, err := hopper.NewClient(testdb.Driver(pool), &hopper.Config{
 		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
 		Workers: workers,
 		Logger:  slog.New(slog.DiscardHandler),

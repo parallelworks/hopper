@@ -38,7 +38,7 @@ func Pool(t testing.TB) *pgxpool.Pool {
 	t.Helper()
 	pool := EmptyPool(t, 0)
 	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
-	if _, err := hoppermigrate.Up(context.Background(), hopperpgx.New(pool), opts); err != nil {
+	if _, err := hoppermigrate.Up(context.Background(), Driver(pool), opts); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return pool
@@ -80,4 +80,9 @@ func EmptyPool(t testing.TB, maxConns int32) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 	return pool
+}
+
+// Driver binds the driver to the isolated schema created by EmptyPool.
+func Driver(pool *pgxpool.Pool) *hopperpgx.Driver {
+	return hopperpgx.NewWithConfig(pool, &hopperpgx.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]})
 }

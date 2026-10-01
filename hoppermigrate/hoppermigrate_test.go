@@ -6,7 +6,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/parallelworks/hopper/driver/hopperpgx"
 	"github.com/parallelworks/hopper/hoppermigrate"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
@@ -31,7 +30,7 @@ func TestUpDownUp(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	pool := testdb.EmptyPool(t, 0)
-	d := hopperpgx.New(pool)
+	d := testdb.Driver(pool)
 	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
 
 	v, err := hoppermigrate.Version(ctx, d)
@@ -117,7 +116,7 @@ func TestUpConcurrent(t *testing.T) {
 	// A small pool reproduces replicas contending for connections while they
 	// wait on the migration lock.
 	pool := testdb.EmptyPool(t, 2)
-	d := hopperpgx.New(pool)
+	d := testdb.Driver(pool)
 	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
 
 	var wg sync.WaitGroup
@@ -149,7 +148,7 @@ func TestUpConcurrent(t *testing.T) {
 func TestUpRejectsUnknownTarget(t *testing.T) {
 	t.Parallel()
 	pool := testdb.EmptyPool(t, 0)
-	_, err := hoppermigrate.Up(context.Background(), hopperpgx.New(pool), &hoppermigrate.Options{Target: hoppermigrate.Latest() + 1})
+	_, err := hoppermigrate.Up(context.Background(), testdb.Driver(pool), &hoppermigrate.Options{Target: hoppermigrate.Latest() + 1})
 	if err == nil {
 		t.Fatal("Up to an unknown version succeeded")
 	}

@@ -29,7 +29,7 @@ func (a execAdapter) Exec(ctx context.Context, sql string, args ...any) (interfa
 }
 
 func (pgxFixture) NewDriver(t *testing.T) driver.Driver[pgx.Tx] {
-	return hopperpgx.New(testdb.Pool(t))
+	return testdb.Driver(testdb.Pool(t))
 }
 
 func (pgxFixture) Begin(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx]) (pgx.Tx, func() error, func() error) {

@@ -49,7 +49,7 @@ func main() {
 	}
 }
 
-const usage = `usage: hopper [-database-url URL] [-json] <command> [args]
+const usage = `usage: hopper [-database-url URL] [-schema NAME] [-json] <command> [args]
 
 commands:
   migrate up|down|version [-target N]
@@ -80,6 +80,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	fs.SetOutput(out)
 	fs.Usage = func() { fmt.Fprintln(out, usage) }
 	url := fs.String("database-url", os.Getenv("HOPPER_DATABASE_URL"), "Postgres URL (default $HOPPER_DATABASE_URL)")
+	schema := fs.String("schema", "hopper", "Postgres schema for Hopper objects")
 	asJSON := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -101,7 +102,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		return fmt.Errorf("connect: %w", err)
 	}
 	defer pool.Close()
-	d := hopperpgx.New(pool)
+	d := hopperpgx.NewWithConfig(pool, &hopperpgx.Config{Schema: *schema})
 	client, err := hopper.NewClient(d, nil)
 	if err != nil {
 		return err

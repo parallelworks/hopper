@@ -33,7 +33,7 @@ func (e *Executor) SubscriptionUpsert(ctx context.Context, subs []driver.Subscri
 		metadata[i] = []byte(jsonOrEmptyObject(s.Metadata))
 	}
 	_, err := e.Conn.Exec(ctx, `
-		INSERT INTO hopper_subscriptions (name, pattern, kind, queue, max_attempts, metadata)
+		INSERT INTO {{schema}}.hopper_subscriptions (name, pattern, kind, queue, max_attempts, metadata)
 		SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::smallint[], $6::jsonb[])
 		ON CONFLICT (name) DO UPDATE SET pattern = EXCLUDED.pattern, kind = EXCLUDED.kind, queue = EXCLUDED.queue,
 		  max_attempts = EXCLUDED.max_attempts, metadata = EXCLUDED.metadata`,
@@ -58,7 +58,7 @@ func (e *Executor) SubscriptionList(ctx context.Context) ([]*driver.Subscription
 		s.MaxAttempts = int(maxAttempts.Int64)
 		s.Metadata = metadata.raw()
 		return &s, nil
-	})(e.Conn.Query(ctx, `SELECT name, pattern, kind, queue, max_attempts, metadata, created_at FROM hopper_subscriptions ORDER BY name`))
+	})(e.Conn.Query(ctx, `SELECT name, pattern, kind, queue, max_attempts, metadata, created_at FROM {{schema}}.hopper_subscriptions ORDER BY name`))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: list subscriptions: %w", err)
 	}
@@ -71,12 +71,12 @@ func (e *Executor) SubscriptionList(ctx context.Context) ([]*driver.Subscription
 // subscription's own metadata. A dedup key becomes the deliveries' unique key,
 // scoped by kind, so each subscription deduplicates independently.
 var messagePublishSQL = fmt.Sprintf(`
-WITH msg AS (SELECT hopper_uuidv7()::text AS id),
+WITH msg AS (SELECT {{schema}}.hopper_uuidv7()::text AS id),
 ins AS (
-  INSERT INTO hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key,
+  INSERT INTO {{schema}}.hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key,
                            ordering_key, expires_at, await)
   SELECT s.kind, s.queue,
-    CASE WHEN $5::float8 > 0 THEN 'scheduled' ELSE 'available' END::hopper_job_state,
+    CASE WHEN $5::float8 > 0 THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state,
     $6::smallint,
     coalesce(s.max_attempts, CASE WHEN $4::text IS NOT NULL THEN 10 ELSE 25 END),
     now() + make_interval(secs => $5::float8),
@@ -86,8 +86,8 @@ ins AS (
     $4::text,
     CASE WHEN $8::float8 > 0 THEN now() + make_interval(secs => $8::float8) END,
     $9::boolean
-  FROM hopper_subscriptions s, msg
-  WHERE $1::text ~ hopper_topic_regex(s.pattern)
+  FROM {{schema}}.hopper_subscriptions s, msg
+  WHERE $1::text ~ {{schema}}.hopper_topic_regex(s.pattern)
   ON CONFLICT (kind, unique_key) WHERE unique_key IS NOT NULL DO UPDATE SET kind = EXCLUDED.kind
   RETURNING %s, (xmax <> 0) AS duplicate
 )
@@ -95,7 +95,7 @@ SELECT * FROM ins`, JobColumns(""))
 
 // publishNotifySQL notifies the queues of the subscriptions matching a
 // topic, which are the delivery queues.
-const publishNotifySQL = `SELECT pg_notify($1, q) FROM (SELECT DISTINCT queue AS q FROM hopper_subscriptions WHERE $2::text ~ hopper_topic_regex(pattern)) d`
+const publishNotifySQL = `SELECT pg_notify($1, q) FROM (SELECT DISTINCT queue AS q FROM {{schema}}.hopper_subscriptions WHERE $2::text ~ {{schema}}.hopper_topic_regex(pattern)) d`
 
 // MessagePublish implements driver.Executor.
 func (e *Executor) MessagePublish(ctx context.Context, p driver.MessagePublishParams) ([]driver.JobInsertResult, error) {

@@ -30,11 +30,11 @@ func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertP
 		return nil, fmt.Errorf("hopperpgx: copy jobs: %w", err)
 	}
 	defer release()
-	if err := registerJobState(ctx, c); err != nil {
+	if err := registerJobState(ctx, c, e.Schema.Table("hopper_job_state")); err != nil {
 		return nil, fmt.Errorf("hopperpgx: copy jobs: %w", err)
 	}
 
-	rows, err := c.Query(ctx, "SELECT hopper_uuidv7(), now() FROM generate_series(1, $1)", n)
+	rows, err := c.Query(ctx, e.Schema.SQL("SELECT {{schema}}.hopper_uuidv7(), now() FROM generate_series(1, $1)"), n)
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: copy jobs: generate ids: %w", err)
 	}
@@ -95,7 +95,7 @@ func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertP
 		}
 	}
 	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "expires_at", "await", "ordering_key", "partition_key", "batch_id", "created_at"}
-	copied, err := copier.CopyFrom(ctx, pgx.Identifier{"hopper_jobs"}, columns, pgx.CopyFromRows(values))
+	copied, err := copier.CopyFrom(ctx, pgx.Identifier{e.Schema.Name, "hopper_jobs"}, columns, pgx.CopyFromRows(values))
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: copy jobs: %w", err)
 	}
@@ -154,14 +154,15 @@ func (p poolConn) Exec(ctx context.Context, sql string, args ...any) (pgconn.Com
 
 // registerJobState teaches a connection the hopper_job_state enum, once per
 // connection, so that COPY can encode it in binary.
-func registerJobState(ctx context.Context, c *pgx.Conn) error {
-	if _, ok := c.TypeMap().TypeForName("hopper_job_state"); ok {
+func registerJobState(ctx context.Context, c *pgx.Conn, name string) error {
+	if _, ok := c.TypeMap().TypeForName(name); ok {
 		return nil
 	}
-	t, err := c.LoadType(ctx, "hopper_job_state")
+	t, err := c.LoadType(ctx, name)
 	if err != nil {
 		return fmt.Errorf("load type hopper_job_state: %w", err)
 	}
+	t.Name = name
 	c.TypeMap().RegisterType(t)
 	return nil
 }

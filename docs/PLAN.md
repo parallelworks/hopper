@@ -344,8 +344,14 @@ engine.
 
 ## 6. Schema (Postgres)
 
-Tables are prefixed with `hopper_` and live in whatever schema is first in the
-connection's `search_path`, so users can isolate hopper in its own schema.
+Tables are prefixed with `hopper_` and live in the PostgreSQL schema configured
+on `hopperpgx.Config.Schema` or `hoppersql.Config.Schema`, defaulting to `hopper`.
+Both drivers qualify tables, functions, enum types, COPY destinations and
+maintenance objects explicitly, including inside caller-owned transactions.
+They never change the application's pool or transaction `search_path`.
+The CLI and UI accept `-schema` with the same default. Existing installations
+must configure their existing schema explicitly; changing Schema selects a
+separate installation and does not relocate data.
 
 ```sql
 CREATE TYPE hopper_job_state AS ENUM (
@@ -1094,6 +1100,10 @@ observability without new machinery.
 - `hopper migrate` in the CLI runs the same migrations. The raw SQL files are also
   published for teams that use goose, atlas or Flyway. `hopper_schema` records the
   applied version either way.
+- Up creates the configured namespace if absent. Each migration sets a
+  transaction-local `search_path` for the embedded unqualified DDL, and schema v8
+  binds SQL producer functions to that namespace. Down to zero leaves the
+  namespace intact. Raw SQL users must set the target path themselves.
 - Every schema change ships with an upgrade test that migrates from the previous version
   to the latest while a client works jobs in every state and inserts keep arriving
   (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that

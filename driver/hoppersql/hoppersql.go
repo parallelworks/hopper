@@ -24,18 +24,32 @@ import (
 
 // Driver implements driver.Driver[*sql.Tx] on a *sql.DB.
 type Driver struct {
-	db *sql.DB
+	db     *sql.DB
+	schema *pgsql.Schema
 }
 
 var _ driver.Driver[*sql.Tx] = (*Driver)(nil)
 
-// New returns a driver on db. The database handle is shared with the
-// application; the driver does not close it.
-func New(db *sql.DB) *Driver {
+// Config tunes the PostgreSQL driver.
+type Config struct {
+	// Schema is the PostgreSQL namespace for all Hopper objects. Empty means "hopper".
+	Schema string
+}
+
+// New returns a driver on db in the default "hopper" schema. The database
+// handle is shared with the application; the driver does not close it.
+func New(db *sql.DB) *Driver { return NewWithConfig(db, nil) }
+
+// NewWithConfig is New with driver settings.
+func NewWithConfig(db *sql.DB, cfg *Config) *Driver {
 	if db == nil {
 		panic("hoppersql: nil db")
 	}
-	return &Driver{db: db}
+	var name string
+	if cfg != nil {
+		name = cfg.Schema
+	}
+	return &Driver{db: db, schema: pgsql.NewSchema(name)}
 }
 
 // DB returns the underlying database handle.
@@ -43,12 +57,12 @@ func (d *Driver) DB() *sql.DB { return d.db }
 
 // Executor implements driver.Driver.
 func (d *Driver) Executor() driver.Executor {
-	return &pgsql.Executor{Conn: &dbConn{base: base{q: d.db}, db: d.db}}
+	return &pgsql.Executor{Conn: d.schema.Wrap(&dbConn{base: base{q: d.db}, db: d.db}), Schema: d.schema}
 }
 
 // UnwrapTx implements driver.Driver.
 func (d *Driver) UnwrapTx(tx *sql.Tx) driver.Executor {
-	return &pgsql.Executor{Conn: &txConn{base: base{q: tx}, tx: tx}, InTx: true}
+	return &pgsql.Executor{Conn: d.schema.Wrap(&txConn{base: base{q: tx}, tx: tx}), Schema: d.schema, InTx: true}
 }
 
 // Capabilities implements driver.Driver.
@@ -63,7 +77,7 @@ func (d *Driver) Listener(context.Context) (driver.Listener, error) {
 
 // Migrator implements driver.Driver.
 func (d *Driver) Migrator() driver.Migrator {
-	return &migrator{db: d.db}
+	return &migrator{db: d.db, schema: d.schema}
 }
 
 // queryer is what *sql.DB, *sql.Tx and *sql.Conn share.
@@ -236,7 +250,8 @@ func wrapErr(err error) error {
 }
 
 type migrator struct {
-	db *sql.DB
+	schema *pgsql.Schema
+	db     *sql.DB
 }
 
 // Lock implements driver.Migrator. The lock is held on a connection
@@ -249,11 +264,12 @@ func (m *migrator) Lock(ctx context.Context) (driver.MigrationExecutor, error) {
 	if _, err := c.ExecContext(ctx, "SELECT pg_advisory_lock($1)", pgsql.MigrationLockKey); err != nil {
 		return nil, errors.Join(fmt.Errorf("hoppersql: acquire migration lock: %w", err), c.Close())
 	}
-	return &migrationExecutor{conn: c}, nil
+	return &migrationExecutor{conn: c, schema: m.schema}, nil
 }
 
 type migrationExecutor struct {
-	conn *sql.Conn
+	schema *pgsql.Schema
+	conn   *sql.Conn
 }
 
 // connConn adapts a dedicated *sql.Conn to pgsql.Conn.
@@ -283,11 +299,11 @@ func (c *connConn) QueryExec(ctx context.Context, query string, queryArgs []any,
 }
 
 func (m *migrationExecutor) Versions(ctx context.Context) ([]int, error) {
-	return pgsql.MigrationVersions(ctx, &connConn{base: base{q: m.conn}, c: m.conn})
+	return pgsql.MigrationVersions(ctx, m.schema.Wrap(&connConn{base: base{q: m.conn}, c: m.conn}), m.schema)
 }
 
 func (m *migrationExecutor) Apply(ctx context.Context, version int, script string, up bool) error {
-	return pgsql.MigrationApply(ctx, &connConn{base: base{q: m.conn}, c: m.conn}, version, script, up)
+	return pgsql.MigrationApply(ctx, m.schema.Wrap(&connConn{base: base{q: m.conn}, c: m.conn}), m.schema, version, script, up)
 }
 
 func (m *migrationExecutor) Close(ctx context.Context) error {

@@ -53,8 +53,8 @@
   one. It has no `LISTEN`, so clients poll every `PollInterval`, and no COPY,
   so large `InsertMany` calls use the single-statement path. `hopperpgx` is
   the faster choice when the application can hold a pgx pool.
-- **Isolation.** Set `search_path` on the pool to keep hopper's tables in
-  their own schema. Notification channels are per database, so two hopper
+- **Isolation.** Set the driver's `Config.Schema` (default `hopper`) to choose
+  its PostgreSQL namespace. The application pool's `search_path` stays unchanged. Notification channels are per database, so two hopper
   schemas in one database will wake each other up; that is harmless.
 
 ## Limits
@@ -131,7 +131,7 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
 ## Command line
 
 ```sh
-hopper migrate up|down|version
+hopper [-schema NAME] migrate up|down|version
 hopper jobs list [-queue Q] [-kind K] [-state S] [-limit N]
 hopper jobs get|retry|cancel <id>
 hopper queues list|pause|resume [name]

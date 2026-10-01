@@ -52,7 +52,7 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	pool := testdb.Pool(t)
-	return &harness{t: t, pool: pool, d: hopperpgx.New(pool)}
+	return &harness{t: t, pool: pool, d: testdb.Driver(pool)}
 }
 
 // client returns a client with fast tuning. It is stopped at test end.

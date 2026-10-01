@@ -51,31 +51,31 @@ const finishedSelectColumns = `id, kind, queue, final_state, priority, attempt, 
 // on small tables and nothing else.
 func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 	return `cascade AS (
-  SELECT d.job_id FROM hopper_job_deps d JOIN finished f ON d.depends_on = f.id
+  SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN finished f ON d.depends_on = f.id
   WHERE f.final_state IN ('cancelled', 'discarded') AND d.on_failure = 'cancel'
   UNION
-  SELECT d.job_id FROM hopper_job_deps d JOIN cascade c ON d.depends_on = c.job_id
+  SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN cascade c ON d.depends_on = c.job_id
   WHERE d.on_failure = 'cancel'
 ),
 cascaded AS (
-  DELETE FROM hopper_jobs j USING (SELECT DISTINCT job_id FROM cascade) c
+  DELETE FROM {{schema}}.hopper_jobs j USING (SELECT DISTINCT job_id FROM cascade) c
   WHERE j.id = c.job_id AND j.state = 'pending'
   RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "NULL::jsonb", "true", "'cancelled'::text", doneChannelParam) + `
 ),
 done AS (SELECT * FROM finished UNION ALL SELECT * FROM cascaded),
 archived AS (
-  INSERT INTO hopper_job_history (
+  INSERT INTO {{schema}}.hopper_job_history (
     id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
     attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
     expires_at, cancel_requested_at, await, created_at, finalized_at, output)
-  SELECT id, seq, kind, queue, final_state::hopper_job_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
+  SELECT id, seq, kind, queue, final_state::{{schema}}.hopper_job_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
     attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
     expires_at, cancel_requested_at, await, created_at, now(), output
   FROM done WHERE archive
   RETURNING id
 ),
 batches AS (
-  UPDATE hopper_batches b
+  UPDATE {{schema}}.hopper_batches b
   SET pending = b.pending - c.n, failed = b.failed + c.f,
       completed_at = CASE WHEN b.pending - c.n <= 0 THEN now() ELSE b.completed_at END
   FROM (SELECT batch_id, count(*) AS n, count(*) FILTER (WHERE final_state IN ('cancelled', 'discarded')) AS f
@@ -84,7 +84,7 @@ batches AS (
   RETURNING b.id, b.pending, b.failed, b.on_success, b.on_failure, b.on_complete
 ),
 callbacks AS (
-  INSERT INTO hopper_jobs (kind, queue, priority, max_attempts, args, metadata)
+  INSERT INTO {{schema}}.hopper_jobs (kind, queue, priority, max_attempts, args, metadata)
   SELECT cb->>'kind', coalesce(cb->>'queue', 'default'), coalesce((cb->>'priority')::smallint, 2),
     coalesce((cb->>'max_attempts')::smallint, 25), coalesce(cb->'args', '{}'),
     coalesce(cb->'metadata', '{}') || jsonb_build_object('batch_id', b.id::text, 'batch_failed', b.failed)
@@ -93,18 +93,18 @@ callbacks AS (
   RETURNING pg_notify(` + insertChannelParam + `, queue)
 ),
 promoted AS (
-  UPDATE hopper_jobs j
-  SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::hopper_job_state
+  UPDATE {{schema}}.hopper_jobs j
+  SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
   WHERE j.state = 'pending'
-    AND j.id IN (SELECT d.job_id FROM hopper_job_deps d JOIN done ON d.depends_on = done.id)
+    AND j.id IN (SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN done ON d.depends_on = done.id)
     AND j.id NOT IN (SELECT id FROM cascaded)
     AND NOT EXISTS (
-      SELECT 1 FROM hopper_job_deps d JOIN hopper_jobs x ON x.id = d.depends_on
+      SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
       WHERE d.job_id = j.id AND x.id NOT IN (SELECT id FROM done))
   RETURNING pg_notify(` + insertChannelParam + `, j.queue)
 ),
 edges AS (
-  DELETE FROM hopper_job_deps d WHERE d.job_id IN (SELECT id FROM done) RETURNING d.job_id
+  DELETE FROM {{schema}}.hopper_job_deps d WHERE d.job_id IN (SELECT id FROM done) RETURNING d.job_id
 )`
 }
 
@@ -117,9 +117,9 @@ WITH p AS (
     $9::float8[], $10::boolean[], $11::text[], $12::text[], $13::boolean[]
   ) AS p(id, kind, queue, priority, max_attempts, scheduled_at, args, metadata, ttl, await, ordering_key, partition_key, pending)
 )
-INSERT INTO hopper_jobs (id, kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, expires_at, await, ordering_key, partition_key, batch_id)
+INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, expires_at, await, ordering_key, partition_key, batch_id)
 SELECT p.id, p.kind, p.queue,
-       CASE WHEN p.pending THEN 'pending' WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::hopper_job_state,
+       CASE WHEN p.pending THEN 'pending' WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state,
        p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata,
        CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key, p.partition_key, $14::uuid
 FROM p
@@ -174,7 +174,7 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 
 	res := &driver.WorkflowInsertResult{}
 	err = e.withTx(ctx, func(tx Tx) error {
-		ids, err := scanIDs(tx.Query(ctx, "SELECT hopper_uuidv7() FROM generate_series(1, $1)", n))
+		ids, err := scanIDs(tx.Query(ctx, "SELECT {{schema}}.hopper_uuidv7() FROM generate_series(1, $1)", n))
 		if err != nil {
 			return fmt.Errorf("generate ids: %w", err)
 		}
@@ -194,7 +194,7 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return err
 		}
 		err = tx.QueryRow(ctx, `
-			INSERT INTO hopper_batches (name, pending, total, on_success, on_failure, on_complete, metadata, edges)
+			INSERT INTO {{schema}}.hopper_batches (name, pending, total, on_success, on_failure, on_complete, metadata, edges)
 			VALUES ($1, $2, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb) RETURNING id`,
 			nullable(params.Name), n, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata), string(edgesJSON)).Scan(&res.ID)
 		if err != nil {
@@ -208,7 +208,7 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return fmt.Errorf("insert jobs: %w", err)
 		}
 		if len(params.Deps) > 0 {
-			if _, err := tx.Exec(ctx, `INSERT INTO hopper_job_deps (job_id, depends_on, on_failure)
+			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_job_deps (job_id, depends_on, on_failure)
 				SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::text[]) ON CONFLICT DO NOTHING`,
 				uuidArray(jobIDs), uuidArray(depIDs), textArray(policies)); err != nil {
 				return fmt.Errorf("insert dependencies: %w", err)
@@ -239,9 +239,9 @@ func callbacksJSON(cbs ...*driver.JobInsertParams) (onSuccess, onFailure, onComp
 
 var workflowJobsSQL = fmt.Sprintf(`
 SELECT %s, finalized_at, output FROM (
-  SELECT %s, seq, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM hopper_jobs WHERE batch_id = $1
+  SELECT %s, seq, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE batch_id = $1
   UNION ALL
-  SELECT %s, seq, finalized_at, output FROM hopper_job_history WHERE batch_id = $1
+  SELECT %s, seq, finalized_at, output FROM {{schema}}.hopper_job_history WHERE batch_id = $1
 ) u ORDER BY seq`, JobColumns(""), JobColumns(""), JobColumns(""))
 
 // WorkflowGet implements driver.Executor.
@@ -253,7 +253,7 @@ func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		metadata  jsonText
 		edges     jsonText
 	)
-	err := e.Conn.QueryRow(ctx, `SELECT id, name, pending, failed, total, created_at, completed_at, metadata, edges FROM hopper_batches WHERE id = $1`, uuidParam(id)).
+	err := e.Conn.QueryRow(ctx, `SELECT id, name, pending, failed, total, created_at, completed_at, metadata, edges FROM {{schema}}.hopper_batches WHERE id = $1`, uuidParam(id)).
 		Scan(&w.Batch.ID, &name, &w.Batch.Pending, &w.Batch.Failed, &w.Batch.Total, &w.Batch.CreatedAt, &completed, &metadata, &edges)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound

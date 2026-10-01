@@ -37,7 +37,7 @@ func TestCLI(t *testing.T) {
 	hopperCmd := func(args ...string) string {
 		t.Helper()
 		var out bytes.Buffer
-		if err := run(ctx, args, &out); err != nil {
+		if err := run(ctx, append([]string{"-schema", schema}, args...), &out); err != nil {
 			t.Fatalf("hopper %s: %v\n%s", strings.Join(args, " "), err, out.String())
 		}
 		return out.String()
