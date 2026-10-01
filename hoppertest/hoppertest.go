@@ -8,6 +8,9 @@
 //	// Run a job's worker directly, without a database round trip.
 //	err := hoppertest.Work(ctx, t, workers, SendEmail{UserID: 42}, nil)
 //
+//	// Start a client for the test; it is stopped when the test ends.
+//	hoppertest.Start(ctx, t, client)
+//
 // The Require helpers look at live jobs (not yet finalized) of one kind, so
 // they work whether or not a client is started. The Tx variants look inside
 // a transaction, for code that inserts with InsertTx and tests that roll
@@ -17,6 +20,7 @@ package hoppertest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -166,6 +170,8 @@ var workSeq atomic.Int64
 // claimed or finalized, and middleware does not run. The worker's Timeout
 // applies. It returns the worker's error, so callers can check for
 // hopper.Snooze and hopper.Cancel results with errors.As.
+// A worker that uses hopper.ClientFromContext gets a client only if ctx
+// carries one, from hopper.ContextWithClient.
 func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.Workers, args T, opts *WorkOpts) error {
 	tb.Helper()
 	encoded, err := json.Marshal(args)
@@ -222,4 +228,20 @@ func syntheticID() hopper.JobID {
 		id[15-i] = byte(n >> (8 * i)) //nolint:gosec // the low 48 bits are wanted
 	}
 	return id
+}
+
+// Start starts client and stops it when the test ends, with a context that
+// outlives ctx so running jobs get their stop grace.
+func Start[TTx any](ctx context.Context, tb testing.TB, client *hopper.Client[TTx]) {
+	tb.Helper()
+	if err := client.Start(ctx); err != nil {
+		tb.Fatalf("hoppertest: start client: %v", err)
+	}
+	tb.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := client.Stop(stopCtx); err != nil && !errors.Is(err, hopper.ErrClientStopped) {
+			tb.Errorf("hoppertest: stop client: %v", err)
+		}
+	})
 }

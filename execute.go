@@ -23,6 +23,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	defer cancel(nil)
 	output := &outputHolder{codec: c.cfg.Codec}
 	jobCtx = context.WithValue(jobCtx, outputKey{}, output)
+	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	c.trackRunning(row.ID, cancel)
 	defer c.untrackRunning(row.ID)
 

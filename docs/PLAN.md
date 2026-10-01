@@ -130,6 +130,13 @@ hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[ResizeImag
 `http.Handle`. Calling `Insert` with an args type that has no registered worker on this
 client is allowed (another service may work it), but `Config.StrictKinds` rejects it.
 
+Workers are registered before the client that runs them exists, so a worker or
+subscriber that needs the client, to insert follow-up jobs, publish or query, takes it
+from its context: `hopper.ClientFromContext[pgx.Tx](ctx)` returns the client running the
+job, and `false` outside a job or for another transaction type. This avoids wiring the
+client back into components after construction. Tests that run a worker inline with
+`hoppertest.Work` supply one with `hopper.ContextWithClient`.
+
 ### 4.2 Client
 
 ```go
