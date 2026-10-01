@@ -124,7 +124,9 @@ func TestFinalizerSplitsTimedOutFlush(t *testing.T) {
 	exec := &stubExec{failAbove: 3}
 	var mu sync.Mutex
 	applied := 0
-	tun := tuning{finalizeInterval: time.Millisecond, finalizeBatch: 16, finalizeBuffer: 32}
+	// The interval is long so the 16 results flush as one batch, on size: a
+	// short one can fire while they are still being submitted and split them.
+	tun := tuning{finalizeInterval: time.Minute, finalizeBatch: 16, finalizeBuffer: 32}
 	f, stop := newTestFinalizer(exec, tun, func() { mu.Lock(); applied++; mu.Unlock() })
 	submitN(f, 16)
 	deadline := time.Now().Add(5 * time.Second)
