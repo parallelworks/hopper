@@ -99,9 +99,9 @@ WITH p AS (
     $9::float8[], $10::boolean[], $11::text[], $12::text[], $13::uuid[]
   ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key, ttl, await, ordering_key, partition_key, batch_id)
 )
-INSERT INTO hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await, ordering_key, partition_key, batch_id)
+INSERT INTO {{schema}}.hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await, ordering_key, partition_key, batch_id)
 SELECT p.kind, p.queue,
-       CASE WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::hopper_job_state,
+       CASE WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state,
        p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata, p.unique_key,
        CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key, p.partition_key, p.batch_id
 FROM p
@@ -227,9 +227,9 @@ const claimEligibleSQL = `
       AND cand.scheduled_at <= now()
       AND (cand.expires_at IS NULL OR cand.expires_at > now())
       AND (cand.ordering_key IS NULL OR (
-        NOT EXISTS (SELECT 1 FROM hopper_jobs r
+        NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs r
                     WHERE r.queue = cand.queue AND r.ordering_key = cand.ordering_key AND r.state = 'running')
-        AND cand.seq = (SELECT min(o.seq) FROM hopper_jobs o
+        AND cand.seq = (SELECT min(o.seq) FROM {{schema}}.hopper_jobs o
                         WHERE o.queue = cand.queue AND o.ordering_key = cand.ordering_key
                           AND o.state IN ('available', 'scheduled', 'retryable'))))`
 
@@ -252,7 +252,7 @@ const claimEligibleSQL = `
 const jobClaimSQL = `
 WITH c AS MATERIALIZED (
   SELECT cand.id, row_number() OVER (ORDER BY cand.priority, cand.scheduled_at, cand.seq) AS n FROM (
-    SELECT cand.id, cand.priority, cand.scheduled_at, cand.seq FROM hopper_jobs cand
+    SELECT cand.id, cand.priority, cand.scheduled_at, cand.seq FROM {{schema}}.hopper_jobs cand
     WHERE ` + claimEligibleSQL + `
     ORDER BY cand.priority, cand.scheduled_at, cand.seq
     LIMIT %d
@@ -260,7 +260,7 @@ WITH c AS MATERIALIZED (
   ) cand
 ),
 claimed AS (
-  UPDATE hopper_jobs j
+  UPDATE {{schema}}.hopper_jobs j
   SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
   FROM c
   WHERE j.id = c.id AND c.n <= $3
@@ -276,14 +276,14 @@ const jobClaimPartitionedSQL = `
 WITH ranked AS MATERIALIZED (
   SELECT cand.id, cand.partition_key,
     row_number() OVER (PARTITION BY cand.partition_key ORDER BY cand.priority, cand.scheduled_at, cand.seq)
-      + coalesce((SELECT count(*) FROM hopper_jobs pr
+      + coalesce((SELECT count(*) FROM {{schema}}.hopper_jobs pr
                   WHERE pr.queue = cand.queue AND pr.partition_key = cand.partition_key AND pr.state = 'running'), 0) AS slot
-  FROM hopper_jobs cand
+  FROM {{schema}}.hopper_jobs cand
   WHERE ` + claimEligibleSQL + `
 ),
 c AS MATERIALIZED (
   SELECT cand.id, row_number() OVER (ORDER BY cand.priority, cand.scheduled_at, cand.seq) AS n FROM (
-    SELECT cand.id, cand.priority, cand.scheduled_at, cand.seq FROM hopper_jobs cand
+    SELECT cand.id, cand.priority, cand.scheduled_at, cand.seq FROM {{schema}}.hopper_jobs cand
     WHERE cand.id IN (SELECT id FROM ranked WHERE partition_key IS NULL OR slot <= $4)
     ORDER BY cand.priority, cand.scheduled_at, cand.seq
     LIMIT %d
@@ -291,7 +291,7 @@ c AS MATERIALIZED (
   ) cand
 ),
 claimed AS (
-  UPDATE hopper_jobs j
+  UPDATE {{schema}}.hopper_jobs j
   SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
   FROM c
   WHERE j.id = c.id AND c.n <= $3
@@ -371,8 +371,8 @@ WITH RECURSIVE r AS (
   ) AS r(id, attempted_by, state, delay, snooze, error, output, archive)
 ),
 retry AS (
-  UPDATE hopper_jobs j
-  SET state = r.state::hopper_job_state,
+  UPDATE {{schema}}.hopper_jobs j
+  SET state = r.state::{{schema}}.hopper_job_state,
       scheduled_at = now() + make_interval(secs => r.delay),
       attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
       errors = CASE WHEN r.error IS NULL THEN j.errors
@@ -384,7 +384,7 @@ retry AS (
   RETURNING j.id
 ),
 finished AS (
-  DELETE FROM hopper_jobs j
+  DELETE FROM {{schema}}.hopper_jobs j
   USING r
   WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by
     AND r.state IN ('completed', 'cancelled', 'discarded')
@@ -452,9 +452,9 @@ func marshalAttemptError(e *driver.AttemptError) ([]byte, error) {
 }
 
 var jobGetQuery = fmt.Sprintf(`
-SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM hopper_jobs WHERE id = $1
+SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE id = $1
 UNION ALL
-SELECT %s, finalized_at, output FROM hopper_job_history WHERE id = $1
+SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history WHERE id = $1
 LIMIT 1`, JobColumns(""), JobColumns(""))
 
 // JobGet implements driver.Executor.
@@ -470,8 +470,8 @@ func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow,
 }
 
 var (
-	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM hopper_jobs`, JobColumns(""))
-	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM hopper_job_history`, JobColumns(""))
+	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM {{schema}}.hopper_jobs`, JobColumns(""))
+	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, JobColumns(""))
 	jobListFilterSQL  = ` WHERE ($1 = '' OR queue = $1) AND (cardinality($2::text[]) = 0 OR kind = ANY($2::text[]))
   AND (cardinality($3::text[]) = 0 OR state::text = ANY($3::text[])) AND id > $4::uuid`
 )
@@ -512,14 +512,14 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 
 var (
 	jobCancelRunningSQL = fmt.Sprintf(`
-UPDATE hopper_jobs SET cancel_requested_at = coalesce(cancel_requested_at, now())
+UPDATE {{schema}}.hopper_jobs SET cancel_requested_at = coalesce(cancel_requested_at, now())
 WHERE id = $1 AND state = 'running'
 RETURNING %s`, JobColumns(""))
 	// jobCancelWaitingSQL finalizes a waiting job as cancelled, with
 	// everything that entails for its batch and its dependents.
 	jobCancelWaitingSQL = `
 WITH RECURSIVE finished AS (
-  DELETE FROM hopper_jobs j WHERE j.id = $1 AND j.state <> 'running'
+  DELETE FROM {{schema}}.hopper_jobs j WHERE j.id = $1 AND j.state <> 'running'
   RETURNING ` + finishedColumns(appendErrorSQL("hopper: cancelled"), "NULL::jsonb", "true", "'cancelled'::text", "$2") + `
 ),
 ` + finalizeTailSQL("$2", "$3") + `
@@ -531,7 +531,7 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 	var job *driver.JobRow
 	err := e.withTx(ctx, func(tx Tx) error {
 		var state string
-		err := tx.QueryRow(ctx, "SELECT state FROM hopper_jobs WHERE id = $1 FOR UPDATE", uuidParam(id)).Scan(&state)
+		err := tx.QueryRow(ctx, "SELECT state FROM {{schema}}.hopper_jobs WHERE id = $1 FOR UPDATE", uuidParam(id)).Scan(&state)
 		if errors.Is(err, ErrNoRows) {
 			// Not live: finalized already, or unknown.
 			job, err = e.JobGet(ctx, id)
@@ -562,15 +562,15 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 
 var (
 	jobRetryLiveSQL = fmt.Sprintf(`
-UPDATE hopper_jobs SET state = 'available', scheduled_at = now()
+UPDATE {{schema}}.hopper_jobs SET state = 'available', scheduled_at = now()
 WHERE id = $1 AND state <> 'running'
 RETURNING %s`, JobColumns(""))
 	// jobRetryHistorySQL moves a finalized job back to the live table with
 	// its history (attempt count and errors) intact. It gets a fresh seq,
 	// as a newly inserted job would, and one more attempt if it had run out.
 	jobRetryHistorySQL = fmt.Sprintf(`
-WITH h AS (DELETE FROM hopper_job_history WHERE id = $1 RETURNING *)
-INSERT INTO hopper_jobs (id, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata,
+WITH h AS (DELETE FROM {{schema}}.hopper_job_history WHERE id = $1 RETURNING *)
+INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata,
   errors, unique_key, ordering_key, partition_key, batch_id, await, created_at)
 SELECT id, kind, queue, 'available', priority, attempt,
   CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END, now(), args, metadata,
@@ -593,7 +593,7 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 	var job *driver.JobRow
 	err := e.withTx(ctx, func(tx Tx) error {
 		var state string
-		err := tx.QueryRow(ctx, "SELECT state FROM hopper_jobs WHERE id = $1 FOR UPDATE", uuidParam(id)).Scan(&state)
+		err := tx.QueryRow(ctx, "SELECT state FROM {{schema}}.hopper_jobs WHERE id = $1 FOR UPDATE", uuidParam(id)).Scan(&state)
 		switch {
 		case errors.Is(err, ErrNoRows):
 			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id)), false, nil)
@@ -623,9 +623,9 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 
 var jobDiscardExpiredSQL = `
 WITH RECURSIVE finished AS (
-  DELETE FROM hopper_jobs j
+  DELETE FROM {{schema}}.hopper_jobs j
   WHERE j.id IN (
-    SELECT id FROM hopper_jobs
+    SELECT id FROM {{schema}}.hopper_jobs
     WHERE state IN ('available', 'scheduled', 'retryable') AND expires_at <= now()
     LIMIT $1 FOR UPDATE SKIP LOCKED
   )
@@ -647,9 +647,9 @@ func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 // running longer than a stuck threshold. It walks the running index, which is
 // bounded by total concurrency.
 var jobRescueQuery = fmt.Sprintf(`
-SELECT %s FROM hopper_jobs j
+SELECT %s FROM {{schema}}.hopper_jobs j
 WHERE j.state = 'running'
-  AND (NOT EXISTS (SELECT 1 FROM hopper_clients c WHERE c.id = j.attempted_by AND c.expires_at > now())
+  AND (NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_clients c WHERE c.id = j.attempted_by AND c.expires_at > now())
        OR ($1::float8 > 0 AND j.attempted_at < now() - make_interval(secs => $1::float8)))
 ORDER BY j.attempted_at
 LIMIT $2`, JobColumns("j."))
@@ -670,7 +670,7 @@ func (e *Executor) JobAge(ctx context.Context, queue string, after time.Duration
 	}
 	// Bumped jobs restart their wait, so a job climbs one level per period.
 	n, err := e.Conn.Exec(ctx, `
-		UPDATE hopper_jobs SET priority = priority - 1, scheduled_at = now()
+		UPDATE {{schema}}.hopper_jobs SET priority = priority - 1, scheduled_at = now()
 		WHERE queue = $1 AND state IN ('available', 'scheduled', 'retryable') AND priority > 1
 		  AND scheduled_at <= now() - make_interval(secs => $2::float8)`, queue, after.Seconds())
 	if err != nil {

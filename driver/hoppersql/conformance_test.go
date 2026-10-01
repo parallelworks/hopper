@@ -30,7 +30,8 @@ func open(t *testing.T, pool *pgxpool.Pool) *sql.DB {
 }
 
 func (sqlFixture) NewDriver(t *testing.T) driver.Driver[*sql.Tx] {
-	return hoppersql.New(open(t, testdb.Pool(t)))
+	pool := testdb.Pool(t)
+	return hoppersql.NewWithConfig(open(t, pool), &hoppersql.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]})
 }
 
 func (sqlFixture) Begin(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) (*sql.Tx, func() error, func() error) {
@@ -92,7 +93,8 @@ func TestConformance(t *testing.T) {
 func TestMigrate(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	d := hoppersql.New(open(t, testdb.EmptyPool(t, 0)))
+	pool := testdb.EmptyPool(t, 0)
+	d := hoppersql.NewWithConfig(open(t, pool), &hoppersql.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]})
 	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
 	if _, err := hoppermigrate.Up(ctx, d, opts); err != nil {
 		t.Fatalf("up: %v", err)

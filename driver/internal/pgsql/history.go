@@ -111,14 +111,14 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 				// the catalog change, once per period. (DETACH CONCURRENTLY
 				// would avoid it, but Postgres refuses it while a DEFAULT
 				// partition exists.)
-				if _, err := e.Conn.Exec(ctx, "DROP TABLE IF EXISTS "+quoteIdent(name)); err != nil {
+				if _, err := e.Conn.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name)); err != nil {
 					return res, fmt.Errorf("hopper: drop partition %s: %w", name, err)
 				}
 				res.Dropped = append(res.Dropped, name)
 			}
 			// Rows in the DEFAULT partition cannot be dropped by period.
 			n, err := e.Conn.Exec(ctx,
-				fmt.Sprintf("DELETE FROM %s_default WHERE %s < now() - make_interval(secs => $1::float8)", g.parent, g.timeColumn),
+				fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", e.Schema.Table(g.parent+"_default"), g.timeColumn),
 				keep.Seconds())
 			if err != nil {
 				return res, fmt.Errorf("hopper: prune %s_default: %w", g.parent, err)
@@ -134,7 +134,7 @@ func (e *Executor) partitionsOf(ctx context.Context, parent string) (map[string]
 	names, err := scanStrings(e.Conn.Query(ctx, `
 		SELECT c.relname FROM pg_inherits i
 		JOIN pg_class c ON c.oid = i.inhrelid
-		WHERE i.inhparent = to_regclass($1)`, parent))
+		WHERE i.inhparent = to_regclass($1)`, e.Schema.Table(parent)))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: list partitions of %s: %w", parent, err)
 	}
@@ -157,18 +157,18 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 			_ = tx.Rollback(context.WithoutCancel(ctx))
 		}
 	}()
-	ident := quoteIdent(name)
-	parent := quoteIdent(g.parent)
+	ident := e.Schema.Table(name)
+	parent := e.Schema.Table(g.parent)
 	fromLit, toLit := literal(from), literal(to)
 
 	// Two leaders can overlap briefly; serialize them on an advisory lock
 	// held for this transaction, then check whether the other one has
 	// already created the partition.
-	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)", HistoryLockKey); err != nil {
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", e.Schema.Name, HistoryLockKey); err != nil {
 		return false, fmt.Errorf("hopper: lock history maintenance: %w", err)
 	}
 	var exists bool
-	if err = tx.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", name).Scan(&exists); err != nil {
+	if err = tx.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", e.Schema.Table(name)).Scan(&exists); err != nil {
 		return false, fmt.Errorf("hopper: check partition %s: %w", name, err)
 	}
 	if exists {
@@ -179,7 +179,7 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// SHARE UPDATE EXCLUSIVE on it. ATTACH does scan the DEFAULT partition
 	// for rows belonging to the new period, under an exclusive lock on that
 	// small table alone; the period is in the future, so it finds none.
-	if _, err = tx.Exec(ctx, "CREATE TABLE "+ident+" (LIKE "+quoteIdent(g.root)+" INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"); err != nil {
+	if _, err = tx.Exec(ctx, "CREATE TABLE "+ident+" (LIKE "+e.Schema.Table(g.root)+" INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"); err != nil {
 		return false, fmt.Errorf("hopper: create partition %s: %w", name, err)
 	}
 	if _, err = tx.Exec(ctx, fmt.Sprintf("ALTER TABLE %s ATTACH PARTITION %s FOR VALUES FROM (%s) TO (%s)", parent, ident, fromLit, toLit)); err != nil {
@@ -206,15 +206,15 @@ func quoteIdent(s string) string {
 
 // MigrationVersions returns the applied schema versions, or nil if the
 // schema has never been installed.
-func MigrationVersions(ctx context.Context, conn Conn) ([]int, error) {
+func MigrationVersions(ctx context.Context, conn Conn, schema *Schema) ([]int, error) {
 	var exists bool
-	if err := conn.QueryRow(ctx, "SELECT to_regclass('hopper_schema') IS NOT NULL").Scan(&exists); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", schema.Table("hopper_schema")).Scan(&exists); err != nil {
 		return nil, err
 	}
 	if !exists {
 		return nil, nil
 	}
-	return scanInts(conn.Query(ctx, "SELECT version FROM hopper_schema ORDER BY version"))
+	return scanInts(conn.Query(ctx, "SELECT version FROM {{schema}}.hopper_schema ORDER BY version"))
 }
 
 var (
@@ -233,7 +233,7 @@ var (
 // MigrationApply runs a migration script and records (up) or removes (down)
 // its version, atomically. The script may hold several statements, so the
 // transport must run it as a simple query (no parameters).
-func MigrationApply(ctx context.Context, conn Conn, version int, script string, up bool) (err error) {
+func MigrationApply(ctx context.Context, conn Conn, schema *Schema, version int, script string, up bool) (err error) {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return err
@@ -244,16 +244,32 @@ func MigrationApply(ctx context.Context, conn Conn, version int, script string, 
 		}
 	}()
 	if up {
+		var exists bool
+		if err = tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", schema.Name).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			if _, err = tx.Exec(ctx, "CREATE SCHEMA "+quoteIdent(schema.Name)); err != nil {
+				return err
+			}
+		}
+	}
+	// Migration scripts use unqualified DDL; this setting is transaction-local
+	// and never changes the application's pooled connections.
+	if _, err = tx.Exec(ctx, "SELECT set_config('search_path', $1, true)", quoteIdent(schema.Name)); err != nil {
+		return err
+	}
+	if up {
 		if _, err = tx.Exec(ctx, script); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, "INSERT INTO hopper_schema (version) VALUES ($1)", version); err != nil {
+		if _, err = tx.Exec(ctx, "INSERT INTO {{schema}}.hopper_schema (version) VALUES ($1)", version); err != nil {
 			return err
 		}
 	} else {
 		// The version row goes first: the down script of version 1 drops
 		// hopper_schema itself.
-		if _, err = tx.Exec(ctx, "DELETE FROM hopper_schema WHERE version = $1", version); err != nil {
+		if _, err = tx.Exec(ctx, "DELETE FROM {{schema}}.hopper_schema WHERE version = $1", version); err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, script); err != nil {

@@ -3,13 +3,16 @@
 Producers not written in Go enqueue work with plain SQL, inside their own
 transactions. Two functions ship with the migrations and are versioned with
 the schema (`hopper_schema`). They change only with a deprecation window.
+Qualify calls with the configured schema; these examples use the default
+`hopper`. The functions resolve internal objects in their installation schema
+even when the caller uses another `search_path`.
 
 ## `hopper_insert(kind text, args jsonb, opts jsonb DEFAULT '{}') RETURNS uuid`
 
 Inserts one job and returns its ID.
 
 ```sql
-SELECT hopper_insert('send_email', '{"user_id": 42, "tmpl": "welcome"}',
+SELECT hopper.hopper_insert('send_email', '{"user_id": 42, "tmpl": "welcome"}',
                      '{"queue": "email", "priority": 1, "max_attempts": 5}');
 ```
 
@@ -36,7 +39,7 @@ one job per subscription, and returns the delivery IDs. Workers are notified
 once per queue when the transaction commits.
 
 ```sql
-SELECT hopper_publish('allocation.created', '{"id": 42}',
+SELECT hopper.hopper_publish('allocation.created', '{"id": 42}',
                       '{"ordering_key": "allocation:42", "dedup_key": "evt-7f3a"}');
 ```
 

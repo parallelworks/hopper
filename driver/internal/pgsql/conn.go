@@ -59,8 +59,9 @@ type Row interface {
 // the caller's transaction, which rules out operations that must not run
 // inside one.
 type Executor struct {
-	Conn Conn
-	InTx bool
+	Conn   Conn
+	Schema *Schema
+	InTx   bool
 }
 
 // withTx runs fn in a transaction (a savepoint when already in one).

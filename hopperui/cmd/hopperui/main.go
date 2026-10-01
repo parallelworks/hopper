@@ -35,14 +35,15 @@ func main() {
 		title   = flag.String("title", "hopper", "title shown in the header")
 		actions = flag.Bool("allow-actions", false, "allow retry, cancel, pause, resume and seek for every request")
 	)
+	schema := flag.String("schema", "hopper", "Postgres schema for Hopper objects")
 	flag.Parse()
-	if err := run(*url, *listen, *prefix, *title, *actions); err != nil {
+	if err := run(*url, *listen, *prefix, *title, *schema, *actions); err != nil {
 		fmt.Fprintln(os.Stderr, "hopperui:", err)
 		os.Exit(1)
 	}
 }
 
-func run(url, listen, prefix, title string, actions bool) error {
+func run(url, listen, prefix, title, schema string, actions bool) error {
 	if url == "" {
 		return errors.New("-database-url or HOPPER_DATABASE_URL is required")
 	}
@@ -53,7 +54,7 @@ func run(url, listen, prefix, title string, actions bool) error {
 		return err
 	}
 	defer pool.Close()
-	client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{Logger: slog.Default()})
+	client, err := hopper.NewClient(hopperpgx.NewWithConfig(pool, &hopperpgx.Config{Schema: schema}), &hopper.Config{Logger: slog.Default()})
 	if err != nil {
 		return err
 	}

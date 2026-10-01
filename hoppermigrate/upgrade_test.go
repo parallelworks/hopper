@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/parallelworks/hopper"
-	"github.com/parallelworks/hopper/driver/hopperpgx"
 	"github.com/parallelworks/hopper/hoppermigrate"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
@@ -32,7 +31,7 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	}
 	ctx := context.Background()
 	pool := testdb.EmptyPool(t, 0)
-	d := hopperpgx.New(pool)
+	d := testdb.Driver(pool)
 	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
 	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Target: hoppermigrate.Latest() - 1, Logger: opts.Logger}); err != nil {
 		t.Fatal(err)

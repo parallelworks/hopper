@@ -125,7 +125,7 @@ func run(ctx context.Context, url, schema string, scenarios []string, opts optio
 		return err
 	}
 	defer cleanup()
-	d := hopperpgx.New(pool)
+	d := hopperpgx.NewWithConfig(pool, &hopperpgx.Config{Schema: schema})
 	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}); err != nil {
 		return err
 	}

@@ -32,7 +32,7 @@ func (e *Executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 		// committed ahead of it.
 		err := tx.QueryRow(ctx, `
 			SELECT global_limit, rate_per_sec, rate_burst, tokens, refilled_at, partition_limit
-			FROM hopper_queues WHERE name = $1 FOR UPDATE`, params.Queue,
+			FROM {{schema}}.hopper_queues WHERE name = $1 FOR UPDATE`, params.Queue,
 		).Scan(&global, &rate, &burst, &tokens, &refilled, &partition)
 		if errors.Is(err, ErrNoRows) {
 			// No row, no limits.
@@ -44,7 +44,7 @@ func (e *Executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 		if err != nil {
 			return fmt.Errorf("hopper: lock queue: %w", err)
 		}
-		if err := tx.QueryRow(ctx, `SELECT now(), (SELECT count(*) FROM hopper_jobs WHERE queue = $1 AND state = 'running')`, params.Queue).Scan(&now, &running); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT now(), (SELECT count(*) FROM {{schema}}.hopper_jobs WHERE queue = $1 AND state = 'running')`, params.Queue).Scan(&now, &running); err != nil {
 			return fmt.Errorf("hopper: count running: %w", err)
 		}
 
@@ -87,7 +87,7 @@ func (e *Executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 		}
 		res.Jobs = jobs
 		if rate.Valid && rate.Float64 > 0 {
-			if _, err := tx.Exec(ctx, `UPDATE hopper_queues SET tokens = $2, refilled_at = $3 WHERE name = $1`,
+			if _, err := tx.Exec(ctx, `UPDATE {{schema}}.hopper_queues SET tokens = $2, refilled_at = $3 WHERE name = $1`,
 				params.Queue, available-float64(len(jobs)), now); err != nil {
 				return fmt.Errorf("hopper: update rate bucket: %w", err)
 			}
@@ -132,7 +132,7 @@ func (e *Executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 	}
 	var id driver.JobID
 	err = e.Conn.QueryRow(ctx, `
-		INSERT INTO hopper_batches (pending, total, on_success, on_failure, on_complete, metadata)
+		INSERT INTO {{schema}}.hopper_batches (pending, total, on_success, on_failure, on_complete, metadata)
 		VALUES ($1, $1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb) RETURNING id`,
 		params.Total, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata)).Scan(&id)
 	if err != nil {
@@ -148,7 +148,7 @@ func (e *Executor) BatchGet(ctx context.Context, id driver.JobID) (*driver.Batch
 		completed sql.NullTime
 		metadata  jsonText
 	)
-	err := e.Conn.QueryRow(ctx, `SELECT id, pending, failed, total, created_at, completed_at, metadata FROM hopper_batches WHERE id = $1`, uuidParam(id)).
+	err := e.Conn.QueryRow(ctx, `SELECT id, pending, failed, total, created_at, completed_at, metadata FROM {{schema}}.hopper_batches WHERE id = $1`, uuidParam(id)).
 		Scan(&b.ID, &b.Pending, &b.Failed, &b.Total, &b.CreatedAt, &completed, &metadata)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound

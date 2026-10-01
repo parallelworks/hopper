@@ -16,5 +16,5 @@ func newDriver(t *testing.T, url string) *hopperpgx.Driver {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	return hopperpgx.New(pool)
+	return hopperpgx.NewWithConfig(pool, &hopperpgx.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]})
 }

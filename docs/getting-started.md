@@ -16,8 +16,9 @@ module depends only on the standard library and [pgx](https://github.com/jackc/p
 
 ## Install the schema
 
-hopper's tables are prefixed `hopper_` and live in the first schema of the
-connection's `search_path`. Install them once per database, from any replica;
+hopper's tables are prefixed `hopper_` and live in the `hopper` PostgreSQL
+schema by default. Migrations create the schema if it does not exist.
+Install them once per schema, from any replica;
 migrations take a cross-process lock, so concurrent starts are fine.
 
 ```go
@@ -39,8 +40,28 @@ or lib/pq) can use `hoppersql.New(db)` in place of `hopperpgx.New(pool)`
 everywhere below; its transactions are then `*sql.Tx`. It polls instead of
 listening, so pickup takes up to `PollInterval` instead of a millisecond.
 
+To choose another schema, configure the driver and use it for both migrations
+and clients:
+
+```go
+driver := hopperpgx.NewWithConfig(pool, &hopperpgx.Config{Schema: "background_jobs"})
+// For database/sql: hoppersql.NewWithConfig(db, &hoppersql.Config{Schema: "background_jobs"})
+```
+
+The CLI accepts `-schema background_jobs` before the command. Driver queries,
+COPY, and caller-owned transactions qualify Hopper objects explicitly; the
+application's `search_path` is unchanged, so the pool can be shared.
+
+**Existing installations:** set `Schema` to the schema where your Hopper tables
+already live (for example `public`) before upgrading. Changing this setting
+selects another installation; it does not move existing jobs or tables.
+Migration credentials need permission to create the schema, or you can create
+it beforehand. Migrating down to zero removes Hopper objects and leaves the
+namespace itself intact.
+
 The SQL files are in `hoppermigrate/migrations` for teams that run migrations
-with their own tool. `hopper_schema` records the applied versions either way.
+with their own tool. Set a transaction-local `search_path` to the target schema
+when running the raw SQL. `hopper_schema` records the applied versions either way.
 
 ## Define a job and its worker
 

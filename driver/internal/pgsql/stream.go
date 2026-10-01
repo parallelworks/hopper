@@ -68,7 +68,7 @@ func (e *Executor) StreamAppend(ctx context.Context, params driver.StreamAppendP
 	if len(params.Payload) > 0 {
 		payload = string(params.Payload)
 	}
-	query := `INSERT INTO hopper_stream_events (topic, key, payload, headers) VALUES ($1, $2, $3::jsonb, $4::jsonb) RETURNING ` + streamEventColumns
+	query := `INSERT INTO {{schema}}.hopper_stream_events (topic, key, payload, headers) VALUES ($1, $2, $3::jsonb, $4::jsonb) RETURNING ` + streamEventColumns
 	args := []any{params.Topic, nullable(params.Key), payload, headers}
 	var (
 		events []*driver.StreamEvent
@@ -88,8 +88,8 @@ func (e *Executor) StreamAppend(ctx context.Context, params driver.StreamAppendP
 // streamReadSQL pages through committed events by position. The row
 // comparison walks the (xid, seq) index in order.
 const streamReadSQL = `
-SELECT ` + streamEventColumns + ` FROM hopper_stream_events
-WHERE (xid, seq) > ($1::xid8, $2::bigint) AND ($3::text = '' OR topic ~ hopper_topic_regex($3::text))
+SELECT ` + streamEventColumns + ` FROM {{schema}}.hopper_stream_events
+WHERE (xid, seq) > ($1::xid8, $2::bigint) AND ($3::text = '' OR topic ~ {{schema}}.hopper_topic_regex($3::text))
 ORDER BY xid, seq LIMIT $4`
 
 // StreamRead implements driver.Executor.
@@ -132,7 +132,7 @@ func (e *Executor) StreamConsumerUpsert(ctx context.Context, consumers []driver.
 	// A consumer starting at latest has seen everything committed so far;
 	// transactions still running are delivered when they commit.
 	_, err := e.Conn.Exec(ctx, `
-		INSERT INTO hopper_stream_consumers (name, pattern, kind, queue, max_attempts, metadata, seen)
+		INSERT INTO {{schema}}.hopper_stream_consumers (name, pattern, kind, queue, max_attempts, metadata, seen)
 		SELECT p.name, p.pattern, p.kind, p.queue, p.max_attempts, p.metadata,
 		  CASE WHEN p.start = 'earliest' THEN $8::pg_snapshot ELSE pg_current_snapshot() END
 		FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::smallint[], $6::jsonb[], $7::text[])
@@ -169,7 +169,7 @@ func scanConsumer(r Row) (*driver.StreamConsumerRow, error) {
 
 // StreamConsumerList implements driver.Executor.
 func (e *Executor) StreamConsumerList(ctx context.Context) ([]*driver.StreamConsumerRow, error) {
-	consumers, err := collect(scanConsumer)(e.Conn.Query(ctx, `SELECT `+streamConsumerColumns+` FROM hopper_stream_consumers ORDER BY name`))
+	consumers, err := collect(scanConsumer)(e.Conn.Query(ctx, `SELECT `+streamConsumerColumns+` FROM {{schema}}.hopper_stream_consumers ORDER BY name`))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: list stream consumers: %w", err)
 	}
@@ -195,7 +195,7 @@ func (e *Executor) StreamConsumerSeek(ctx context.Context, name string, params d
 			// Events of one transaction share created_at, so seq - 1 is
 			// before all of them.
 			var xid string
-			err := tx.QueryRow(ctx, `SELECT xid::text, seq FROM hopper_stream_events WHERE created_at >= $1 ORDER BY xid, seq LIMIT 1`, params.Time).Scan(&xid, &pos.Seq)
+			err := tx.QueryRow(ctx, `SELECT xid::text, seq FROM {{schema}}.hopper_stream_events WHERE created_at >= $1 ORDER BY xid, seq LIMIT 1`, params.Time).Scan(&xid, &pos.Seq)
 			if errors.Is(err, ErrNoRows) {
 				params.Latest = true
 				break
@@ -214,12 +214,12 @@ func (e *Executor) StreamConsumerSeek(ctx context.Context, name string, params d
 		}
 		switch {
 		case params.Latest:
-			n, err = tx.Exec(ctx, `UPDATE hopper_stream_consumers SET seen = pg_current_snapshot(), reading = NULL, xid = '0', seq = 0 WHERE name = $1`, name)
+			n, err = tx.Exec(ctx, `UPDATE {{schema}}.hopper_stream_consumers SET seen = pg_current_snapshot(), reading = NULL, xid = '0', seq = 0 WHERE name = $1`, name)
 		case pos.IsZero():
-			n, err = tx.Exec(ctx, `UPDATE hopper_stream_consumers SET seen = $2::pg_snapshot, reading = NULL, xid = '0', seq = 0 WHERE name = $1`, name, earliestSnapshot)
+			n, err = tx.Exec(ctx, `UPDATE {{schema}}.hopper_stream_consumers SET seen = $2::pg_snapshot, reading = NULL, xid = '0', seq = 0 WHERE name = $1`, name, earliestSnapshot)
 		default:
 			snapshot := fmt.Sprintf("%d:%d:", pos.Xid, pos.Xid)
-			n, err = tx.Exec(ctx, `UPDATE hopper_stream_consumers SET seen = $2::pg_snapshot, reading = NULL, xid = $3::xid8, seq = $4 WHERE name = $1`, name, snapshot, xidParam(pos), pos.Seq)
+			n, err = tx.Exec(ctx, `UPDATE {{schema}}.hopper_stream_consumers SET seen = $2::pg_snapshot, reading = NULL, xid = $3::xid8, seq = $4 WHERE name = $1`, name, snapshot, xidParam(pos), pos.Seq)
 		}
 		if err != nil {
 			return err
@@ -247,15 +247,15 @@ func (e *Executor) StreamConsumerSeek(ctx context.Context, name string, params d
 // It returns how many, the last position, and the queues delivered to.
 const streamPumpSQL = `
 WITH ev AS (
-  SELECT xid, seq, topic, key, payload, headers, message_id FROM hopper_stream_events
+  SELECT xid, seq, topic, key, payload, headers, message_id FROM {{schema}}.hopper_stream_events
   WHERE xid >= pg_snapshot_xmin($1::pg_snapshot) AND xid < pg_snapshot_xmax($2::pg_snapshot)
     AND (xid, seq) > ($3::xid8, $4::bigint)
     AND pg_visible_in_snapshot(xid, $2::pg_snapshot) AND NOT pg_visible_in_snapshot(xid, $1::pg_snapshot)
-    AND topic ~ hopper_topic_regex($5::text)
+    AND topic ~ {{schema}}.hopper_topic_regex($5::text)
   ORDER BY xid, seq LIMIT $6
 ),
 ins AS (
-  INSERT INTO hopper_jobs (kind, queue, priority, max_attempts, args, metadata, ordering_key)
+  INSERT INTO {{schema}}.hopper_jobs (kind, queue, priority, max_attempts, args, metadata, ordering_key)
   SELECT $7::text, $8::text, 2, coalesce($9::smallint, CASE WHEN ev.key IS NOT NULL THEN 10 ELSE 25 END), ev.payload,
     $10::jsonb || jsonb_build_object('topic', ev.topic, 'message_id', ev.message_id::text, 'headers', ev.headers,
                                      'stream', $11::text, 'position', ev.xid::text || ':' || ev.seq::text),
@@ -280,7 +280,7 @@ func (e *Executor) StreamPump(ctx context.Context, name string, limit int) (driv
 			seen, reading sql.NullString
 			xid           string
 		)
-		err := tx.QueryRow(ctx, `SELECT pattern, kind, queue, max_attempts, metadata, seen::text, reading::text, xid::text, seq FROM hopper_stream_consumers WHERE name = $1 FOR UPDATE`, name).
+		err := tx.QueryRow(ctx, `SELECT pattern, kind, queue, max_attempts, metadata, seen::text, reading::text, xid::text, seq FROM {{schema}}.hopper_stream_consumers WHERE name = $1 FOR UPDATE`, name).
 			Scan(&c.Pattern, &c.Kind, &c.Queue, &maxAttempts, &metadata, &seen, &reading, &xid, &c.Position.Seq)
 		if errors.Is(err, ErrNoRows) {
 			return driver.ErrNotFound
@@ -323,11 +323,11 @@ func (e *Executor) StreamPump(ctx context.Context, name string, limit int) (driv
 		}
 		if res.Delivered < limit {
 			// The delta is exhausted: the new snapshot is what has been seen.
-			_, err = tx.Exec(ctx, `UPDATE hopper_stream_consumers SET seen = $2::pg_snapshot, reading = NULL, xid = '0', seq = 0,
+			_, err = tx.Exec(ctx, `UPDATE {{schema}}.hopper_stream_consumers SET seen = $2::pg_snapshot, reading = NULL, xid = '0', seq = 0,
 				delivered_at = CASE WHEN $3 > 0 THEN now() ELSE delivered_at END WHERE name = $1`,
 				name, reading.String, res.Delivered)
 		} else {
-			_, err = tx.Exec(ctx, `UPDATE hopper_stream_consumers SET reading = $2::pg_snapshot, xid = $3::xid8, seq = $4, delivered_at = now() WHERE name = $1`,
+			_, err = tx.Exec(ctx, `UPDATE {{schema}}.hopper_stream_consumers SET reading = $2::pg_snapshot, xid = $3::xid8, seq = $4, delivered_at = now() WHERE name = $1`,
 				name, reading.String, xidParam(res.Position), res.Position.Seq)
 		}
 		if err != nil {

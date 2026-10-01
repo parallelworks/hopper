@@ -3,8 +3,8 @@
 //	client, err := hopper.NewClient(hopperpgx.New(pool), cfg)
 //
 // The driver is generic over pgx.Tx, so InsertTx accepts only a pgx
-// transaction. Tables live in the first schema of the connection's
-// search_path; set it on the pool to isolate hopper in its own schema.
+// transaction. Objects live in the configurable Schema (default "hopper"),
+// independently of the connection's search_path.
 //
 // The SQL and the logic around it are shared with hoppersql; this package
 // adds what pgx alone offers: COPY for bulk inserts, LISTEN, and pipelined
@@ -26,13 +26,16 @@ import (
 
 // Driver implements driver.Driver[pgx.Tx] on a pgxpool.Pool.
 type Driver struct {
-	pool *pgxpool.Pool
-	cfg  Config
+	pool   *pgxpool.Pool
+	cfg    Config
+	schema *pgsql.Schema
 }
 
 // Config tunes the driver. The zero value is fine for a pool that connects
 // directly to Postgres.
 type Config struct {
+	// Schema is the PostgreSQL namespace for all Hopper objects. Empty means "hopper".
+	Schema string
 	// ListenConnConfig is used for the LISTEN connection instead of the
 	// pool's connection settings. Set it to a direct Postgres address when
 	// the pool goes through a transaction pooler such as PgBouncer, which
@@ -57,6 +60,7 @@ func NewWithConfig(pool *pgxpool.Pool, cfg *Config) *Driver {
 	if cfg != nil {
 		d.cfg = *cfg
 	}
+	d.schema = pgsql.NewSchema(d.cfg.Schema)
 	return d
 }
 
@@ -65,12 +69,12 @@ func (d *Driver) Pool() *pgxpool.Pool { return d.pool }
 
 // Executor implements driver.Driver.
 func (d *Driver) Executor() driver.Executor {
-	return &executor{Executor: &pgsql.Executor{Conn: conn{db: d.pool}}, pool: d.pool}
+	return &executor{Executor: &pgsql.Executor{Conn: d.schema.Wrap(conn{db: d.pool}), Schema: d.schema}, pool: d.pool}
 }
 
 // UnwrapTx implements driver.Driver.
 func (d *Driver) UnwrapTx(tx pgx.Tx) driver.Executor {
-	return &executor{Executor: &pgsql.Executor{Conn: conn{db: tx}, InTx: true}, tx: tx}
+	return &executor{Executor: &pgsql.Executor{Conn: d.schema.Wrap(conn{db: tx}), Schema: d.schema, InTx: true}, tx: tx}
 }
 
 // Capabilities implements driver.Driver.
@@ -90,7 +94,7 @@ func (d *Driver) Listener(ctx context.Context) (driver.Listener, error) {
 	}
 	// Name the connection so operators (and tests) can tell it apart in
 	// pg_stat_activity: "hopper-listener:<schema>".
-	if _, err := c.Exec(ctx, "SELECT set_config('application_name', 'hopper-listener:' || current_schema(), false)"); err != nil {
+	if _, err := c.Exec(ctx, "SELECT set_config('application_name', $1, false)", "hopper-listener:"+d.schema.Name); err != nil {
 		return nil, errors.Join(fmt.Errorf("hopperpgx: name listener: %w", err), c.Close(context.WithoutCancel(ctx)))
 	}
 	return &listener{conn: c}, nil
@@ -123,7 +127,7 @@ func (l *listener) Close(ctx context.Context) error {
 
 // Migrator implements driver.Driver.
 func (d *Driver) Migrator() driver.Migrator {
-	return &migrator{pool: d.pool}
+	return &migrator{pool: d.pool, schema: d.schema}
 }
 
 // executor is the shared implementation plus the COPY path, which needs
@@ -301,7 +305,8 @@ func wrapErr(err error) error {
 }
 
 type migrator struct {
-	pool *pgxpool.Pool
+	schema *pgsql.Schema
+	pool   *pgxpool.Pool
 }
 
 // Lock implements driver.Migrator. The lock is taken on a dedicated
@@ -315,19 +320,20 @@ func (m *migrator) Lock(ctx context.Context) (driver.MigrationExecutor, error) {
 	if _, err := c.Exec(ctx, "SELECT pg_advisory_lock($1)", pgsql.MigrationLockKey); err != nil {
 		return nil, errors.Join(fmt.Errorf("acquire migration lock: %w", err), c.Close(context.WithoutCancel(ctx)))
 	}
-	return &migrationExecutor{conn: c}, nil
+	return &migrationExecutor{conn: c, schema: m.schema}, nil
 }
 
 type migrationExecutor struct {
-	conn *pgx.Conn
+	schema *pgsql.Schema
+	conn   *pgx.Conn
 }
 
 func (m *migrationExecutor) Versions(ctx context.Context) ([]int, error) {
-	return pgsql.MigrationVersions(ctx, conn{db: m.conn})
+	return pgsql.MigrationVersions(ctx, m.schema.Wrap(conn{db: m.conn}), m.schema)
 }
 
 func (m *migrationExecutor) Apply(ctx context.Context, version int, script string, up bool) error {
-	return pgsql.MigrationApply(ctx, conn{db: m.conn}, version, script, up)
+	return pgsql.MigrationApply(ctx, m.schema.Wrap(conn{db: m.conn}), m.schema, version, script, up)
 }
 
 func (m *migrationExecutor) Close(ctx context.Context) error {

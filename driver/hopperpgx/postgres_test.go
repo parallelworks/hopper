@@ -20,7 +20,7 @@ import (
 func setup(t *testing.T) (context.Context, *hopperpgx.Driver, driver.Executor) {
 	t.Helper()
 	pool := testdb.Pool(t)
-	d := hopperpgx.New(pool)
+	d := testdb.Driver(pool)
 	return context.Background(), d, d.Executor()
 }
 
