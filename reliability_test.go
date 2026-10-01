@@ -198,9 +198,9 @@ func TestRescueAfterClientCrash(t *testing.T) {
 	if len(job.Errors) != 1 || job.Errors[0].Error != "hopper: client lost" {
 		t.Errorf("exhausted job = %+v", job)
 	}
-	if h.count("SELECT count(*) FROM hopper_clients") != 1 {
-		t.Error("crashed client's lease row was not pruned")
-	}
+	// The leader prunes the crashed client's lease row after the rescue, in
+	// the same pass but a few statements later.
+	waitFor(t, func() bool { return h.count("SELECT count(*) FROM hopper_clients") == 1 })
 }
 
 func TestFencedClientCancelsJobsAndReregisters(t *testing.T) {
