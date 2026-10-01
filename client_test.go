@@ -83,10 +83,18 @@ func (h *harness) client(cfg *hopper.Config) *hopper.Client[pgxTx] {
 // workers.
 func (h *harness) started(workers *hopper.Workers, maxWorkers int) *hopper.Client[pgxTx] {
 	h.t.Helper()
+	return h.startedWith(workers, maxWorkers, fastTuning)
+}
+
+// startedWith is started with explicit tuning, for tests whose outcome must
+// not depend on a lease surviving a slow CI machine.
+func (h *harness) startedWith(workers *hopper.Workers, maxWorkers int, tun hopper.Tuning) *hopper.Client[pgxTx] {
+	h.t.Helper()
 	c := h.client(&hopper.Config{
 		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: maxWorkers}},
 		Workers: workers,
 	})
+	c.SetTuning(tun)
 	if err := c.Start(context.Background()); err != nil {
 		h.t.Fatalf("Start: %v", err)
 	}
@@ -747,9 +755,14 @@ func TestConcurrentClientsFinalizeExactlyOnce(t *testing.T) {
 		return nil
 	})
 
+	// Exactly-once holds while leases hold. A lease of two seconds has been
+	// lost on a loaded CI machine, which fences the client and re-runs its
+	// jobs elsewhere, so these clients keep theirs for a minute.
+	tun := fastTuning
+	tun.LeaseTTL, tun.LeaseRenew = time.Minute, 5*time.Second
 	const clients, jobs = 4, 2000
 	for range clients {
-		h.started(workers, 8)
+		h.startedWith(workers, 8, tun)
 	}
 	inserter := h.client(&hopper.Config{})
 	params := make([]hopper.InsertParams, jobs)
