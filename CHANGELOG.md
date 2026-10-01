@@ -6,6 +6,13 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.1.2](https://github.com/parallelworks/hopper/compare/v0.1.1...v0.1.2) (2026-10-01)
+
+
+### Bug fixes
+
+* **core:** a deep finalizer buffer, and timed-out flushes retried in halves ([#22](https://github.com/parallelworks/hopper/issues/22)) ([c27b943](https://github.com/parallelworks/hopper/commit/c27b94389a71b39afa70ff62fe4f4b6e4dc0c626))
+
 ## [0.1.1] - 2026-09-29
 
 The first soak on the reference hardware found three defects in the live
