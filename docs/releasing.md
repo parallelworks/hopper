@@ -16,19 +16,23 @@ and [goreleaser](https://goreleaser.com) (`.github/workflows/release.yml`).
    and keeps **one release PR** open, titled `chore: release canary`,
    that holds the next version's changelog entry. `fix` and `perf` bump the
    patch version, `feat` the minor version, and a `!` (breaking change) also
-   bumps the minor version before v1.0.0 (`bump-minor-pre-major`). The
-   three modules always move together (`linked-versions`).
-2. The release PR updates `CHANGELOG.md` in each module, the manifest
+   bumps the minor version before v1.0.0 (`bump-minor-pre-major`).
+   release-please manages one package, the core module; the sub-modules are
+   versioned with it rather than on their own, so a change anywhere in the
+   repository releases all three.
+2. The release PR updates `CHANGELOG.md`, the manifest
    (`.release-please-manifest.json`), and the sub-modules' `go.mod`
    requirement on the core module, through the `// x-release-please-version`
-   annotation on that line. The `replace ... => ../` directives stay: they
-   apply only inside this repository, and consumers resolve the tag.
+   annotation on that line (`extra-files`). The `replace ... => ../`
+   directives stay: they apply only inside this repository, and consumers
+   resolve the tag.
 3. Merging the release PR (with `gh pr merge --squash --admin`, since the
-   `canary` ruleset asks for two reviews) creates the three tags and a
-   GitHub release per module; the root one carries the changelog entry.
-   goreleaser then builds `hopper`, `hopperbench` and `hopperui` for Linux
-   and macOS (amd64, arm64), and attaches the archives and checksums to the
-   root release.
+   `canary` ruleset asks for two reviews) creates the `vX.Y.Z` tag and the
+   GitHub release with the changelog entry. The workflow then tags
+   `hopperotel/vX.Y.Z` and `hopperui/vX.Y.Z` on the same commit, and
+   goreleaser builds `hopper`, `hopperbench` and `hopperui` for Linux and
+   macOS (amd64, arm64) and attaches the archives and checksums to the
+   release.
 
 Nothing else is needed for a normal release. A minor release should still
 have the §8.2 targets re-run on the reference hardware and the results
@@ -39,7 +43,8 @@ merged.
 
 No secrets. The workflow runs with the default `GITHUB_TOKEN` and grants
 permissions per job: `contents`, `pull-requests` and `actions: write` to the
-release-please job, `contents: write` alone to the goreleaser job. Every
+release-please job, `contents: write` alone to the job that tags the
+sub-modules and runs goreleaser. Every
 action in `.github/workflows` is pinned to a commit SHA, with the version as
 a trailing comment; Dependabot bumps both.
 GitHub does not start workflows for a pull request that token opened, so

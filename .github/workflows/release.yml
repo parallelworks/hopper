@@ -2,9 +2,10 @@ name: Release
 
 # release-please keeps a release PR open against canary that accumulates
 # the next version's changelog from the squash-merged Conventional Commit
-# titles. Merging that PR tags the three modules at one version (v1.2.3,
-# hopperotel/v1.2.3, hopperui/v1.2.3) and publishes the GitHub release;
-# goreleaser then attaches the CLI binaries to it. See docs/releasing.md.
+# titles. Merging that PR tags the core module (v1.2.3) and publishes the
+# GitHub release; this workflow then tags the sub-modules on the same
+# commit (hopperotel/v1.2.3, hopperui/v1.2.3) and goreleaser attaches the
+# CLI binaries to the release. See docs/releasing.md.
 #
 # Everything runs with the default GITHUB_TOKEN. GitHub does not start
 # workflows for pull requests that token opened, so after release-please
@@ -43,7 +44,7 @@ jobs:
           PR: ${{ steps.release.outputs.pr }}
         run: gh workflow run ci.yml --ref "$(jq -r .headBranchName <<<"$PR")"
 
-  binaries:
+  tags-and-binaries:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
@@ -54,6 +55,20 @@ jobs:
         with:
           fetch-depth: 0
       - run: git fetch --force --tags
+      - name: Tag the sub-modules at the same version
+        # release-please manages one package, the core module, and rewrites
+        # the sub-modules' requirement on it (x-release-please-version in
+        # their go.mod). Their tags are added here so that all three modules
+        # resolve at one version.
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for m in hopperotel hopperui; do
+            git tag -a "$m/$TAG" "$TAG" -m "$m $TAG"
+          done
+          git push origin "hopperotel/$TAG" "hopperui/$TAG"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
