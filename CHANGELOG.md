@@ -6,6 +6,13 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.3.0](https://github.com/parallelworks/hopper/compare/v0.2.0...v0.3.0) (2026-10-01)
+
+
+### Features
+
+* **driver:** make PostgreSQL schema configurable ([#31](https://github.com/parallelworks/hopper/issues/31)) ([5fd71c6](https://github.com/parallelworks/hopper/commit/5fd71c684487ad9e92266316d491196132b75730))
+
 ## [0.2.0](https://github.com/parallelworks/hopper/compare/v0.1.2...v0.2.0) (2026-10-01)
 
 
