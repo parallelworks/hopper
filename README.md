@@ -44,6 +44,14 @@ _, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42}, nil)        // commits
 _, err = client.PublishTx(ctx, tx, AllocationCreated{ID: 42}, nil)  // fans out to subscribers
 ```
 
+Inside a worker or subscriber, the client running the job comes from the context, so
+follow-up work needs no reference wired in after construction:
+
+```go
+client, _ := hopper.ClientFromContext[pgx.Tx](ctx)
+_, err := client.Insert(ctx, Next{ID: job.Args.ID}, nil)
+```
+
 ## The name
 
 A feed hopper releases work into a machine one piece at a time. The name is
