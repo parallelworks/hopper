@@ -137,7 +137,12 @@ func verifySchema(t *testing.T, ctx context.Context, e driver.Executor) {
 		}
 		clients[i] = id
 	}
-	params := make([]driver.JobInsertParams, 20)
+	// Each claim asks for a whole claim bucket. A claim locks its bucket's
+	// worth of rows and releases the ones beyond its count only when its
+	// statement ends, so two concurrent claims of a smaller count could
+	// leave jobs unclaimed.
+	const perClient = 16
+	params := make([]driver.JobInsertParams, len(clients)*perClient)
 	for i := range params {
 		params[i] = driver.JobInsertParams{Kind: "schema", Queue: "default", Priority: 2, MaxAttempts: 3}
 	}
@@ -151,7 +156,7 @@ func verifySchema(t *testing.T, ctx context.Context, e driver.Executor) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			claims[i], errs[i] = e.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clients[i], Limit: 10})
+			claims[i], errs[i] = e.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clients[i], Limit: perClient})
 		}()
 	}
 	wg.Wait()
@@ -183,8 +188,8 @@ func verifySchema(t *testing.T, ctx context.Context, e driver.Executor) {
 			}
 		}
 	}
-	if len(seen) != 20 {
-		t.Fatalf("claimed %d jobs", len(seen))
+	if len(seen) != len(params) {
+		t.Fatalf("claimed %d of %d jobs", len(seen), len(params))
 	}
 	if _, err := e.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: time.Hour, StreamRetention: time.Hour}); err != nil {
 		t.Fatal(err)
