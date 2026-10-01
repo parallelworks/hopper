@@ -2,10 +2,12 @@ package hopper_test
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 
 	"github.com/parallelworks/hopper"
+	"github.com/parallelworks/hopper/driver"
 )
 
 type orderEvent struct {
@@ -110,5 +112,70 @@ func TestStreams(t *testing.T) {
 	}
 	if _, err := s.Append(ctx, nil, nil); err == nil {
 		t.Error("nil event accepted")
+	}
+}
+
+// Events are ordered by transaction ID as a number. The IDs are written
+// here by hand to straddle a power of ten, where the order of their text
+// forms is the opposite one.
+func TestStreamOrderAcrossTransactionIDDigits(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	exec := h.d.Executor()
+	// These transaction IDs are older than any snapshot's xmin, so every
+	// snapshot but the earliest sees them as committed.
+	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_stream_events (xid, topic) VALUES ('9', 't.a'), ('10', 't.b'), ('11', 't.c')`); err != nil {
+		t.Fatal(err)
+	}
+	xids := func(events []*driver.StreamEvent) []uint64 {
+		out := make([]uint64, len(events))
+		for i, e := range events {
+			out[i] = e.Position.Xid
+		}
+		return out
+	}
+
+	events, err := exec.StreamRead(ctx, driver.StreamReadParams{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := xids(events); !slices.Equal(got, []uint64{9, 10, 11}) {
+		t.Errorf("read order = %v, want [9 10 11]", got)
+	}
+
+	// A pump that stops part way keeps the last event it delivered as its
+	// cursor, and the next one continues after it.
+	err = exec.StreamConsumerUpsert(ctx, []driver.StreamConsumerRow{
+		{Name: "digits", Pattern: "#", Kind: "stream:digits", Queue: "digits", Start: driver.StreamStartEarliest},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := exec.StreamPump(ctx, "digits", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Delivered != 2 || res.Position.Xid != 10 {
+		t.Errorf("pump of two = %+v, want 2 delivered up to transaction 10", res)
+	}
+	res, err = exec.StreamPump(ctx, "digits", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Delivered != 1 || res.Position.Xid != 11 {
+		t.Errorf("pump of the rest = %+v, want 1 delivered up to transaction 11", res)
+	}
+
+	// A seek to a time starts at the first event at or after it.
+	if err := exec.StreamConsumerSeek(ctx, "digits", driver.StreamSeekParams{Time: events[0].CreatedAt}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = exec.StreamPump(ctx, "digits", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Delivered != 3 {
+		t.Errorf("pump after seek to time = %+v, want 3 delivered", res)
 	}
 }

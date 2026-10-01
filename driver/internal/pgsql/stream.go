@@ -86,11 +86,13 @@ func (e *Executor) StreamAppend(ctx context.Context, params driver.StreamAppendP
 }
 
 // streamReadSQL pages through committed events by position. The row
-// comparison walks the (xid, seq) index in order.
+// comparison walks the (xid, seq) index in order. The ORDER BY names the
+// table's columns: a bare xid there is the output column, xid::text, which
+// sorts 1000 before 999.
 const streamReadSQL = `
-SELECT ` + streamEventColumns + ` FROM {{schema}}.hopper_stream_events
+SELECT ` + streamEventColumns + ` FROM {{schema}}.hopper_stream_events e
 WHERE (xid, seq) > ($1::xid8, $2::bigint) AND ($3::text = '' OR topic ~ {{schema}}.hopper_topic_regex($3::text))
-ORDER BY xid, seq LIMIT $4`
+ORDER BY e.xid, e.seq LIMIT $4`
 
 // StreamRead implements driver.Executor.
 func (e *Executor) StreamRead(ctx context.Context, params driver.StreamReadParams) ([]*driver.StreamEvent, error) {
@@ -195,7 +197,7 @@ func (e *Executor) StreamConsumerSeek(ctx context.Context, name string, params d
 			// Events of one transaction share created_at, so seq - 1 is
 			// before all of them.
 			var xid string
-			err := tx.QueryRow(ctx, `SELECT xid::text, seq FROM {{schema}}.hopper_stream_events WHERE created_at >= $1 ORDER BY xid, seq LIMIT 1`, params.Time).Scan(&xid, &pos.Seq)
+			err := tx.QueryRow(ctx, `SELECT xid::text, seq FROM {{schema}}.hopper_stream_events e WHERE created_at >= $1 ORDER BY e.xid, e.seq LIMIT 1`, params.Time).Scan(&xid, &pos.Seq)
 			if errors.Is(err, ErrNoRows) {
 				params.Latest = true
 				break
@@ -263,7 +265,7 @@ ins AS (
   FROM ev
   RETURNING queue
 ),
-last AS (SELECT xid::text AS xid, seq FROM ev ORDER BY xid DESC, seq DESC LIMIT 1)
+last AS (SELECT xid::text AS xid, seq FROM ev ORDER BY ev.xid DESC, ev.seq DESC LIMIT 1)
 SELECT (SELECT count(*) FROM ins), (SELECT xid FROM last), (SELECT seq FROM last), (SELECT string_agg(DISTINCT queue, $12::text) FROM ins)`
 
 // StreamPump implements driver.Executor.
