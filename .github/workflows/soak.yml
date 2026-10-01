@@ -13,6 +13,12 @@ on:
 permissions:
   contents: read
 
+# Naming the shell adds pipefail, which the default shell leaves off: without
+# it the soak step reports tee's exit status and a failed benchmark passes.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   soak:
     runs-on: ubuntu-latest
@@ -32,6 +38,8 @@ jobs:
       DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_soak?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -43,6 +51,8 @@ jobs:
               -jobs 200000 -history 5000000 -schema "soak_$round"
           done | tee soak.jsonl
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        # A failed soak keeps the rounds it completed.
+        if: ${{ !cancelled() }}
         with:
           name: soak-${{ github.run_id }}
           path: soak.jsonl

@@ -46,7 +46,10 @@ permissions per job: `contents`, `pull-requests` and `actions: write` to the
 release-please job, `contents: write` alone to the job that tags the
 sub-modules and runs goreleaser. Every
 action in `.github/workflows` is pinned to a commit SHA, with the version as
-a trailing comment; Dependabot bumps both.
+a trailing comment; Dependabot bumps both, once a release is a week old.
+CI's `workflows` job audits the workflow files with
+[zizmor](https://docs.zizmor.sh) and fails on any finding.
+The release binaries are built without the Go build cache.
 GitHub does not start workflows for a pull request that token opened, so
 after release-please has created or updated its PR the workflow dispatches
 `ci.yml` on the PR's branch (`gh workflow run`); that run appears among the

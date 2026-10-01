@@ -1,12 +1,16 @@
 version: 2
+# The cooldown holds an update back until the release is a week old, so that a
+# compromised release is likely to have been pulled before it is proposed here.
 updates:
   - package-ecosystem: gomod
     directories: ["/", "/tools", "/hopperotel", "/hopperui"]
     schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
     commit-message: { prefix: "build(deps)" }
     groups:
       go: { patterns: ["*"] }
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
     commit-message: { prefix: "ci(deps)" }
