@@ -207,7 +207,11 @@ type tuning struct {
 	leaseRenew       time.Duration
 	claimCooldown    time.Duration
 	finalizeInterval time.Duration
-	finalizeBatch    int
+	// finalizeBatch is how many results one flush writes; finalizeBuffer is
+	// how many may wait for a flush before job goroutines block on submit
+	// and the producers stop claiming.
+	finalizeBatch  int
+	finalizeBuffer int
 	// stopGrace is how long a hard stop waits for cancelled jobs to return
 	// before flushing what has finished and giving up on the rest.
 	stopGrace time.Duration
@@ -234,6 +238,7 @@ var defaultTuning = tuning{
 	claimCooldown:       20 * time.Millisecond,
 	finalizeInterval:    25 * time.Millisecond,
 	finalizeBatch:       500,
+	finalizeBuffer:      10000,
 	stopGrace:           2 * time.Second,
 	copyThreshold:       256,
 	notifyInterval:      10 * time.Millisecond,
