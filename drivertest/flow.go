@@ -79,29 +79,40 @@ func testRateLimit[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err := exec.QueueSetLimits(ctx, driver.QueueLimits{Name: "default", RatePerSec: 5, RateBurst: 2}); err != nil {
 		t.Fatal(err)
 	}
-	insert(ctx, t, exec, params("k", 10))
+	insert(ctx, t, exec, params("k", 20))
 	clientID := register(ctx, t, exec)
+	// The bucket refills while the test runs, and a loaded machine can take
+	// longer between two claims than a token takes to refill. What a claim
+	// may return is therefore bounded by the time since the first one.
+	start := time.Now()
+	refilled := func() float64 { return 5 * time.Since(start).Seconds() }
 	if got := claimLimited(ctx, t, exec, clientID, 10); len(got.Jobs) != 2 {
 		t.Fatalf("burst claim = %d, want 2", len(got.Jobs))
 	}
+	claimed := 2
 	empty := claimLimited(ctx, t, exec, clientID, 10)
-	if len(empty.Jobs) != 0 || empty.Wait <= 0 || empty.Wait > 250*time.Millisecond {
-		t.Errorf("claim with an empty bucket = %d jobs, wait %s; want 0 and ~200ms", len(empty.Jobs), empty.Wait)
+	claimed += len(empty.Jobs)
+	switch {
+	case float64(len(empty.Jobs)) > refilled():
+		t.Errorf("claim with an empty bucket = %d jobs after %s at 5/s", len(empty.Jobs), time.Since(start))
+	case len(empty.Jobs) == 0 && (empty.Wait <= 0 || empty.Wait > 200*time.Millisecond):
+		t.Errorf("claim with an empty bucket waits %s; want at most the 200ms a token takes", empty.Wait)
 	}
 	// Tokens refill at the rate.
 	time.Sleep(450 * time.Millisecond)
-	if got := claimLimited(ctx, t, exec, clientID, 10); len(got.Jobs) != 2 {
+	got := claimLimited(ctx, t, exec, clientID, 10)
+	claimed += len(got.Jobs)
+	if len(got.Jobs) != 2 {
 		t.Errorf("claim after refill = %d, want 2 (rate 5/s for 0.45s, capped by burst)", len(got.Jobs))
 	}
 	// Overall, no more than rate × time + burst are ever claimed.
 	deadline := time.Now().Add(time.Second)
-	claimed := 4
 	for time.Now().Before(deadline) {
 		claimed += len(claimLimited(ctx, t, exec, clientID, 10).Jobs)
 		time.Sleep(50 * time.Millisecond)
 	}
-	if claimed > 2+5*2 {
-		t.Errorf("claimed %d jobs in ~1.5s at 5/s with burst 2", claimed)
+	if float64(claimed) > 2+refilled() {
+		t.Errorf("claimed %d jobs in %s at 5/s with burst 2", claimed, time.Since(start))
 	}
 }
 
