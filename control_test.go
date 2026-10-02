@@ -439,6 +439,11 @@ func TestEventsAndStats(t *testing.T) {
 	}
 }
 
+// noSlots is a schedule that never comes due.
+type noSlots struct{}
+
+func (noSlots) Next(time.Time) time.Time { return time.Time{} }
+
 func TestPeriodicJobsRunOnceAcrossLeaders(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -456,7 +461,9 @@ func TestPeriodicJobsRunOnceAcrossLeaders(t *testing.T) {
 			Periodic: []hopper.PeriodicJob{
 				hopper.Every(time.Second, noop{N: 1}, nil),
 				hopper.Cron("* * * * * *", noop{N: 2}, &hopper.PeriodicOpts{Name: "cron-seconds"}),
-				hopper.Every(time.Hour, noop{N: 3}, &hopper.PeriodicOpts{Name: "hourly", RunOnStart: true}),
+				// No regular slots, so only RunOnStart inserts this one: an
+				// hourly schedule adds a job when the test spans the hour.
+				{Name: "on-start", Schedule: noSlots{}, Args: noop{N: 3}, Opts: &hopper.PeriodicOpts{RunOnStart: true}},
 			},
 		}
 	}
