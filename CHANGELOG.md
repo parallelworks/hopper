@@ -6,6 +6,13 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.4.0](https://github.com/parallelworks/hopper/compare/v0.3.1...v0.4.0) (2026-10-02)
+
+
+### Features
+
+* **core:** a configurable client lease, and a job on its last attempt survives a lost lease ([#44](https://github.com/parallelworks/hopper/issues/44)) ([23abd36](https://github.com/parallelworks/hopper/commit/23abd367e46255d17a9137e02a58083749d6d0e0))
+
 ## [0.3.1](https://github.com/parallelworks/hopper/compare/v0.3.0...v0.3.1) (2026-10-02)
 
 
