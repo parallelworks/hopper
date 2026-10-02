@@ -194,6 +194,7 @@ func TestNewClientValidation(t *testing.T) {
 		"empty queue name":       {Queues: map[string]hopper.QueueConfig{"": {MaxWorkers: 1}}, Workers: workers},
 		"negative attempts":      {MaxAttempts: -1},
 		"negative timeout":       {JobTimeout: -1},
+		"lease under a second":   {LeaseTTL: 500 * time.Millisecond},
 		"strict without workers": {StrictKinds: true},
 	}
 	for name, cfg := range cases {
@@ -206,6 +207,26 @@ func TestNewClientValidation(t *testing.T) {
 	}
 	if _, err := hopper.NewClient(h.d, nil); err != nil {
 		t.Errorf("nil config rejected: %v", err)
+	}
+}
+
+func TestLeaseTTLSetsTheLeaseAndItsRenewal(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	for name, tc := range map[string]struct {
+		cfg        *hopper.Config
+		ttl, renew time.Duration
+	}{
+		"default":    {nil, 15 * time.Second, 5 * time.Second},
+		"configured": {&hopper.Config{LeaseTTL: 3 * time.Minute}, 3 * time.Minute, time.Minute},
+	} {
+		c, err := hopper.NewClient(h.d, tc.cfg)
+		if err != nil {
+			t.Fatalf("%s: NewClient: %v", name, err)
+		}
+		if ttl, renew := c.LeaseTuning(); ttl != tc.ttl || renew != tc.renew {
+			t.Errorf("%s: lease = %s renewed every %s, want %s every %s", name, ttl, renew, tc.ttl, tc.renew)
+		}
 	}
 }
 

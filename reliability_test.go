@@ -246,6 +246,65 @@ func TestFencedClientCancelsJobsAndReregisters(t *testing.T) {
 	}
 }
 
+// lastAttemptWorker reports when it starts, waits to be released, and records
+// whether its context was cancelled while it waited.
+type lastAttemptWorker struct {
+	hopper.WorkerDefaults[noop]
+	started   chan struct{}
+	release   chan struct{}
+	runs      atomic.Int64
+	cancelled atomic.Bool
+}
+
+func (w *lastAttemptWorker) Work(ctx context.Context, _ *hopper.Job[noop]) error {
+	w.runs.Add(1)
+	w.started <- struct{}{}
+	select {
+	case <-w.release:
+		return nil
+	case <-ctx.Done():
+		w.cancelled.Store(true)
+		return ctx.Err()
+	}
+}
+
+func (w *lastAttemptWorker) Timeout(*hopper.Job[noop]) time.Duration { return -1 }
+
+func TestFencedClientLetsALastAttemptFinish(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	w := &lastAttemptWorker{started: make(chan struct{}, 10), release: make(chan struct{})}
+	workers := hopper.NewWorkers()
+	hopper.AddWorker(workers, w)
+	c := h.started(workers, 1)
+	oldID := c.ClientID()
+
+	res, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{MaxAttempts: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-w.started
+
+	if _, err := h.pool.Exec(ctx, "UPDATE hopper_clients SET expires_at = now() - interval '1s' WHERE id = $1", oldID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return c.ClientID() != oldID })
+
+	// The job has no attempt left, so nothing will run it again and the
+	// fenced client leaves it running. Whether its result or the leader's
+	// rescue lands first decides the recorded state, so only the run itself
+	// is asserted.
+	close(w.release)
+	job := waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted, hopper.JobStateDiscarded)
+	if w.cancelled.Load() {
+		t.Errorf("the last attempt was cancelled when the lease was lost; job = %+v", job)
+	}
+	if runs := w.runs.Load(); runs != 1 {
+		t.Errorf("job ran %d times, want 1", runs)
+	}
+}
+
 func TestLeaderFailover(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
