@@ -6,6 +6,13 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.3.1](https://github.com/parallelworks/hopper/compare/v0.3.0...v0.3.1) (2026-10-02)
+
+
+### Bug fixes
+
+* **streams:** events are ordered by transaction ID as a number, not as text ([#38](https://github.com/parallelworks/hopper/issues/38)) ([863c673](https://github.com/parallelworks/hopper/commit/863c67360374a80dd85726188fb8691e3a8dfa65))
+
 ## [0.3.0](https://github.com/parallelworks/hopper/compare/v0.2.0...v0.3.0) (2026-10-01)
 
 
