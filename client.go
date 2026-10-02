@@ -95,7 +95,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		exec:        d.Executor(),
 		caps:        d.Capabilities(),
 		cfg:         resolved,
-		tuning:      defaultTuning,
+		tuning:      defaultTuning.withLease(resolved.LeaseTTL),
 		logger:      resolved.Logger,
 		workers:     resolved.Workers,
 		leaderPoke:  make(chan struct{}, 1),
@@ -205,7 +205,7 @@ func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig, paused, limit
 		claim: func(ctx context.Context, limit int, limited bool) (driver.JobClaimResult, error) {
 			return c.exec.JobClaim(ctx, driver.JobClaimParams{Queue: name, ClientID: c.clientID.Load(), Limit: limit, Limited: limited})
 		},
-		work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.generation(), row, qcfg) },
+		work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.jobContext(row), row, qcfg) },
 		submit: c.finalizer.submit,
 		wake:   make(chan struct{}, 1),
 		freed:  make(chan struct{}, 1),
@@ -295,7 +295,19 @@ func (c *Client[TTx]) newGeneration() {
 	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // cancelled by fence or Stop
 }
 
-// generation returns the context jobs run under.
+// jobContext returns the context a claimed job runs under. A job with
+// attempts left runs under the lease generation, so that a client which
+// loses its lease stops it before another client runs it again. A job on its
+// last attempt will not run again, so cancelling it would only discard its
+// work: it runs under the work context, which only a hard stop cancels.
+func (c *Client[TTx]) jobContext(row *driver.JobRow) context.Context {
+	if row.Attempt >= row.MaxAttempts {
+		return c.workCtx
+	}
+	return c.generation()
+}
+
+// generation returns the context of the current lease generation.
 func (c *Client[TTx]) generation() context.Context {
 	c.genMu.Lock()
 	defer c.genMu.Unlock()

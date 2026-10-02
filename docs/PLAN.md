@@ -701,7 +701,8 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
 
 ### 7.6 Liveness and rescue
 Liveness is tracked **per client, not per job**. Each client holds a lease row in
-`hopper_clients` and renews it every 5s (the TTL is 15s):
+`hopper_clients` and renews it three times per TTL (`Config.LeaseTTL`, 15s by default,
+so every 5s):
 
 ```sql
 UPDATE hopper_clients SET expires_at = now() + $ttl WHERE id = $me AND expires_at > now();
@@ -716,8 +717,10 @@ the largest source of write amplification in heartbeat-based designs.
   `discarded` if they are out of attempts). A crashed pod's jobs run again within about
   20s.
 - **Fencing.** If a renewal matches zero rows (after a long GC pause or a partition),
-  the client has lost its lease. It cancels every in-flight job context and re-registers
-  under a new ID. Results still in flight are submitted anyway: the finalize fence (§7.5)
+  the client has lost its lease. It cancels the context of every in-flight job that has
+  attempts left and re-registers under a new ID. A job on its last attempt keeps
+  running, because the rescuer discards it instead of running it again, so no second
+  attempt can overlap it and cancelling would only lose its work. Results still in flight are submitted anyway: the finalize fence (§7.5)
   rejects any whose job was rescued meanwhile and applies the rest, which is equivalent
   to a rescue. A leader that finds its own jobs among the rescue candidates fences
   itself first, so it does not re-claim them under the lapsed ID before its lease loop

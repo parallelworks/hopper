@@ -60,6 +60,12 @@ type Config struct {
 	// consumers that start from the earliest event or are moved back.
 	// Defaults to 7 days; negative keeps them forever.
 	StreamRetention time.Duration
+	// LeaseTTL is how long this client's lease lasts without a renewal. It
+	// is renewed three times per TTL; when it lapses, the client's running
+	// jobs are rescued and the client cancels them. A longer lease rides
+	// out a longer database outage before interrupting jobs, and delays the
+	// rescue of a crashed client's jobs by as much. Defaults to 15 seconds.
+	LeaseTTL time.Duration
 	// RescueStuckAfter, if set, rescues jobs that have been running longer
 	// than this even though their client's lease is live, for workers that
 	// ignore their context. Off by default; timeouts cover most cases.
@@ -111,6 +117,7 @@ const (
 	DefaultMaxAttempts        = 25
 	DefaultStopTimeout        = 30 * time.Second
 	DefaultPollInterval       = time.Second
+	DefaultLeaseTTL           = 15 * time.Second
 	DefaultCompletedRetention = 24 * time.Hour
 	DefaultFailedRetention    = 7 * 24 * time.Hour
 	DefaultStreamRetention    = 7 * 24 * time.Hour
@@ -140,6 +147,9 @@ func (cfg *Config) withDefaults() (Config, error) {
 	if out.PollInterval == 0 {
 		out.PollInterval = DefaultPollInterval
 	}
+	if out.LeaseTTL == 0 {
+		out.LeaseTTL = DefaultLeaseTTL
+	}
 	if out.CompletedRetention == 0 {
 		out.CompletedRetention = DefaultCompletedRetention
 	}
@@ -162,6 +172,9 @@ func (cfg *Config) withDefaults() (Config, error) {
 	}
 	if out.JobTimeout < 0 || out.StopTimeout < 0 || out.PollInterval < 0 || out.RescueStuckAfter < 0 {
 		return out, errors.New("hopper: Config durations must be positive")
+	}
+	if out.LeaseTTL < time.Second {
+		return out, errors.New("hopper: Config.LeaseTTL must be at least one second")
 	}
 	if len(out.Queues) > 0 && out.Workers == nil {
 		return out, errors.New("hopper: Config.Workers is required to work queues")
@@ -232,9 +245,20 @@ type tuning struct {
 	streamBatch int
 }
 
+// withLease returns t with the client lease lasting ttl.
+func (t tuning) withLease(ttl time.Duration) tuning {
+	t.leaseTTL = ttl
+	t.leaseRenew = ttl / leaseRenewalsPerTTL
+	return t
+}
+
+// leaseRenewalsPerTTL is how many renewals fit in one lease, so that two can
+// fail before the lease lapses.
+const leaseRenewalsPerTTL = 3
+
 var defaultTuning = tuning{
-	leaseTTL:            15 * time.Second,
-	leaseRenew:          5 * time.Second,
+	leaseTTL:            DefaultLeaseTTL,
+	leaseRenew:          DefaultLeaseTTL / leaseRenewalsPerTTL,
 	claimCooldown:       20 * time.Millisecond,
 	finalizeInterval:    25 * time.Millisecond,
 	finalizeBatch:       500,

@@ -43,6 +43,11 @@ func (c *Client[TTx]) SetTuning(t Tuning) {
 	c.notifier.interval = c.tuning.notifyInterval
 }
 
+// LeaseTuning returns the client lease's length and renewal interval.
+func (c *Client[TTx]) LeaseTuning() (ttl, renew time.Duration) {
+	return c.tuning.leaseTTL, c.tuning.leaseRenew
+}
+
 // IsLeader reports whether the client currently holds the leader lease.
 func (c *Client[TTx]) IsLeader() bool { return c.isLeader.Load() }
 

@@ -85,15 +85,24 @@ for a queue's completed jobs entirely, for maximum throughput.
 
 ## Failure handling
 
-- **A process dies.** Its lease (renewed every 5 s, 15 s TTL) expires, and the
-  leader moves its running jobs back to `retryable` with the error `hopper:
-  client lost`. Expect them to run again within about 20 seconds. Jobs out of
-  attempts are dead-lettered instead.
-- **A process pauses** (long GC, VM stall, partition) longer than the TTL and
-  then resumes. Its next renewal fails; it cancels every running job's context
-  and re-registers under a new client ID. Results still in flight are applied
+- **A process dies.** Its lease (`Config.LeaseTTL`, 15 s by default, renewed
+  three times per TTL) expires, and the leader moves its running jobs back to
+  `retryable` with the error `hopper: client lost`. Expect them to run again
+  within about 20 seconds with the default lease. Jobs out of attempts are
+  dead-lettered instead.
+- **A process pauses, or loses the database** (long GC, VM stall, partition)
+  for longer than the lease and then resumes. Its next renewal fails; it
+  cancels the context of every running job that has attempts left and
+  re-registers under a new client ID. Results still in flight are applied
   only if the job was not rescued meanwhile, so a job never runs two attempts
-  at once for long.
+  at once for long. A job on its last attempt is left running: nothing will
+  run it again, so cancelling it would only throw its work away. Its result
+  is recorded if it lands before the leader's rescue, and otherwise the job
+  stays dead-lettered as `client lost` although its work finished.
+- **Long jobs.** When jobs are long calls to another system, raise
+  `Config.LeaseTTL` so that a brief database outage does not interrupt them.
+  The cost is that a crashed process's jobs wait that much longer to be
+  rescued. The lease is per client, so each program picks its own.
 - **A worker hangs** ignoring its context. Timeouts (`Config.JobTimeout`, one
   minute by default, or the worker's `Timeout`) cover the common case.
   `Config.RescueStuckAfter` additionally rescues any job running longer than
