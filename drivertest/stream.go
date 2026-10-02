@@ -148,8 +148,18 @@ func testStreams[TTx any](t *testing.T, f Fixture[TTx]) {
 	if res := pump("audit"); res.Delivered != 0 {
 		t.Errorf("audit pump after the delta = %+v", res)
 	}
-	if jobs := deliveries("audit"); len(jobs) != 2 || jobs[0].MaxAttempts != 3 || jobs[0].OrderingKey != "" {
-		t.Errorf("audit deliveries = %v", jobs)
+	// Deliveries are listed in ID order, which within one millisecond is
+	// not the order they were made in.
+	if jobs := deliveries("audit"); len(jobs) != 2 {
+		t.Errorf("audit deliveries = %d, want 2", len(jobs))
+	} else {
+		j := jobs[0]
+		if argsN(j) != 4 {
+			j = jobs[1]
+		}
+		if j.MaxAttempts != 3 || j.OrderingKey != "" {
+			t.Errorf("audit delivery of the unkeyed event = %+v", j)
+		}
 	}
 
 	// Seeking replays: to a position, to a time, to the start, to now.
