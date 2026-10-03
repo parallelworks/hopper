@@ -60,6 +60,13 @@ type Config struct {
 	// consumers that start from the earliest event or are moved back.
 	// Defaults to 7 days; negative keeps them forever.
 	StreamRetention time.Duration
+	// NeverLead keeps this client out of leader elections. It still claims
+	// and works jobs, but never runs the leader's duties: rescuing jobs from
+	// lost clients, retention, maintenance, periodic jobs and stream
+	// delivery. Use it for clients that share an install but must not run it,
+	// such as a developer's process against a shared environment. At least
+	// one client of every install must be able to lead.
+	NeverLead bool
 	// LeaseTTL is how long this client's lease lasts without a renewal. It
 	// is renewed three times per TTL; when it lapses, the client's running
 	// jobs are rescued and the client cancels them. A longer lease rides

@@ -174,7 +174,9 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	if c.caps.Listen {
 		c.listenWG.Go(func() { c.listenLoop(c.bgCtx) })
 	}
-	c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
+	if !c.cfg.NeverLead {
+		c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
+	}
 	c.leaseWG.Go(func() { c.leaseLoop(c.bgCtx) })
 
 	c.state = clientStarted

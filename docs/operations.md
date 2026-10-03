@@ -10,9 +10,15 @@
   traffic (claims, finalizes, leases, leader duties) plus one dedicated
   connection for `LISTEN`, outside the pool. Give the pool what the
   application needs on top of that.
-- **Replicas.** Adding replicas adds throughput. Every replica competes for
+- **Replicas.** Adding replicas adds throughput. Every replica works jobs;
+  every replica except one with `Config.NeverLead` also competes for
   leadership; only the leader runs periodic jobs, rescue and retention, and a
   replacement takes over within 15 seconds of the leader stopping.
+- **Clients that must not lead.** Set `Config.NeverLead` on a client that
+  shares an install it should not run, such as a developer's process pointed
+  at a shared environment. It claims and works jobs like any other, but never
+  rescues, prunes, runs periodic jobs or delivers streams. An install whose
+  clients all set it has no leader, so nothing is ever rescued or pruned.
 
 ## Postgres
 
