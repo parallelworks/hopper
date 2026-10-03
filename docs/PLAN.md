@@ -767,6 +767,10 @@ Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
 partitions ahead of time and dropping expired ones, removing stale `hopper_clients`
 rows, and resolving batch and workflow completion.
 
+A client with `Config.NeverLead` never attempts the lease. It claims and works jobs
+like any other, so an install can include processes that should do work but not run
+the install, such as a developer's process against a shared environment.
+
 ### 7.9 Periodic jobs
 `hopper.Every(d, …)` and `hopper.Cron(spec, …)` are both available from v0.1. Cron
 supports standard five-field syntax, an optional seconds field, `@hourly`-style

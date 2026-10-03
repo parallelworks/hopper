@@ -305,6 +305,55 @@ func TestFencedClientLetsALastAttemptFinish(t *testing.T) {
 	}
 }
 
+func TestNeverLeadClientWorksJobsWithoutLeading(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+
+	worked := make(chan hopper.JobID, 1)
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[noop]) error {
+		worked <- job.ID
+		return nil
+	})
+	follower := h.client(&hopper.Config{
+		Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers:   workers,
+		NeverLead: true,
+	})
+	if err := follower.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := follower.Insert(ctx, noop{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case id := <-worked:
+		if id != res.Job.ID {
+			t.Fatalf("worked %s, want %s", id, res.Job.ID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the job was never worked")
+	}
+
+	// Several leader intervals pass without it standing.
+	time.Sleep(500 * time.Millisecond)
+	if follower.IsLeader() {
+		t.Fatal("a NeverLead client became leader")
+	}
+	if n := h.count("SELECT count(*) FROM hopper_leader"); n != 0 {
+		t.Errorf("leader rows = %d, want 0", n)
+	}
+
+	leader := h.started(hopper.NewWorkers(), 1)
+	waitFor(t, leader.IsLeader)
+	if follower.IsLeader() {
+		t.Error("the NeverLead client became leader alongside another")
+	}
+}
+
 func TestLeaderFailover(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
