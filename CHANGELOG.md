@@ -6,6 +6,13 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.5.0](https://github.com/parallelworks/hopper/compare/v0.4.0...v0.5.0) (2026-10-03)
+
+
+### Features
+
+* **core:** a client can work jobs without standing for leader ([#46](https://github.com/parallelworks/hopper/issues/46)) ([eef321d](https://github.com/parallelworks/hopper/commit/eef321da93ee0f53f7684d54d9b2a0ba7e8a0926))
+
 ## [0.4.0](https://github.com/parallelworks/hopper/compare/v0.3.1...v0.4.0) (2026-10-02)
 
 
