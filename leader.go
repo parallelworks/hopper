@@ -43,6 +43,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			}
 			c.rescue(ctx)
 			c.expire(ctx)
+			c.settleBatches(ctx)
 			c.age(ctx)
 			c.pruneClients(ctx)
 			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval {
@@ -152,7 +153,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 
 		fin := make([]driver.JobFinalize, len(jobs))
 		queueOf := make(map[JobID]string, len(jobs))
+		noBatches := true
 		for i, j := range jobs {
+			noBatches = noBatches && j.BatchID.IsZero()
 			reason := "hopper: client lost"
 			if c.stuck(j) {
 				reason = "hopper: job ran longer than RescueStuckAfter"
@@ -170,7 +173,7 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			fin[i] = f
 			queueOf[j.ID] = j.Queue
 		}
-		applied, err := c.exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin})
+		applied, err := c.exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin, NoBatches: noBatches})
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: rescue jobs", "error", err)
@@ -253,6 +256,37 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 			c.logger.InfoContext(ctx, "hopper: discarded expired jobs", "count", len(jobs))
 		}
 		if len(jobs) < c.tuning.rescueBatch {
+			return
+		}
+	}
+}
+
+// settleBatches completes the batches whose last jobs were finalized at the
+// same time by statements that could not see each other's progress, and
+// that their clients did not settle (a client that stopped, a batch row
+// held too long, or a previous release), and folds any progress left. It
+// walks the batches in ID order. Progress keeps arriving while batches are
+// worked, so a pass stops after one leader interval, and the next resumes
+// where it stopped.
+func (c *Client[TTx]) settleBatches(ctx context.Context) {
+	deadline := time.Now().Add(c.tuning.leaderInterval)
+	for {
+		res, err := c.exec.BatchSettle(ctx, driver.BatchSettleParams{After: c.settleAfter, Limit: c.tuning.rescueBatch})
+		if err != nil {
+			if ctx.Err() == nil {
+				c.logger.ErrorContext(ctx, "hopper: settle batches", "error", err)
+			}
+			return
+		}
+		if res.Completed > 0 {
+			c.logger.DebugContext(ctx, "hopper: completed batches", "count", res.Completed)
+		}
+		if res.Folded < int64(c.tuning.rescueBatch) {
+			c.settleAfter = driver.JobID{}
+			return
+		}
+		c.settleAfter = res.Last
+		if time.Now().After(deadline) {
 			return
 		}
 	}

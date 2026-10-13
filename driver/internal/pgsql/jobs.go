@@ -382,7 +382,7 @@ func claimRows(ctx context.Context, conn Conn, query string, args ...any) ([]*dr
 // attempt; terminal outcomes go through finalizeTailSQL: history, batches,
 // and workflow dependents. Error timestamps come from database time and
 // awaited jobs announce themselves on the done channel.
-var jobFinalizeSQL = `
+var jobFinalizeHeadSQL = `
 WITH RECURSIVE r AS (
   SELECT * FROM unnest(
     $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::boolean[], $6::jsonb[], $7::jsonb[], $8::boolean[], $11::text[]
@@ -413,7 +413,15 @@ finished AS (
   RETURNING ` + finishedColumns(`CASE WHEN r.error IS NULL THEN j.errors
          ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END`, "r.output", "r.archive", "r.state", "$9") + `
 ),
-` + finalizeTailSQL("$9", "$10") + `
+`
+
+var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
+SELECT id FROM retry UNION ALL SELECT id FROM finished`
+
+// jobFinalizePlainSQL is jobFinalizeSQL for results whose jobs belong to
+// no batch or workflow (driver.JobFinalizeParams.NoBatches): without the
+// insert channel, so the snooze reasons are $10.
+var jobFinalizePlainSQL = strings.ReplaceAll(jobFinalizeHeadSQL, "$11", "$10") + plainFinalizeTailSQL + `
 SELECT id FROM retry UNION ALL SELECT id FROM finished`
 
 // JobFinalizeMany implements driver.Executor.
@@ -454,11 +462,16 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		// dead-letter queue.
 		archives[i] = f.Archive || f.State != driver.JobStateCompleted
 	}
-	applied, err := scanIDs(e.Conn.Query(ctx, jobFinalizeSQL,
+	args := []any{
 		uuidArray(ids), int64Array(attemptedBy), textArray(states), floatArray(delays), boolArray(snoozes),
 		jsonArray(errs), jsonArray(outputs), boolArray(archives), driver.ChannelDone, driver.ChannelInsert,
 		nullableTextArray(reasons),
-	))
+	}
+	query := jobFinalizeSQL
+	if params.NoBatches {
+		query, args = jobFinalizePlainSQL, append(args[:9], args[10])
+	}
+	applied, err := scanIDs(e.Conn.Query(ctx, query, args...))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 	}

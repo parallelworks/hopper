@@ -153,3 +153,54 @@ func TestUpRejectsUnknownTarget(t *testing.T) {
 		t.Fatal("Up to an unknown version succeeded")
 	}
 }
+
+// TestDownFoldsBatchProgress goes back below v11, whose release counts a
+// batch down on pending alone: progress rows are folded into it, and a batch
+// that had nothing left completes with its callback.
+func TestDownFoldsBatchProgress(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
+	if _, err := hoppermigrate.Up(ctx, d, opts); err != nil {
+		t.Fatal(err)
+	}
+	var open, ready string
+	if err := pool.QueryRow(ctx, `INSERT INTO hopper_batches (pending, total) VALUES (3, 3) RETURNING id::text`).Scan(&open); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO hopper_batches (pending, total, on_complete)
+	    VALUES (2, 2, '{"kind": "done"}') RETURNING id::text`).Scan(&ready); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_batch_progress (batch_id, done, failed)
+	    VALUES ($1::uuid, 1, 1), ($1::uuid, 1, 0), ($2::uuid, 1, 0), ($2::uuid, 1, 0)`, open, ready); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: opts.Logger, Target: 10}); err != nil {
+		t.Fatal(err)
+	}
+	var (
+		pending, failed int
+		completed       bool
+	)
+	if err := pool.QueryRow(ctx, `SELECT pending, failed, completed_at IS NOT NULL FROM hopper_batches WHERE id = $1::uuid`, open).
+		Scan(&pending, &failed, &completed); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 || failed != 1 || completed {
+		t.Errorf("open batch after down: pending = %d, failed = %d, completed = %t; want 1, 1, false", pending, failed, completed)
+	}
+	if err := pool.QueryRow(ctx, `SELECT pending, completed_at IS NOT NULL FROM hopper_batches WHERE id = $1::uuid`, ready).
+		Scan(&pending, &completed); err != nil {
+		t.Fatal(err)
+	}
+	var callbacks int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM hopper_jobs WHERE kind = 'done' AND metadata->>'batch_id' = $1`, ready).Scan(&callbacks); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 || !completed || callbacks != 1 {
+		t.Errorf("batch with nothing left after down: pending = %d, completed = %t, callbacks = %d", pending, completed, callbacks)
+	}
+}

@@ -72,8 +72,10 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"InsertTx", testInsertTx[TTx]},
 		{"Claim", testClaim[TTx]},
 		{"ClaimSkipsLocked", testClaimSkipsLocked[TTx]},
-		{"Finalize", testFinalize[TTx]},
-		{"FinalizeFences", testFinalizeFences[TTx]},
+		{"Finalize", func(t *testing.T, f Fixture[TTx]) { testFinalize(t, f, false) }},
+		{"FinalizeNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalize(t, f, true) }},
+		{"FinalizeFences", func(t *testing.T, f Fixture[TTx]) { testFinalizeFences(t, f, false) }},
+		{"FinalizeFencesNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeFences(t, f, true) }},
 		{"Lease", testLease[TTx]},
 		{"Leader", testLeader[TTx]},
 		{"Rescue", testRescue[TTx]},
@@ -82,7 +84,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"RetryOrderingKey", testRetryOrderingKey[TTx]},
 		{"RetryOrderingKeyConcurrent", testRetryOrderingKeyConcurrent[TTx]},
 		{"TTL", testTTL[TTx]},
-		{"SnoozeReason", testSnoozeReason[TTx]},
+		{"SnoozeReason", func(t *testing.T, f Fixture[TTx]) { testSnoozeReason(t, f, false) }},
+		{"SnoozeReasonNoBatches", func(t *testing.T, f Fixture[TTx]) { testSnoozeReason(t, f, true) }},
 		{"SnoozeReasonConcurrent", testSnoozeReasonConcurrent[TTx]},
 		{"List", testList[TTx]},
 		{"Queues", testQueues[TTx]},
@@ -100,6 +103,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"PartitionLimit", testPartitionLimit[TTx]},
 		{"Aging", testAging[TTx]},
 		{"Batches", testBatches[TTx]},
+		{"BatchesConcurrent", testBatchesConcurrent[TTx]},
 		{"Workflows", testWorkflows[TTx]},
 		{"Streams", testStreams[TTx]},
 		{"Maintain", testMaintain[TTx]},
@@ -110,6 +114,24 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 			tc.fn(t, f)
 		})
 	}
+}
+
+// noBatchesExec finalizes with JobFinalizeParams.NoBatches set, which a
+// caller may when none of the jobs belongs to a batch: the tests of jobs
+// outside batches see the same results through it.
+type noBatchesExec struct{ driver.Executor }
+
+func (e noBatchesExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+	params.NoBatches = true
+	return e.Executor.JobFinalizeMany(ctx, params)
+}
+
+// executor returns d's executor, finalizing with NoBatches if noBatches.
+func executor[TTx any](d driver.Driver[TTx], noBatches bool) driver.Executor {
+	if noBatches {
+		return noBatchesExec{d.Executor()}
+	}
+	return d.Executor()
 }
 
 func params(kind string, n int) []driver.JobInsertParams {

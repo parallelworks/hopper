@@ -61,7 +61,9 @@ type Client[TTx any] struct {
 	listening  atomic.Bool
 	isLeader   atomic.Bool
 	leaderPoke chan struct{}
-	streamPoke chan struct{}
+	// settleAfter is where the leader's next batch sweep resumes.
+	settleAfter driver.JobID
+	streamPoke  chan struct{}
 
 	events *eventBus
 

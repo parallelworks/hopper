@@ -357,4 +357,89 @@ func TestBatchCallbacks(t *testing.T) {
 	if _, err := c.NewBatch(hopper.BatchOpts{}).Insert(ctx); err == nil {
 		t.Error("empty batch accepted")
 	}
+	// What would fail the batch's insert, or its completion, where the
+	// callbacks are inserted, is rejected before any of its jobs goes in.
+	for name, opts := range map[string]hopper.BatchOpts{
+		"metadata":     {OnComplete: reportDone{RunID: 10}, Metadata: []byte("{")},
+		"max attempts": {OnComplete: reportDone{RunID: 10}, CallbackOpts: &hopper.InsertOpts{MaxAttempts: 40000}},
+	} {
+		b := c.NewBatch(opts)
+		b.Add(shard{N: 500}, nil)
+		if _, err := b.Insert(ctx); err == nil {
+			t.Errorf("batch with bad %s accepted", name)
+		}
+	}
+	var inserted int
+	if err := h.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM hopper_jobs WHERE args->>'n' = '500')
+	    + (SELECT count(*) FROM hopper_job_history WHERE args->>'n' = '500')`).Scan(&inserted); err != nil || inserted != 0 {
+		t.Errorf("rejected batches inserted %d jobs, %v", inserted, err)
+	}
+}
+
+// TestBatchesCompleteOnceAcrossClients works many batches on two clients,
+// whose finalizes of a batch's last jobs can run concurrently, each missing
+// the other's progress: every batch's callback runs exactly once.
+func TestBatchesCompleteOnceAcrossClients(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	var (
+		mu   sync.Mutex
+		runs = map[string]int{}
+	)
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[shard]) error { return nil })
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[reportDone]) error {
+		var meta struct {
+			BatchID string `json:"batch_id"`
+		}
+		if err := json.Unmarshal(job.Metadata, &meta); err != nil {
+			return err
+		}
+		mu.Lock()
+		runs[meta.BatchID]++
+		mu.Unlock()
+		return nil
+	})
+	// Without a leader, so that the clients' own settles complete every
+	// batch, including those whose last jobs they finalized at the same time.
+	clients := make([]*hopper.Client[pgxTx], 2)
+	for i := range clients {
+		clients[i] = h.client(&hopper.Config{
+			Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 8}},
+			Workers:   workers,
+			NeverLead: true,
+		})
+		if err := clients[i].Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const batches, size = 30, 8
+	ids := make([]string, batches)
+	for i := range ids {
+		b := clients[i%2].NewBatch(hopper.BatchOpts{OnComplete: reportDone{RunID: i}})
+		for j := range size {
+			b.Add(shard{N: 1000*i + j}, nil)
+		}
+		res, err := b.Insert(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = res.ID.String()
+	}
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(runs) == batches
+	})
+	// Long enough for a second completion to have run its callback too.
+	time.Sleep(3 * fastTuning.LeaderInterval)
+	mu.Lock()
+	defer mu.Unlock()
+	for i, id := range ids {
+		if runs[id] != 1 {
+			t.Errorf("batch %d: callback ran %d times", i, runs[id])
+		}
+	}
 }

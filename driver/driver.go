@@ -204,6 +204,14 @@ type Executor interface {
 	// BatchInsert creates a batch expecting Total jobs and returns its ID.
 	// The jobs are inserted separately with their BatchID set.
 	BatchInsert(ctx context.Context, params BatchInsertParams) (JobID, error)
+	// BatchSettle brings batches' recorded progress up to date and
+	// completes, inserting their callbacks, those with no job left.
+	// Statements that finalize jobs record their batches' progress without
+	// waiting on each other, so two that finalize a batch's last jobs at
+	// the same time can each miss the other's progress and leave the batch
+	// open. A client settles the batches it has just finalized jobs of, and
+	// the leader sweeps up the rest.
+	BatchSettle(ctx context.Context, params BatchSettleParams) (BatchSettleResult, error)
 	// BatchGet returns a batch's progress.
 	BatchGet(ctx context.Context, id JobID) (*BatchRow, error)
 	// WorkflowInsert inserts a batch, its jobs and the dependencies between
@@ -493,14 +501,38 @@ type BatchInsertParams struct {
 	Metadata                         json.RawMessage
 }
 
+// BatchSettleParams selects the batches BatchSettle settles.
+type BatchSettleParams struct {
+	// IDs names the batches to settle, waiting briefly for a batch row
+	// another statement holds; one it cannot get is left for the sweep. An
+	// empty non-nil IDs settles nothing.
+	IDs []JobID
+	// When IDs is nil, up to Limit batches with progress and an ID after
+	// After are settled, in ID order, skipping rows other statements hold.
+	After JobID
+	Limit int
+}
+
+// BatchSettleResult reports what BatchSettle did.
+type BatchSettleResult struct {
+	// Folded counts the batches whose progress was brought up to date, and
+	// Completed those of them that completed.
+	Folded, Completed int64
+	// Last is the greatest ID among the batches folded, the After of the
+	// next chunk of a sweep.
+	Last JobID
+}
+
 // BatchRow is a batch's progress.
 type BatchRow struct {
 	ID JobID
 	// Name is set for workflows.
-	Name    string
+	Name string
+	// Pending counts the batch's jobs not yet finalized.
 	Pending int
-	Failed  int
-	Total   int
+	// Failed counts its jobs that were cancelled or discarded.
+	Failed int
+	Total  int
 	// CompletedAt is set once every job has been finalized.
 	CompletedAt time.Time
 	CreatedAt   time.Time
@@ -615,6 +647,10 @@ type JobClaimResult struct {
 // JobFinalizeParams is a batch of results to apply.
 type JobFinalizeParams struct {
 	Jobs []JobFinalize
+	// NoBatches reports that none of the jobs belongs to a batch or a
+	// workflow, so the engine may skip the bookkeeping those need. Workflow
+	// jobs belong to a batch, so the jobs then have no dependents either.
+	NoBatches bool
 }
 
 // JobFinalize is the result of one attempt.
