@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -365,73 +366,167 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 	d := f.NewDriver(t)
 	exec := d.Executor()
 	later := time.Now().Add(time.Hour)
-	p := params("k", 5)
+	p := params("k", 7)
 	for i := range p {
 		p[i].OrderingKey = "a"
+		if i > 0 {
+			p[i].ScheduledAt = later
+		}
 	}
-	p[1].ScheduledAt, p[1].TTL = later, time.Millisecond
-	p[2].OrderingKey, p[2].ScheduledAt = "b", later
-	p[3].Queue, p[3].ScheduledAt = "other", later
+	p[1].TTL = 2 * time.Hour
+	p[2].OrderingKey = "b"
+	p[3].Queue = "other"
 	inserted := insert(ctx, t, exec, p)
 	id := func(i int) driver.JobID { return inserted[i].Job.ID }
 	if _, err := exec.JobCancel(ctx, id(4)); err != nil {
+		t.Fatal(err)
+	}
+	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = now() - interval '1s' WHERE id = $1::uuid", id(6).String())
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Name: "w", Jobs: []driver.JobInsertParams{{Kind: "w", Queue: "wf", Priority: 2, MaxAttempts: 1}, {Kind: "w", Queue: "wf", Priority: 2, MaxAttempts: 1, OrderingKey: "a"}},
+		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	clientID := register(ctx, t, exec)
 	if jobs := claim(ctx, t, exec, clientID, 10); len(jobs) != 1 || jobs[0].ID != id(0) {
 		t.Fatalf("claim = %+v", jobs)
 	}
-	state := func(i int) driver.JobState {
+	get := func(id driver.JobID) *driver.JobRow {
 		t.Helper()
-		j, err := exec.JobGet(ctx, id(i))
+		j, err := exec.JobGet(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return j.State
+		return j
 	}
-	retry := func(want ...int) {
+	wake := func(queue string, limit, want int) {
 		t.Helper()
-		jobs, err := exec.JobRetryOrderingKey(ctx, "default", "a")
-		if err != nil || len(jobs) != len(want) {
-			t.Fatalf("JobRetryOrderingKey = %+v, %v, want %v", jobs, err, want)
+		n, err := exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: queue, OrderingKey: "a", Limit: limit})
+		if err != nil || n != want {
+			t.Fatalf("JobRetryOrderingKey(%s, limit %d) = %d, %v, want %d", queue, limit, n, err, want)
 		}
-		for i, j := range jobs {
-			if j.ID != id(want[i]) || j.State != driver.JobStateAvailable || !j.ExpiresAt.IsZero() {
-				t.Errorf("woken job = %+v", j)
-			}
+	}
+	claimed := func(want ...driver.JobID) {
+		t.Helper()
+		jobs := claim(ctx, t, exec, clientID, 10)
+		if len(jobs) != len(want) || (len(want) == 1 && jobs[0].ID != want[0]) {
+			t.Fatalf("claim = %+v, want %v", jobs, want)
 		}
 	}
 
-	// The running job is left to finish; the waiting job of its key in this
-	// queue is brought forward, and no other key, queue or finalized job is.
-	time.Sleep(10 * time.Millisecond)
-	retry(1)
-	if state(0) != driver.JobStateRunning || state(2) != driver.JobStateScheduled || state(3) != driver.JobStateScheduled || state(4) != driver.JobStateCancelled {
-		t.Errorf("states = %v %v %v %v", state(0), state(2), state(3), state(4))
+	// Waiting jobs of the key in this queue wake oldest first, keeping their
+	// TTL; another key, another queue, a finalized job, a pending job and a
+	// job past its TTL stay as they are, and the running job runs on.
+	wake("default", 1, 1)
+	if j := get(id(1)); j.State != driver.JobStateAvailable || j.ExpiresAt.IsZero() || get(id(5)).State != driver.JobStateScheduled {
+		t.Errorf("after one: %+v, %s", j, get(id(5)).State)
 	}
-	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 0 {
-		t.Errorf("expired after retry = %+v, %v", expired, err)
+	wake("default", 10, 1)
+	wake("wf", 10, 0)
+	states := map[int]driver.JobState{
+		0: driver.JobStateRunning, 2: driver.JobStateScheduled, 3: driver.JobStateScheduled,
+		4: driver.JobStateCancelled, 5: driver.JobStateAvailable, 6: driver.JobStateScheduled,
+	}
+	for i, want := range states {
+		if got := get(id(i)).State; got != want {
+			t.Errorf("job %d is %s, want %s", i, got, want)
+		}
+	}
+	if got := get(wf.Jobs[1].Job.ID).State; got != driver.JobStatePending {
+		t.Errorf("pending job is %s", got)
 	}
 
-	// A snoozed head keeps blocking its key until it is woken, then runs
-	// first, without its reason.
+	// The running job was marked, so its retry runs at once.
+	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	claimed(id(0))
+
+	// A snooze with no wake waits, and blocks the key, until a wake.
 	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
-	if jobs := claim(ctx, t, exec, clientID, 10); len(jobs) != 0 {
-		t.Fatalf("claimed %+v behind a snoozed head", jobs)
-	}
-	retry(0)
+	claimed()
+	wake("default", 10, 1)
 	if r := storedReason(ctx, t, f, d, id(0)); r != "" {
 		t.Errorf("woken job kept reason %q", r)
 	}
-	if jobs := claim(ctx, t, exec, clientID, 10); len(jobs) != 1 || jobs[0].ID != id(0) {
-		t.Fatalf("claim after wake = %+v", jobs)
+	claimed(id(0))
+
+	// A wake during the attempt makes its snooze run at once, without a reason.
+	wake("default", 10, 0)
+	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
+	if r := storedReason(ctx, t, f, d, id(0)); r != "" {
+		t.Errorf("snooze after a wake kept reason %q", r)
+	}
+	claimed(id(0))
+
+	// A mark from before the attempt started does not count.
+	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET wake_requested_at = attempted_at - interval '1s' WHERE id = $1::uuid", id(0).String())
+	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	claimed()
+	if n, err := exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: "default", OrderingKey: "none", Limit: 10}); err != nil || n != 0 {
+		t.Errorf("unknown key = %d, %v", n, err)
+	}
+}
+
+// testRetryOrderingKeyConcurrent checks that a wake racing the end of an
+// attempt is never lost, and that a wake and the leader's aging, which lock
+// the same rows, never deadlock.
+func testRetryOrderingKeyConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	wakeKey := func(key string) {
+		if _, err := exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: "default", OrderingKey: key, Limit: 1000}); err != nil {
+			t.Error(err)
+		}
 	}
 
-	// So does one waiting out a retry delay.
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
-	retry(0)
-	if jobs, err := exec.JobRetryOrderingKey(ctx, "default", "none"); err != nil || len(jobs) != 0 {
-		t.Errorf("unknown key = %+v, %v", jobs, err)
+	for round := range 40 {
+		key := fmt.Sprintf("race-%d", round)
+		p := params("k", 1)
+		p[0].OrderingKey = key
+		job := insert(ctx, t, exec, p)[0].Job.ID
+		if jobs := claim(ctx, t, exec, clientID, 1); len(jobs) != 1 || jobs[0].ID != job {
+			t.Fatalf("claim = %+v", jobs)
+		}
+		var wg sync.WaitGroup
+		wg.Go(func() { wakeKey(key) })
+		wg.Go(func() {
+			res := driver.JobFinalize{ID: job, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true}
+			if applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{res}}); err != nil || len(applied) != 1 {
+				t.Errorf("finalize = %v, %v", applied, err)
+			}
+		})
+		wg.Wait()
+		if due := f.QueryText(ctx, t, d, "SELECT (scheduled_at <= now())::text FROM hopper_jobs WHERE id = $1::uuid", job.String()); due != "true" {
+			t.Fatalf("round %d: a wake racing the snooze was lost", round)
+		}
+		f.Exec(ctx, t, d, "DELETE FROM hopper_jobs WHERE id = $1::uuid", job.String())
+	}
+
+	// Rows laid out in the heap in the reverse of their seq order: the
+	// aging pass meets them in one order and the wake locks them in the
+	// other. Each round rewrites them one by one, newest first, which
+	// appends their new versions in that order.
+	p := params("k", 300)
+	for i := range p {
+		p[i].OrderingKey, p[i].Priority, p[i].ScheduledAt = "aging", 3, time.Now().Add(time.Hour)
+	}
+	aging := insert(ctx, t, exec, p)
+	for range 20 {
+		for i := len(aging) - 1; i >= 0; i-- {
+			f.Exec(ctx, t, d, `UPDATE hopper_jobs SET state = 'scheduled', priority = 3, scheduled_at = now() - interval '1 hour'
+			  WHERE id = $1::uuid`, aging[i].Job.ID.String())
+		}
+		var wg sync.WaitGroup
+		wg.Go(func() { wakeKey("aging") })
+		wg.Go(func() {
+			if _, err := exec.JobAge(ctx, "default", time.Millisecond); err != nil {
+				t.Error(err)
+			}
+		})
+		wg.Wait()
 	}
 }
 

@@ -378,7 +378,8 @@ func claimRows(ctx context.Context, conn Conn, query string, args ...any) ([]*dr
 // transition checks the prior state (running) and the owning client, so a
 // stale result from a fenced client never overwrites a newer attempt.
 // Retries and snoozes are updated in place, with a snooze's reason (or
-// NULL); terminal outcomes go through finalizeTailSQL: history, batches,
+// NULL), and run at once if JobRetryOrderingKey woke the key during the
+// attempt; terminal outcomes go through finalizeTailSQL: history, batches,
 // and workflow dependents. Error timestamps come from database time and
 // awaited jobs announce themselves on the done channel.
 var jobFinalizeSQL = `
@@ -390,12 +391,15 @@ WITH RECURSIVE r AS (
 retry AS (
   UPDATE {{schema}}.hopper_jobs j
   SET state = r.state::{{schema}}.hopper_job_state,
-      scheduled_at = now() + make_interval(secs => r.delay),
+      scheduled_at = CASE WHEN coalesce(j.wake_requested_at >= j.attempted_at, false) THEN now()
+                          ELSE now() + make_interval(secs => r.delay) END,
       attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
       errors = CASE WHEN r.error IS NULL THEN j.errors
                     ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END,
       attempted_by = NULL,
-      snooze_reason = CASE WHEN r.snooze THEN r.snooze_reason END
+      snooze_reason = CASE WHEN r.snooze AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false)
+                           THEN r.snooze_reason END,
+      wake_requested_at = NULL
   FROM r
   WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by
     AND r.state IN ('retryable', 'scheduled')
@@ -580,9 +584,14 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 	return job, nil
 }
 
+// jobRunNowSQL is the SET list that makes a waiting job runnable now and
+// drops the reason it was waiting. A job that was already due keeps its
+// scheduled_at, so it keeps its place in claim order and its aging.
+const jobRunNowSQL = `state = 'available', scheduled_at = least(scheduled_at, now()), snooze_reason = NULL, wake_requested_at = NULL`
+
 var (
 	jobRetryLiveSQL = fmt.Sprintf(`
-UPDATE {{schema}}.hopper_jobs SET state = 'available', scheduled_at = now(), snooze_reason = NULL, expires_at = NULL
+UPDATE {{schema}}.hopper_jobs SET `+jobRunNowSQL+`, expires_at = NULL
 WHERE id = $1 AND state <> 'running'
 RETURNING %s`, JobColumns(""))
 	// jobRetryHistorySQL moves a finalized job back to the live table with
@@ -641,20 +650,49 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 	return job, nil
 }
 
-// jobRetryOrderingKeySQL walks hopper_jobs_ordering, which covers exactly
-// the waiting states of a key.
-var jobRetryOrderingKeySQL = fmt.Sprintf(`
-UPDATE {{schema}}.hopper_jobs SET state = 'available', scheduled_at = now(), snooze_reason = NULL, expires_at = NULL
-WHERE queue = $1 AND ordering_key = $2 AND state IN ('scheduled', 'retryable')
-RETURNING %s`, JobColumns(""))
+// jobMarkOrderingKeySQL marks the key's running job (through the unique
+// index on running ordering keys) so that its finalize honours the wake.
+const jobMarkOrderingKeySQL = `
+UPDATE {{schema}}.hopper_jobs SET wake_requested_at = now()
+WHERE queue = $1 AND ordering_key = $2 AND state = 'running'`
 
-// JobRetryOrderingKey implements driver.Executor.
-func (e *Executor) JobRetryOrderingKey(ctx context.Context, queue, orderingKey string) ([]*driver.JobRow, error) {
-	jobs, err := liveJobs(e.Conn.Query(ctx, jobRetryOrderingKeySQL, queue, orderingKey))
-	if err != nil {
-		return nil, fmt.Errorf("hopper: retry ordering key: %w", err)
+// jobRetryOrderingKeySQL locks a batch of the key's waiting jobs in seq
+// order through hopper_jobs_ordering and makes them runnable. Jobs past
+// their TTL are left to the expiry sweep, so whether one runs does not
+// depend on whether the sweep reached it first. The claim, the aging pass
+// and the expiry sweep skip locked rows, so they cannot deadlock with this
+// fixed lock order. A replacing insert of several jobs of one key still
+// can, and Postgres then aborts one of the two statements.
+const jobRetryOrderingKeySQL = `
+WITH waiting AS (
+  SELECT id FROM {{schema}}.hopper_jobs
+  WHERE queue = $1 AND ordering_key = $2 AND state IN ('scheduled', 'retryable')
+    AND (expires_at IS NULL OR expires_at > now())
+  ORDER BY seq
+  LIMIT $3
+  FOR UPDATE
+),
+woken AS (
+  UPDATE {{schema}}.hopper_jobs j SET ` + jobRunNowSQL + `
+  FROM waiting w
+  WHERE j.id = w.id
+  RETURNING j.id
+)
+SELECT count(*) FROM woken`
+
+// JobRetryOrderingKey implements driver.Executor. The mark and the wake are
+// separate statements, in that order, so the wake reads a snapshot taken
+// after the mark: a job that ends its attempt before the mark reaches it is
+// waiting by then and is woken, and one that ends after sees the mark.
+func (e *Executor) JobRetryOrderingKey(ctx context.Context, params driver.JobRetryOrderingKeyParams) (int, error) {
+	if _, err := e.Conn.Exec(ctx, jobMarkOrderingKeySQL, params.Queue, params.OrderingKey); err != nil {
+		return 0, fmt.Errorf("hopper: retry ordering key: %w", err)
 	}
-	return jobs, nil
+	var n int
+	if err := e.Conn.QueryRow(ctx, jobRetryOrderingKeySQL, params.Queue, params.OrderingKey, max(params.Limit, 1)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("hopper: retry ordering key: %w", err)
+	}
+	return n, nil
 }
 
 var jobDiscardExpiredSQL = `
@@ -705,10 +743,15 @@ func (e *Executor) JobAge(ctx context.Context, queue string, after time.Duration
 		return 0, nil
 	}
 	// Bumped jobs restart their wait, so a job climbs one level per period.
+	// A row another statement holds is aged next period instead of waited
+	// for, so aging never takes part in a deadlock.
 	n, err := e.Conn.Exec(ctx, `
 		UPDATE {{schema}}.hopper_jobs SET priority = priority - 1, scheduled_at = now()
-		WHERE queue = $1 AND state IN ('available', 'scheduled', 'retryable') AND priority > 1
-		  AND scheduled_at <= now() - make_interval(secs => $2::float8)`, queue, after.Seconds())
+		WHERE id IN (
+		  SELECT id FROM {{schema}}.hopper_jobs
+		  WHERE queue = $1 AND state IN ('available', 'scheduled', 'retryable') AND priority > 1
+		    AND scheduled_at <= now() - make_interval(secs => $2::float8)
+		  FOR UPDATE SKIP LOCKED)`, queue, after.Seconds())
 	if err != nil {
 		return 0, fmt.Errorf("hopper: age jobs: %w", err)
 	}

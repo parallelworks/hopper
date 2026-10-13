@@ -392,7 +392,8 @@ CREATE TABLE hopper_jobs (
   cancel_requested_at timestamptz,
   await               boolean     NOT NULL DEFAULT false,   -- notify waiters on finalize
   created_at          timestamptz NOT NULL DEFAULT now(),
-  snooze_reason       text                       -- why a snoozed job waits (schema v9); live table only
+  snooze_reason       text,                      -- why a snoozed job waits (schema v9); live table only
+  wake_requested_at   timestamptz                -- JobRetryOrderingKey reached the job while it ran (schema v10); live table only
 ) WITH (fillfactor = 70);
 
 -- Claim path: the only index the hot query touches.
@@ -618,7 +619,9 @@ RETURNING j.*;
   passes, without running again. A running job is not interrupted, but if its attempt
   ends in a retry or a snooze past the deadline, it is discarded. `JobRetry` clears the
   deadline, live or from history: an explicit retry is the operator overriding the
-  wait, so a job past its TTL still runs.
+  wait, so a job past its TTL still runs. `JobRetryOrderingKey` keeps it: a wake is a
+  producer saying a key's work is due, not an operator overriding a deadline, so a
+  woken job keeps its TTL and one already past it is left to expire.
 - **Limits.** Queues with a `GlobalLimit` or `RateLimit` claim inside a short
   transaction that locks their `hopper_queues` row (§9). Unlimited queues never touch
   that row, so they pay nothing for the feature.
@@ -657,10 +660,12 @@ updated in place, a snooze with its reason. Terminal outcomes are moved to histo
 WITH r AS (SELECT * FROM unnest($ids, $attempted_by, $states, $delays, $snoozes, $errors, $outputs, $archives,
                                  $snooze_reasons) AS r(...)),
 retry AS (
-  UPDATE hopper_jobs j SET state = r.state, scheduled_at = now() + r.delay,
+  UPDATE hopper_jobs j SET state = r.state,
+         scheduled_at = CASE WHEN j.wake_requested_at >= j.attempted_at THEN now() ELSE now() + r.delay END,
          attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
          errors = j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())), attempted_by = NULL,
-         snooze_reason = CASE WHEN r.snooze THEN r.snooze_reason END
+         snooze_reason = CASE WHEN r.snooze AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false) THEN r.snooze_reason END,
+         wake_requested_at = NULL
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
     AND j.state = 'running' AND j.attempted_by = r.attempted_by
   RETURNING j.id),
@@ -693,12 +698,13 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
     in `snooze_reason` and shown as `JobRow.SnoozeReason`, so operators (`hopper jobs
     get`, `hopperui`) can see why the job waits; `hopperotel` records it on the attempt's
     span, and the `job.snoozed` event carries it as `Event.Error`. The claim clears it
-    in the statement that takes the job, and so do every other finalize, `JobRetry`
-    and a replacing insert, so the reason only ever describes the current wait. A
-    client of the previous release clears it in none of these, so during a rolling
-    deploy a running or retrying row can still hold one; reads therefore report the
-    reason only for a `scheduled` row. History has no such column, but a snoozed job
-    that expires or is cancelled keeps the reason in the error it is finalized with
+    in the statement that takes the job, and so do every other finalize, `JobRetry`,
+    `JobRetryOrderingKey` and a replacing insert, so the reason only ever describes the
+    current wait. A client of the previous release clears it in none of these, so
+    during a rolling deploy a running or retrying row can still hold one; reads
+    therefore report the reason only for a `scheduled` row. History has no such
+    column, but a snoozed job that expires or is cancelled keeps the reason in the
+    error it is finalized with
     (`hopper: expired while snoozed: <reason>`, `hopper: cancelled while snoozed:
     <reason>`).
   - **`hopper.Cancel(err)`:** `discarded` immediately.
@@ -1053,10 +1059,20 @@ observability without new machinery.
     Ordering keys are available on plain jobs too, through `InsertOpts.OrderingKey`.
   - A failing delivery blocks its key while it retries. Later messages for that key
     wait until it succeeds or is dead-lettered, and dead-lettering unblocks the key.
-  - `JobRetryOrderingKey(queue, key)` brings forward every job of a key that is waiting
-    out a snooze, a retry delay or its schedule, in one statement through the same
-    index, and leaves a running job alone. A producer whose newer job should not wait
-    behind an older one's delay wakes the key instead of cancelling the job in it.
+  - `JobRetryOrderingKey(queue, key)` wakes a key, for a producer whose newer job should
+    not wait behind an older one's delay, without cancelling the job in it. It makes the
+    key's waiting jobs (scheduled or retryable, TTL not passed) runnable now, in batches
+    of 1000 locked in `seq` order through the same index. A job that was already due
+    keeps its `scheduled_at`, so it keeps its claim order and aging. It does not
+    interrupt a running job, but marks it (`wake_requested_at`, schema v10): if that
+    attempt ends in a snooze or a retry, the finalize makes the job runnable at once
+    and clears the mark, and a mark older than the attempt is ignored. The mark is a
+    statement of its own, before the wake, so the wake's snapshot is taken after it: a
+    job that finishes its attempt before the mark reaches it is waiting by then and is
+    woken, and one that finishes after sees the mark. The claim, the aging pass
+    and the expiry sweep skip locked rows, so the wake's fixed lock order cannot deadlock
+    with them; a replacing insert of several jobs of one key still can, and Postgres
+    then aborts one of the two statements.
   - Ordered deliveries get a shorter default retry budget (10 attempts, with backoff
     capped at 5 minutes), so a poison message is dead-lettered within about an hour
     instead of blocking its key for days. The budget is configurable per subscription
@@ -1145,7 +1161,7 @@ observability without new machinery.
   polling, then works them all with a client (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that
   block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
   constraints, and so on). A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a 50 ms `lock_timeout` in a loop (schema v9), because a lock
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10), because a lock
   request queued behind an open transaction on the table would hold up every claim
   behind it; claims wait at most one try at a time. Between tries it sleeps a jittered,
   growing interval capped at a second, raises a `NOTICE` every 10 seconds while it

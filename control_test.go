@@ -126,14 +126,13 @@ func TestJobRetryOrderingKeyWakesASnoozedKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	jobs, err := c.JobRetryOrderingKey(ctx, "", "a")
-	if err != nil || len(jobs) != 1 || jobs[0].ID != first.Job.ID {
-		t.Fatalf("JobRetryOrderingKey = %+v, %v", jobs, err)
+	if n, err := c.JobRetryOrderingKey(ctx, "", "a"); err != nil || n != 1 {
+		t.Fatalf("JobRetryOrderingKey = %d, %v", n, err)
 	}
 	waitForJob(t, c, first.Job.ID, hopper.JobStateCompleted)
 	waitForJob(t, c, second.Job.ID, hopper.JobStateCompleted)
-	if jobs, err := c.JobRetryOrderingKey(ctx, "", ""); err != nil || jobs != nil {
-		t.Errorf("empty key = %+v, %v", jobs, err)
+	if _, err := c.JobRetryOrderingKey(ctx, "", ""); err == nil {
+		t.Error("empty key: no error")
 	}
 }
 
