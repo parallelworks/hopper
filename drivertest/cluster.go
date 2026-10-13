@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -490,9 +492,23 @@ func testHistoryMaintainWhileInUse[TTx any](t *testing.T, f Fixture[TTx]) {
 	d := f.NewDriver(t)
 	exec := d.Executor()
 	p := driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, FailedRetention: 7 * 24 * time.Hour}
-	if _, err := exec.HistoryMaintain(ctx, p); err != nil {
+	first, err := exec.HistoryMaintain(ctx, p)
+	if err != nil {
 		t.Fatal(err)
 	}
+	// A partition ahead that is missing, as one the leader could not create
+	// earlier would be: its attach scans the DEFAULT partition, where the
+	// current period's history goes until its partition exists.
+	ahead := ""
+	for _, name := range first.Created {
+		if strings.HasPrefix(name, "hopper_job_history_completed_") {
+			ahead = name
+		}
+	}
+	if ahead == "" {
+		t.Fatalf("no completed-history partition created ahead: %+v", first)
+	}
+	f.Exec(ctx, t, d, `DROP TABLE `+ahead)
 	const old = "hopper_job_history_completed_2020010100"
 	f.Exec(ctx, t, d, `CREATE TABLE `+old+` PARTITION OF hopper_job_history_completed
 		FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`)
@@ -512,10 +528,10 @@ func testHistoryMaintainWhileInUse[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err != nil {
 		t.Fatalf("maintenance while history is in use: %v", err)
 	}
-	if len(res.Dropped) != 0 || len(res.Deferred) != 1 || res.Deferred[0] != old {
-		t.Errorf("maintenance while history is in use = %+v", res)
+	if len(res.Dropped) != 0 || len(res.Created) != 0 || !slices.Equal(res.Deferred, []string{ahead, old}) {
+		t.Errorf("maintenance while history is in use = %+v; want %s and %s deferred", res, ahead, old)
 	}
-	// Other finalizes are not queued behind a waiting drop.
+	// Other finalizes are not queued behind a waiting attach or drop.
 	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: jobs[1].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
 		t.Errorf("finalize during maintenance applied %v", applied)
 	}
@@ -523,7 +539,7 @@ func testHistoryMaintainWhileInUse[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	res, err = exec.HistoryMaintain(ctx, p)
-	if err != nil || len(res.Dropped) != 1 || res.Dropped[0] != old || len(res.Deferred) != 0 {
+	if err != nil || !slices.Equal(res.Created, []string{ahead}) || len(res.Dropped) != 1 || res.Dropped[0] != old || len(res.Deferred) != 0 {
 		t.Errorf("maintenance after the transaction = %+v, %v", res, err)
 	}
 }

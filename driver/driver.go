@@ -716,9 +716,9 @@ type HistoryMaintainResult struct {
 	// Created and Dropped name storage units (partitions on Postgres).
 	Created []string
 	Dropped []string
-	// Deferred names storage units past retention that were in use, such as
-	// by a transaction that wrote history and has not ended; they are
-	// dropped by a later pass.
+	// Deferred names storage units whose creation or drop had to wait for a
+	// transaction that has not ended, such as one that wrote history; a
+	// later pass retries them.
 	Deferred []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64

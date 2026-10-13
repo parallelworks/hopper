@@ -461,7 +461,7 @@ func (fanIn) Kind() string { return "fan_in" }
 
 // TestCompleteTxFanIn completes one of a job's two dependencies with
 // CompleteTx and keeps its transaction open until the other dependency's
-// finalize is waiting on it. Neither statement sees the other dependency
+// finalize has committed. Neither statement sees the other dependency
 // finished, so neither promotes the dependent; the leader does.
 func TestCompleteTxFanIn(t *testing.T) {
 	t.Parallel()
@@ -483,8 +483,7 @@ func TestCompleteTxFanIn(t *testing.T) {
 				return err
 			}
 			close(completed)
-			for h.count(`SELECT count(*) FROM pg_stat_activity
-				WHERE wait_event_type = 'Lock' AND position(current_schema() IN query) > 0`) == 0 {
+			for h.count(`SELECT count(*) FROM hopper_jobs WHERE kind = 'fan_in' AND args->>'name' = 'y'`) != 0 {
 				time.Sleep(5 * time.Millisecond)
 			}
 			return tx.Commit(ctx)
@@ -507,4 +506,54 @@ func TestCompleteTxFanIn(t *testing.T) {
 	if _, ok := ran.Load("after"); !ok {
 		t.Error("the dependent completed without running")
 	}
+}
+
+// TestCompleteTxBatchRace completes one of a batch's two jobs with
+// CompleteTx and keeps its transaction open until the other job's finalize
+// has committed, so neither sees the other's progress. With no leader, the
+// batch completes because the client settles it once the worker returns.
+func TestCompleteTxBatchRace(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	completed := make(chan struct{})
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[fanIn]) error {
+		if job.Args.Name == "y" {
+			<-completed
+			return nil
+		}
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+		if err := hopper.CompleteTx(ctx, tx, job); err != nil {
+			return err
+		}
+		close(completed)
+		for h.count(`SELECT count(*) FROM hopper_jobs WHERE kind = 'fan_in' AND args->>'name' = 'y'`) != 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		return tx.Commit(ctx)
+	})
+	c := h.client(&hopper.Config{
+		Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 4}},
+		Workers:   workers,
+		NeverLead: true,
+	})
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b := c.NewBatch(hopper.BatchOpts{OnComplete: reportDone{RunID: 1}})
+	b.Add(fanIn{Name: "x"}, nil)
+	b.Add(fanIn{Name: "y"}, nil)
+	res, err := b.Insert(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		row, err := c.BatchGet(ctx, res.ID)
+		return err == nil && !row.CompletedAt.IsZero()
+	})
 }

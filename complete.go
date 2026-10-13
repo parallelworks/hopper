@@ -30,9 +30,9 @@ var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt"
 // the attempt fails as that outcome says and the job is retried.
 //
 // Call it last, just before the commit. From CompleteTx until tx ends, tx
-// holds the job's row, its batch's row and a lock on the history table, so
-// the finalizing of sibling jobs in the same batch or workflow, and the
-// dropping of expired history partitions, wait until then.
+// holds the job's row and those of workflow dependents it promotes or
+// cancels, and holds off the creation and drop of history partitions. The
+// job's siblings in its batch finalize without waiting for it.
 //
 //	func (w *Worker) Work(ctx context.Context, job *hopper.Job[Args]) error {
 //		tx, err := w.pool.Begin(ctx)
@@ -66,7 +66,7 @@ func CompleteTx[TTx any, T JobArgs](ctx context.Context, tx TTx, job *Job[T]) er
 	// from another goroutine must not block on the database.
 	result := a.completion
 	result.Output = a.get()
-	applied, err := c.driver.UnwrapTx(tx).JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{result}})
+	applied, err := c.driver.UnwrapTx(tx).JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{result}, NoBatches: job.BatchID.IsZero()})
 	if err != nil {
 		return err
 	}

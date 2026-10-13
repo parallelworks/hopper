@@ -750,10 +750,13 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   index probe in a batched statement. If `tx` did not commit, the result applies:
   the attempt failed, and the job retries (or is discarded on its last attempt), so
   no job is left running because a worker ignored a failed commit.
-- From `CompleteTx` until `tx` ends, `tx` holds the job's row, its batch's row and a
-  lock on the history table, so sibling finalizes in the same batch or workflow and
-  the drop of an expired history partition wait for it. `CompleteTx` belongs last,
-  just before the commit.
+- From `CompleteTx` until `tx` ends, `tx` holds the job's row and those of workflow
+  dependents it promotes or cancels, and a lock on the history table that holds off
+  the creation and drop of history partitions (which give up after 200 ms and retry
+  on the next pass, §7.10). Its batch progress is an appended row (§11), so the job's
+  siblings finalize without waiting for it. Once the worker returns, the client
+  settles the job's batch, which completes it if a sibling finalized at the same
+  time missed this job's progress. `CompleteTx` belongs last, just before the commit.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure
@@ -870,12 +873,17 @@ Retention is enforced by dropping whole partitions, so there is no `DELETE`, no 
 tuples and no vacuum work. The leader creates partitions several intervals ahead
 (three hours for `completed`, two days for `failed`), on election and every five
 minutes. A partition is created standalone and then attached, which takes only a
-`SHARE UPDATE EXCLUSIVE` lock on the parent, so finalizes are never blocked by
-maintenance. Only future periods are created and no row is ever moved: rows finalized
-before their period's partition existed (the first period after installation, or
-after a long leader outage) land in a `DEFAULT` partition and are deleted individually
-once past retention. Dropping a partition takes a brief `ACCESS EXCLUSIVE` lock on the
-parent, once per period. Retention periods are set in `Config` and enforced by the
+`SHARE UPDATE EXCLUSIVE` lock on the parent. Only future periods are created and no
+row is ever moved: rows finalized before their period's partition existed (the first
+period after installation, or after a long leader outage) land in a `DEFAULT`
+partition and are deleted individually once past retention. Attaching scans the
+`DEFAULT` partition under an `ACCESS EXCLUSIVE` lock on it, and dropping a partition
+takes a brief `ACCESS EXCLUSIVE` lock on the parent, once per period. A transaction
+that wrote history and is still open (a worker's `CompleteTx`) holds either lock off,
+and while the DDL waits, every finalize that writes to the same table queues behind
+it. Both therefore run under a 200 ms `lock_timeout`: one that cannot get its lock is
+reported as deferred and retried on the next pass, so maintenance never holds up
+finalizes for longer than that. Retention periods are set in `Config` and enforced by the
 leader, so the leader's settings apply cluster-wide.
 
 The defaults follow common practice: job queues keep successful jobs briefly and

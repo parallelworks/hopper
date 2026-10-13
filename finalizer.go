@@ -179,14 +179,15 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 }
 
 // settle settles the batches of the jobs a flush finished, once it has
-// committed: a batch whose last jobs this flush and another client's
-// finalized at the same time is completed by whichever of the two settles
-// second.
+// committed, and of those a worker completed with CompleteTx, whose
+// transaction committed before the worker returned: a batch whose last jobs
+// this client and another finalized at the same time is completed by
+// whichever of the two settles second.
 func (f *finalizer) settle(ctx context.Context, batch []pending) {
 	seen := map[driver.JobID]struct{}{}
 	var ids []driver.JobID
 	for _, p := range batch {
-		if _, dup := seen[p.job.BatchID]; dup || p.job.BatchID.IsZero() || !p.result.State.Terminal() {
+		if _, dup := seen[p.job.BatchID]; dup || p.job.BatchID.IsZero() || (!p.result.State.Terminal() && p.completedTx == nil) {
 			continue
 		}
 		seen[p.job.BatchID] = struct{}{}
