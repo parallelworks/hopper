@@ -153,3 +153,41 @@ func TestUpRejectsUnknownTarget(t *testing.T) {
 		t.Fatal("Up to an unknown version succeeded")
 	}
 }
+
+// TestDownRecountsOpenBatches goes back below v11, whose release counts a
+// batch down in pending: open batches get their counts from their jobs.
+func TestDownRecountsOpenBatches(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
+	if _, err := hoppermigrate.Up(ctx, d, opts); err != nil {
+		t.Fatal(err)
+	}
+	var batch string
+	if err := pool.QueryRow(ctx, `INSERT INTO hopper_batches (pending, total) VALUES (3, 3) RETURNING id::text`).Scan(&batch); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`SELECT hopper_insert('k', jsonb_build_object('n', n), '{}') FROM generate_series(1, 2) n WHERE $1::text IS NOT NULL`,
+		`UPDATE hopper_jobs SET batch_id = $1::uuid`,
+		`INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata,
+		   errors, await, created_at, finalized_at, batch_id)
+		 VALUES (hopper_uuidv7(), 1, 'k', 'default', 'discarded', 2, 1, 1, now(), '{}', '{}', '[]', false, now(), now(), $1::uuid)`,
+	} {
+		if _, err := pool.Exec(ctx, q, batch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: opts.Logger, Target: 10}); err != nil {
+		t.Fatal(err)
+	}
+	var pending, failed int
+	if err := pool.QueryRow(ctx, `SELECT pending, failed FROM hopper_batches WHERE id = $1::uuid`, batch).Scan(&pending, &failed); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 2 || failed != 1 {
+		t.Errorf("after down: pending = %d, failed = %d; want 2, 1", pending, failed)
+	}
+}

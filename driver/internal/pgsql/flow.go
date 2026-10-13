@@ -132,13 +132,49 @@ func (e *Executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 	}
 	var id driver.JobID
 	err = e.Conn.QueryRow(ctx, `
-		INSERT INTO {{schema}}.hopper_batches (pending, total, on_success, on_failure, on_complete, metadata)
-		VALUES ($1, $1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb) RETURNING id`,
-		params.Total, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata)).Scan(&id)
+		INSERT INTO {{schema}}.hopper_batches (id, pending, total, on_success, on_failure, on_complete, metadata)
+		VALUES (coalesce($6::uuid, {{schema}}.hopper_uuidv7()), $1, $1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb) RETURNING id`,
+		params.Total, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata), nullableUUID(params.ID)).Scan(&id)
 	if err != nil {
 		return driver.JobID{}, fmt.Errorf("hopper: insert batch: %w", err)
 	}
 	return id, nil
+}
+
+// batchProgressColumns reads a batch's pending and failed counts: from its
+// jobs while it is open, and as recorded when it completed.
+const batchProgressColumns = `CASE WHEN b.completed_at IS NULL
+    THEN (SELECT count(*) FROM {{schema}}.hopper_jobs j WHERE j.batch_id = b.id) ELSE 0 END AS pending,
+  CASE WHEN b.completed_at IS NULL THEN ` + batchFailedSQL + ` ELSE b.failed END AS failed`
+
+// batchCompleteReadySQL completes open batches none of whose jobs is live,
+// oldest first, and inserts their callbacks. It skips a batch another
+// statement is completing.
+var batchCompleteReadySQL = `
+WITH RECURSIVE ready AS (
+  SELECT b.id FROM {{schema}}.hopper_batches b
+  WHERE b.completed_at IS NULL
+    AND NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs j WHERE j.batch_id = b.id)
+  ORDER BY b.created_at
+  LIMIT $1
+  FOR UPDATE OF b SKIP LOCKED
+),
+batches AS (
+  UPDATE {{schema}}.hopper_batches b
+  SET completed_at = now(), failed = ` + batchFailedSQL + `
+  FROM ready WHERE b.id = ready.id AND b.completed_at IS NULL
+  RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete
+),
+` + batchCallbacksSQL("$2") + `
+SELECT count(*) FROM batches`
+
+// BatchCompleteReady implements driver.Executor.
+func (e *Executor) BatchCompleteReady(ctx context.Context, limit int) (int64, error) {
+	var n int64
+	if err := e.Conn.QueryRow(ctx, batchCompleteReadySQL, max(limit, 1), driver.ChannelInsert).Scan(&n); err != nil {
+		return 0, fmt.Errorf("hopper: complete ready batches: %w", err)
+	}
+	return n, nil
 }
 
 // BatchGet implements driver.Executor.
@@ -148,7 +184,7 @@ func (e *Executor) BatchGet(ctx context.Context, id driver.JobID) (*driver.Batch
 		completed sql.NullTime
 		metadata  jsonText
 	)
-	err := e.Conn.QueryRow(ctx, `SELECT id, pending, failed, total, created_at, completed_at, metadata FROM {{schema}}.hopper_batches WHERE id = $1`, uuidParam(id)).
+	err := e.Conn.QueryRow(ctx, `SELECT id, `+batchProgressColumns+`, total, created_at, completed_at, metadata FROM {{schema}}.hopper_batches b WHERE id = $1`, uuidParam(id)).
 		Scan(&b.ID, &b.Pending, &b.Failed, &b.Total, &b.CreatedAt, &completed, &metadata)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound

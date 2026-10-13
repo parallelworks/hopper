@@ -15,8 +15,18 @@ import (
 // waiting job, expiring) produces a CTE named finished, in the shape
 // finishedColumns builds, and ends with finalizeTailSQL, which does
 // everything a finalized job entails: cancelling the dependents of a failed
-// job, archiving, counting batches down, promoting dependents whose
-// dependencies are all finished, and dropping satisfied edges.
+// job, archiving, completing batches that have no live job left, promoting
+// dependents whose dependencies are all finished, and dropping satisfied
+// edges.
+//
+// A batch is complete when none of its jobs is live. The statement that
+// finalizes the last one completes it, guarded by completed_at so the
+// callbacks run once, and touches the batch row only then: finalizes do not
+// queue on a shared counter, and a caller's transaction that finalized a
+// job and is still open (CompleteTx) holds up none of the job's siblings.
+// Two last jobs finalized in concurrent transactions each see the other
+// live, so neither completes the batch; BatchCompleteReady, run by the
+// leader, does.
 
 // finishedColumns lists the columns a finishing CTE returns from a
 // hopper_jobs row aliased j: the row, with the given expressions for its
@@ -46,6 +56,26 @@ func appendErrorSQL(message string) string {
 const finishedSelectColumns = `id, kind, queue, final_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
   attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id, expires_at,
   cancel_requested_at, await, created_at, NULL::text AS snooze_reason, now() AS finalized_at, output`
+
+// batchFailedSQL counts a batch's failed jobs in history. A statement does
+// not see the history rows it archives itself, so its callers add those.
+const batchFailedSQL = `(SELECT count(*) FROM {{schema}}.hopper_job_history h
+    WHERE h.batch_id = b.id AND h.state IN ('cancelled', 'discarded'))`
+
+// batchCallbacksSQL returns the CTE that inserts the callbacks of the
+// batches a CTE named batches has just completed, and notifies their
+// queues.
+func batchCallbacksSQL(insertChannelParam string) string {
+	return `callbacks AS (
+  INSERT INTO {{schema}}.hopper_jobs (kind, queue, priority, max_attempts, args, metadata)
+  SELECT cb->>'kind', coalesce(cb->>'queue', 'default'), coalesce((cb->>'priority')::smallint, 2),
+    coalesce((cb->>'max_attempts')::smallint, 25), coalesce(cb->'args', '{}'),
+    coalesce(cb->'metadata', '{}') || jsonb_build_object('batch_id', b.id::text, 'batch_failed', b.failed)
+  FROM batches b, LATERAL (VALUES (CASE WHEN b.failed = 0 THEN b.on_success ELSE b.on_failure END), (b.on_complete)) AS v(cb)
+  WHERE cb IS NOT NULL
+  RETURNING pg_notify(` + insertChannelParam + `, queue)
+)`
+}
 
 // finalizeTailSQL returns the CTEs that follow a finished CTE; the statement
 // must start with WITH RECURSIVE. Cancelled dependents that were awaited
@@ -79,22 +109,14 @@ archived AS (
 ),
 batches AS (
   UPDATE {{schema}}.hopper_batches b
-  SET pending = b.pending - c.n, failed = b.failed + c.f,
-      completed_at = CASE WHEN b.pending - c.n <= 0 THEN now() ELSE b.completed_at END
-  FROM (SELECT batch_id, count(*) AS n, count(*) FILTER (WHERE final_state IN ('cancelled', 'discarded')) AS f
+  SET completed_at = now(), failed = c.f + ` + batchFailedSQL + `
+  FROM (SELECT batch_id, count(*) FILTER (WHERE final_state IN ('cancelled', 'discarded')) AS f
         FROM done WHERE batch_id IS NOT NULL GROUP BY batch_id) c
-  WHERE b.id = c.batch_id
-  RETURNING b.id, b.pending, b.failed, b.on_success, b.on_failure, b.on_complete
+  WHERE b.id = c.batch_id AND b.completed_at IS NULL
+    AND NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs j WHERE j.batch_id = b.id AND j.id NOT IN (SELECT id FROM done))
+  RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete
 ),
-callbacks AS (
-  INSERT INTO {{schema}}.hopper_jobs (kind, queue, priority, max_attempts, args, metadata)
-  SELECT cb->>'kind', coalesce(cb->>'queue', 'default'), coalesce((cb->>'priority')::smallint, 2),
-    coalesce((cb->>'max_attempts')::smallint, 25), coalesce(cb->'args', '{}'),
-    coalesce(cb->'metadata', '{}') || jsonb_build_object('batch_id', b.id::text, 'batch_failed', b.failed)
-  FROM batches b, LATERAL (VALUES (CASE WHEN b.failed = 0 THEN b.on_success ELSE b.on_failure END), (b.on_complete)) AS v(cb)
-  WHERE b.pending <= 0 AND cb IS NOT NULL
-  RETURNING pg_notify(` + insertChannelParam + `, queue)
-),
+` + batchCallbacksSQL(insertChannelParam) + `,
 promoted AS (
   UPDATE {{schema}}.hopper_jobs j
   SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
@@ -256,7 +278,7 @@ func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		metadata  jsonText
 		edges     jsonText
 	)
-	err := e.Conn.QueryRow(ctx, `SELECT id, name, pending, failed, total, created_at, completed_at, metadata, edges FROM {{schema}}.hopper_batches WHERE id = $1`, uuidParam(id)).
+	err := e.Conn.QueryRow(ctx, `SELECT id, name, `+batchProgressColumns+`, total, created_at, completed_at, metadata, edges FROM {{schema}}.hopper_batches b WHERE id = $1`, uuidParam(id)).
 		Scan(&w.Batch.ID, &name, &w.Batch.Pending, &w.Batch.Failed, &w.Batch.Total, &w.Batch.CreatedAt, &completed, &metadata, &edges)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound

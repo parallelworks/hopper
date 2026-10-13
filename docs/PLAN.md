@@ -471,7 +471,9 @@ ordering-key indexes (§10) and the SQL contract functions. Schema v3 (M7) adds
 index, `hopper_batches` and the batch index. Schema v4 (M8) adds `hopper_job_deps`, the
 name and edges of a batch, and a `batch_id` index on history (§11). Schema v5 (M8) adds
 the stream log `hopper_stream_events` (partitioned by day) and `hopper_stream_consumers`
-(§10).
+(§10). Schema v11 indexes open batches (`hopper_batches_open`, on `created_at` where
+`completed_at IS NULL`), for the leader's completion pass (§11), and closes batches the
+previous release left open with none of their jobs live.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -483,9 +485,10 @@ index inserts stay local like a sequence.
   On Postgres 18 and later it calls the built-in `uuidv7()`. On 14–17 it is a SQL
   function that builds a v7 UUID from `clock_timestamp()` and the built-in
   `gen_random_uuid()`. Generation therefore works the same for Go inserts, `COPY`
-  and the SQL contract, and hopper's Go code needs no random number generator or
-  cryptography. Engines without a database-side generator (MongoDB) generate IDs in
-  the driver.
+  and the SQL contract, and hopper's Go code needs no cryptography. The one exception
+  is the ID of a batch, which its jobs carry before the batch row exists (§11): the
+  client builds that v7 UUID itself, from the clock and `math/rand/v2`. Engines without
+  a database-side generator (MongoDB) generate IDs in the driver.
 - **Ordering uses `seq`, not the ID.** Several IDs created in the same millisecond
   are not guaranteed to sort in insertion order on every Postgres version. An
   internal identity column, `seq`, provides the tie-break for claim order and for
@@ -796,7 +799,7 @@ can briefly overlap during a partition.
 
 Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
 partitions ahead of time and dropping expired ones, removing stale `hopper_clients`
-rows, and resolving batch and workflow completion.
+rows, and completing batches whose last jobs finished in concurrent transactions (§11).
 
 A client with `Config.NeverLead` never attempts the lease. It claims and works jobs
 like any other, so an install can include processes that should do work but not run
@@ -1116,14 +1119,37 @@ observability without new machinery.
 ## 11. Batches and workflows
 
 - **Batches (M7).** `hopper_batches (id, pending, failed, total, on_success, on_failure,
-  on_complete, metadata, completed_at)`. Jobs carry `batch_id`. Every statement that
-  finalizes jobs (the batched finalize, cancelling a waiting job, expiring) decrements
-  `pending` once per batch per statement, not once per job, which bounds contention on
-  the batch row, and counts cancelled and discarded jobs as failures. The statement that
-  reaches zero inserts the callbacks in the same statement: `on_success` when nothing
-  failed, `on_failure` otherwise, `on_complete` either way, each with `batch_id` and
-  `batch_failed` in its metadata, and notifies their queues. `client.NewBatch(opts)`,
-  `Add`, `Insert`/`InsertTx` and `BatchGet` are the API.
+  on_complete, metadata, completed_at)`. Jobs carry `batch_id`. A batch is complete when
+  none of its jobs is left in the live table, so its progress is derived from its jobs
+  rather than counted on the batch row:
+  - **Completion.** Every statement that finalizes jobs (the batched finalize,
+    cancelling a waiting job, expiring) checks, for each batch among them, whether any
+    other job of the batch is still live (the `batch_id` index). If none is, it
+    completes the batch (`completed_at`, and `failed`, counted from history: cancelled
+    and discarded jobs are always archived) and inserts the callbacks in the same
+    statement: `on_success` when nothing failed, `on_failure` otherwise, `on_complete`
+    either way, each with `batch_id` and `batch_failed` in its metadata, and notifies
+    their queues. The update is guarded by `completed_at IS NULL`, so callbacks run once.
+  - **No shared counter.** Finalizes touch the batch row only to complete it. Counting
+    down on it (schema v3 to v10) made every finalize of a batch job queue on that row,
+    and a transaction that finalized a job and stayed open, as `CompleteTx` does, held
+    up all of its siblings' finalizes and the finalizer flushes they were in.
+  - **Concurrent last jobs.** Two last jobs finalized by concurrent transactions each see
+    the other still live, so neither statement completes the batch. The leader
+    completes, on every pass, open batches none of whose jobs is live
+    (`BatchCompleteReady`, oldest first through `hopper_batches_open`, skipping rows
+    another statement holds). Such a batch completes up to one leader interval later.
+  - **Insert order.** Because a batch with no live jobs is complete, a batch inserted
+    without a transaction must not be visible before its jobs: `Batch.Insert` generates
+    the batch's ID (UUIDv7, §6.1), inserts the jobs with it, then the batch row.
+    `InsertTx` does the same inside the caller's transaction. A batch whose jobs all
+    finish before its row is inserted is completed by the leader's pass. A job left out
+    as a duplicate (§7.2) is not part of the batch.
+  - **Progress.** `BatchGet` and `WorkflowGet` report `Pending` (live jobs) and
+    `Failed` (failed jobs in history) from the jobs while the batch is open, and the
+    recorded counts once it is complete. `pending` on the row is no longer maintained;
+    going back below v11 recomputes it for open batches.
+  - `client.NewBatch(opts)`, `Add`, `Insert`/`InsertTx` and `BatchGet` are the API.
 - **Workflows (M8).** A workflow is a batch whose jobs depend on each other, so it has
   a name, the batch's progress and callbacks, and its graph (`hopper_batches.edges`).
   `NewWorkflow` collects steps; a step can only depend on steps added before it, so the
@@ -1161,7 +1187,8 @@ observability without new machinery.
   polling, then works them all with a client (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that
   block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
   constraints, and so on). A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10), because a lock
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v11's index
+  on `hopper_batches`, which a finalize of the previous release locks), because a lock
   request queued behind an open transaction on the table would hold up every claim
   behind it; claims wait at most one try at a time. Between tries it sleeps a jittered,
   growing interval capped at a second, raises a `NOTICE` every 10 seconds while it

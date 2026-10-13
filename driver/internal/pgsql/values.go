@@ -208,6 +208,15 @@ func jsonOrEmptyObject(b []byte) string {
 
 func uuidParam(id driver.JobID) string { return id.String() }
 
+// nullableUUID returns a NULL parameter for the zero ID.
+func nullableUUID(id driver.JobID) *string {
+	if id.IsZero() {
+		return nil
+	}
+	s := id.String()
+	return &s
+}
+
 // smallint checks a value bound for a smallint column.
 func smallint(v int, column string) (int, error) {
 	if v < -32768 || v > 32767 {

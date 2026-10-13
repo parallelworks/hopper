@@ -100,6 +100,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"PartitionLimit", testPartitionLimit[TTx]},
 		{"Aging", testAging[TTx]},
 		{"Batches", testBatches[TTx]},
+		{"BatchesConcurrent", testBatchesConcurrent[TTx]},
 		{"Workflows", testWorkflows[TTx]},
 		{"Streams", testStreams[TTx]},
 		{"Maintain", testMaintain[TTx]},

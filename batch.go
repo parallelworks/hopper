@@ -2,8 +2,10 @@ package hopper
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -85,20 +87,34 @@ func (b *Batch[TTx]) insert(ctx context.Context, exec driver.Executor, inTx bool
 		}
 		*cb.dst = &p
 	}
-	id, err := exec.BatchInsert(ctx, bp)
-	if err != nil {
-		return nil, err
-	}
+	// A batch is complete once none of its jobs is live, so the jobs go in
+	// first: a batch without a transaction around it must not be seen
+	// before them.
+	bp.ID = newBatchID()
 	params := make([]InsertParams, len(b.params))
 	for i, p := range b.params {
-		p.batchID = id
+		p.batchID = bp.ID
 		params[i] = p
 	}
 	results, err := b.c.insertMany(ctx, exec, params, inTx)
 	if err != nil {
 		return nil, err
 	}
-	return &BatchResult{ID: id, Jobs: results}, nil
+	if _, err := exec.BatchInsert(ctx, bp); err != nil {
+		return nil, err
+	}
+	return &BatchResult{ID: bp.ID, Jobs: results}, nil
+}
+
+// newBatchID returns a version 7 UUID, as the database generates: the Unix
+// time in milliseconds, then random bits.
+func newBatchID() JobID {
+	var id JobID
+	binary.BigEndian.PutUint64(id[0:8], uint64(time.Now().UnixMilli())<<16|uint64(rand.Uint32()&0xffff)) //nolint:gosec // a positive timestamp
+	binary.BigEndian.PutUint64(id[8:16], rand.Uint64())
+	id[6] = 0x70 | id[6]&0x0f
+	id[8] = 0x80 | id[8]&0x3f
+	return id
 }
 
 // BatchGet returns a batch's progress.

@@ -358,3 +358,60 @@ func TestBatchCallbacks(t *testing.T) {
 		t.Error("empty batch accepted")
 	}
 }
+
+// TestBatchesCompleteOnceAcrossClients works many batches on two clients,
+// whose finalizes of a batch's last jobs can run concurrently and leave the
+// batch to the leader: every batch's callback runs exactly once.
+func TestBatchesCompleteOnceAcrossClients(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	var (
+		mu   sync.Mutex
+		runs = map[string]int{}
+	)
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[shard]) error { return nil })
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[reportDone]) error {
+		var meta struct {
+			BatchID string `json:"batch_id"`
+		}
+		if err := json.Unmarshal(job.Metadata, &meta); err != nil {
+			return err
+		}
+		mu.Lock()
+		runs[meta.BatchID]++
+		mu.Unlock()
+		return nil
+	})
+	clients := []*hopper.Client[pgxTx]{h.started(workers, 8), h.started(workers, 8)}
+
+	const batches, size = 30, 8
+	ids := make([]string, batches)
+	for i := range ids {
+		b := clients[i%2].NewBatch(hopper.BatchOpts{OnComplete: reportDone{RunID: i}})
+		for j := range size {
+			b.Add(shard{N: 1000*i + j}, nil)
+		}
+		res, err := b.Insert(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = res.ID.String()
+	}
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(runs) == batches
+	})
+	// Long enough for a second completion, by a finalize or the leader, to
+	// have run its callback too.
+	time.Sleep(3 * fastTuning.LeaderInterval)
+	mu.Lock()
+	defer mu.Unlock()
+	for i, id := range ids {
+		if runs[id] != 1 {
+			t.Errorf("batch %d: callback ran %d times", i, runs[id])
+		}
+	}
+}

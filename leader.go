@@ -43,6 +43,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			}
 			c.rescue(ctx)
 			c.expire(ctx)
+			c.completeBatches(ctx)
 			c.age(ctx)
 			c.pruneClients(ctx)
 			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval {
@@ -253,6 +254,27 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 			c.logger.InfoContext(ctx, "hopper: discarded expired jobs", "count", len(jobs))
 		}
 		if len(jobs) < c.tuning.rescueBatch {
+			return
+		}
+	}
+}
+
+// completeBatches completes batches whose last jobs finished in concurrent
+// transactions, none of which saw the others commit, or before the batch
+// itself was inserted.
+func (c *Client[TTx]) completeBatches(ctx context.Context) {
+	for {
+		n, err := c.exec.BatchCompleteReady(ctx, c.tuning.rescueBatch)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.logger.ErrorContext(ctx, "hopper: complete ready batches", "error", err)
+			}
+			return
+		}
+		if n > 0 {
+			c.logger.DebugContext(ctx, "hopper: completed batches", "count", n)
+		}
+		if n < int64(c.tuning.rescueBatch) {
 			return
 		}
 	}
