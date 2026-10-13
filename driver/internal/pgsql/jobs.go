@@ -641,6 +641,22 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 	return job, nil
 }
 
+// jobRetryOrderingKeySQL walks hopper_jobs_ordering, which covers exactly
+// the waiting states of a key.
+var jobRetryOrderingKeySQL = fmt.Sprintf(`
+UPDATE {{schema}}.hopper_jobs SET state = 'available', scheduled_at = now(), snooze_reason = NULL, expires_at = NULL
+WHERE queue = $1 AND ordering_key = $2 AND state IN ('scheduled', 'retryable')
+RETURNING %s`, JobColumns(""))
+
+// JobRetryOrderingKey implements driver.Executor.
+func (e *Executor) JobRetryOrderingKey(ctx context.Context, queue, orderingKey string) ([]*driver.JobRow, error) {
+	jobs, err := liveJobs(e.Conn.Query(ctx, jobRetryOrderingKeySQL, queue, orderingKey))
+	if err != nil {
+		return nil, fmt.Errorf("hopper: retry ordering key: %w", err)
+	}
+	return jobs, nil
+}
+
 var jobDiscardExpiredSQL = `
 WITH RECURSIVE finished AS (
   DELETE FROM {{schema}}.hopper_jobs j

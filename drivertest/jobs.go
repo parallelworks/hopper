@@ -360,6 +360,81 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	later := time.Now().Add(time.Hour)
+	p := params("k", 5)
+	for i := range p {
+		p[i].OrderingKey = "a"
+	}
+	p[1].ScheduledAt, p[1].TTL = later, time.Millisecond
+	p[2].OrderingKey, p[2].ScheduledAt = "b", later
+	p[3].Queue, p[3].ScheduledAt = "other", later
+	inserted := insert(ctx, t, exec, p)
+	id := func(i int) driver.JobID { return inserted[i].Job.ID }
+	if _, err := exec.JobCancel(ctx, id(4)); err != nil {
+		t.Fatal(err)
+	}
+	clientID := register(ctx, t, exec)
+	if jobs := claim(ctx, t, exec, clientID, 10); len(jobs) != 1 || jobs[0].ID != id(0) {
+		t.Fatalf("claim = %+v", jobs)
+	}
+	state := func(i int) driver.JobState {
+		t.Helper()
+		j, err := exec.JobGet(ctx, id(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return j.State
+	}
+	retry := func(want ...int) {
+		t.Helper()
+		jobs, err := exec.JobRetryOrderingKey(ctx, "default", "a")
+		if err != nil || len(jobs) != len(want) {
+			t.Fatalf("JobRetryOrderingKey = %+v, %v, want %v", jobs, err, want)
+		}
+		for i, j := range jobs {
+			if j.ID != id(want[i]) || j.State != driver.JobStateAvailable || !j.ExpiresAt.IsZero() {
+				t.Errorf("woken job = %+v", j)
+			}
+		}
+	}
+
+	// The running job is left to finish; the waiting job of its key in this
+	// queue is brought forward, and no other key, queue or finalized job is.
+	time.Sleep(10 * time.Millisecond)
+	retry(1)
+	if state(0) != driver.JobStateRunning || state(2) != driver.JobStateScheduled || state(3) != driver.JobStateScheduled || state(4) != driver.JobStateCancelled {
+		t.Errorf("states = %v %v %v %v", state(0), state(2), state(3), state(4))
+	}
+	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 0 {
+		t.Errorf("expired after retry = %+v, %v", expired, err)
+	}
+
+	// A snoozed head keeps blocking its key until it is woken, then runs
+	// first, without its reason.
+	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
+	if jobs := claim(ctx, t, exec, clientID, 10); len(jobs) != 0 {
+		t.Fatalf("claimed %+v behind a snoozed head", jobs)
+	}
+	retry(0)
+	if r := storedReason(ctx, t, f, d, id(0)); r != "" {
+		t.Errorf("woken job kept reason %q", r)
+	}
+	if jobs := claim(ctx, t, exec, clientID, 10); len(jobs) != 1 || jobs[0].ID != id(0) {
+		t.Fatalf("claim after wake = %+v", jobs)
+	}
+
+	// So does one waiting out a retry delay.
+	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	retry(0)
+	if jobs, err := exec.JobRetryOrderingKey(ctx, "default", "none"); err != nil || len(jobs) != 0 {
+		t.Errorf("unknown key = %+v, %v", jobs, err)
+	}
+}
+
 func testTTL[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)

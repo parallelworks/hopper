@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -53,6 +54,27 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID) (*JobRow, error) {
 	c.wakeQueue(job.Queue)
 	c.notifier.mark(job.Queue)
 	return job, nil
+}
+
+// JobRetryOrderingKey brings forward every job of the ordering key in the
+// queue that is waiting out a snooze, a retry delay or its schedule, as
+// JobRetry does for one job, and returns them. The key's jobs still run one
+// at a time, oldest first. A running job is left to finish, so this wakes a
+// key without cancelling the job in it. An empty key returns nothing.
+func (c *Client[TTx]) JobRetryOrderingKey(ctx context.Context, queue, orderingKey string) ([]*JobRow, error) {
+	if orderingKey == "" {
+		return nil, nil
+	}
+	queue = cmp.Or(queue, QueueDefault)
+	jobs, err := c.exec.JobRetryOrderingKey(ctx, queue, orderingKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(jobs) > 0 {
+		c.wakeQueue(queue)
+		c.notifier.mark(queue)
+	}
+	return jobs, nil
 }
 
 // JobFilter selects jobs for Jobs. Empty fields match everything.

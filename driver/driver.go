@@ -144,6 +144,11 @@ type Executor interface {
 	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
 	// holds the same unique key.
 	JobRetry(ctx context.Context, id JobID) (*JobRow, error)
+	// JobRetryOrderingKey makes every job of the ordering key in the queue
+	// that is waiting on its schedule (scheduled or retryable) available
+	// now, clearing its TTL and snooze reason as JobRetry does, and returns
+	// them. Running, pending and finalized jobs are left alone.
+	JobRetryOrderingKey(ctx context.Context, queue, orderingKey string) ([]*JobRow, error)
 	// JobDiscardExpired moves waiting jobs whose TTL has passed to history
 	// as discarded, and returns them.
 	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)

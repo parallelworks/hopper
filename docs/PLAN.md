@@ -196,6 +196,7 @@ report, err := hopper.Await[ReportURL](ctx, client, res.Job.ID) // worker called
 ```go
 client.JobCancel(ctx, id)            // works on any live job, including one running on another pod
 client.JobRetry(ctx, id)             // re-drive a discarded or cancelled job from history
+client.JobRetryOrderingKey(ctx, "billing", "customer:42") // wake a key's snoozed and retrying jobs
 job, err := client.JobGet(ctx, id)   // live or historical
 
 for job, err := range client.Jobs(ctx, hopper.JobFilter{
@@ -1052,6 +1053,10 @@ observability without new machinery.
     Ordering keys are available on plain jobs too, through `InsertOpts.OrderingKey`.
   - A failing delivery blocks its key while it retries. Later messages for that key
     wait until it succeeds or is dead-lettered, and dead-lettering unblocks the key.
+  - `JobRetryOrderingKey(queue, key)` brings forward every job of a key that is waiting
+    out a snooze, a retry delay or its schedule, in one statement through the same
+    index, and leaves a running job alone. A producer whose newer job should not wait
+    behind an older one's delay wakes the key instead of cancelling the job in it.
   - Ordered deliveries get a shorter default retry budget (10 attempts, with backoff
     capped at 5 minutes), so a poison message is dead-lettered within about an hour
     instead of blocking its key for days. The budget is configurable per subscription
