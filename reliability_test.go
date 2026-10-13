@@ -397,9 +397,13 @@ func TestLeaderMaintainsHistoryPartitions(t *testing.T) {
 	waitFor(t, c.IsLeader)
 	// On election the leader creates the partitions for the periods ahead.
 	next := "hopper_job_history_completed_" + time.Now().UTC().Add(time.Hour).Format("2006010215")
-	waitFor(t, func() bool { return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", next) == 1 })
+	waitFor(t, func() bool {
+		return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", next) == 1
+	})
 	nextDay := "hopper_job_history_failed_" + time.Now().UTC().Add(24*time.Hour).Format("20060102")
-	waitFor(t, func() bool { return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", nextDay) == 1 })
+	waitFor(t, func() bool {
+		return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", nextDay) == 1
+	})
 }
 
 // TestLeaderRetriesDeferredPartitions holds off the attach of the
@@ -429,7 +433,9 @@ func TestLeaderRetriesDeferredPartitions(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool { return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", next) == 1 })
+	waitFor(t, func() bool {
+		return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", next) == 1
+	})
 }
 
 func TestNotificationsWakeOtherClients(t *testing.T) {
