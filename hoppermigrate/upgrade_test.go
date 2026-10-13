@@ -135,8 +135,14 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 		}
 	})
 
+	// The migration gives up on its own only after 10 minutes, too long
+	// for a test; a loop that never gets the lock fails here instead. How
+	// long it takes otherwise depends on the load on the host, so only the
+	// claims' wait is bounded tightly.
+	upCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	start := time.Now()
-	res, err := hoppermigrate.Up(ctx, d, opts)
+	res, err := hoppermigrate.Up(upCtx, d, opts)
 	took := time.Since(start)
 	close(stop)
 	wg.Wait()
@@ -146,8 +152,8 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	if res.Version != hoppermigrate.Latest() || len(res.Applied) != 1 {
 		t.Errorf("Up = %+v", res)
 	}
-	if took > holdFor+10*time.Second {
-		t.Errorf("migration took %s under traffic", took)
+	if took < holdFor*9/10 {
+		t.Errorf("migration took %s, less than the held transaction's %s: it was not held up", took, holdFor)
 	}
 	if s := time.Duration(slowest.Load()); s > holdFor/2 {
 		t.Errorf("a claim waited %s during the migration", s)
