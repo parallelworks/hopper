@@ -6,6 +6,17 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.6.0](https://github.com/parallelworks/hopper/compare/v0.5.0...v0.6.0) (2026-10-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* **core:** a snoozed job records why it is waiting, and a client will not start on an outdated schema ([#49](https://github.com/parallelworks/hopper/issues/49))
+
+### Features
+
+* **core:** a snoozed job records why it is waiting, and a client will not start on an outdated schema ([#49](https://github.com/parallelworks/hopper/issues/49)) ([1439b4b](https://github.com/parallelworks/hopper/commit/1439b4ba3967e0b7e03c8f91010ea850093070d1))
+
 ## [0.5.0](https://github.com/parallelworks/hopper/compare/v0.4.0...v0.5.0) (2026-10-03)
 
 
