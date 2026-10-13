@@ -246,7 +246,7 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 			return
 		}
 		for _, j := range jobs {
-			c.emit(EventJobDiscarded, j, "hopper: expired")
+			c.emit(EventJobDiscarded, j, j.Errors[len(j.Errors)-1].Error)
 			c.signalDone(j.ID)
 		}
 		if len(jobs) > 0 {

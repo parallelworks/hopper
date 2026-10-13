@@ -74,6 +74,22 @@ func (sqlFixture) CountHistory(ctx context.Context, t *testing.T, d driver.Drive
 	return count(ctx, t, d, "hopper_job_history")
 }
 
+func (sqlFixture) Exec(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) {
+	t.Helper()
+	if _, err := d.(*hoppersql.Driver).DB().ExecContext(ctx, query, args...); err != nil {
+		t.Error(err)
+	}
+}
+
+func (sqlFixture) QueryText(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) string {
+	t.Helper()
+	var s string
+	if err := d.(*hoppersql.Driver).DB().QueryRowContext(ctx, query, args...).Scan(&s); err != nil {
+		t.Error(err)
+	}
+	return s
+}
+
 func count(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], table string) int {
 	t.Helper()
 	var n int

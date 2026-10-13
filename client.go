@@ -9,11 +9,13 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/hoppermigrate"
 )
 
 // Client is the per-process runtime. It inserts, claims, works and finalizes
@@ -113,7 +115,9 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 
 // Start registers the client's lease and begins claiming and working jobs.
 // ctx bounds the startup itself; the client keeps running after it ends.
-// Use Run for a lifecycle tied to a context.
+// Use Run for a lifecycle tied to a context. It returns ErrSchemaOutdated,
+// naming the missing migrations, if the database's schema is older than
+// this release needs.
 func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -123,6 +127,9 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	case clientStopped:
 		return ErrClientStopped
 	case clientIdle:
+	}
+	if err := checkSchema(ctx, c.exec); err != nil {
+		return err
 	}
 	if len(c.cfg.Queues) == 0 {
 		// Insert-only clients hold no lease and run nothing.
@@ -184,6 +191,26 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	return nil
 }
 
+// checkSchema fails unless the database has every migration this release's
+// statements rely on. Without it, a client deployed before its migrations
+// would fail every statement with a missing column or function.
+func checkSchema(ctx context.Context, exec driver.Executor) error {
+	have, err := exec.SchemaVersion(ctx)
+	if err != nil {
+		return err
+	}
+	need := hoppermigrate.Latest()
+	if have >= need {
+		return nil
+	}
+	missing := make([]string, 0, need-have)
+	for _, m := range hoppermigrate.Migrations()[have:] {
+		missing = append(missing, fmt.Sprintf("%03d_%s", m.Version, m.Name))
+	}
+	return fmt.Errorf("%w: it is at version %d and this release needs %d; apply %s with hoppermigrate.Up or `hopper migrate up` before starting clients",
+		ErrSchemaOutdated, have, need, strings.Join(missing, ", "))
+}
+
 // queueState returns a queue's pause and limit flags from a listing.
 func queueState(queues []*driver.QueueRow, name string) (paused, limited bool) {
 	for _, q := range queues {
@@ -229,6 +256,9 @@ func (c *Client[TTx]) finalized(job *driver.JobRow, result driver.JobFinalize) {
 	)
 	if result.Error != nil {
 		errText = result.Error.Error
+	}
+	if result.Snooze {
+		errText = result.SnoozeReason
 	}
 	switch result.State {
 	case driver.JobStateCompleted:

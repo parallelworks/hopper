@@ -16,6 +16,7 @@ import (
 
 	"github.com/parallelworks/hopper"
 	"github.com/parallelworks/hopper/driver/hopperpgx"
+	"github.com/parallelworks/hopper/hoppermigrate"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
 
@@ -867,5 +868,45 @@ func TestDefaultBackoff(t *testing.T) {
 	}
 	if got := hopper.DefaultBackoff(30); got != 24*time.Hour {
 		t.Errorf("backoff(30) = %s, want 24h cap", got)
+	}
+}
+
+// TestStartChecksSchemaVersion pins that a client deployed before its
+// release's migrations refuses to start, naming the migrations to apply,
+// instead of failing every statement once it runs.
+func TestStartChecksSchemaVersion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	h := &harness{t: t, pool: pool, d: testdb.Driver(pool)}
+	latest := hoppermigrate.Migrations()[hoppermigrate.Latest()-1]
+	configs := map[string]func() *hopper.Config{
+		"insert-only": func() *hopper.Config { return &hopper.Config{} },
+		"worker": func() *hopper.Config {
+			return &hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()}
+		},
+	}
+	for _, version := range []int{0, latest.Version - 1} {
+		if version > 0 {
+			if _, err := hoppermigrate.Up(ctx, h.d, &hoppermigrate.Options{Target: version, Logger: testLogger()}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for name, cfg := range configs {
+			err := h.client(cfg()).Start(ctx)
+			if !errors.Is(err, hopper.ErrSchemaOutdated) ||
+				!strings.Contains(err.Error(), fmt.Sprintf("at version %d and this release needs %d", version, latest.Version)) ||
+				!strings.Contains(err.Error(), fmt.Sprintf("%03d_%s", latest.Version, latest.Name)) {
+				t.Errorf("%s client on schema v%d: Start = %v", name, version, err)
+			}
+		}
+	}
+	if _, err := hoppermigrate.Up(ctx, h.d, &hoppermigrate.Options{Logger: testLogger()}); err != nil {
+		t.Fatal(err)
+	}
+	for name, cfg := range configs {
+		if err := h.client(cfg()).Start(ctx); err != nil {
+			t.Errorf("%s client on the latest schema: Start = %v", name, err)
+		}
 	}
 }

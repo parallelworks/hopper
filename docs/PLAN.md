@@ -611,10 +611,13 @@ RETURNING j.*;
 - **Expiry.** `InsertOpts.TTL` sets `expires_at` to `now() + TTL` at insert. It bounds
   how long the job may wait to run, not only its first wait: a waiting row
   (`available`, `scheduled` or `retryable`) past `expires_at` is skipped by the claim,
-  and the leader moves it to history as `discarded` with the error `hopper: expired`.
+  and the leader moves it to history as `discarded` with the error `hopper: expired`
+  (with `while snoozed: <reason>` appended for a job snoozed with a reason).
   So a job that has run and is retrying or snoozed is discarded too once its deadline
   passes, without running again. A running job is not interrupted, but if its attempt
-  ends in a retry or a snooze past the deadline, it is discarded.
+  ends in a retry or a snooze past the deadline, it is discarded. `JobRetry` clears the
+  deadline, live or from history: an explicit retry is the operator overriding the
+  wait, so a job past its TTL still runs.
 - **Limits.** Queues with a `GlobalLimit` or `RateLimit` claim inside a short
   transaction that locks their `hopper_queues` row (§9). Unlimited queues never touch
   that row, so they pay nothing for the feature.
@@ -688,9 +691,15 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
     A worker that returns a `*hopper.SnoozeError` with a `Reason` has the reason stored
     in `snooze_reason` and shown as `JobRow.SnoozeReason`, so operators (`hopper jobs
     get`, `hopperui`) can see why the job waits; `hopperotel` records it on the attempt's
-    span. The claim clears it in the statement that takes the job, and so do every
-    other finalize, `JobRetry` and a replacing insert, so the reason only ever
-    describes the current wait. History has no such column.
+    span, and the `job.snoozed` event carries it as `Event.Error`. The claim clears it
+    in the statement that takes the job, and so do every other finalize, `JobRetry`
+    and a replacing insert, so the reason only ever describes the current wait. A
+    client of the previous release clears it in none of these, so during a rolling
+    deploy a running or retrying row can still hold one; reads therefore report the
+    reason only for a `scheduled` row. History has no such column, but a snoozed job
+    that expires or is cancelled keeps the reason in the error it is finalized with
+    (`hopper: expired while snoozed: <reason>`, `hopper: cancelled while snoozed:
+    <reason>`).
   - **`hopper.Cancel(err)`:** `discarded` immediately.
 - `backoff(n) = n^4 + 5s ± 10% jitter`, capped at 24h. It can be overridden per worker
   with `NextRetry(job) time.Time` or per queue with a `RetryPolicy`.
@@ -754,8 +763,9 @@ returns any cancel requests for that client's running jobs (through the small ru
 index), which covers missed notifications. The job finalizes as `cancelled` if the
 worker returns an error after the request, and as `completed` if it finishes anyway.
 `JobRetry` re-drives a cancelled or discarded job from history (with one more attempt
-allowed if it had run out, and a fresh `seq`) or brings a waiting job forward; it
-refuses a running job and a job whose unique key is held by a live job.
+allowed if it had run out, and a fresh `seq`) or brings a waiting job forward; either
+way it clears the job's TTL (§7.3). It refuses a running job and a job whose unique key
+is held by a live job.
 
 ### 7.8 Leader election
 Leadership is a lease row in `hopper_leader`:
@@ -1130,12 +1140,19 @@ observability without new machinery.
   polling, then works them all with a client (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that
   block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
   constraints, and so on). A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a short `lock_timeout` in a loop (schema v9), because a lock
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9), because a lock
   request queued behind an open transaction on the table would hold up every claim
-  behind it.
+  behind it; claims wait at most one try at a time. Between tries it sleeps a jittered,
+  growing interval capped at a second, raises a `NOTICE` every 10 seconds while it
+  waits, and gives up with an error after 10 minutes, so a transaction held open for
+  longer fails the migration (end it and run `Up` again) rather than stalling it
+  forever.
 - Each release's statements target its own schema version: the code is deployed after
   `Up` (the client never runs against an older schema), and the previous release keeps
-  working on the new schema while it is rolled out. When the latest version adds
+  working on the new schema while it is rolled out. `Client.Start` enforces the first
+  half: it reads the newest version in `hopper_schema` (without the migration lock, so
+  it does not wait for a migration in progress) and fails with `ErrSchemaOutdated`,
+  naming the missing migrations, when it is older than the release's latest. When the latest version adds
   something this release's statements use, the upgrade test produces the jobs and
   traffic before and during the migration through the SQL producer contract and
   version-independent statements, and starts this release's client once it is done.

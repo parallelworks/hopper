@@ -33,9 +33,12 @@ func finishedColumns(errorsExpr, outputExpr, archiveExpr, stateExpr, doneChannel
 }
 
 // appendErrorSQL is an errors expression that records a failure hopper
-// itself decided, at database time.
+// itself decided, at database time. A snoozed job's reason is kept in it,
+// since the row that held the reason is leaving the live table.
 func appendErrorSQL(message string) string {
-	return fmt.Sprintf(`j.errors || jsonb_build_object('at', now(), 'attempt', j.attempt, 'error', '%s')`, message)
+	return fmt.Sprintf(`j.errors || jsonb_build_object('at', now(), 'attempt', j.attempt, 'error',
+      CASE WHEN j.state = 'scheduled' AND j.snooze_reason IS NOT NULL THEN '%[1]s while snoozed: ' || j.snooze_reason
+           ELSE '%[1]s' END)`, message)
 }
 
 // finishedSelectColumns reads finished rows back in JobColumns order plus

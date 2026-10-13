@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -215,6 +216,18 @@ func MigrationVersions(ctx context.Context, conn Conn, schema *Schema) ([]int, e
 		return nil, nil
 	}
 	return scanInts(conn.Query(ctx, "SELECT version FROM {{schema}}.hopper_schema ORDER BY version"))
+}
+
+// SchemaVersion implements driver.Executor.
+func (e *Executor) SchemaVersion(ctx context.Context) (int, error) {
+	versions, err := MigrationVersions(ctx, e.Conn, e.Schema)
+	if err != nil {
+		return 0, fmt.Errorf("hopper: read schema version: %w", err)
+	}
+	if len(versions) == 0 {
+		return 0, nil
+	}
+	return slices.Max(versions), nil
 }
 
 var (

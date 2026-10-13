@@ -22,7 +22,17 @@ Install them once per schema, from any replica;
 migrations take a cross-process lock, so concurrent starts are fine.
 When upgrading hopper, run the new version's migrations before its clients
 start; clients of the previous version keep working on the new schema while
-they are replaced.
+they are replaced. A client's `Start` checks the schema and fails with
+`hopper.ErrSchemaOutdated`, naming the migrations to apply, if they have not
+run.
+
+A migration that adds or drops a column on `hopper_jobs` (such as v9) needs a
+brief exclusive lock on the table. It takes the lock only when no transaction
+holds one, trying every so often, so claims are never held up for more than
+50 ms; it reports that it is still waiting with a `NOTICE` every 10 seconds.
+If a transaction keeps the table locked for 10 minutes, the migration fails
+with an error that says so: find the long transaction in
+`pg_stat_activity`, end it, and run the migrations again.
 
 ```go
 pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))

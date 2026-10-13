@@ -77,6 +77,22 @@ func (pgxFixture) CountHistory(ctx context.Context, t *testing.T, d driver.Drive
 	return count(ctx, t, d, "hopper_job_history")
 }
 
+func (pgxFixture) Exec(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], query string, args ...any) {
+	t.Helper()
+	if _, err := pool(d).Exec(ctx, query, args...); err != nil {
+		t.Error(err)
+	}
+}
+
+func (pgxFixture) QueryText(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], query string, args ...any) string {
+	t.Helper()
+	var s string
+	if err := d.(*hopperpgx.Driver).Pool().QueryRow(ctx, query, args...).Scan(&s); err != nil {
+		t.Error(err)
+	}
+	return s
+}
+
 func count(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], table string) int {
 	t.Helper()
 	var n int

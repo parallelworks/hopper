@@ -73,7 +73,12 @@ func scanJob(row Row, history bool, dup *bool) (*driver.JobRow, error) {
 	j.Args, j.Metadata, j.Output = args.raw(), metadata.raw(), output.raw()
 	j.Errors = []driver.AttemptError(errs)
 	j.UniqueKey, j.OrderingKey, j.PartitionKey = uniqueKey.String, orderingKey.String, partKey.String
-	j.SnoozeReason = snoozeReason.String
+	// Only a snoozed job is waiting for a reason. A client of the previous
+	// release neither clears it on claim nor on finalize, so during a rolling
+	// deploy a running or retrying row can still hold one.
+	if j.State == driver.JobStateScheduled {
+		j.SnoozeReason = snoozeReason.String
+	}
 	if batchID.Valid {
 		j.BatchID = batchID.ID
 	}
@@ -577,7 +582,7 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 
 var (
 	jobRetryLiveSQL = fmt.Sprintf(`
-UPDATE {{schema}}.hopper_jobs SET state = 'available', scheduled_at = now(), snooze_reason = NULL
+UPDATE {{schema}}.hopper_jobs SET state = 'available', scheduled_at = now(), snooze_reason = NULL, expires_at = NULL
 WHERE id = $1 AND state <> 'running'
 RETURNING %s`, JobColumns(""))
 	// jobRetryHistorySQL moves a finalized job back to the live table with

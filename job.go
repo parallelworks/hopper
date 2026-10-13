@@ -132,7 +132,9 @@ type InsertResult struct {
 type SnoozeError struct {
 	Duration time.Duration
 	// Reason is stored on the job while it waits, as JobRow.SnoozeReason,
-	// for operators. It is cleared when the job runs again.
+	// for operators, and is the Error of the job.snoozed event. It is
+	// cleared when the job runs again. A job that expires or is cancelled
+	// while it waits keeps the reason in the error it is finalized with.
 	Reason string
 }
 
@@ -197,6 +199,10 @@ var ErrJobTimeout = errors.New("hopper: job timed out")
 var (
 	ErrClientStarted = errors.New("hopper: client already started")
 	ErrClientStopped = errors.New("hopper: client stopped")
+	// ErrSchemaOutdated is returned by Start when the database's schema is
+	// older than this release needs. Apply the missing migrations with
+	// hoppermigrate.Up or `hopper migrate up` first.
+	ErrSchemaOutdated = errors.New("hopper: database schema is out of date")
 )
 
 // jobTimeoutCause is stored via context.WithTimeoutCause so workers can

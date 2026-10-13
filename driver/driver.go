@@ -99,6 +99,10 @@ type Notification struct {
 type Executor interface {
 	// Now returns the database's clock.
 	Now(ctx context.Context) (time.Time, error)
+	// SchemaVersion returns the newest applied schema version, or 0 if the
+	// schema has not been installed. It takes no lock, so it does not wait
+	// for a migration in progress.
+	SchemaVersion(ctx context.Context) (int, error)
 
 	// JobInsertMany inserts jobs in one statement and returns one result per
 	// input, in input order. An input whose unique key matches a live job is
@@ -135,7 +139,8 @@ type Executor interface {
 	JobCancel(ctx context.Context, id JobID) (*JobRow, error)
 	// JobRetry makes a job available now: a cancelled or discarded job is
 	// moved back from history (with one more attempt allowed if it had run
-	// out), and a waiting job has its schedule brought forward. It returns
+	// out), and a waiting job has its schedule brought forward. Either way
+	// the job's TTL is cleared, as an operator overriding the wait. It returns
 	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
 	// holds the same unique key.
 	JobRetry(ctx context.Context, id JobID) (*JobRow, error)
@@ -347,8 +352,9 @@ type JobRow struct {
 	Await             bool
 	CreatedAt         time.Time
 	// SnoozeReason is the reason the worker gave when it last snoozed the
-	// job, while the job waits out that snooze. It is empty otherwise: the
-	// claim, any other finalize, a retry and a replacing insert clear it.
+	// job, while the job waits out that snooze. It is empty in any state but
+	// scheduled: the claim, any other finalize, a retry and a replacing
+	// insert clear it, and a row in another state never reports one.
 	SnoozeReason string
 	// FinalizedAt is set for jobs in history.
 	FinalizedAt time.Time

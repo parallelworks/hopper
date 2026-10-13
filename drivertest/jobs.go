@@ -311,6 +311,7 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	p := params("k", 3)
 	p[0].UniqueKey = "u"
 	p[2].ScheduledAt = time.Now().Add(time.Hour)
+	p[2].TTL = time.Millisecond
 	inserted := insert(ctx, t, exec, p)
 	clientID := register(ctx, t, exec)
 	jobs := claim(ctx, t, exec, clientID, 2)
@@ -320,8 +321,17 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.JobRetry(ctx, jobs[0].ID); !errors.Is(err, driver.ErrJobRunning) {
 		t.Errorf("retry of running job = %v", err)
 	}
-	if job, err := exec.JobRetry(ctx, inserted[2].Job.ID); err != nil || job.State != driver.JobStateAvailable {
+	// A retry overrides the wait, so a TTL that has passed no longer
+	// applies: the job is neither discarded nor skipped by the claim.
+	time.Sleep(10 * time.Millisecond)
+	if job, err := exec.JobRetry(ctx, inserted[2].Job.ID); err != nil || job.State != driver.JobStateAvailable || !job.ExpiresAt.IsZero() {
 		t.Errorf("retry of scheduled job = %+v, %v", job, err)
+	}
+	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 0 {
+		t.Errorf("expired after retry = %+v, %v", expired, err)
+	}
+	if got := claim(ctx, t, exec, clientID, 1); len(got) != 1 || got[0].ID != inserted[2].Job.ID {
+		t.Errorf("claim after retry = %+v", got)
 	}
 	finalize(ctx, t, exec,
 		driver.JobFinalize{ID: inserted[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}},
@@ -409,9 +419,12 @@ func testTTL[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err != nil || len(expired) != 2 {
 		t.Fatalf("expired = %v, %v", expired, err)
 	}
+	// The snoozed job's reason is kept in its error, as the row that held
+	// it has left the live table.
+	want := map[driver.JobID]string{ran[0].ID: "hopper: expired", ran[1].ID: "hopper: expired while snoozed: later"}
 	for _, j := range expired {
-		if (j.ID != ran[0].ID && j.ID != ran[1].ID) || j.State != driver.JobStateDiscarded || j.SnoozeReason != "" || j.Errors[len(j.Errors)-1].Error != "hopper: expired" {
-			t.Errorf("expired job = %+v", j)
+		if j.State != driver.JobStateDiscarded || j.SnoozeReason != "" || j.Errors[len(j.Errors)-1].Error != want[j.ID] {
+			t.Errorf("expired job = %+v, want error %q", j, want[j.ID])
 		}
 	}
 	if j, err := exec.JobGet(ctx, ran[2].ID); err != nil || j.State != driver.JobStateRunning {
