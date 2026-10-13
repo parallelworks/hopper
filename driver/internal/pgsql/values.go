@@ -19,6 +19,13 @@ import (
 
 func textArray(values []string) []string { return orEmpty(values) }
 
+// storableText replaces what PostgreSQL refuses in text and jsonb strings,
+// NUL and invalid UTF-8, so that one worker's text cannot fail the
+// statement that finalizes a whole batch.
+func storableText(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, "�"), "\x00", "�")
+}
+
 // nullableTextArray sends empty strings as NULL.
 func nullableTextArray(values []string) []*string {
 	elems := make([]*string, len(values))

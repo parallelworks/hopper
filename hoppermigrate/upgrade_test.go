@@ -67,8 +67,14 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	exec(`UPDATE hopper_jobs SET state = 'retryable', attempt = 1, errors = '[{"attempt": 1, "error": "flaky"}]'
 	      WHERE (args->>'n')::int % 10 = 1`)
 	exec(`UPDATE hopper_jobs SET state = 'completed', attempt = 1 WHERE (args->>'n')::int % 10 = 4`)
+	// The columns are named because hopper_jobs gains columns that history
+	// does not have, such as snooze_reason.
+	const historyColumns = `id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
+	  attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id, expires_at,
+	  cancel_requested_at, await, created_at`
 	exec(`WITH j AS (DELETE FROM hopper_jobs WHERE state = 'completed' RETURNING *)
-	      INSERT INTO hopper_job_history SELECT j.*, now(), NULL FROM j`)
+	      INSERT INTO hopper_job_history (` + historyColumns + `, finalized_at, output)
+	      SELECT ` + historyColumns + `, now(), NULL FROM j`)
 
 	// A producer's transaction that has inserted a job stays open across
 	// the start of the migration, as an InsertTx inside a longer unit of

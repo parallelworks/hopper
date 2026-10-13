@@ -63,6 +63,21 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx]) {
 	// A snooze without a reason leaves none behind.
 	snooze("")
 
+	// Text PostgreSQL cannot store is repaired, not refused: a refused
+	// result would fail every result finalized in the same statement.
+	claimIt()
+	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "bad \xff\x00 reason"}); len(applied) != 1 {
+		t.Fatal("snooze with unstorable reason not applied")
+	}
+	if j := get(); j.SnoozeReason != "bad �� reason" {
+		t.Errorf("unstorable reason stored as %q", j.SnoozeReason)
+	}
+	claimIt()
+	finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "bad \x00 error", Trace: "bad \x00 trace"}})
+	if j := get(); j.Errors[len(j.Errors)-1].Error != "bad � error" || j.Errors[len(j.Errors)-1].Trace != "bad � trace" {
+		t.Errorf("unstorable error stored as %+v", j.Errors[len(j.Errors)-1])
+	}
+
 	// A retry clears the reason; so does the claim, checked by claimIt.
 	snooze("first")
 	claimIt()

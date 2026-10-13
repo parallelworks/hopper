@@ -432,10 +432,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
 		}
 		ids[i], attemptedBy[i], states[i] = f.ID, f.AttemptedBy, string(f.State)
-		delays[i], snoozes[i] = max(f.Delay, 0).Seconds(), f.Snooze
-		if f.Snooze {
-			reasons[i] = f.SnoozeReason
-		}
+		delays[i], snoozes[i], reasons[i] = max(f.Delay, 0).Seconds(), f.Snooze, storableText(f.SnoozeReason)
 		if f.Error != nil {
 			b, err := marshalAttemptError(f.Error)
 			if err != nil {
@@ -466,7 +463,7 @@ func marshalAttemptError(e *driver.AttemptError) ([]byte, error) {
 		Attempt int    `json:"attempt"`
 		Error   string `json:"error"`
 		Trace   string `json:"trace,omitempty"`
-	}{e.Attempt, e.Error, e.Trace})
+	}{e.Attempt, storableText(e.Error), storableText(e.Trace)})
 }
 
 var jobGetQuery = fmt.Sprintf(`
