@@ -357,6 +357,23 @@ func TestBatchCallbacks(t *testing.T) {
 	if _, err := c.NewBatch(hopper.BatchOpts{}).Insert(ctx); err == nil {
 		t.Error("empty batch accepted")
 	}
+	// What would fail the batch's insert, or its completion, where the
+	// callbacks are inserted, is rejected before any of its jobs goes in.
+	for name, opts := range map[string]hopper.BatchOpts{
+		"metadata":     {OnComplete: reportDone{RunID: 10}, Metadata: []byte("{")},
+		"max attempts": {OnComplete: reportDone{RunID: 10}, CallbackOpts: &hopper.InsertOpts{MaxAttempts: 40000}},
+	} {
+		b := c.NewBatch(opts)
+		b.Add(shard{N: 500}, nil)
+		if _, err := b.Insert(ctx); err == nil {
+			t.Errorf("batch with bad %s accepted", name)
+		}
+	}
+	var inserted int
+	if err := h.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM hopper_jobs WHERE args->>'n' = '500')
+	    + (SELECT count(*) FROM hopper_job_history WHERE args->>'n' = '500')`).Scan(&inserted); err != nil || inserted != 0 {
+		t.Errorf("rejected batches inserted %d jobs, %v", inserted, err)
+	}
 }
 
 // TestBatchesCompleteOnceAcrossClients works many batches on two clients,

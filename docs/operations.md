@@ -18,7 +18,9 @@
   shares an install it should not run, such as a developer's process pointed
   at a shared environment. It claims and works jobs like any other, but never
   rescues, prunes, runs periodic jobs or delivers streams. An install whose
-  clients all set it has no leader, so nothing is ever rescued or pruned.
+  clients all set it has no leader, so nothing is ever rescued or pruned, a
+  batch whose last jobs finish in concurrent transactions never completes, and
+  `hopper_batch_progress` keeps a row per batch per finalize until one does.
 
 ## Postgres
 

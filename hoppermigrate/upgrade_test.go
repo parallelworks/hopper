@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -84,9 +85,9 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	      INSERT INTO hopper_job_history (` + historyColumns + `, finalized_at, output)
 	      SELECT ` + historyColumns + `, now(), NULL FROM j`)
 
-	// A batch of five jobs as the previous release inserts it, counting down
-	// in pending, with a callback; and one it left open with no jobs, long
-	// ago, which never completed there.
+	// A batch of five jobs as the previous release inserts it, with a
+	// callback, two of which that release has finalized and counted down in
+	// pending.
 	var batch string
 	if err := pool.QueryRow(ctx, `INSERT INTO hopper_batches (pending, total, on_complete)
 	    VALUES (5, 5, '{"kind": "upgrade", "args": {"n": 300000}}') RETURNING id::text`).Scan(&batch); err != nil {
@@ -97,11 +98,8 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	if n := count(`SELECT count(*) FROM hopper_jobs WHERE batch_id IS NOT NULL`); n != 5 {
 		t.Fatalf("%d jobs in the batch, want 5", n)
 	}
-	var stuck string
-	if err := pool.QueryRow(ctx, `INSERT INTO hopper_batches (pending, total, on_complete, created_at)
-	    VALUES (1, 1, '{"kind": "upgrade", "args": {"n": 300100}}', now() - interval '1 day') RETURNING id::text`).Scan(&stuck); err != nil {
-		t.Fatal(err)
-	}
+	exec(`DELETE FROM hopper_jobs WHERE (args->>'n')::int IN (300010, 300020)`)
+	exec(`UPDATE hopper_batches SET pending = 3 WHERE id = $1::uuid`, batch)
 
 	// A producer's transaction that has inserted a job stays open across
 	// the start of the migration, as an InsertTx inside a longer unit of
@@ -192,7 +190,10 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	if res.Version != hoppermigrate.Latest() || len(res.Applied) != 1 {
 		t.Errorf("Up = %+v", res)
 	}
-	if took < holdFor*9/10 {
+	// A migration that locks hopper_jobs waits for the held transaction,
+	// which shows the test reached its lock; one that leaves the table
+	// alone has nothing to wait for.
+	if latest := hoppermigrate.Migrations()[hoppermigrate.Latest()-1]; strings.Contains(latest.Up, "hopper_jobs") && took < holdFor*9/10 {
 		t.Errorf("migration took %s, less than the held transaction's %s: it was not held up", took, holdFor)
 	}
 	if s := time.Duration(slowest.Load()); s > holdFor/2 {
@@ -247,9 +248,8 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	               AND (args->>'n')::int < 100`); n != 10 {
 		t.Errorf("%d of the previous release's running jobs completed, want 10", n)
 	}
-	// The previous release's batch completed once its jobs had, and ran its
-	// callback once; the one it had left open was closed without running
-	// its callback.
+	// The previous release's batch completed once this release had
+	// finalized the rest of its jobs, and ran its callback once.
 	deadline = time.Now().Add(15 * time.Second)
 	for count(`SELECT count(*) FROM hopper_job_history WHERE (args->>'n')::int = 300000`) == 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
@@ -260,12 +260,6 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	if n := count(`SELECT count(*) FROM (SELECT id FROM hopper_jobs WHERE (args->>'n')::int = 300000
 	               UNION ALL SELECT id FROM hopper_job_history WHERE (args->>'n')::int = 300000) c`); n != 1 {
 		t.Errorf("the batch's callback ran %d times, want 1", n)
-	}
-	if b, err := client.BatchGet(ctx, mustParse(t, stuck)); err != nil || b.CompletedAt.IsZero() {
-		t.Errorf("the batch left open = %+v, %v", b, err)
-	}
-	if n := count(`SELECT count(*) FROM hopper_jobs WHERE (args->>'n')::int = 300100`); n != 0 {
-		t.Errorf("the callback of the batch left open ran %d times", n)
 	}
 	v, err := hoppermigrate.Version(ctx, d)
 	if err != nil || v != hoppermigrate.Latest() {

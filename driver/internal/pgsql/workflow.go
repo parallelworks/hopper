@@ -15,18 +15,22 @@ import (
 // waiting job, expiring) produces a CTE named finished, in the shape
 // finishedColumns builds, and ends with finalizeTailSQL, which does
 // everything a finalized job entails: cancelling the dependents of a failed
-// job, archiving, completing batches that have no live job left, promoting
+// job, archiving, recording batch progress and completing batches, promoting
 // dependents whose dependencies are all finished, and dropping satisfied
 // edges.
 //
-// A batch is complete when none of its jobs is live. The statement that
-// finalizes the last one completes it, guarded by completed_at so the
-// callbacks run once, and touches the batch row only then: finalizes do not
-// queue on a shared counter, and a caller's transaction that finalized a
-// job and is still open (CompleteTx) holds up none of the job's siblings.
-// Two last jobs finalized in concurrent transactions each see the other
-// live, so neither completes the batch; BatchCompleteReady, run by the
-// leader, does.
+// A batch's progress is appended, one hopper_batch_progress row per batch
+// per statement, rather than counted down on the batch row, so finalizes do
+// not queue on that row, and a caller's transaction that finalized a job
+// and is still open (CompleteTx) holds up none of the job's siblings. The
+// statement that finds nothing remaining (pending less the rows' done and
+// its own) completes the batch instead of appending, guarded by
+// completed_at so the callbacks run once. Whether the batch is ready is
+// decided from the statement's snapshot alone, and the update re-checks only
+// completed_at, so a fold the leader commits meanwhile cannot make the
+// statement count rows twice. Two last jobs finalized in concurrent
+// statements each miss the other's uncommitted row, so neither completes
+// the batch; BatchSettle, run by the leader, does.
 
 // finishedColumns lists the columns a finishing CTE returns from a
 // hopper_jobs row aliased j: the row, with the given expressions for its
@@ -57,10 +61,10 @@ const finishedSelectColumns = `id, kind, queue, final_state, priority, attempt, 
   attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id, expires_at,
   cancel_requested_at, await, created_at, NULL::text AS snooze_reason, now() AS finalized_at, output`
 
-// batchFailedSQL counts a batch's failed jobs in history. A statement does
-// not see the history rows it archives itself, so its callers add those.
-const batchFailedSQL = `(SELECT count(*) FROM {{schema}}.hopper_job_history h
-    WHERE h.batch_id = b.id AND h.state IN ('cancelled', 'discarded'))`
+// batchProgressSQL sums a batch's progress rows, joined LATERAL to a
+// relation that has the batch's id as id.
+const batchProgressSQL = `LATERAL (SELECT coalesce(sum(p.done), 0) AS done, coalesce(sum(p.failed), 0) AS failed
+    FROM {{schema}}.hopper_batch_progress p WHERE p.batch_id = b.id) p`
 
 // batchCallbacksSQL returns the CTE that inserts the callbacks of the
 // batches a CTE named batches has just completed, and notifies their
@@ -107,14 +111,27 @@ archived AS (
   FROM done WHERE archive
   RETURNING id
 ),
+batch_counts AS (
+  SELECT batch_id, count(*) AS n, count(*) FILTER (WHERE final_state IN ('cancelled', 'discarded')) AS f
+  FROM done WHERE batch_id IS NOT NULL GROUP BY batch_id
+),
+ready AS (
+  SELECT b.id, b.failed + p.failed + c.f AS failed
+  FROM batch_counts c JOIN {{schema}}.hopper_batches b ON b.id = c.batch_id, ` + batchProgressSQL + `
+  WHERE b.completed_at IS NULL AND b.pending - p.done - c.n <= 0
+),
 batches AS (
-  UPDATE {{schema}}.hopper_batches b
-  SET completed_at = now(), failed = c.f + ` + batchFailedSQL + `
-  FROM (SELECT batch_id, count(*) FILTER (WHERE final_state IN ('cancelled', 'discarded')) AS f
-        FROM done WHERE batch_id IS NOT NULL GROUP BY batch_id) c
-  WHERE b.id = c.batch_id AND b.completed_at IS NULL
-    AND NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs j WHERE j.batch_id = b.id AND j.id NOT IN (SELECT id FROM done))
+  UPDATE {{schema}}.hopper_batches b SET completed_at = now(), failed = r.failed
+  FROM ready r WHERE b.id = r.id AND b.completed_at IS NULL
   RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete
+),
+progress AS (
+  INSERT INTO {{schema}}.hopper_batch_progress (batch_id, done, failed)
+  SELECT c.batch_id, c.n, c.f FROM batch_counts c WHERE c.batch_id NOT IN (SELECT id FROM batches)
+  RETURNING batch_id
+),
+progress_cleared AS (
+  DELETE FROM {{schema}}.hopper_batch_progress p WHERE p.batch_id IN (SELECT id FROM batches) RETURNING p.batch_id
 ),
 ` + batchCallbacksSQL(insertChannelParam) + `,
 promoted AS (
@@ -278,7 +295,8 @@ func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		metadata  jsonText
 		edges     jsonText
 	)
-	err := e.Conn.QueryRow(ctx, `SELECT id, name, `+batchProgressColumns+`, total, created_at, completed_at, metadata, edges FROM {{schema}}.hopper_batches b WHERE id = $1`, uuidParam(id)).
+	err := e.Conn.QueryRow(ctx, `SELECT id, name, `+batchProgressSelect+`, total, created_at, completed_at, metadata, edges
+		FROM {{schema}}.hopper_batches b, `+batchProgressSQL+` WHERE id = $1`, uuidParam(id)).
 		Scan(&w.Batch.ID, &name, &w.Batch.Pending, &w.Batch.Failed, &w.Batch.Total, &w.Batch.CreatedAt, &completed, &metadata, &edges)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound

@@ -201,18 +201,16 @@ type Executor interface {
 	// if needed. Zero values remove the corresponding limit.
 	QueueSetLimits(ctx context.Context, limits QueueLimits) error
 
-	// BatchInsert creates a batch of Total jobs and returns its ID. The
-	// jobs are inserted separately with their BatchID set, before the batch
-	// or in the same transaction. The statement that finalizes a batch's
-	// last live job completes it and inserts its callbacks.
+	// BatchInsert creates a batch expecting Total jobs and returns its ID.
+	// The jobs are inserted separately with their BatchID set.
 	BatchInsert(ctx context.Context, params BatchInsertParams) (JobID, error)
-	// BatchCompleteReady completes up to limit open batches none of whose
-	// jobs is live, inserts their callbacks, and returns how many. Two last
-	// jobs of a batch finalized in concurrent transactions each see the
-	// other still live, and neither completes the batch; the leader calls
-	// this to finish what they left, and to complete a batch whose jobs all
-	// finished before it was inserted.
-	BatchCompleteReady(ctx context.Context, limit int) (int64, error)
+	// BatchSettle brings up to limit batches' recorded progress up to date
+	// and completes, inserting their callbacks, those with no job left.
+	// Statements that finalize jobs record their batches' progress without
+	// waiting on each other, so two that finalize a batch's last jobs at
+	// the same time can each miss the other's progress and leave the batch
+	// open; the leader calls this to complete it.
+	BatchSettle(ctx context.Context, limit int) (BatchSettleResult, error)
 	// BatchGet returns a batch's progress.
 	BatchGet(ctx context.Context, id JobID) (*BatchRow, error)
 	// WorkflowInsert inserts a batch, its jobs and the dependencies between
@@ -494,11 +492,6 @@ func (l QueueLimits) Limited() bool {
 
 // BatchInsertParams describes a batch of jobs with completion callbacks.
 type BatchInsertParams struct {
-	// ID, if set, is the batch's ID; otherwise the engine generates one.
-	// A batch is complete once none of its jobs is live, so its jobs must
-	// be inserted before the batch, with this ID, or in the same
-	// transaction as it.
-	ID    JobID
 	Total int
 	// Callbacks are inserted when the batch completes: OnSuccess if no job
 	// was cancelled or discarded, OnFailure otherwise, and OnComplete
@@ -507,12 +500,19 @@ type BatchInsertParams struct {
 	Metadata                         json.RawMessage
 }
 
+// BatchSettleResult reports what BatchSettle did.
+type BatchSettleResult struct {
+	// Folded counts the batches whose progress was brought up to date, and
+	// Completed those of them that completed.
+	Folded, Completed int64
+}
+
 // BatchRow is a batch's progress.
 type BatchRow struct {
 	ID JobID
 	// Name is set for workflows.
 	Name string
-	// Pending counts the batch's jobs that are still live.
+	// Pending counts the batch's jobs not yet finalized.
 	Pending int
 	// Failed counts its jobs that were cancelled or discarded.
 	Failed int

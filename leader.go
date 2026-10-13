@@ -43,7 +43,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			}
 			c.rescue(ctx)
 			c.expire(ctx)
-			c.completeBatches(ctx)
+			c.settleBatches(ctx)
 			c.age(ctx)
 			c.pruneClients(ctx)
 			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval {
@@ -259,22 +259,22 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 	}
 }
 
-// completeBatches completes batches whose last jobs finished in concurrent
-// transactions, none of which saw the others commit, or before the batch
-// itself was inserted.
-func (c *Client[TTx]) completeBatches(ctx context.Context) {
+// settleBatches brings batches' progress up to date and completes those
+// whose last jobs were finalized at the same time by statements that could
+// not see each other's progress.
+func (c *Client[TTx]) settleBatches(ctx context.Context) {
 	for {
-		n, err := c.exec.BatchCompleteReady(ctx, c.tuning.rescueBatch)
+		res, err := c.exec.BatchSettle(ctx, c.tuning.rescueBatch)
 		if err != nil {
 			if ctx.Err() == nil {
-				c.logger.ErrorContext(ctx, "hopper: complete ready batches", "error", err)
+				c.logger.ErrorContext(ctx, "hopper: settle batches", "error", err)
 			}
 			return
 		}
-		if n > 0 {
-			c.logger.DebugContext(ctx, "hopper: completed batches", "count", n)
+		if res.Completed > 0 {
+			c.logger.DebugContext(ctx, "hopper: completed batches", "count", res.Completed)
 		}
-		if n < int64(c.tuning.rescueBatch) {
+		if res.Folded < int64(c.tuning.rescueBatch) {
 			return
 		}
 	}
