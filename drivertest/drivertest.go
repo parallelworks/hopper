@@ -11,7 +11,7 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing, snooze reasons, leases, leader election, rescue candidates,
+// fencing (also inside a caller's transaction), snooze reasons, leases, leader election, rescue candidates,
 // cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
 // notifications and history maintenance. Engine-specific behavior, such as how partitions are managed,
 // belongs in the driver's own tests.
@@ -76,6 +76,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalize(t, f, true) }},
 		{"FinalizeFences", func(t *testing.T, f Fixture[TTx]) { testFinalizeFences(t, f, false) }},
 		{"FinalizeFencesNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeFences(t, f, true) }},
+		{"FinalizeTx", testFinalizeTx[TTx]},
+		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},
 		{"Leader", testLeader[TTx]},
 		{"Rescue", testRescue[TTx]},

@@ -10,7 +10,9 @@ Postgres is the first engine, behind a driver interface designed for more.
 - **Fast:** set-based claim, finalize and insert (including `COPY`), a live
   table that stays small however much history accumulates, and retention by
   dropping partitions. Throughput and latency targets are release gates.
-- **Transactional enqueue:** jobs and messages commit or roll back with your data.
+- **Transactional enqueue and completion:** jobs and messages commit or roll
+  back with your data, and a worker can complete its job in the transaction
+  that does its work.
 - **Scale by adding replicas:** work is claimed with `FOR UPDATE SKIP LOCKED`, and
   periodic jobs and maintenance run on one elected leader.
 - **Reliable:** retries with backoff, dead-lettering and replay, unique jobs, and

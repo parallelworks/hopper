@@ -171,7 +171,8 @@ var workSeq atomic.Int64
 // applies. It returns the worker's error, so callers can check for
 // hopper.Snooze and hopper.Cancel results with errors.As.
 // A worker that uses hopper.ClientFromContext gets a client only if ctx
-// carries one, from hopper.ContextWithClient.
+// carries one, from hopper.ContextWithClient. hopper.SetOutput and
+// hopper.CompleteTx return hopper.ErrNotInJob, since there is no stored job.
 func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.Workers, args T, opts *WorkOpts) error {
 	tb.Helper()
 	encoded, err := json.Marshal(args)

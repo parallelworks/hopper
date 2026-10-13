@@ -236,7 +236,9 @@ func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig, paused, limit
 		claim: func(ctx context.Context, limit int, limited bool) (driver.JobClaimResult, error) {
 			return c.exec.JobClaim(ctx, driver.JobClaimParams{Queue: name, ClientID: c.clientID.Load(), Limit: limit, Limited: limited})
 		},
-		work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.jobContext(row), row, qcfg) },
+		work: func(row *driver.JobRow) (driver.JobFinalize, bool) {
+			return c.execute(c.jobContext(row), row, qcfg)
+		},
 		submit: c.finalizer.submit,
 		wake:   make(chan struct{}, 1),
 		freed:  make(chan struct{}, 1),

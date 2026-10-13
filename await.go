@@ -7,21 +7,34 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/parallelworks/hopper/driver"
 )
 
-type outputKey struct{}
+type attemptKey struct{}
 
-// outputHolder collects a job's output from SetOutput.
-type outputHolder struct {
-	codec Codec
-	mu    sync.Mutex
-	data  json.RawMessage
+// attempt is the state a running job's context carries: its output from
+// SetOutput, and whether CompleteTx finalized it.
+type attempt struct {
+	codec   Codec
+	row     *driver.JobRow
+	archive bool
+
+	mu        sync.Mutex
+	output    json.RawMessage
+	completed bool
 }
 
-func (h *outputHolder) get() json.RawMessage {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.data
+func (a *attempt) get() json.RawMessage {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.output
+}
+
+func (a *attempt) completedTx() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.completed
 }
 
 // ErrNotInJob is returned by SetOutput outside a worker.
@@ -30,19 +43,20 @@ var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 // SetOutput records the job's result, which is stored with the finalized
 // job, returned by JobGet and delivered to Await. The last call wins. Output
 // is kept only for archived jobs, so it is lost on queues with
-// DeleteCompleted.
+// DeleteCompleted. A job finalized with CompleteTx stores the output set
+// before that call.
 func SetOutput(ctx context.Context, v any) error {
-	h, ok := ctx.Value(outputKey{}).(*outputHolder)
+	a, ok := ctx.Value(attemptKey{}).(*attempt)
 	if !ok {
 		return ErrNotInJob
 	}
-	data, err := h.codec.Marshal(v)
+	data, err := a.codec.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("hopper: encode output: %w", err)
 	}
-	h.mu.Lock()
-	h.data = data
-	h.mu.Unlock()
+	a.mu.Lock()
+	a.output = data
+	a.mu.Unlock()
 	return nil
 }
 

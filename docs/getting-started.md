@@ -118,6 +118,29 @@ return &hopper.SnoozeError{Duration: 10 * time.Minute, Reason: "export not ready
 Workers must be idempotent: a job runs twice only when the process running it
 is lost mid-job, but it can happen.
 
+When the work is writes to the same database, complete the job in the same
+transaction. The job is then finished exactly when the work commits, and a
+crash afterwards cannot run it again:
+
+```go
+func (w *TransferWorker) Work(ctx context.Context, job *hopper.Job[Transfer]) error {
+    tx, err := w.pool.Begin(ctx)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback(ctx)
+    if err := w.ledger.Apply(ctx, tx, job.Args); err != nil {
+        return err
+    }
+    if err := hopper.CompleteTx(ctx, tx, job); err != nil {
+        return err // hopper.ErrJobFenced: this attempt no longer owns the job
+    }
+    return tx.Commit(ctx)
+}
+```
+
+If the transaction does not commit, return an error so the job is retried.
+
 For a function instead of a type:
 
 ```go

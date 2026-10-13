@@ -131,6 +131,26 @@ hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[ResizeImag
 `http.Handle`. Calling `Insert` with an args type that has no registered worker on this
 client is allowed (another service may work it), but `Config.StrictKinds` rejects it.
 
+A worker whose work is in the same database can complete its job in the same
+transaction, so the job runs exactly once even if the process dies right after:
+
+```go
+func (w *TransferWorker) Work(ctx context.Context, job *hopper.Job[Transfer]) error {
+    tx, err := w.pool.Begin(ctx)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback(ctx)
+    if err := w.ledger.Apply(ctx, tx, job.Args); err != nil {
+        return err
+    }
+    if err := hopper.CompleteTx(ctx, tx, job); err != nil {
+        return err
+    }
+    return tx.Commit(ctx)
+}
+```
+
 Workers are registered before the client that runs them exists, so a worker or
 subscriber that needs the client, to insert follow-up jobs, publish or query, takes it
 from its context: `hopper.ClientFromContext[pgx.Tx](ctx)` returns the client running the
@@ -712,8 +732,21 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   - **`hopper.Cancel(err)`:** `discarded` immediately.
 - `backoff(n) = n^4 + 5s ± 10% jitter`, capped at 24h. It can be overridden per worker
   with `NextRetry(job) time.Time` or per queue with a `RetryPolicy`.
-- `CompleteTx(ctx, tx, job)` finalizes inside the worker's own transaction, so the work
-  and its completion commit together. It bypasses the buffer.
+- `hopper.CompleteTx(ctx, tx, job)` completes the job inside the worker's own
+  transaction, so the work and its completion commit together. It runs the finalize
+  statement above for one completed result through `Driver.UnwrapTx(tx)`, bypassing
+  the buffer, with the output `SetOutput` recorded so far and the queue's
+  `DeleteCompleted`; it takes the client from the job's context (§4.1), so it needs
+  no client argument. The fence applies as to any finalize: if the attempt no longer
+  owns the job, nothing is written and `ErrJobFenced` is returned. History, awaited
+  jobs (`pg_notify` is transactional), batches and workflow dependents all take effect
+  when `tx` commits.
+- When the worker then returns nil, the client submits nothing to the finalizer and
+  emits `job.completed` itself. When it returns an error, the error is finalized as
+  usual: if `tx` committed, the fence drops it (the job is already finished), and if
+  `tx` rolled back, the attempt fails and retries. A worker that rolls back and still
+  returns nil leaves its job running until the client's lease ends, so it must
+  return an error instead.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure
@@ -1271,8 +1304,8 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease, backdate an attempt, count rows). Engine internals such as partition management stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. Global and rate limits never exceeded. Ordering keys never run two at once. |
-| Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |
 | Test helpers | The `hoppertest` package: `RequireInserted[T]`, `RequireManyInserted[T]`, `RequireNotInserted[T]` and their `Tx` variants (which look inside the caller's transaction), and `Work[T]`, which runs a worker inline on a synthetic job with no database round trip. |

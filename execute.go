@@ -13,16 +13,18 @@ import (
 )
 
 // execute runs one claimed job and turns its outcome into a finalize result.
-// It never panics and never blocks past the job's timeout.
+// It never panics and never blocks past the job's timeout. It reports false
+// when there is nothing to finalize: the worker completed the job with
+// CompleteTx and returned nil.
 //
 // The job's context descends from the lease generation (cancelled by a hard
 // stop or fencing) and can also be cancelled by JobCancel, with cause
 // ErrJobCancelled, and by the timeout, with cause ErrJobTimeout.
-func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) driver.JobFinalize {
+func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) (driver.JobFinalize, bool) {
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	output := &outputHolder{codec: c.cfg.Codec}
-	jobCtx = context.WithValue(jobCtx, outputKey{}, output)
+	a := &attempt{codec: c.cfg.Codec, row: row, archive: !qcfg.DeleteCompleted}
+	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	c.trackRunning(row.ID, cancel)
 	defer c.untrackRunning(row.ID)
@@ -30,9 +32,13 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	unit, err := c.runWorker(jobCtx, row)
 	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err)
 	if f.State.Terminal() {
-		f.Output = output.get()
+		f.Output = a.get()
 	}
-	return f
+	if err == nil && a.completedTx() {
+		c.finalized(row, f)
+		return f, false
+	}
+	return f, true
 }
 
 func (c *Client[TTx]) runWorker(ctx context.Context, row *driver.JobRow) (workUnit, error) {
