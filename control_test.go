@@ -103,6 +103,39 @@ func TestJobRetryRedrivesFromHistory(t *testing.T) {
 	}
 }
 
+func TestJobRetryOrderingKeyWakesASnoozedKey(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	var calls atomic.Int32
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[noop]) error {
+		if calls.Add(1) == 1 {
+			return &hopper.SnoozeError{Duration: time.Hour, Reason: "waiting"}
+		}
+		return nil
+	})
+	c := h.started(workers, 1)
+	first, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{OrderingKey: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, c, first.Job.ID, hopper.JobStateScheduled)
+	second, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{OrderingKey: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := c.JobRetryOrderingKey(ctx, "", "a"); err != nil || n != 1 {
+		t.Fatalf("JobRetryOrderingKey = %d, %v", n, err)
+	}
+	waitForJob(t, c, first.Job.ID, hopper.JobStateCompleted)
+	waitForJob(t, c, second.Job.ID, hopper.JobStateCompleted)
+	if _, err := c.JobRetryOrderingKey(ctx, "", ""); err == nil {
+		t.Error("empty key: no error")
+	}
+}
+
 func TestTTLDiscardsUnstartedJobs(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)

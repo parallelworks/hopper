@@ -79,6 +79,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Rescue", testRescue[TTx]},
 		{"Cancel", testCancel[TTx]},
 		{"Retry", testRetry[TTx]},
+		{"RetryOrderingKey", testRetryOrderingKey[TTx]},
+		{"RetryOrderingKeyConcurrent", testRetryOrderingKeyConcurrent[TTx]},
 		{"TTL", testTTL[TTx]},
 		{"SnoozeReason", testSnoozeReason[TTx]},
 		{"SnoozeReasonConcurrent", testSnoozeReasonConcurrent[TTx]},

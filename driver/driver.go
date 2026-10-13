@@ -144,6 +144,14 @@ type Executor interface {
 	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
 	// holds the same unique key.
 	JobRetry(ctx context.Context, id JobID) (*JobRow, error)
+	// JobRetryOrderingKey wakes an ordering key in a queue. Up to Limit of
+	// its jobs waiting on their schedule (scheduled or retryable, oldest
+	// first, TTL not passed) become runnable now, keeping their TTL and
+	// losing their snooze reason; it returns how many. A running job of the
+	// key is marked, so that if its attempt ends in a snooze or a retry the
+	// job is runnable at once instead of after its delay. Pending and
+	// finalized jobs are left alone.
+	JobRetryOrderingKey(ctx context.Context, params JobRetryOrderingKeyParams) (int, error)
 	// JobDiscardExpired moves waiting jobs whose TTL has passed to history
 	// as discarded, and returns them.
 	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)
@@ -426,6 +434,13 @@ type JobInsertResult struct {
 	// Duplicate is true when a live job with the same unique key already
 	// existed. Job is then that existing job.
 	Duplicate bool
+}
+
+// JobRetryOrderingKeyParams selects the key to wake.
+type JobRetryOrderingKeyParams struct {
+	Queue       string
+	OrderingKey string
+	Limit       int
 }
 
 // JobListParams filters a listing. Empty fields match everything.

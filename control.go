@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -53,6 +54,39 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID) (*JobRow, error) {
 	c.wakeQueue(job.Queue)
 	c.notifier.mark(job.Queue)
 	return job, nil
+}
+
+// retryOrderingKeyBatch bounds how many jobs one statement of
+// JobRetryOrderingKey locks and rewrites.
+const retryOrderingKeyBatch = 1000
+
+// JobRetryOrderingKey wakes an ordering key: its jobs waiting out a snooze,
+// a retry delay or their schedule become runnable now, and still run one at
+// a time, oldest first. Unlike JobRetry it keeps each job's TTL, and leaves
+// a job already past it to expire. A job of the key that is running is not
+// interrupted; if its attempt ends in a snooze or a retry, it runs again at
+// once instead of after its delay. It returns how many waiting jobs it woke.
+func (c *Client[TTx]) JobRetryOrderingKey(ctx context.Context, queue, orderingKey string) (int, error) {
+	if orderingKey == "" {
+		return 0, errors.New("hopper: ordering key is required")
+	}
+	queue = cmp.Or(queue, QueueDefault)
+	total := 0
+	for {
+		n, err := c.exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: queue, OrderingKey: orderingKey, Limit: retryOrderingKeyBatch})
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < retryOrderingKeyBatch {
+			break
+		}
+	}
+	if total > 0 {
+		c.wakeQueue(queue)
+		c.notifier.mark(queue)
+	}
+	return total, nil
 }
 
 // JobFilter selects jobs for Jobs. Empty fields match everything.
