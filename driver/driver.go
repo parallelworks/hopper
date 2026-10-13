@@ -339,12 +339,17 @@ type JobRow struct {
 	PartitionKey string
 	// BatchID is the batch the job belongs to, or zero.
 	BatchID JobID
-	// ExpiresAt is the TTL deadline, or zero.
+	// ExpiresAt is the TTL deadline, or zero. A job still waiting to run
+	// at this time, for its first attempt or a later one, is discarded.
 	ExpiresAt time.Time
 	// CancelRequestedAt is set when JobCancel is called on a running job.
 	CancelRequestedAt time.Time
 	Await             bool
 	CreatedAt         time.Time
+	// SnoozeReason is the reason the worker gave when it last snoozed the
+	// job, while the job waits out that snooze. It is empty otherwise: the
+	// claim, any other finalize, a retry and a replacing insert clear it.
+	SnoozeReason string
 	// FinalizedAt is set for jobs in history.
 	FinalizedAt time.Time
 	// Output is the value recorded by the worker, for jobs in history.
@@ -380,8 +385,9 @@ type JobInsertParams struct {
 	PartitionKey string
 	// BatchID, if set, counts the job toward a batch.
 	BatchID JobID
-	// TTL, if positive, discards the job if it has not started within this
-	// long of database now().
+	// TTL, if positive, sets ExpiresAt to this long after database now().
+	// A job past ExpiresAt is not claimed while it waits (available,
+	// scheduled or retryable) and JobDiscardExpired discards it.
 	TTL time.Duration
 	// Await marks the job so that its finalize is announced on ChannelDone.
 	Await bool
@@ -605,6 +611,8 @@ type JobFinalize struct {
 	// Snooze gives the attempt back, so the retry does not count against
 	// MaxAttempts.
 	Snooze bool
+	// SnoozeReason is stored as the job's SnoozeReason when Snooze is set.
+	SnoozeReason string
 	// Error is appended to the job's errors. Its At field is set by the
 	// engine from database time.
 	Error *AttemptError
@@ -676,7 +684,7 @@ type MessagePublishParams struct {
 	DedupKey string
 	// Delay schedules the deliveries for later.
 	Delay time.Duration
-	// TTL discards deliveries not started within this long.
+	// TTL sets each delivery's ExpiresAt, as JobInsertParams.TTL does.
 	TTL      time.Duration
 	Priority int
 	Await    bool

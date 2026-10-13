@@ -118,6 +118,21 @@ func TestUI(t *testing.T) {
 	}
 	code, body = get(readOnly, "/jobs/"+job.Job.ID.String())
 	want(200, body, code, `&#34;n&#34;: 1`, "available", "emails")
+	snoozed, err := client.Insert(ctx, ping{N: 2}, &hopper.InsertOpts{Queue: "naps"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE hopper_jobs SET state = 'scheduled', snooze_reason = 'mail server <busy>' WHERE id = $1", [16]byte(snoozed.Job.ID)); err != nil {
+		t.Fatal(err)
+	}
+	code, body = get(readOnly, "/jobs/"+snoozed.Job.ID.String())
+	want(200, body, code, "<dt>snooze reason</dt><dd>mail server &lt;busy&gt;</dd>")
+	code, body = get(readOnly, "/jobs?queue=naps")
+	want(200, body, code, `title="snoozed: mail server &lt;busy&gt;"`)
+	_, body = get(readOnly, "/jobs/"+job.Job.ID.String())
+	if strings.Contains(body, "snooze reason") {
+		t.Error("job that never snoozed shows a snooze reason")
+	}
 	code, body = get(readOnly, "/jobs/not-an-id")
 	want(400, body, code)
 	code, body = get(readOnly, "/jobs/"+hopper.JobID{1}.String())

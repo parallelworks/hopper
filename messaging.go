@@ -177,7 +177,9 @@ type PublishOpts struct {
 	Headers map[string]string
 	// Delay defers delivery.
 	Delay time.Duration
-	// TTL discards deliveries not started within this long.
+	// TTL bounds how long each delivery may wait to run, as
+	// InsertOpts.TTL does: one still waiting when it passes, whether before
+	// its first attempt, between retries or while snoozed, is discarded.
 	TTL time.Duration
 	// Priority defaults to PriorityNormal.
 	Priority Priority

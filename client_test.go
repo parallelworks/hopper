@@ -518,6 +518,48 @@ func TestSnoozeKeepsAttempt(t *testing.T) {
 	}
 }
 
+func TestSnoozeRecordsReason(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	var calls atomic.Int32
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[noop]) error {
+		if calls.Add(1) == 1 {
+			return &hopper.SnoozeError{Duration: time.Second, Reason: "waiting for the export"}
+		}
+		if job.SnoozeReason != "" {
+			t.Errorf("claimed job has snooze reason %q", job.SnoozeReason)
+		}
+		return nil
+	})
+	c := h.started(workers, 1)
+
+	res, err := c.Insert(ctx, noop{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := waitForJob(t, c, res.Job.ID, hopper.JobStateScheduled)
+	if job.SnoozeReason != "waiting for the export" || job.Attempt != 0 {
+		t.Errorf("snoozed job = %+v", job)
+	}
+	job = waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted)
+	if calls.Load() != 2 || job.SnoozeReason != "" {
+		t.Errorf("calls = %d, job = %+v", calls.Load(), job)
+	}
+}
+
+func TestSnoozeErrorText(t *testing.T) {
+	t.Parallel()
+	if got := hopper.Snooze(time.Minute).Error(); got != "hopper: job snoozed for 1m0s" {
+		t.Errorf("Snooze = %q", got)
+	}
+	err := &hopper.SnoozeError{Duration: time.Minute, Reason: "rate limited"}
+	if got := err.Error(); got != "hopper: job snoozed for 1m0s: rate limited" {
+		t.Errorf("SnoozeError with reason = %q", got)
+	}
+}
+
 func TestCancelDiscardsImmediately(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)

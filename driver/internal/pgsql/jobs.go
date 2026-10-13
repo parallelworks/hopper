@@ -12,19 +12,27 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
+var jobColumns = []string{
+	"id", "kind", "queue", "state", "priority", "attempt", "max_attempts",
+	"scheduled_at", "attempted_at", "attempted_by", "args", "metadata", "errors",
+	"unique_key", "ordering_key", "partition_key", "batch_id", "expires_at", "cancel_requested_at", "await", "created_at",
+	"snooze_reason",
+}
+
 // JobColumns lists hopper_jobs columns in scan order. prefix qualifies them
 // with a table alias.
 func JobColumns(prefix string) string {
-	cols := []string{
-		"id", "kind", "queue", "state", "priority", "attempt", "max_attempts",
-		"scheduled_at", "attempted_at", "attempted_by", "args", "metadata", "errors",
-		"unique_key", "ordering_key", "partition_key", "batch_id", "expires_at", "cancel_requested_at", "await", "created_at",
-	}
-	out := make([]string, len(cols))
-	for i, c := range cols {
+	out := make([]string, len(jobColumns))
+	for i, c := range jobColumns {
 		out[i] = prefix + c
 	}
 	return strings.Join(out, ", ")
+}
+
+// historyColumns lists hopper_job_history columns in JobColumns order.
+// History has no snooze_reason, because a finalized job is not waiting.
+func historyColumns() string {
+	return strings.Replace(JobColumns(""), "snooze_reason", "NULL::text AS snooze_reason", 1)
 }
 
 // scanJob scans a row of JobColumns, plus finalized_at and output when
@@ -38,6 +46,7 @@ func scanJob(row Row, history bool, dup *bool) (*driver.JobRow, error) {
 		finalizedAt                      sql.NullTime
 		attemptedBy                      sql.NullInt64
 		uniqueKey, orderingKey, partKey  sql.NullString
+		snoozeReason                     sql.NullString
 		args, metadata, output           jsonText
 		errs                             attemptErrors
 		batchID                          nullUUID
@@ -46,6 +55,7 @@ func scanJob(row Row, history bool, dup *bool) (*driver.JobRow, error) {
 		&j.ID, &j.Kind, &j.Queue, &state, &priority, &attempt, &maxAttempts,
 		&j.ScheduledAt, &attemptedAt, &attemptedBy, &args, &metadata, &errs,
 		&uniqueKey, &orderingKey, &partKey, &batchID, &expiresAt, &cancelAt, &j.Await, &j.CreatedAt,
+		&snoozeReason,
 	}
 	if history {
 		dest = append(dest, &finalizedAt, &output)
@@ -63,6 +73,7 @@ func scanJob(row Row, history bool, dup *bool) (*driver.JobRow, error) {
 	j.Args, j.Metadata, j.Output = args.raw(), metadata.raw(), output.raw()
 	j.Errors = []driver.AttemptError(errs)
 	j.UniqueKey, j.OrderingKey, j.PartitionKey = uniqueKey.String, orderingKey.String, partKey.String
+	j.SnoozeReason = snoozeReason.String
 	if batchID.Valid {
 		j.BatchID = batchID.ID
 	}
@@ -116,7 +127,8 @@ const (
   priority     = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.priority     ELSE EXCLUDED.priority     END,
   max_attempts = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.max_attempts ELSE EXCLUDED.max_attempts END,
   scheduled_at = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.scheduled_at ELSE EXCLUDED.scheduled_at END,
-  state        = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.state        ELSE EXCLUDED.state        END`
+  state        = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.state        ELSE EXCLUDED.state        END,
+  snooze_reason = NULL`
 )
 
 var (
@@ -261,7 +273,7 @@ WITH c AS MATERIALIZED (
 ),
 claimed AS (
   UPDATE {{schema}}.hopper_jobs j
-  SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
+  SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2, snooze_reason = NULL
   FROM c
   WHERE j.id = c.id AND c.n <= $3
   RETURNING j.seq, ` + "%s" + `
@@ -292,7 +304,7 @@ c AS MATERIALIZED (
 ),
 claimed AS (
   UPDATE {{schema}}.hopper_jobs j
-  SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2
+  SET state = 'running', attempt = j.attempt + 1, attempted_at = now(), attempted_by = $2, snooze_reason = NULL
   FROM c
   WHERE j.id = c.id AND c.n <= $3
   RETURNING j.seq, ` + "%s" + `
@@ -360,15 +372,15 @@ func claimRows(ctx context.Context, conn Conn, query string, args ...any) ([]*dr
 // jobFinalizeSQL applies a batch of results in one statement. Every
 // transition checks the prior state (running) and the owning client, so a
 // stale result from a fenced client never overwrites a newer attempt.
-// Retries and snoozes are updated in place; terminal outcomes go through
-// finalizeTailSQL: history, batches, and workflow dependents. Error
-// timestamps come from database time and awaited jobs announce themselves
-// on the done channel.
+// Retries and snoozes are updated in place, with a snooze's reason (or
+// NULL); terminal outcomes go through finalizeTailSQL: history, batches,
+// and workflow dependents. Error timestamps come from database time and
+// awaited jobs announce themselves on the done channel.
 var jobFinalizeSQL = `
 WITH RECURSIVE r AS (
   SELECT * FROM unnest(
-    $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::boolean[], $6::jsonb[], $7::jsonb[], $8::boolean[]
-  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive)
+    $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::boolean[], $6::jsonb[], $7::jsonb[], $8::boolean[], $11::text[]
+  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason)
 ),
 retry AS (
   UPDATE {{schema}}.hopper_jobs j
@@ -377,7 +389,8 @@ retry AS (
       attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
       errors = CASE WHEN r.error IS NULL THEN j.errors
                     ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END,
-      attempted_by = NULL
+      attempted_by = NULL,
+      snooze_reason = CASE WHEN r.snooze THEN r.snooze_reason END
   FROM r
   WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by
     AND r.state IN ('retryable', 'scheduled')
@@ -406,6 +419,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		states      = make([]string, n)
 		delays      = make([]float64, n)
 		snoozes     = make([]bool, n)
+		reasons     = make([]string, n)
 		errs        = make([][]byte, n)
 		outputs     = make([][]byte, n)
 		archives    = make([]bool, n)
@@ -419,6 +433,9 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		}
 		ids[i], attemptedBy[i], states[i] = f.ID, f.AttemptedBy, string(f.State)
 		delays[i], snoozes[i] = max(f.Delay, 0).Seconds(), f.Snooze
+		if f.Snooze {
+			reasons[i] = f.SnoozeReason
+		}
 		if f.Error != nil {
 			b, err := marshalAttemptError(f.Error)
 			if err != nil {
@@ -434,6 +451,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 	applied, err := scanIDs(e.Conn.Query(ctx, jobFinalizeSQL,
 		uuidArray(ids), int64Array(attemptedBy), textArray(states), floatArray(delays), boolArray(snoozes),
 		jsonArray(errs), jsonArray(outputs), boolArray(archives), driver.ChannelDone, driver.ChannelInsert,
+		nullableTextArray(reasons),
 	))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
@@ -455,7 +473,7 @@ var jobGetQuery = fmt.Sprintf(`
 SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE id = $1
 UNION ALL
 SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history WHERE id = $1
-LIMIT 1`, JobColumns(""), JobColumns(""))
+LIMIT 1`, JobColumns(""), historyColumns())
 
 // JobGet implements driver.Executor.
 func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
@@ -471,7 +489,7 @@ func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow,
 
 var (
 	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM {{schema}}.hopper_jobs`, JobColumns(""))
-	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, JobColumns(""))
+	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, historyColumns())
 	jobListFilterSQL  = ` WHERE ($1 = '' OR queue = $1) AND (cardinality($2::text[]) = 0 OR kind = ANY($2::text[]))
   AND (cardinality($3::text[]) = 0 OR state::text = ANY($3::text[])) AND id > $4::uuid`
 )
@@ -562,7 +580,7 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 
 var (
 	jobRetryLiveSQL = fmt.Sprintf(`
-UPDATE {{schema}}.hopper_jobs SET state = 'available', scheduled_at = now()
+UPDATE {{schema}}.hopper_jobs SET state = 'available', scheduled_at = now(), snooze_reason = NULL
 WHERE id = $1 AND state <> 'running'
 RETURNING %s`, JobColumns(""))
 	// jobRetryHistorySQL moves a finalized job back to the live table with

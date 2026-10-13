@@ -20,6 +20,9 @@ hopper's tables are prefixed `hopper_` and live in the `hopper` PostgreSQL
 schema by default. Migrations create the schema if it does not exist.
 Install them once per schema, from any replica;
 migrations take a cross-process lock, so concurrent starts are fine.
+When upgrading hopper, run the new version's migrations before its clients
+start; clients of the previous version keep working on the new schema while
+they are replaced.
 
 ```go
 pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
@@ -93,6 +96,13 @@ dead-letter queue. Two other returns are special:
 ```go
 return hopper.Snooze(10 * time.Minute) // run again later; does not use an attempt
 return hopper.Cancel(err)              // discard now, with err recorded
+```
+
+To show operators why a job is waiting, return the snooze with a reason. It is
+stored on the job as `SnoozeReason` until the job runs again:
+
+```go
+return &hopper.SnoozeError{Duration: 10 * time.Minute, Reason: "export not ready"}
 ```
 
 Workers must be idempotent: a job runs twice only when the process running it

@@ -11,9 +11,9 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing, leases, leader election, rescue candidates, cancel, retry, TTL
-// expiry, listing, queues, periodic slots, stats, notifications and history
-// maintenance. Engine-specific behavior, such as how partitions are managed,
+// fencing, snooze reasons, leases, leader election, rescue candidates,
+// cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
+// notifications and history maintenance. Engine-specific behavior, such as how partitions are managed,
 // belongs in the driver's own tests.
 package drivertest
 
@@ -72,6 +72,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Cancel", testCancel[TTx]},
 		{"Retry", testRetry[TTx]},
 		{"TTL", testTTL[TTx]},
+		{"SnoozeReason", testSnoozeReason[TTx]},
+		{"SnoozeReasonConcurrent", testSnoozeReasonConcurrent[TTx]},
 		{"List", testList[TTx]},
 		{"Queues", testQueues[TTx]},
 		{"Periodic", testPeriodic[TTx]},

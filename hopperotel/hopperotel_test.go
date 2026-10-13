@@ -151,6 +151,35 @@ func TestMiddlewareTracesAndMeasures(t *testing.T) {
 	}
 }
 
+func TestMiddlewareRecordsSnoozeReason(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+	m := hopperotel.New(&hopperotel.Config{TracerProvider: tp, MeterProvider: sdkmetric.NewMeterProvider()})
+	job := &hopper.JobRow{Kind: "ping", Queue: hopper.QueueDefault}
+	for _, reason := range []string{"upstream rate limit", ""} {
+		err := m.Work(context.Background(), job, func(context.Context) error {
+			return &hopper.SnoozeError{Duration: time.Minute, Reason: reason}
+		})
+		var snooze *hopper.SnoozeError
+		if !errors.As(err, &snooze) {
+			t.Fatalf("Work = %v", err)
+		}
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 2 {
+		t.Fatalf("spans = %v", names(spans))
+	}
+	for i, want := range []string{"upstream rate limit", ""} {
+		s := spans[i]
+		if attr(s.Attributes, "hopper.job.outcome") != "snoozed" || attr(s.Attributes, "hopper.job.snooze_reason") != want {
+			t.Errorf("span %d attributes = %v", i, s.Attributes)
+		}
+		if s.Status.Code.String() == "Error" {
+			t.Errorf("span %d: a snooze is not an error", i)
+		}
+	}
+}
+
 func attr(attrs []attribute.KeyValue, key string) string {
 	for _, a := range attrs {
 		if string(a.Key) == key {

@@ -127,6 +127,39 @@ func TestTTLDiscardsUnstartedJobs(t *testing.T) {
 	}
 }
 
+// TestTTLDiscardsJobsWaitingToRunAgain pins that a TTL bounds every wait,
+// not only the first: a job that has run and waits to run again, snoozed
+// or retrying, is discarded once it passes, without running again.
+func TestTTLDiscardsJobsWaitingToRunAgain(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	var calls [2]atomic.Int32
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[noop]) error {
+		calls[job.Args.N].Add(1)
+		if job.Args.N == 0 {
+			return &hopper.SnoozeError{Duration: time.Hour, Reason: "later"}
+		}
+		return errors.New("flaky") // the first retry is seconds away
+	})
+	c := h.started(workers, 2)
+	var ids [2]hopper.JobID
+	for n := range ids {
+		res, err := c.Insert(ctx, noop{N: n}, &hopper.InsertOpts{TTL: 500 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[n] = res.Job.ID
+	}
+	for n, id := range ids {
+		job := waitForJob(t, c, id, hopper.JobStateDiscarded)
+		if last := job.Errors[len(job.Errors)-1]; last.Error != "hopper: expired" || calls[n].Load() != 1 || job.SnoozeReason != "" {
+			t.Errorf("job %d = %+v after %d attempts", n, job, calls[n].Load())
+		}
+	}
+}
+
 func TestPauseAndResume(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
