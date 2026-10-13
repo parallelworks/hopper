@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/parallelworks/hopper/driver"
 )
@@ -244,23 +245,17 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if applied := finalize(ctx, t, d.UnwrapTx(tx), completed(x)); len(applied) != 1 {
 		t.Fatalf("finalize in tx applied %v", applied)
 	}
-	done := make(chan []driver.JobID, 1)
-	go func() {
-		applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(y)}})
-		if err != nil {
-			t.Error(err)
-		}
-		done <- applied
-	}()
-	waitForLockWait(ctx, t, f, d)
+	// The other dependency's finalize does not wait for the transaction.
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(y)}}); err != nil || len(applied) != 1 {
+		t.Fatalf("concurrent finalize = %v, %v", applied, err)
+	}
 	if n := promote(); n != 0 {
 		t.Errorf("promoted %d while a dependency's finalize was uncommitted", n)
 	}
 	if err := commit(); err != nil {
 		t.Fatal(err)
-	}
-	if applied := <-done; len(applied) != 1 {
-		t.Fatalf("concurrent finalize applied %v", applied)
 	}
 	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStatePending {
 		t.Fatalf("dependent after both finalizes = %+v, %v; the race should leave it pending", j, err)

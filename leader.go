@@ -47,8 +47,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			c.promoteReady(ctx)
 			c.age(ctx)
 			c.pruneClients(ctx)
-			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval {
-				c.maintainHistory(ctx)
+			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval && c.maintainHistory(ctx) {
 				lastMaintenance = time.Now()
 			}
 		default:
@@ -356,7 +355,12 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 	}
 }
 
-func (c *Client[TTx]) maintainHistory(ctx context.Context) {
+// maintainHistory creates and drops history partitions. It reports false
+// when a partition's creation or drop was deferred, for the next leader pass
+// to retry rather than the next maintenance interval: a partition ahead that
+// is missing when its period starts sends that period's history to the
+// DEFAULT partition.
+func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	res, err := c.exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{
 		CompletedRetention: c.cfg.CompletedRetention,
 		FailedRetention:    c.cfg.FailedRetention,
@@ -366,9 +370,10 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) {
 		if ctx.Err() == nil {
 			c.logger.ErrorContext(ctx, "hopper: maintain history", "error", err)
 		}
-		return
+		return true
 	}
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || len(res.Deferred) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "deferred", res.Deferred, "pruned", res.Pruned)
 	}
+	return len(res.Deferred) == 0
 }
