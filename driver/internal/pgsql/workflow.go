@@ -33,16 +33,19 @@ func finishedColumns(errorsExpr, outputExpr, archiveExpr, stateExpr, doneChannel
 }
 
 // appendErrorSQL is an errors expression that records a failure hopper
-// itself decided, at database time.
+// itself decided, at database time. A snoozed job's reason is kept in it,
+// since the row that held the reason is leaving the live table.
 func appendErrorSQL(message string) string {
-	return fmt.Sprintf(`j.errors || jsonb_build_object('at', now(), 'attempt', j.attempt, 'error', '%s')`, message)
+	return fmt.Sprintf(`j.errors || jsonb_build_object('at', now(), 'attempt', j.attempt, 'error',
+      CASE WHEN j.state = 'scheduled' AND j.snooze_reason IS NOT NULL THEN '%[1]s while snoozed: ' || j.snooze_reason
+           ELSE '%[1]s' END)`, message)
 }
 
 // finishedSelectColumns reads finished rows back in JobColumns order plus
 // finalized_at and output, as history rows scan.
 const finishedSelectColumns = `id, kind, queue, final_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
   attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id, expires_at,
-  cancel_requested_at, await, created_at, now() AS finalized_at, output`
+  cancel_requested_at, await, created_at, NULL::text AS snooze_reason, now() AS finalized_at, output`
 
 // finalizeTailSQL returns the CTEs that follow a finished CTE; the statement
 // must start with WITH RECURSIVE. Cancelled dependents that were awaited
@@ -242,7 +245,7 @@ SELECT %s, finalized_at, output FROM (
   SELECT %s, seq, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE batch_id = $1
   UNION ALL
   SELECT %s, seq, finalized_at, output FROM {{schema}}.hopper_job_history WHERE batch_id = $1
-) u ORDER BY seq`, JobColumns(""), JobColumns(""), JobColumns(""))
+) u ORDER BY seq`, JobColumns(""), JobColumns(""), historyColumns())
 
 // WorkflowGet implements driver.Executor.
 func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.WorkflowRow, error) {

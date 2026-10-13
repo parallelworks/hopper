@@ -99,6 +99,10 @@ type Notification struct {
 type Executor interface {
 	// Now returns the database's clock.
 	Now(ctx context.Context) (time.Time, error)
+	// SchemaVersion returns the newest applied schema version, or 0 if the
+	// schema has not been installed. It takes no lock, so it does not wait
+	// for a migration in progress.
+	SchemaVersion(ctx context.Context) (int, error)
 
 	// JobInsertMany inserts jobs in one statement and returns one result per
 	// input, in input order. An input whose unique key matches a live job is
@@ -135,7 +139,8 @@ type Executor interface {
 	JobCancel(ctx context.Context, id JobID) (*JobRow, error)
 	// JobRetry makes a job available now: a cancelled or discarded job is
 	// moved back from history (with one more attempt allowed if it had run
-	// out), and a waiting job has its schedule brought forward. It returns
+	// out), and a waiting job has its schedule brought forward. Either way
+	// the job's TTL is cleared, as an operator overriding the wait. It returns
 	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
 	// holds the same unique key.
 	JobRetry(ctx context.Context, id JobID) (*JobRow, error)
@@ -339,12 +344,18 @@ type JobRow struct {
 	PartitionKey string
 	// BatchID is the batch the job belongs to, or zero.
 	BatchID JobID
-	// ExpiresAt is the TTL deadline, or zero.
+	// ExpiresAt is the TTL deadline, or zero. A job still waiting to run
+	// at this time, for its first attempt or a later one, is discarded.
 	ExpiresAt time.Time
 	// CancelRequestedAt is set when JobCancel is called on a running job.
 	CancelRequestedAt time.Time
 	Await             bool
 	CreatedAt         time.Time
+	// SnoozeReason is the reason the worker gave when it last snoozed the
+	// job, while the job waits out that snooze. It is empty in any state but
+	// scheduled: the claim, any other finalize, a retry and a replacing
+	// insert clear it, and a row in another state never reports one.
+	SnoozeReason string
 	// FinalizedAt is set for jobs in history.
 	FinalizedAt time.Time
 	// Output is the value recorded by the worker, for jobs in history.
@@ -380,8 +391,9 @@ type JobInsertParams struct {
 	PartitionKey string
 	// BatchID, if set, counts the job toward a batch.
 	BatchID JobID
-	// TTL, if positive, discards the job if it has not started within this
-	// long of database now().
+	// TTL, if positive, sets ExpiresAt to this long after database now().
+	// A job past ExpiresAt is not claimed while it waits (available,
+	// scheduled or retryable) and JobDiscardExpired discards it.
 	TTL time.Duration
 	// Await marks the job so that its finalize is announced on ChannelDone.
 	Await bool
@@ -605,6 +617,8 @@ type JobFinalize struct {
 	// Snooze gives the attempt back, so the retry does not count against
 	// MaxAttempts.
 	Snooze bool
+	// SnoozeReason is stored as the job's SnoozeReason when Snooze is set.
+	SnoozeReason string
 	// Error is appended to the job's errors. Its At field is set by the
 	// engine from database time.
 	Error *AttemptError
@@ -676,7 +690,7 @@ type MessagePublishParams struct {
 	DedupKey string
 	// Delay schedules the deliveries for later.
 	Delay time.Duration
-	// TTL discards deliveries not started within this long.
+	// TTL sets each delivery's ExpiresAt, as JobInsertParams.TTL does.
 	TTL      time.Duration
 	Priority int
 	Await    bool

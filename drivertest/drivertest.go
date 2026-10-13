@@ -11,9 +11,9 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing, leases, leader election, rescue candidates, cancel, retry, TTL
-// expiry, listing, queues, periodic slots, stats, notifications and history
-// maintenance. Engine-specific behavior, such as how partitions are managed,
+// fencing, snooze reasons, leases, leader election, rescue candidates,
+// cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
+// notifications and history maintenance. Engine-specific behavior, such as how partitions are managed,
 // belongs in the driver's own tests.
 package drivertest
 
@@ -49,6 +49,14 @@ type Fixture[TTx any] interface {
 	// CountLive and CountHistory count jobs in the live table and in history.
 	CountLive(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
 	CountHistory(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
+	// Exec runs a SQL statement with hopper's tables on the search path, for
+	// rows the suite writes directly, such as those a client of the previous
+	// release leaves behind. QueryText returns the single text value a query
+	// selects, for what the driver's reads do not show. Both report a failure
+	// with t.Error rather than t.Fatal, so the suite may call them from any
+	// goroutine.
+	Exec(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any)
+	QueryText(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any) string
 }
 
 // Run runs the suite.
@@ -72,6 +80,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Cancel", testCancel[TTx]},
 		{"Retry", testRetry[TTx]},
 		{"TTL", testTTL[TTx]},
+		{"SnoozeReason", testSnoozeReason[TTx]},
+		{"SnoozeReasonConcurrent", testSnoozeReasonConcurrent[TTx]},
 		{"List", testList[TTx]},
 		{"Queues", testQueues[TTx]},
 		{"Periodic", testPeriodic[TTx]},

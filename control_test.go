@@ -127,6 +127,73 @@ func TestTTLDiscardsUnstartedJobs(t *testing.T) {
 	}
 }
 
+// TestTTLDiscardsJobsWaitingToRunAgain pins that a TTL bounds every wait,
+// not only the first: a job that has run and waits to run again, snoozed
+// or retrying, is discarded once it passes, without running again. The
+// TTL leaves a loaded machine seconds to claim each job once, and both
+// waits (a snooze of an hour, a first retry about six seconds away) end
+// after it.
+func TestTTLDiscardsJobsWaitingToRunAgain(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	var calls [2]atomic.Int32
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[noop]) error {
+		calls[job.Args.N].Add(1)
+		if job.Args.N == 0 {
+			return &hopper.SnoozeError{Duration: time.Hour, Reason: "later"}
+		}
+		return errors.New("flaky")
+	})
+	c := h.client(&hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers: workers,
+	})
+	events := make(chan hopper.Event, 100)
+	ectx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		for ev := range c.Events(ectx, hopper.EventJobSnoozed, hopper.EventJobDiscarded) {
+			events <- ev
+		}
+	}()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var ids [2]hopper.JobID
+	for n := range ids {
+		res, err := c.Insert(ctx, noop{N: n}, &hopper.InsertOpts{TTL: 3 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[n] = res.Job.ID
+	}
+	// The snoozed job's reason travels with its event and with the error
+	// it is discarded with.
+	want := [2]string{"hopper: expired while snoozed: later", "hopper: expired"}
+	for n, id := range ids {
+		job := waitForJob(t, c, id, hopper.JobStateDiscarded)
+		if last := job.Errors[len(job.Errors)-1]; last.Error != want[n] || calls[n].Load() != 1 || job.SnoozeReason != "" {
+			t.Errorf("job %d = %+v after %d attempts", n, job, calls[n].Load())
+		}
+	}
+	got := map[string]bool{}
+	for len(got) < 3 {
+		select {
+		case ev := <-events:
+			got[string(ev.Kind)+": "+ev.Error] = true
+		case <-time.After(10 * time.Second):
+			t.Fatalf("events so far: %v", got)
+		}
+	}
+	for _, key := range []string{"job.snoozed: later", "job.discarded: " + want[0], "job.discarded: " + want[1]} {
+		if !got[key] {
+			t.Errorf("no event %q in %v", key, got)
+		}
+	}
+}
+
 func TestPauseAndResume(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)

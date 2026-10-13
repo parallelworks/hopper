@@ -311,6 +311,7 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	p := params("k", 3)
 	p[0].UniqueKey = "u"
 	p[2].ScheduledAt = time.Now().Add(time.Hour)
+	p[2].TTL = time.Millisecond
 	inserted := insert(ctx, t, exec, p)
 	clientID := register(ctx, t, exec)
 	jobs := claim(ctx, t, exec, clientID, 2)
@@ -320,8 +321,17 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.JobRetry(ctx, jobs[0].ID); !errors.Is(err, driver.ErrJobRunning) {
 		t.Errorf("retry of running job = %v", err)
 	}
-	if job, err := exec.JobRetry(ctx, inserted[2].Job.ID); err != nil || job.State != driver.JobStateAvailable {
+	// A retry overrides the wait, so a TTL that has passed no longer
+	// applies: the job is neither discarded nor skipped by the claim.
+	time.Sleep(10 * time.Millisecond)
+	if job, err := exec.JobRetry(ctx, inserted[2].Job.ID); err != nil || job.State != driver.JobStateAvailable || !job.ExpiresAt.IsZero() {
 		t.Errorf("retry of scheduled job = %+v, %v", job, err)
+	}
+	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 0 {
+		t.Errorf("expired after retry = %+v, %v", expired, err)
+	}
+	if got := claim(ctx, t, exec, clientID, 1); len(got) != 1 || got[0].ID != inserted[2].Job.ID {
+		t.Errorf("claim after retry = %+v", got)
 	}
 	finalize(ctx, t, exec,
 		driver.JobFinalize{ID: inserted[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}},
@@ -374,6 +384,51 @@ func testTTL[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if again, err := exec.JobDiscardExpired(ctx, 100); err != nil || len(again) != 0 {
 		t.Errorf("second expiry = %v, %v", again, err)
+	}
+
+	// The deadline bounds every wait, not only the first: a job that has
+	// run and waits to run again, to retry or after a snooze, expires too.
+	// A running job does not.
+	p = params("again", 3)
+	for i := range p {
+		p[i].Queue, p[i].TTL = "again", 500*time.Millisecond
+	}
+	insert(ctx, t, exec, p)
+	clientID := register(ctx, t, exec)
+	claimAgain := func() []*driver.JobRow {
+		t.Helper()
+		res, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "again", ClientID: clientID, Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Jobs
+	}
+	ran := claimAgain()
+	if len(ran) != 3 {
+		t.Fatalf("claimed %d", len(ran))
+	}
+	finalize(ctx, t, exec,
+		driver.JobFinalize{ID: ran[0].ID, AttemptedBy: clientID, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}},
+		driver.JobFinalize{ID: ran[1].ID, AttemptedBy: clientID, State: driver.JobStateScheduled, Snooze: true, SnoozeReason: "later"},
+	)
+	time.Sleep(600 * time.Millisecond)
+	if jobs := claimAgain(); len(jobs) != 0 {
+		t.Errorf("claimed expired jobs: %+v", jobs)
+	}
+	expired, err = exec.JobDiscardExpired(ctx, 100)
+	if err != nil || len(expired) != 2 {
+		t.Fatalf("expired = %v, %v", expired, err)
+	}
+	// The snoozed job's reason is kept in its error, as the row that held
+	// it has left the live table.
+	want := map[driver.JobID]string{ran[0].ID: "hopper: expired", ran[1].ID: "hopper: expired while snoozed: later"}
+	for _, j := range expired {
+		if j.State != driver.JobStateDiscarded || j.SnoozeReason != "" || j.Errors[len(j.Errors)-1].Error != want[j.ID] {
+			t.Errorf("expired job = %+v, want error %q", j, want[j.ID])
+		}
+	}
+	if j, err := exec.JobGet(ctx, ran[2].ID); err != nil || j.State != driver.JobStateRunning {
+		t.Errorf("running job past its TTL = %+v, %v", j, err)
 	}
 }
 

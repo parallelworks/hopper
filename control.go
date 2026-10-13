@@ -41,8 +41,10 @@ func (c *Client[TTx]) JobCancel(ctx context.Context, id JobID) (*JobRow, error) 
 
 // JobRetry makes a job run again as soon as possible: a cancelled or
 // discarded job is re-driven from history with one more attempt allowed if
-// it had run out, and a waiting job has its schedule brought forward. It
-// returns ErrJobRunning for a running job.
+// it had run out, and a waiting job has its schedule brought forward. An
+// explicit retry overrides the wait, so the job's TTL no longer applies:
+// a job past its deadline still runs. It returns ErrJobRunning for a
+// running job.
 func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID) (*JobRow, error) {
 	job, err := c.exec.JobRetry(ctx, id)
 	if err != nil {
@@ -263,7 +265,7 @@ type Event struct {
 	// Job is set for job events: the row as claimed, before the outcome.
 	Job *JobRow
 	// Error is the attempt's error text for failed, discarded and
-	// cancelled jobs.
+	// cancelled jobs, and the snooze reason, if any, for snoozed jobs.
 	Error string
 	// ClientID is the client the event happened on.
 	ClientID int64

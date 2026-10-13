@@ -113,6 +113,7 @@ type SendEmailWorker struct {
 func (w *SendEmailWorker) Work(ctx context.Context, job *hopper.Job[SendEmail]) error {
     // A returned error schedules a retry with backoff.
     // return hopper.Snooze(time.Minute)  // reschedule without using up an attempt
+    // return &hopper.SnoozeError{Duration: time.Minute, Reason: "mailer rate limit"} // and say why
     // return hopper.Cancel(err)          // discard now, with no retry
     return w.Mailer.Send(ctx, job.Args.UserID, job.Args.Tmpl)
 }
@@ -225,7 +226,7 @@ hopper.Subscribe(workers, hopper.Subscription{Name: "billing", Pattern: "allocat
 res, err := client.PublishTx(ctx, tx, AllocationCreated{ID: 42}, &hopper.PublishOpts{
     OrderingKey: "allocation:42",   // FIFO per key
     DedupKey:    "evt-7f3a",        // idempotent publish
-    TTL:         10 * time.Minute,  // expire undelivered
+    TTL:         10 * time.Minute,  // discard deliveries still waiting to run after this
 })
 res.MessageID; res.Deliveries      // one delivery per matching subscription
 
@@ -386,10 +387,11 @@ CREATE TABLE hopper_jobs (
   ordering_key        text,
   partition_key       text,                      -- for partitioned rate/concurrency limits (M7)
   batch_id            uuid,
-  expires_at          timestamptz,               -- TTL: discarded if not started by then
+  expires_at          timestamptz,               -- TTL: discarded if still waiting to run by then
   cancel_requested_at timestamptz,
   await               boolean     NOT NULL DEFAULT false,   -- notify waiters on finalize
-  created_at          timestamptz NOT NULL DEFAULT now()
+  created_at          timestamptz NOT NULL DEFAULT now(),
+  snooze_reason       text                       -- why a snoozed job waits (schema v9); live table only
 ) WITH (fillfactor = 70);
 
 -- Claim path: the only index the hot query touches.
@@ -606,9 +608,16 @@ RETURNING j.*;
   `scheduled_at` has just arrived.
 - **Pipelining.** When the finalizer has pending results and the producer wants work,
   both statements are sent in one pgx batch, which is one network round trip.
-- **Expiry.** Rows past `expires_at` (set from `InsertOpts.TTL`, as `now() + TTL`) are
-  skipped by the claim, and the leader moves them to history as `discarded` with the
-  error `hopper: expired`.
+- **Expiry.** `InsertOpts.TTL` sets `expires_at` to `now() + TTL` at insert. It bounds
+  how long the job may wait to run, not only its first wait: a waiting row
+  (`available`, `scheduled` or `retryable`) past `expires_at` is skipped by the claim,
+  and the leader moves it to history as `discarded` with the error `hopper: expired`
+  (with `while snoozed: <reason>` appended for a job snoozed with a reason).
+  So a job that has run and is retrying or snoozed is discarded too once its deadline
+  passes, without running again. A running job is not interrupted, but if its attempt
+  ends in a retry or a snooze past the deadline, it is discarded. `JobRetry` clears the
+  deadline, live or from history: an explicit retry is the operator overriding the
+  wait, so a job past its TTL still runs.
 - **Limits.** Queues with a `GlobalLimit` or `RateLimit` claim inside a short
   transaction that locks their `hopper_queues` row (§9). Unlimited queues never touch
   that row, so they pay nothing for the feature.
@@ -641,14 +650,16 @@ keeps claiming; only when the buffer is full do job goroutines block on submit, 
 stops the producers. A flush that hits its 30 s timeout is retried as two halves,
 down to single results, so one statement the database cannot finish in time degrades
 into smaller ones instead of being sent again as it was. Retries and snoozes are
-updated in place. Terminal outcomes are moved to history.
+updated in place, a snooze with its reason. Terminal outcomes are moved to history.
 
 ```sql
-WITH r AS (SELECT * FROM unnest($ids, $attempted_by, $states, $delays, $snoozes, $errors, $outputs, $archives) AS r(...)),
+WITH r AS (SELECT * FROM unnest($ids, $attempted_by, $states, $delays, $snoozes, $errors, $outputs, $archives,
+                                 $snooze_reasons) AS r(...)),
 retry AS (
   UPDATE hopper_jobs j SET state = r.state, scheduled_at = now() + r.delay,
          attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
-         errors = j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())), attempted_by = NULL
+         errors = j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())), attempted_by = NULL,
+         snooze_reason = CASE WHEN r.snooze THEN r.snooze_reason END
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
     AND j.state = 'running' AND j.attempted_by = r.attempted_by
   RETURNING j.id),
@@ -677,6 +688,18 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   - **error:** `retryable` at `now() + backoff(attempt)`, or `discarded` when
     `attempt >= max_attempts`.
   - **`hopper.Snooze(d)`:** `scheduled` at `now() + d`, without using up an attempt.
+    A worker that returns a `*hopper.SnoozeError` with a `Reason` has the reason stored
+    in `snooze_reason` and shown as `JobRow.SnoozeReason`, so operators (`hopper jobs
+    get`, `hopperui`) can see why the job waits; `hopperotel` records it on the attempt's
+    span, and the `job.snoozed` event carries it as `Event.Error`. The claim clears it
+    in the statement that takes the job, and so do every other finalize, `JobRetry`
+    and a replacing insert, so the reason only ever describes the current wait. A
+    client of the previous release clears it in none of these, so during a rolling
+    deploy a running or retrying row can still hold one; reads therefore report the
+    reason only for a `scheduled` row. History has no such column, but a snoozed job
+    that expires or is cancelled keeps the reason in the error it is finalized with
+    (`hopper: expired while snoozed: <reason>`, `hopper: cancelled while snoozed:
+    <reason>`).
   - **`hopper.Cancel(err)`:** `discarded` immediately.
 - `backoff(n) = n^4 + 5s ± 10% jitter`, capped at 24h. It can be overridden per worker
   with `NextRetry(job) time.Time` or per queue with a `RetryPolicy`.
@@ -740,8 +763,9 @@ returns any cancel requests for that client's running jobs (through the small ru
 index), which covers missed notifications. The job finalizes as `cancelled` if the
 worker returns an error after the request, and as `completed` if it finishes anyway.
 `JobRetry` re-drives a cancelled or discarded job from history (with one more attempt
-allowed if it had run out, and a fresh `seq`) or brings a waiting job forward; it
-refuses a running job and a job whose unique key is held by a live job.
+allowed if it had run out, and a fresh `seq`) or brings a waiting job forward; either
+way it clears the job's TTL (§7.3). It refuses a running job and a job whose unique key
+is held by a live job.
 
 ### 7.8 Leader election
 Leadership is a lease row in `hopper_leader`:
@@ -1112,10 +1136,26 @@ observability without new machinery.
   binds SQL producer functions to that namespace. Down to zero leaves the
   namespace intact. Raw SQL users must set the target path themselves.
 - Every schema change ships with an upgrade test that migrates from the previous version
-  to the latest while a client works jobs in every state and inserts keep arriving
-  (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that
+  to the latest while jobs wait in every state, inserts keep arriving and claims keep
+  polling, then works them all with a client (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that
   block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
-  constraints, and so on).
+  constraints, and so on). A change that needs `ACCESS EXCLUSIVE`, such as adding a
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9), because a lock
+  request queued behind an open transaction on the table would hold up every claim
+  behind it; claims wait at most one try at a time. Between tries it sleeps a jittered,
+  growing interval capped at a second, raises a `NOTICE` every 10 seconds while it
+  waits, and gives up with an error after 10 minutes, so a transaction held open for
+  longer fails the migration (end it and run `Up` again) rather than stalling it
+  forever.
+- Each release's statements target its own schema version: the code is deployed after
+  `Up` (the client never runs against an older schema), and the previous release keeps
+  working on the new schema while it is rolled out. `Client.Start` enforces the first
+  half: it reads the newest version in `hopper_schema` (without the migration lock, so
+  it does not wait for a migration in progress) and fails with `ErrSchemaOutdated`,
+  naming the missing migrations, when it is older than the release's latest. When the latest version adds
+  something this release's statements use, the upgrade test produces the jobs and
+  traffic before and during the migration through the SQL producer contract and
+  version-independent statements, and starts this release's client once it is done.
 
 ## 13. Observability and operations
 

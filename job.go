@@ -58,8 +58,10 @@ type InsertOpts struct {
 	// Unique makes the job unique among live jobs of its kind. See
 	// UniqueOpts.
 	Unique *UniqueOpts
-	// TTL discards the job if it has not started within this long of its
-	// insert. Zero means no limit.
+	// TTL bounds how long the job may wait to run, measured from its
+	// insert: before its first attempt, between retries, and while snoozed.
+	// A job still waiting when it passes is discarded without running again.
+	// A running job is not interrupted. Zero means no limit.
 	TTL time.Duration
 	// Await announces the job's finalize, so that Await returns as soon as
 	// it commits instead of on its next poll.
@@ -125,13 +127,22 @@ type InsertResult struct {
 }
 
 // SnoozeError is returned by a worker to run the job again later without
-// using up an attempt. Use Snooze to create one.
+// using up an attempt. Use Snooze to create one, or return a SnoozeError
+// with a Reason to record why the job is waiting.
 type SnoozeError struct {
 	Duration time.Duration
+	// Reason is stored on the job while it waits, as JobRow.SnoozeReason,
+	// for operators, and is the Error of the job.snoozed event. It is
+	// cleared when the job runs again. A job that expires or is cancelled
+	// while it waits keeps the reason in the error it is finalized with.
+	Reason string
 }
 
 func (e *SnoozeError) Error() string {
-	return fmt.Sprintf("hopper: job snoozed for %s", e.Duration)
+	if e.Reason == "" {
+		return fmt.Sprintf("hopper: job snoozed for %s", e.Duration)
+	}
+	return fmt.Sprintf("hopper: job snoozed for %s: %s", e.Duration, e.Reason)
 }
 
 // Snooze returns an error a worker can return to reschedule the job after d
@@ -188,6 +199,10 @@ var ErrJobTimeout = errors.New("hopper: job timed out")
 var (
 	ErrClientStarted = errors.New("hopper: client already started")
 	ErrClientStopped = errors.New("hopper: client stopped")
+	// ErrSchemaOutdated is returned by Start when the database's schema is
+	// older than this release needs. Apply the missing migrations with
+	// hoppermigrate.Up or `hopper migrate up` first.
+	ErrSchemaOutdated = errors.New("hopper: database schema is out of date")
 )
 
 // jobTimeoutCause is stored via context.WithTimeoutCause so workers can

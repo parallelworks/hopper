@@ -24,7 +24,7 @@ SELECT hopper.hopper_insert('send_email', '{"user_id": 42, "tmpl": "welcome"}',
 | `scheduled_at` | timestamptz | Run no earlier than this. |
 | `metadata` | object | Stored with the job; trace context goes here. |
 | `unique_key` | string | At most one live job per (kind, key); a conflict returns the existing job's ID. |
-| `ttl_seconds` | number | Discard the job if it has not started within this long. |
+| `ttl_seconds` | number | Discard the job if it is still waiting to run this long after the insert: before its first attempt, between retries or while snoozed. |
 | `ordering_key` | string | Serialize with other jobs of the same key in the queue. |
 | `await` | bool | Announce the finalize on `hopper_done`. |
 
@@ -48,7 +48,7 @@ SELECT hopper.hopper_publish('allocation.created', '{"id": 42}',
 | `ordering_key` | string | FIFO per key, per queue. |
 | `dedup_key` | string | Idempotent publish while an earlier delivery is live. |
 | `delay_seconds` | number | Deliver later. |
-| `ttl_seconds` | number | Discard deliveries not started within this long. |
+| `ttl_seconds` | number | Discard each delivery still waiting to run this long after the publish, as `ttl_seconds` above. |
 | `priority` | 1–4 | Defaults to 2. |
 | `headers` | object of strings | Available to consumers as `Message.Headers`. |
 | `await` | bool | Announce each delivery's finalize on `hopper_done`. |

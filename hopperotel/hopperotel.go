@@ -141,7 +141,13 @@ func (m *middleware) Work(ctx context.Context, job *hopper.JobRow, next func(con
 
 	outcome := outcomeOf(err)
 	span.SetAttributes(attribute.String("hopper.job.outcome", outcome))
-	if err != nil && outcome != "snoozed" {
+	var snooze *hopper.SnoozeError
+	switch {
+	case outcome == "snoozed":
+		if errors.As(err, &snooze) && snooze.Reason != "" {
+			span.SetAttributes(attribute.String("hopper.job.snooze_reason", snooze.Reason))
+		}
+	case err != nil:
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	}

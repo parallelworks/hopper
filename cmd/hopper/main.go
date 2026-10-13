@@ -244,6 +244,9 @@ func printJob(w io.Writer, j *hopper.JobRow) {
 	fmt.Fprintf(w, "id:            %s\nkind:          %s\nqueue:         %s\nstate:         %s\npriority:      %d\nattempt:       %d/%d\n",
 		j.ID, j.Kind, j.Queue, j.State, j.Priority, j.Attempt, j.MaxAttempts)
 	fmt.Fprintf(w, "scheduled_at:  %s\ncreated_at:    %s\n", j.ScheduledAt.Local().Format(time.RFC3339), j.CreatedAt.Local().Format(time.RFC3339))
+	if j.SnoozeReason != "" {
+		fmt.Fprintf(w, "snooze_reason: %q\n", j.SnoozeReason)
+	}
 	if !j.AttemptedAt.IsZero() {
 		fmt.Fprintf(w, "attempted_at:  %s (client %d)\n", j.AttemptedAt.Local().Format(time.RFC3339), j.AttemptedBy)
 	}

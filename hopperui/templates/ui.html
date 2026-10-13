@@ -94,7 +94,7 @@
 <tr>
   <td><a href="{{$.Prefix}}/jobs/{{.ID}}"><code>{{.ID}}</code></a></td>
   <td>{{.Kind}}</td><td>{{.Queue}}</td>
-  <td><span class="state {{.State}}">{{.State}}</span></td>
+  <td><span class="state {{.State}}"{{with .SnoozeReason}} title="snoozed: {{.}}"{{end}}>{{.State}}</span></td>
   <td class="n">{{.Attempt}}/{{.MaxAttempts}}</td>
   <td title="{{ts .ScheduledAt}}">{{since .ScheduledAt}}</td>
   <td title="{{ts .CreatedAt}}">{{since .CreatedAt}}</td>
@@ -123,6 +123,7 @@
 <dl>
   <dt>created</dt><dd>{{ts .CreatedAt}}</dd>
   <dt>scheduled</dt><dd>{{ts .ScheduledAt}}</dd>
+  {{if .SnoozeReason}}<dt>snooze reason</dt><dd>{{.SnoozeReason}}</dd>{{end}}
   {{if not .AttemptedAt.IsZero}}<dt>attempted</dt><dd>{{ts .AttemptedAt}} by client {{.AttemptedBy}}</dd>{{end}}
   {{if not .FinalizedAt.IsZero}}<dt>finalized</dt><dd>{{ts .FinalizedAt}}</dd>{{end}}
   {{if not .ExpiresAt.IsZero}}<dt>expires</dt><dd>{{ts .ExpiresAt}}</dd>{{end}}

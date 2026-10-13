@@ -96,6 +96,7 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 		f.State = driver.JobStateScheduled
 		f.Delay = snooze.Duration
 		f.Snooze = true
+		f.SnoozeReason = snooze.Reason
 		return f
 	}
 
