@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 	"unicode"
@@ -192,12 +191,6 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 	}
 	if opts.MaxAttempts < 1 {
 		return driver.JobInsertParams{}, 0, fmt.Errorf("hopper: MaxAttempts %d must be positive", opts.MaxAttempts)
-	}
-	// Checked here rather than left to the engine because a batch callback
-	// is only inserted when the batch completes, where a value out of range
-	// would fail the completing statement.
-	if opts.MaxAttempts > math.MaxInt16 {
-		return driver.JobInsertParams{}, 0, fmt.Errorf("hopper: MaxAttempts %d is more than %d", opts.MaxAttempts, math.MaxInt16)
 	}
 	if len(opts.Metadata) > 0 && !json.Valid(opts.Metadata) {
 		return driver.JobInsertParams{}, 0, errors.New("hopper: Metadata is not valid JSON")

@@ -377,8 +377,8 @@ func TestBatchCallbacks(t *testing.T) {
 }
 
 // TestBatchesCompleteOnceAcrossClients works many batches on two clients,
-// whose finalizes of a batch's last jobs can run concurrently and leave the
-// batch to the leader: every batch's callback runs exactly once.
+// whose finalizes of a batch's last jobs can run concurrently, each missing
+// the other's progress: every batch's callback runs exactly once.
 func TestBatchesCompleteOnceAcrossClients(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -401,7 +401,19 @@ func TestBatchesCompleteOnceAcrossClients(t *testing.T) {
 		mu.Unlock()
 		return nil
 	})
-	clients := []*hopper.Client[pgxTx]{h.started(workers, 8), h.started(workers, 8)}
+	// Without a leader, so that the clients' own settles complete every
+	// batch, including those whose last jobs they finalized at the same time.
+	clients := make([]*hopper.Client[pgxTx], 2)
+	for i := range clients {
+		clients[i] = h.client(&hopper.Config{
+			Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 8}},
+			Workers:   workers,
+			NeverLead: true,
+		})
+		if err := clients[i].Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	const batches, size = 30, 8
 	ids := make([]string, batches)
@@ -421,8 +433,7 @@ func TestBatchesCompleteOnceAcrossClients(t *testing.T) {
 		defer mu.Unlock()
 		return len(runs) == batches
 	})
-	// Long enough for a second completion, by a finalize or the leader, to
-	// have run its callback too.
+	// Long enough for a second completion to have run its callback too.
 	time.Sleep(3 * fastTuning.LeaderInterval)
 	mu.Lock()
 	defer mu.Unlock()

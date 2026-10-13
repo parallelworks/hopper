@@ -166,10 +166,10 @@ func testClaimSkipsLocked[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
-func testFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
+func testFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
-	exec := d.Executor()
+	exec := executor(d, noBatches)
 	p := params("k", 6)
 	p[5].Await = true
 	inserted := insert(ctx, t, exec, p)
@@ -243,9 +243,9 @@ func testFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
-func testFinalizeFences[TTx any](t *testing.T, f Fixture[TTx]) {
+func testFinalizeFences[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	ctx := context.Background()
-	exec := f.NewDriver(t).Executor()
+	exec := executor(f.NewDriver(t), noBatches)
 	insert(ctx, t, exec, params("k", 1))
 	a, b := register(ctx, t, exec), register(ctx, t, exec)
 	jobs := claim(ctx, t, exec, a, 1)

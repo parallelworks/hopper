@@ -15,12 +15,18 @@
 -- A new table takes no lock on an existing one, and a client of the
 -- previous release keeps counting down pending, which the remaining count
 -- includes.
+--
+-- Every finalize of a batch's jobs writes to this table, and settles empty
+-- it right after, so a vacuum would end most
+-- passes by taking an exclusive lock to give back the empty tail, holding
+-- up every finalize while it does. As schema v7 does for the live table,
+-- vacuums leave the pages in place.
 
 CREATE TABLE hopper_batch_progress (
   id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   batch_id uuid NOT NULL,
   done     int  NOT NULL,  -- jobs finalized
   failed   int  NOT NULL   -- of those, cancelled or discarded
-);
+) WITH (vacuum_truncate = false);
 
 CREATE INDEX hopper_batch_progress_batch ON hopper_batch_progress (batch_id);

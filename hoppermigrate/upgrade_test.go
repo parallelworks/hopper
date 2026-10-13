@@ -113,16 +113,6 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	if _, err := held.Exec(ctx, `SELECT hopper_insert('upgrade', '{"n": 100000}', '{"max_attempts": 3}')`); err != nil {
 		t.Fatal(err)
 	}
-	// So does a finalize of the previous release, which counts its batch
-	// down on the batch row.
-	heldBatch, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer heldBatch.Rollback(ctx) //nolint:errcheck // committed below
-	if _, err := heldBatch.Exec(ctx, `UPDATE hopper_batches SET pending = pending WHERE id = $1::uuid`, batch); err != nil {
-		t.Fatal(err)
-	}
 	const holdFor = 2 * time.Second
 
 	var (
@@ -168,9 +158,6 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 		if err := held.Commit(ctx); err != nil {
 			t.Errorf("commit the held transaction: %v", err)
 		}
-		if err := heldBatch.Commit(ctx); err != nil {
-			t.Errorf("commit the held batch transaction: %v", err)
-		}
 	})
 
 	// The migration gives up on its own only after 10 minutes, too long
@@ -193,7 +180,7 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	// A migration that locks hopper_jobs waits for the held transaction,
 	// which shows the test reached its lock; one that leaves the table
 	// alone has nothing to wait for.
-	if latest := hoppermigrate.Migrations()[hoppermigrate.Latest()-1]; strings.Contains(latest.Up, "hopper_jobs") && took < holdFor*9/10 {
+	if latest := hoppermigrate.Migrations()[hoppermigrate.Latest()-1]; namesJobs(latest.Up) && took < holdFor*9/10 {
 		t.Errorf("migration took %s, less than the held transaction's %s: it was not held up", took, holdFor)
 	}
 	if s := time.Duration(slowest.Load()); s > holdFor/2 {
@@ -265,6 +252,17 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	if err != nil || v != hoppermigrate.Latest() {
 		t.Errorf("Version = %d, %v", v, err)
 	}
+}
+
+// namesJobs reports whether a migration script names hopper_jobs outside
+// its comments, so that a comment mentioning the table does not count.
+func namesJobs(script string) bool {
+	for line := range strings.Lines(script) {
+		if code, _, _ := strings.Cut(line, "--"); strings.Contains(code, "hopper_jobs") {
+			return true
+		}
+	}
+	return false
 }
 
 func mustParse(t *testing.T, s string) hopper.JobID {

@@ -22,6 +22,10 @@ type stubExec struct {
 	failAbove int
 }
 
+func (e *stubExec) BatchSettle(context.Context, driver.BatchSettleParams) (driver.BatchSettleResult, error) {
+	return driver.BatchSettleResult{}, nil
+}
+
 func (e *stubExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
 	n := len(params.Jobs)
 	e.mu.Lock()
@@ -185,6 +189,10 @@ type failNExec struct {
 	fail  int
 	err   error
 	calls *int
+}
+
+func (e *failNExec) BatchSettle(context.Context, driver.BatchSettleParams) (driver.BatchSettleResult, error) {
+	return driver.BatchSettleResult{}, nil
 }
 
 func (e *failNExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {

@@ -472,7 +472,8 @@ index, `hopper_batches` and the batch index. Schema v4 (M8) adds `hopper_job_dep
 name and edges of a batch, and a `batch_id` index on history (§11). Schema v5 (M8) adds
 the stream log `hopper_stream_events` (partitioned by day) and `hopper_stream_consumers`
 (§10). Schema v11 adds `hopper_batch_progress (id, batch_id, done, failed)`, where
-finalizing statements record batch progress (§11).
+finalizing statements record batch progress (§11), with `vacuum_truncate = false`
+like `hopper_jobs`, since every finalize of a batch's jobs writes to it.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -797,8 +798,7 @@ can briefly overlap during a partition.
 
 Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
 partitions ahead of time and dropping expired ones, removing stale `hopper_clients`
-rows, folding batch progress and completing batches whose last jobs were finalized at
-the same time (§11).
+rows, and sweeping the batch progress that clients did not settle (§11).
 
 A client with `Config.NeverLead` never attempts the lease. It claims and works jobs
 like any other, so an install can include processes that should do work but not run
@@ -1131,29 +1131,52 @@ observability without new machinery.
   - **Completion.** A batch's remaining count is `pending` less the progress rows'
     `done`. The statement that finds nothing remaining after its own jobs completes
     the batch instead of appending: it sets `completed_at` and the total `failed`,
-    deletes the batch's progress rows, and inserts the callbacks in the same
+    zeroes `pending` (which the previous release reads as is), deletes the batch's
+    progress rows, and inserts the callbacks in the same
     statement: `on_success` when nothing failed, `on_failure` otherwise, `on_complete`
     either way, each with `batch_id` and `batch_failed` in its metadata, and notifies
     their queues. It decides from its snapshot alone, and the update re-checks only
     `completed_at IS NULL`, so callbacks run once and a fold committed meanwhile
     (below) cannot be counted twice. Failures are counted here rather than read from
     history, which retention prunes.
-  - **Folding, and concurrent last jobs.** The leader's `BatchSettle`, on every pass,
-    locks batches that have progress rows (`SKIP LOCKED`), folds the rows into
-    `pending` and `failed`, and completes those with nothing remaining, with their
-    callbacks. That keeps the progress table to the last few seconds of finalizes,
-    and completes a batch whose last jobs two statements finalized at the same time,
-    each missing the other's uncommitted row; such a batch completes up to one leader
-    interval later. An uncommitted progress row is invisible to the fold and stays
-    until it commits.
+  - **Settling, and concurrent last jobs.** Two statements that finalize a batch's last
+    jobs at the same time each miss the other's uncommitted row, so neither completes
+    the batch. `BatchSettle` locks batch rows that have progress rows, folds the rows
+    into `pending` and `failed`, and completes those with nothing remaining, with
+    their callbacks. The finalizer runs it on the batches of a flush once the flush
+    has committed, waiting for a batch row another settle holds, so of the two the
+    one settling second sees the other's progress and completes the batch. The wait
+    is bounded (`lock_timeout` 500 ms, below `deadlock_timeout`, so a settle that
+    would deadlock with a finalize completing several batches gives up first); a
+    batch it cannot get is left to the leader, which on every pass sweeps batches
+    with progress rows in ID order (`SKIP LOCKED`, resuming where a pass stopped)
+    and deletes progress rows whose batch no longer exists. The sweep covers a
+    client that stopped between commit and settle, and results the leader itself
+    applies (rescue). Settling after every flush keeps the progress table to the
+    flushes in flight. An uncommitted progress row is invisible to a settle and
+    stays until it commits.
+  - **Jobs outside batches.** A flush whose jobs all have no batch (and therefore no
+    workflow dependents) sets `JobFinalizeParams.NoBatches`, and the engine runs a
+    finalize without the batch and dependency steps, which roughly halves the cost of
+    a small flush.
   - **Reading progress.** `BatchGet` and `WorkflowGet` report `pending` and `failed`
     with the progress rows folded in.
   - **Rolling deploys.** A client of the previous release counts down `pending`, which
     the remaining count includes, and completes the batch when `pending` reaches zero,
     which it does only if it finalized every job. Otherwise this release completes it;
-    the `completed_at` guard keeps the two from both running the callbacks. Going back
-    below v11 folds the progress rows into `pending` and completes, with callbacks,
-    the batches left with nothing remaining.
+    the `completed_at` guard keeps the two from both running the callbacks. A client
+    of this release settles its batches after each flush, so the previous release's
+    countdown sees its progress folded; only a batch whose settle was left to the
+    sweep waits, while a client of the previous release holds the leader lease, until
+    a client of this release is elected. Going back below v11 locks the progress table, folds
+    the rows into `pending` and completes, with callbacks, the batches left with
+    nothing remaining.
+  - **Callbacks are validated at insert.** A callback that the completing statement
+    could not insert (a priority outside 1..4, `max_attempts` beyond `smallint`) is
+    rejected by `BatchInsert`, because the completing statement would fail, and in
+    `BatchSettle` that would fail every other batch's fold with it. Rows written
+    before this check have the values clamped into range when the callback is
+    inserted.
 - **Workflows (M8).** A workflow is a batch whose jobs depend on each other, so it has
   a name, the batch's progress and callbacks, and its graph (`hopper_batches.edges`).
   `NewWorkflow` collects steps; a step can only depend on steps added before it, so the

@@ -27,10 +27,10 @@ func leaveReason[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d d
 	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET snooze_reason = 'left behind' WHERE id = $1::uuid", id.String())
 }
 
-func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx]) {
+func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
-	exec := d.Executor()
+	exec := executor(d, noBatches)
 	p := params("k", 1)
 	p[0].UniqueKey = "nap"
 	id := insert(ctx, t, exec, p)[0].Job.ID

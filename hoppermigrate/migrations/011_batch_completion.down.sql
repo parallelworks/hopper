@@ -1,6 +1,12 @@
 -- The previous release counts batches down on pending alone: fold the
 -- progress rows into it. A batch whose count reaches zero here completes,
 -- with its callbacks, as the previous release's finalize would have done.
+--
+-- The table is locked first: a row a client of this release committed
+-- after the fold read the table would otherwise be dropped unfolded, and its
+-- batch would never complete. The drop needs the same lock anyway.
+
+LOCK TABLE hopper_batch_progress IN ACCESS EXCLUSIVE MODE;
 
 WITH sums AS (
   SELECT batch_id, sum(done) AS done, sum(failed) AS failed FROM hopper_batch_progress GROUP BY batch_id

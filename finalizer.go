@@ -42,6 +42,7 @@ type finalizer struct {
 // finalizeExecutor is the part of driver.Executor the finalizer uses.
 type finalizeExecutor interface {
 	JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error)
+	BatchSettle(ctx context.Context, params driver.BatchSettleParams) (driver.BatchSettleResult, error)
 }
 
 type pending struct {
@@ -136,16 +137,21 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 		return
 	}
 	jobs := make([]driver.JobFinalize, len(batch))
+	noBatches := true
 	for i, p := range batch {
 		jobs[i] = p.result
+		noBatches = noBatches && p.job.BatchID.IsZero()
 	}
 	backoff := 50 * time.Millisecond
 	for {
 		opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
-		applied, err := f.exec.JobFinalizeMany(opCtx, driver.JobFinalizeParams{Jobs: jobs})
+		applied, err := f.exec.JobFinalizeMany(opCtx, driver.JobFinalizeParams{Jobs: jobs, NoBatches: noBatches})
 		cancel()
 		if err == nil {
 			f.afterFlush(ctx, batch, applied)
+			if !noBatches {
+				f.settle(ctx, batch)
+			}
 			return
 		}
 		if ctx.Err() != nil {
@@ -164,6 +170,30 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 			f.flush(ctx, batch[half:])
 			return
 		}
+	}
+}
+
+// settle settles the batches of the jobs a flush finished, once it has
+// committed: a batch whose last jobs this flush and another client's
+// finalized at the same time is completed by whichever of the two settles
+// second.
+func (f *finalizer) settle(ctx context.Context, batch []pending) {
+	seen := map[driver.JobID]struct{}{}
+	var ids []driver.JobID
+	for _, p := range batch {
+		if _, dup := seen[p.job.BatchID]; dup || p.job.BatchID.IsZero() || !p.result.State.Terminal() {
+			continue
+		}
+		seen[p.job.BatchID] = struct{}{}
+		ids = append(ids, p.job.BatchID)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
+	defer cancel()
+	if _, err := f.exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: ids}); err != nil {
+		f.logger.WarnContext(ctx, "hopper: settle batches; the leader will", "count", len(ids), "error", err)
 	}
 }
 

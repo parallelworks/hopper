@@ -25,12 +25,14 @@ import (
 // and is still open (CompleteTx) holds up none of the job's siblings. The
 // statement that finds nothing remaining (pending less the rows' done and
 // its own) completes the batch instead of appending, guarded by
-// completed_at so the callbacks run once. Whether the batch is ready is
+// completed_at so the callbacks run once, and zeroes pending, which a
+// client of the previous release reads as is. Whether the batch is ready is
 // decided from the statement's snapshot alone, and the update re-checks only
-// completed_at, so a fold the leader commits meanwhile cannot make the
+// completed_at, so a settle committed meanwhile cannot make the
 // statement count rows twice. Two last jobs finalized in concurrent
 // statements each miss the other's uncommitted row, so neither completes
-// the batch; BatchSettle, run by the leader, does.
+// the batch; BatchSettle, which each client runs on its batches after the
+// statement commits and the leader on any left, does.
 
 // finishedColumns lists the columns a finishing CTE returns from a
 // hopper_jobs row aliased j: the row, with the given expressions for its
@@ -68,18 +70,41 @@ const batchProgressSQL = `LATERAL (SELECT coalesce(sum(p.done), 0) AS done, coal
 
 // batchCallbacksSQL returns the CTE that inserts the callbacks of the
 // batches a CTE named batches has just completed, and notifies their
-// queues.
+// queues. BatchInsert rejects a priority or max_attempts out of range, and
+// those of rows written before it did are clamped, so that one batch's
+// callback cannot fail the statement that completes or settles others.
 func batchCallbacksSQL(insertChannelParam string) string {
 	return `callbacks AS (
   INSERT INTO {{schema}}.hopper_jobs (kind, queue, priority, max_attempts, args, metadata)
-  SELECT cb->>'kind', coalesce(cb->>'queue', 'default'), coalesce((cb->>'priority')::smallint, 2),
-    coalesce((cb->>'max_attempts')::smallint, 25), coalesce(cb->'args', '{}'),
+  SELECT cb->>'kind', coalesce(cb->>'queue', 'default'),
+    least(greatest(coalesce((cb->>'priority')::numeric, 2), 1), 4)::smallint,
+    least(greatest(coalesce((cb->>'max_attempts')::numeric, 25), 1), 32767)::smallint, coalesce(cb->'args', '{}'),
     coalesce(cb->'metadata', '{}') || jsonb_build_object('batch_id', b.id::text, 'batch_failed', b.failed)
   FROM batches b, LATERAL (VALUES (CASE WHEN b.failed = 0 THEN b.on_success ELSE b.on_failure END), (b.on_complete)) AS v(cb)
   WHERE cb IS NOT NULL
   RETURNING pg_notify(` + insertChannelParam + `, queue)
 )`
 }
+
+// archivedSQL is the CTE that writes the rows of a CTE named done that are
+// to be archived to history.
+const archivedSQL = `archived AS (
+  INSERT INTO {{schema}}.hopper_job_history (
+    id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
+    attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
+    expires_at, cancel_requested_at, await, created_at, finalized_at, output)
+  SELECT id, seq, kind, queue, final_state::{{schema}}.hopper_job_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
+    attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
+    expires_at, cancel_requested_at, await, created_at, now(), output
+  FROM done WHERE archive
+  RETURNING id
+)`
+
+// plainFinalizeTailSQL is finalizeTailSQL for statements whose jobs belong
+// to no batch or workflow, which therefore have no batch to record and no
+// dependents: it only archives.
+const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
+` + archivedSQL
 
 // finalizeTailSQL returns the CTEs that follow a finished CTE; the statement
 // must start with WITH RECURSIVE. Cancelled dependents that were awaited
@@ -100,17 +125,7 @@ cascaded AS (
   RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "NULL::jsonb", "true", "'cancelled'::text", doneChannelParam) + `
 ),
 done AS (SELECT * FROM finished UNION ALL SELECT * FROM cascaded),
-archived AS (
-  INSERT INTO {{schema}}.hopper_job_history (
-    id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
-    attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, finalized_at, output)
-  SELECT id, seq, kind, queue, final_state::{{schema}}.hopper_job_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
-    attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, now(), output
-  FROM done WHERE archive
-  RETURNING id
-),
+` + archivedSQL + `,
 batch_counts AS (
   SELECT batch_id, count(*) AS n, count(*) FILTER (WHERE final_state IN ('cancelled', 'discarded')) AS f
   FROM done WHERE batch_id IS NOT NULL GROUP BY batch_id
@@ -121,7 +136,7 @@ ready AS (
   WHERE b.completed_at IS NULL AND b.pending - p.done - c.n <= 0
 ),
 batches AS (
-  UPDATE {{schema}}.hopper_batches b SET completed_at = now(), failed = r.failed
+  UPDATE {{schema}}.hopper_batches b SET completed_at = now(), pending = 0, failed = r.failed
   FROM ready r WHERE b.id = r.id AND b.completed_at IS NULL
   RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete
 ),
