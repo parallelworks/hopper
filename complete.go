@@ -22,12 +22,12 @@ var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt"
 //
 // The completion is fenced like every finalize: if the attempt no longer
 // owns the job, nothing is written and ErrJobFenced is returned, and the
-// worker should roll tx back. Once the worker returns, the client cannot
-// tell whether tx committed, so it sends the attempt's other outcome, also
-// fenced: the worker's error, or a failure if it returned nil. If tx
-// committed, the job is finished and that outcome is dropped, whatever the
-// worker returned, and the job.completed event fires. If tx did not commit,
-// the attempt fails as that outcome says and the job is retried.
+// worker should roll tx back. Once the worker returns, the client reads the
+// job to learn whether tx committed. If it did, the job is finished,
+// whatever the worker returned, and the job.completed event fires. If it did
+// not, the attempt fails with the worker's error, or with a failure if the
+// worker returned nil, and the job is retried. A worker that returns before
+// tx ends holds up only its own job's result, until tx ends.
 //
 // Call it last, just before the commit. From CompleteTx until tx ends, tx
 // holds the job's row and those of workflow dependents it promotes or

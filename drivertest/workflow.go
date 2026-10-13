@@ -210,8 +210,9 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 
 // testWorkflowFanInConcurrent finalizes a job's two dependencies in
 // concurrent transactions. Each statement still sees the other dependency
-// live, so neither promotes the dependent; the leader's
-// WorkflowPromoteReady does, and only once both have committed.
+// live, so neither promotes the dependent; WorkflowPromoteReady, run by
+// each finalizing client after its statement commits, does once both have
+// committed, and the leader's sweep finds what clients left.
 func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -228,13 +229,13 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
 		t.Fatalf("claimed %d", len(jobs))
 	}
-	promote := func() int64 {
+	promote := func(dependsOn ...driver.JobID) int64 {
 		t.Helper()
-		n, err := exec.WorkflowPromoteReady(ctx, 10)
+		res, err := exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: dependsOn, Limit: 10})
 		if err != nil {
 			t.Fatal(err)
 		}
-		return n
+		return res.Promoted
 	}
 	completed := func(id driver.JobID) driver.JobFinalize {
 		return driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
@@ -251,7 +252,7 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(y)}}); err != nil || len(applied) != 1 {
 		t.Fatalf("concurrent finalize = %v, %v", applied, err)
 	}
-	if n := promote(); n != 0 {
+	if n := promote(y); n != 0 {
 		t.Errorf("promoted %d while a dependency's finalize was uncommitted", n)
 	}
 	if err := commit(); err != nil {
@@ -260,13 +261,64 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStatePending {
 		t.Fatalf("dependent after both finalizes = %+v, %v; the race should leave it pending", j, err)
 	}
-	if n := promote(); n != 1 {
+	if n := promote(x); n != 1 {
 		t.Errorf("promoted %d, want 1", n)
 	}
 	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateAvailable {
 		t.Errorf("dependent after promote = %+v, %v", j, err)
 	}
-	if n := promote(); n != 0 {
+	if n := promote(x, y); n != 0 {
 		t.Errorf("second promote = %d", n)
+	}
+	if n := promote(); n != 0 {
+		t.Errorf("sweep after the dependent was promoted = %d", n)
+	}
+
+	// The sweep walks the jobs with dependencies a chunk at a time, in ID
+	// order from After. Each of two workflows has a step whose dependency
+	// finished, left pending as a client that stopped before promoting it
+	// would leave it.
+	if jobs := claim(ctx, t, exec, clientID, 1); len(jobs) != 1 || jobs[0].ID != dep {
+		t.Fatalf("claimed %+v, want the fan-in dependent", jobs)
+	}
+	finalize(ctx, t, exec, completed(dep))
+	var steps []driver.JobID
+	for range 2 {
+		wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+			Name: "chain", Jobs: params("chain", 2), Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobs := claim(ctx, t, exec, clientID, 1)
+		if len(jobs) != 1 || jobs[0].ID != wf.Jobs[0].Job.ID {
+			t.Fatalf("claimed %+v", jobs)
+		}
+		finalize(ctx, t, exec, completed(jobs[0].ID))
+		f.Exec(ctx, t, d, `UPDATE hopper_jobs SET state = 'pending' WHERE id = $1::uuid`, wf.Jobs[1].Job.ID.String())
+		steps = append(steps, wf.Jobs[1].Job.ID)
+	}
+	sweep := func(after driver.JobID) driver.WorkflowPromoteResult {
+		t.Helper()
+		res, err := exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{After: after, Limit: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	var after driver.JobID
+	for _, step := range steps {
+		if res := sweep(after); res.Scanned != 1 || res.Promoted != 1 || res.Last != step {
+			t.Errorf("chunk = %+v; want %s promoted", res, step)
+		}
+		after = step
+	}
+	if res := sweep(after); res.Scanned != 0 || res.Promoted != 0 {
+		t.Errorf("chunk past the last = %+v", res)
+	}
+	for _, step := range steps {
+		if j, err := exec.JobGet(ctx, step); err != nil || j.State != driver.JobStateAvailable {
+			t.Errorf("swept step = %+v, %v", j, err)
+		}
 	}
 }

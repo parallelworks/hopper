@@ -254,8 +254,7 @@ func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 		return tx.QueryRow(ctx, batchSettleIDsSQL, driver.ChannelInsert, ids).Scan(&res.Folded, &res.Completed, &last)
 	})
 	if err != nil {
-		var coded interface{ SQLState() string }
-		if errors.As(err, &coded) && coded.SQLState() == "55P03" {
+		if lockNotAvailable(err) {
 			return driver.BatchSettleResult{}, nil
 		}
 		return driver.BatchSettleResult{}, fmt.Errorf("hopper: settle batches: %w", err)

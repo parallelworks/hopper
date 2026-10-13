@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -243,6 +244,45 @@ func testFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 }
 
+// testFinalizeSkipLocked finalizes with SkipLocked while another
+// transaction holds one of the rows, as a worker's CompleteTx that has not
+// ended does: the statement returns at once, without that job, and applies
+// it once the row is free.
+func testFinalizeSkipLocked[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := executor(d, noBatches)
+	insert(ctx, t, exec, params("k", 2))
+	clientID := register(ctx, t, exec)
+	jobs := claim(ctx, t, exec, clientID, 2)
+	if len(jobs) != 2 {
+		t.Fatalf("claimed %d", len(jobs))
+	}
+	held, free := jobs[0].ID, jobs[1].ID
+	tx, _, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // rolled back below
+	finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: held, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	failed := driver.JobFinalize{ID: held, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}}
+	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	applied, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: []driver.JobFinalize{
+		failed, {ID: free, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+	}})
+	if err != nil || !slices.Equal(applied, []driver.JobID{free}) {
+		t.Fatalf("finalize with a held row = %v, %v; want only %s", applied, err, free)
+	}
+	if err := rollback(); err != nil {
+		t.Fatal(err)
+	}
+	applied, err = exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: []driver.JobFinalize{failed}})
+	if err != nil || !slices.Equal(applied, []driver.JobID{held}) {
+		t.Fatalf("finalize once the row is free = %v, %v", applied, err)
+	}
+	if j, err := exec.JobGet(ctx, held); err != nil || j.State != driver.JobStateRetryable {
+		t.Errorf("job = %+v, %v", j, err)
+	}
+}
+
 func testFinalizeFences[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	ctx := context.Background()
 	exec := executor(f.NewDriver(t), noBatches)
@@ -349,8 +389,10 @@ func testFinalizeTxConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	for i, r := range inserted {
 		commitTx := i%2 == 0
 		tx, commit, rollback := f.Begin(ctx, t, d)
+		// Rolled back on exit too, so a failed check cannot leave it open
+		// with the competing finalize waiting on it.
+		defer rollback() //nolint:errcheck // already ended on the happy path
 		if applied := finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
-			_ = rollback()
 			t.Fatalf("finalize in tx applied %v", applied)
 		}
 		done := make(chan []driver.JobID, 1)

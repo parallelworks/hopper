@@ -1,6 +1,7 @@
 package pgsql
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -71,6 +72,7 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 	if err := e.Conn.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
 		return res, fmt.Errorf("hopper: history maintenance: %w", err)
 	}
+	lockTimeout := fmt.Sprintf("%dms", max(cmp.Or(params.LockTimeout, defaultDDLLockTimeout), time.Millisecond).Milliseconds())
 	retention := map[string]time.Duration{
 		"hopper_job_history_completed": params.CompletedRetention,
 		"hopper_job_history_failed":    params.FailedRetention,
@@ -83,15 +85,24 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 		}
 		keep := retention[g.parent]
 
-		// Create the periods ahead of the current one.
+		// Create the periods ahead of the current one. Every attach waits
+		// for the same locks (the parent, and the DEFAULT partition it
+		// scans), so once one is deferred the rest are deferred untried:
+		// each attempt would hold the group's writers up for
+		// the lock timeout again.
 		start := now.UTC().Truncate(g.period)
+		blocked := false
 		for i := 1; i <= g.ahead; i++ {
 			from := start.Add(time.Duration(i) * g.period)
 			name := g.name(from)
 			if _, ok := existing[name]; ok {
 				continue
 			}
-			created, deferred, err := e.createPartition(ctx, g, name, from, from.Add(g.period))
+			if blocked {
+				res.Deferred = append(res.Deferred, name)
+				continue
+			}
+			created, deferred, err := e.createPartition(ctx, g, name, from, from.Add(g.period), lockTimeout)
 			if err != nil {
 				return res, err
 			}
@@ -99,25 +110,34 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 				res.Created = append(res.Created, name)
 			}
 			if deferred {
+				blocked = true
 				res.Deferred = append(res.Deferred, name)
 			}
 		}
 
-		// Drop partitions whose whole period is past retention.
+		// Drop partitions whose whole period is past retention. Every drop
+		// waits for the same lock on the parent, so as with the attaches,
+		// once one is deferred the rest are deferred untried.
 		if keep > 0 {
 			cutoff := now.Add(-keep)
+			blocked := false
 			for name := range existing {
 				from, ok := g.parse(name)
 				if !ok || !from.Add(g.period).Before(cutoff) {
 					continue
 				}
-				dropped, err := e.dropPartition(ctx, name)
+				if blocked {
+					res.Deferred = append(res.Deferred, name)
+					continue
+				}
+				dropped, err := e.dropPartition(ctx, name, lockTimeout)
 				if err != nil {
 					return res, err
 				}
 				if dropped {
 					res.Dropped = append(res.Dropped, name)
 				} else {
+					blocked = true
 					res.Deferred = append(res.Deferred, name)
 				}
 			}
@@ -134,11 +154,12 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 	return res, nil
 }
 
-// ddlLockTimeout bounds how long a partition's creation or drop waits for
-// its lock. While it waits, every statement that needs the same table queues
+// defaultDDLLockTimeout bounds how long a partition's creation or drop
+// waits for its lock, unless HistoryMaintainParams.LockTimeout says
+// otherwise. While it waits, every statement that needs the same table queues
 // behind it, and a transaction that wrote history (a worker's CompleteTx)
 // holds it off until that transaction ends; the next pass retries.
-const ddlLockTimeout = "200ms"
+const defaultDDLLockTimeout = 200 * time.Millisecond
 
 // lockNotAvailable reports whether err is a lock_timeout expiry.
 func lockNotAvailable(err error) bool {
@@ -149,28 +170,20 @@ func lockNotAvailable(err error) bool {
 // dropPartition drops a partition past retention. DROP takes a brief
 // ACCESS EXCLUSIVE lock on the parent for the catalog change, once per
 // period. (DETACH CONCURRENTLY would avoid it, but Postgres refuses it while
-// a DEFAULT partition exists.) The wait is bounded by ddlLockTimeout: a
-// drop that cannot get the lock in time returns false.
-func (e *Executor) dropPartition(ctx context.Context, name string) (dropped bool, err error) {
-	tx, err := e.Conn.Begin(ctx)
+// a DEFAULT partition exists.) The wait is bounded by lockTimeout: a drop
+// that cannot get the lock in time returns false.
+func (e *Executor) dropPartition(ctx context.Context, name, lockTimeout string) (bool, error) {
+	err := e.withTx(ctx, func(tx Tx) error {
+		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+lockTimeout+"'"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name))
+		return err
+	})
+	if lockNotAvailable(err) {
+		return false, nil
+	}
 	if err != nil {
-		return false, err
-	}
-	defer func() {
-		if !dropped {
-			_ = tx.Rollback(context.WithoutCancel(ctx))
-		}
-	}()
-	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+ddlLockTimeout+"'"); err != nil {
-		return false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
-	}
-	if _, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name)); err != nil {
-		if lockNotAvailable(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
 	}
 	return true, nil
@@ -194,8 +207,8 @@ func (e *Executor) partitionsOf(ctx context.Context, parent string) (map[string]
 
 // createPartition creates a time partition for a future period and attaches
 // it. It returns false if another leader created the partition meanwhile,
-// and deferred if it could not get its locks within ddlLockTimeout.
-func (e *Executor) createPartition(ctx context.Context, g historyGroup, name string, from, to time.Time) (created, deferred bool, err error) {
+// and deferred if it could not get its locks within lockTimeout.
+func (e *Executor) createPartition(ctx context.Context, g historyGroup, name string, from, to time.Time, lockTimeout string) (created, deferred bool, err error) {
 	tx, err := e.Conn.Begin(ctx)
 	if err != nil {
 		return false, false, err
@@ -229,10 +242,13 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// small table alone; the period is in the future, so it finds none. A
 	// transaction that wrote a row to the DEFAULT partition holds that lock
 	// off until it ends, so the wait is bounded.
-	if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout = '"+ddlLockTimeout+"'"); err != nil {
+	if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout = '"+lockTimeout+"'"); err != nil {
 		return false, false, fmt.Errorf("hopper: create partition %s: %w", name, err)
 	}
 	if _, err = tx.Exec(ctx, "CREATE TABLE "+ident+" (LIKE "+e.Schema.Table(g.root)+" INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"); err != nil {
+		if lockNotAvailable(err) {
+			return false, true, nil
+		}
 		return false, false, fmt.Errorf("hopper: create partition %s: %w", name, err)
 	}
 	if _, err = tx.Exec(ctx, fmt.Sprintf("ALTER TABLE %s ATTACH PARTITION %s FOR VALUES FROM (%s) TO (%s)", parent, ident, fromLit, toLit)); err != nil {

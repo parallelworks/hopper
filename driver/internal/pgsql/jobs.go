@@ -424,6 +424,22 @@ SELECT id FROM retry UNION ALL SELECT id FROM finished`
 var jobFinalizePlainSQL = strings.ReplaceAll(jobFinalizeHeadSQL, "$11", "$10") + plainFinalizeTailSQL + `
 SELECT id FROM retry UNION ALL SELECT id FROM finished`
 
+// skipLockedSQL makes a finalize statement skip the jobs whose rows another
+// transaction holds (driver.JobFinalizeParams.SkipLocked).
+func skipLockedSQL(query string) string {
+	const unnested = "  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason)\n"
+	if !strings.Contains(query, unnested) {
+		panic("pgsql: finalize statement has no unnested results")
+	}
+	return strings.Replace(query, unnested, unnested+
+		"  WHERE r.id IN (SELECT id FROM {{schema}}.hopper_jobs WHERE id = ANY($1::uuid[]) FOR UPDATE SKIP LOCKED)\n", 1)
+}
+
+var (
+	jobFinalizeSkipLockedSQL      = skipLockedSQL(jobFinalizeSQL)
+	jobFinalizePlainSkipLockedSQL = skipLockedSQL(jobFinalizePlainSQL)
+)
+
 // JobFinalizeMany implements driver.Executor.
 func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
 	if len(params.Jobs) == 0 {
@@ -468,8 +484,14 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		nullableTextArray(reasons),
 	}
 	query := jobFinalizeSQL
+	if params.SkipLocked {
+		query = jobFinalizeSkipLockedSQL
+	}
 	if params.NoBatches {
 		query, args = jobFinalizePlainSQL, append(args[:9], args[10])
+		if params.SkipLocked {
+			query = jobFinalizePlainSkipLockedSQL
+		}
 	}
 	applied, err := scanIDs(e.Conn.Query(ctx, query, args...))
 	if err != nil {

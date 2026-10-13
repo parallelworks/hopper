@@ -221,13 +221,13 @@ type Executor interface {
 	// WorkflowGet returns a workflow's progress, its jobs (live and
 	// finished) and its edges.
 	WorkflowGet(ctx context.Context, id JobID) (*WorkflowRow, error)
-	// WorkflowPromoteReady makes up to limit pending jobs whose
-	// dependencies have all finalized claimable, and returns how many. The
-	// statement that finalizes a job promotes its dependents itself, but two
-	// dependencies finalized by concurrent transactions each see the other
-	// still live, and neither promotes; the leader calls this to finish
-	// what they left.
-	WorkflowPromoteReady(ctx context.Context, limit int) (int64, error)
+	// WorkflowPromoteReady makes pending jobs whose dependencies have all
+	// finalized claimable. The statement that finalizes a job promotes its
+	// dependents itself, but two dependencies finalized by concurrent
+	// transactions each see the other still live, and neither promotes. A
+	// client therefore promotes the dependents of the jobs it has just
+	// finalized, and the leader sweeps up the rest.
+	WorkflowPromoteReady(ctx context.Context, params WorkflowPromoteParams) (WorkflowPromoteResult, error)
 
 	// PeriodicInsert inserts the job for a periodic slot if that slot has
 	// not been inserted yet, atomically, and reports whether it did. A slot
@@ -658,6 +658,31 @@ type JobFinalizeParams struct {
 	// workflow, so the engine may skip the bookkeeping those need. Workflow
 	// jobs belong to a batch, so the jobs then have no dependents either.
 	NoBatches bool
+	// SkipLocked skips the jobs whose rows another transaction holds, such
+	// as a worker's CompleteTx that has not ended, instead of waiting for
+	// it. A skipped job is not among the applied.
+	SkipLocked bool
+}
+
+// WorkflowPromoteParams selects the jobs WorkflowPromoteReady considers.
+type WorkflowPromoteParams struct {
+	// DependsOn names finalized jobs whose pending dependents to promote.
+	// An empty non-nil DependsOn promotes nothing.
+	DependsOn []JobID
+	// When DependsOn is nil, up to Limit jobs with dependencies and an ID
+	// after After are considered, in ID order.
+	After JobID
+	Limit int
+}
+
+// WorkflowPromoteResult reports what WorkflowPromoteReady did.
+type WorkflowPromoteResult struct {
+	// Promoted counts the jobs made claimable.
+	Promoted int64
+	// Scanned counts the jobs considered by a sweep, and Last is the
+	// greatest of their IDs, the After of the next chunk.
+	Scanned int64
+	Last    JobID
 }
 
 // JobFinalize is the result of one attempt.
@@ -709,6 +734,11 @@ type HistoryMaintainParams struct {
 	FailedRetention time.Duration
 	// StreamRetention is how long stream events are kept.
 	StreamRetention time.Duration
+	// LockTimeout bounds how long creating or dropping a storage unit
+	// waits for its lock, during which the writers of that table queue
+	// behind it; what cannot get its lock in time is deferred. Zero means
+	// the engine's default.
+	LockTimeout time.Duration
 }
 
 // HistoryMaintainResult reports what maintenance did.

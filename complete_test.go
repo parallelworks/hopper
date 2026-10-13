@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -265,8 +266,8 @@ func TestCompleteTxWhenTheTransactionDoesNotCommit(t *testing.T) {
 	if job.Attempt != 2 || len(job.Errors) != 1 || !strings.Contains(job.Errors[0].Error, "did not commit") {
 		t.Errorf("job whose worker swallowed the rollback = %+v", job)
 	}
-	if len(logs.matching("CompleteTx transaction did not commit")) == 0 {
-		t.Error("no warning that the CompleteTx transaction did not commit")
+	if len(logs.matching("hopper: job failed")) == 0 {
+		t.Error("the attempt whose CompleteTx transaction did not commit was not logged as failed")
 	}
 
 	// An error after a committed completion changes nothing: the job is
@@ -462,7 +463,8 @@ func (fanIn) Kind() string { return "fan_in" }
 // TestCompleteTxFanIn completes one of a job's two dependencies with
 // CompleteTx and keeps its transaction open until the other dependency's
 // finalize has committed. Neither statement sees the other dependency
-// finished, so neither promotes the dependent; the leader does.
+// finished, so neither promotes the dependent. With no leader, the client
+// promotes it once the worker returns.
 func TestCompleteTxFanIn(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -492,7 +494,14 @@ func TestCompleteTxFanIn(t *testing.T) {
 		}
 		return nil
 	})
-	c := h.started(workers, 4)
+	c := h.client(&hopper.Config{
+		Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 4}},
+		Workers:   workers,
+		NeverLead: true,
+	})
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	wf := hopper.NewWorkflow("fan-in", nil)
 	x := wf.Add(fanIn{Name: "x"}, nil)
@@ -556,4 +565,137 @@ func TestCompleteTxBatchRace(t *testing.T) {
 		row, err := c.BatchGet(ctx, res.ID)
 		return err == nil && !row.CompletedAt.IsZero()
 	})
+}
+
+// TestCompleteTxRolledBackThenRescued rolls a CompleteTx transaction back
+// and has the job rescued before the worker's result is written, as when the
+// client loses its lease while the worker commits: the rescue waits for the
+// transaction and applies once it rolls back. The worker's result is then
+// fenced, but the job did not complete, and must not be reported as if it
+// had.
+func TestCompleteTxRolledBackThenRescued(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[fanIn]) error {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		if err := hopper.CompleteTx(ctx, tx, job); err != nil {
+			_ = tx.Rollback(ctx)
+			return err
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			return err
+		}
+		if _, err := h.pool.Exec(ctx, `UPDATE hopper_jobs
+			SET state = 'scheduled', scheduled_at = now() + interval '1 hour', attempted_by = NULL WHERE id = $1`, job.ID); err != nil {
+			return err
+		}
+		return errors.New("commit failed")
+	})
+	logs := &recordingHandler{}
+	c := h.client(&hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers: workers,
+		Logger:  slog.New(logs),
+	})
+	events := make(chan hopper.Event, 10)
+	ectx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		for ev := range c.Events(ectx, hopper.EventJobCompleted) {
+			events <- ev
+		}
+	}()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, fanIn{Name: "rescued"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(logs.matching("result dropped")) > 0 })
+	select {
+	case ev := <-events:
+		t.Errorf("completed event for %s, whose transaction rolled back", ev.Job.ID)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State != hopper.JobStateScheduled {
+		t.Errorf("rescued job = %+v, %v", job, err)
+	}
+}
+
+// TestCompleteTxLeftOpen has a worker return while the transaction it
+// completed its job in is still open. The job's result waits for that
+// transaction alone: the client's other jobs finalize meanwhile, and the
+// job completes if the transaction then commits, or retries if it rolls
+// back.
+func TestCompleteTxLeftOpen(t *testing.T) {
+	t.Parallel()
+	for _, commit := range []bool{true, false} {
+		t.Run(fmt.Sprintf("commit=%t", commit), func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			ctx := context.Background()
+			returned := make(chan struct{})
+			release := make(chan struct{})
+			workers := hopper.NewWorkers()
+			hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[fanIn]) error {
+				if job.Args.Name != "open" {
+					return nil
+				}
+				if job.Attempt > 1 {
+					return nil
+				}
+				tx, err := h.pool.Begin(ctx)
+				if err != nil {
+					return err
+				}
+				if err := hopper.CompleteTx(ctx, tx, job); err != nil {
+					_ = tx.Rollback(ctx)
+					return err
+				}
+				go func() {
+					<-release
+					if commit {
+						_ = tx.Commit(context.Background())
+					} else {
+						_ = tx.Rollback(context.Background())
+					}
+				}()
+				close(returned)
+				return nil
+			})
+			c := h.started(workers, 4)
+			open, err := c.Insert(ctx, fanIn{Name: "open"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			<-returned
+			time.Sleep(100 * time.Millisecond)
+			other, err := c.Insert(ctx, fanIn{Name: "other"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForJob(t, c, other.Job.ID, hopper.JobStateCompleted)
+			if job, err := c.JobGet(ctx, open.Job.ID); err != nil || job.State != hopper.JobStateRunning {
+				t.Errorf("job with its transaction open = %+v, %v", job, err)
+			}
+			close(release)
+			if commit {
+				job := waitForJob(t, c, open.Job.ID, hopper.JobStateCompleted)
+				if job.Attempt != 1 {
+					t.Errorf("committed job completed in attempt %d", job.Attempt)
+				}
+				return
+			}
+			job := waitForJob(t, c, open.Job.ID, hopper.JobStateCompleted)
+			if job.Attempt != 2 || len(job.Errors) != 1 {
+				t.Errorf("job whose transaction rolled back = attempt %d, errors %+v; want a failed first attempt", job.Attempt, job.Errors)
+			}
+		})
+	}
 }

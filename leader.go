@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"context"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -173,7 +174,7 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			fin[i] = f
 			queueOf[j.ID] = j.Queue
 		}
-		applied, err := c.exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin, NoBatches: noBatches})
+		applied, err := c.exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin, NoBatches: noBatches, SkipLocked: true})
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: rescue jobs", "error", err)
@@ -293,20 +294,29 @@ func (c *Client[TTx]) settleBatches(ctx context.Context) {
 }
 
 // promoteReady promotes workflow jobs whose last dependencies finished in
-// concurrent transactions, none of which saw the others commit.
+// concurrent transactions and that the finalizing clients did not promote
+// (a client that stopped first, or a previous release). It walks the edges
+// a chunk at a time, in ID order, for at most one leader interval per pass,
+// and the next pass resumes where it stopped.
 func (c *Client[TTx]) promoteReady(ctx context.Context) {
+	deadline := time.Now().Add(c.tuning.leaderInterval)
 	for {
-		n, err := c.exec.WorkflowPromoteReady(ctx, c.tuning.rescueBatch)
+		res, err := c.exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{After: c.promoteAfter, Limit: c.tuning.rescueBatch})
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: promote ready workflow jobs", "error", err)
 			}
 			return
 		}
-		if n > 0 {
-			c.logger.InfoContext(ctx, "hopper: promoted workflow jobs whose dependencies finished concurrently", "count", n)
+		if res.Promoted > 0 {
+			c.logger.InfoContext(ctx, "hopper: promoted workflow jobs whose dependencies finished concurrently", "count", res.Promoted)
 		}
-		if n < int64(c.tuning.rescueBatch) {
+		if res.Scanned < int64(c.tuning.rescueBatch) {
+			c.promoteAfter = driver.JobID{}
+			return
+		}
+		c.promoteAfter = res.Last
+		if time.Now().After(deadline) {
 			return
 		}
 	}
@@ -361,10 +371,12 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 // is missing when its period starts sends that period's history to the
 // DEFAULT partition.
 func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
+	timeout := ddlLockTimeout(c.ddlDeferrals)
 	res, err := c.exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{
 		CompletedRetention: c.cfg.CompletedRetention,
 		FailedRetention:    c.cfg.FailedRetention,
 		StreamRetention:    c.cfg.StreamRetention,
+		LockTimeout:        timeout,
 	})
 	if err != nil {
 		if ctx.Err() == nil {
@@ -372,8 +384,34 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 		}
 		return true
 	}
-	if len(res.Created) > 0 || len(res.Dropped) > 0 || len(res.Deferred) > 0 || res.Pruned > 0 {
-		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "deferred", res.Deferred, "pruned", res.Pruned)
+	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
+		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
 	}
-	return len(res.Deferred) == 0
+	if len(res.Deferred) == 0 {
+		c.ddlDeferrals = 0
+		return true
+	}
+	c.ddlDeferrals++
+	level := slog.LevelDebug
+	if c.ddlDeferrals >= ddlDeferralsWarn {
+		level = slog.LevelWarn
+	}
+	c.logger.Log(ctx, level, "hopper: history partitions deferred: a transaction that wrote history held their lock",
+		"deferred", res.Deferred, "lock_timeout", timeout, "passes", c.ddlDeferrals)
+	return false
+}
+
+// Deferred partition work is retried on every leader pass, each time
+// waiting longer for its lock: doubling from 200 ms to at most 2 s, so that
+// transactions that keep overlapping cannot hold retention and the
+// partitions ahead off forever, while each attempt holds the table's
+// writers up for no longer than its timeout.
+const (
+	ddlLockTimeoutBase = 200 * time.Millisecond
+	ddlLockTimeoutMax  = 2 * time.Second
+	ddlDeferralsWarn   = 5
+)
+
+func ddlLockTimeout(deferrals int) time.Duration {
+	return min(ddlLockTimeoutBase<<min(deferrals, 4), ddlLockTimeoutMax)
 }

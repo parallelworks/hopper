@@ -13,12 +13,15 @@ import (
 )
 
 // execute runs one claimed job and turns its outcome into a finalize result.
-// It never panics and never blocks past the job's timeout.
+// It never panics and never blocks past the job's timeout, other than for
+// one bounded read of a job the worker completed with CompleteTx.
 //
 // A job the worker completed with CompleteTx is finished once the worker's
-// transaction commits, which the client cannot see. Its result is the
-// outcome for the case that it did not commit, the worker's error or
-// errNotCommitted; the fence drops it if it did.
+// transaction commits, which the client cannot see, so it reads the job. If
+// the job finished in this attempt, its completion is reported and nothing
+// is written. Otherwise its result is the attempt's other outcome, the
+// worker's error or errNotCommitted, which the finalizer writes without
+// waiting on a transaction that has not ended.
 //
 // The job's context descends from the lease generation (cancelled by a hard
 // stop or fencing) and can also be cancelled by JobCancel, with cause
@@ -34,14 +37,20 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 
 	unit, err := c.runWorker(jobCtx, row)
 	completed := a.completedTx()
-	if completed != nil && err == nil {
-		err = errNotCommitted
+	state := txUnknown
+	if completed != nil {
+		if state = readTx(ctx, c.exec, row); state == txCommitted {
+			return pending{job: row, result: *completed, completedTx: completed, committed: true}
+		}
+		if err == nil {
+			err = errNotCommitted
+		}
 	}
 	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err)
 	if f.State.Terminal() {
 		f.Output = a.get()
 	}
-	if completed == nil {
+	if completed == nil || state != txUnknown {
 		c.logOutcome(ctx, row, f, err)
 	}
 	return pending{job: row, result: f, completedTx: completed}
@@ -50,6 +59,53 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 // errNotCommitted fails an attempt whose worker completed it with
 // CompleteTx and returned nil, but whose transaction did not commit.
 var errNotCommitted = errors.New("hopper: the worker returned nil, but the transaction it completed the job in did not commit")
+
+// txState is what the database shows of a job its worker completed with
+// CompleteTx.
+type txState int
+
+const (
+	// txUnknown: the read failed.
+	txUnknown txState = iota
+	// txCommitted: the job finished as this attempt completed it, or is
+	// gone, as a completed job on a DeleteCompleted queue is.
+	txCommitted
+	// txRunning: the job is still running in this attempt, so the
+	// transaction rolled back or has not ended.
+	txRunning
+	// txLost: the job has moved on without this attempt, as when a rescue
+	// applied once the transaction rolled back.
+	txLost
+)
+
+// readTxTimeout bounds readTx.
+const readTxTimeout = 5 * time.Second
+
+// readTx reads the job a worker completed with CompleteTx. A fenced result
+// cannot tell a commit from a rescue that applied once the transaction
+// rolled back, since both fence it; the job's row can.
+func readTx(ctx context.Context, exec interface {
+	JobGet(context.Context, driver.JobID) (*driver.JobRow, error)
+}, row *driver.JobRow,
+) txState {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readTxTimeout)
+	defer cancel()
+	job, err := exec.JobGet(rctx, row.ID)
+	switch {
+	case errors.Is(err, driver.ErrNotFound):
+		return txCommitted
+	case err != nil:
+		return txUnknown
+	case job.AttemptedBy != row.AttemptedBy || job.Attempt != row.Attempt:
+		return txLost
+	case job.State == driver.JobStateCompleted:
+		return txCommitted
+	case job.State == driver.JobStateRunning:
+		return txRunning
+	default:
+		return txLost
+	}
+}
 
 // completedResult is the result of an attempt that succeeded.
 func completedResult(row *driver.JobRow, qcfg QueueConfig) driver.JobFinalize {
