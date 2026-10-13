@@ -108,14 +108,15 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 				if !ok || !from.Add(g.period).Before(cutoff) {
 					continue
 				}
-				// DROP takes a brief ACCESS EXCLUSIVE lock on the parent for
-				// the catalog change, once per period. (DETACH CONCURRENTLY
-				// would avoid it, but Postgres refuses it while a DEFAULT
-				// partition exists.)
-				if _, err := e.Conn.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name)); err != nil {
-					return res, fmt.Errorf("hopper: drop partition %s: %w", name, err)
+				dropped, err := e.dropPartition(ctx, name)
+				if err != nil {
+					return res, err
 				}
-				res.Dropped = append(res.Dropped, name)
+				if dropped {
+					res.Dropped = append(res.Dropped, name)
+				} else {
+					res.Deferred = append(res.Deferred, name)
+				}
 			}
 			// Rows in the DEFAULT partition cannot be dropped by period.
 			n, err := e.Conn.Exec(ctx,
@@ -128,6 +129,43 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 		}
 	}
 	return res, nil
+}
+
+// dropLockTimeout bounds how long a partition drop waits for its lock.
+const dropLockTimeout = "200ms"
+
+// dropPartition drops a partition past retention. DROP takes a brief
+// ACCESS EXCLUSIVE lock on the parent for the catalog change, once per
+// period. (DETACH CONCURRENTLY would avoid it, but Postgres refuses it while
+// a DEFAULT partition exists.) While it waits for that lock, every other
+// statement on the parent queues behind it, and a transaction that wrote
+// history (a worker's CompleteTx) holds it off until it ends, so the wait is
+// bounded: a drop that cannot get the lock in time returns false and is
+// retried by the next pass.
+func (e *Executor) dropPartition(ctx context.Context, name string) (dropped bool, err error) {
+	tx, err := e.Conn.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if !dropped {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+		}
+	}()
+	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+dropLockTimeout+"'"); err != nil {
+		return false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
+	}
+	if _, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name)); err != nil {
+		var coded interface{ SQLState() string }
+		if errors.As(err, &coded) && coded.SQLState() == "55P03" {
+			return false, nil
+		}
+		return false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
+	}
+	return true, nil
 }
 
 // partitionsOf lists the partitions attached to parent.

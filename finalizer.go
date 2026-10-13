@@ -48,6 +48,11 @@ type finalizeExecutor interface {
 type pending struct {
 	job    *driver.JobRow
 	result driver.JobFinalize
+	// completedTx is the completion the worker wrote with CompleteTx, if
+	// it did. result is then the attempt's outcome for the case that the
+	// worker's transaction did not commit: if it did, the job is finished
+	// and the fence drops result.
+	completedTx *driver.JobFinalize
 }
 
 func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, wake func(string), applied func(*driver.JobRow, driver.JobFinalize)) *finalizer {
@@ -66,11 +71,11 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, wake fun
 // submit queues a result. It blocks while the buffer is full. A result
 // submitted after the finalizer has stopped is dropped: the job stays
 // running in the database and is rescued once this client's lease expires.
-func (f *finalizer) submit(job *driver.JobRow, result driver.JobFinalize) {
+func (f *finalizer) submit(p pending) {
 	select {
-	case f.in <- pending{job: job, result: result}:
+	case f.in <- p:
 	case <-f.done:
-		f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", result.ID)
+		f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", p.result.ID)
 	}
 }
 
@@ -198,6 +203,8 @@ func (f *finalizer) settle(ctx context.Context, batch []pending) {
 }
 
 // afterFlush logs fenced results and wakes producers for immediate retries.
+// A fenced result of a job completed with CompleteTx means that completion
+// committed: the job's completion is reported instead.
 func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []driver.JobID) {
 	var ok map[driver.JobID]struct{}
 	if len(applied) != len(batch) {
@@ -209,9 +216,16 @@ func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []d
 	for _, p := range batch {
 		if ok != nil {
 			if _, was := ok[p.result.ID]; !was {
+				if p.completedTx != nil {
+					f.applied(p.job, *p.completedTx)
+					continue
+				}
 				f.logger.WarnContext(ctx, "hopper: result dropped: job no longer owned by this attempt", "job_id", p.result.ID)
 				continue
 			}
+		}
+		if p.completedTx != nil {
+			f.logger.WarnContext(ctx, "hopper: job's CompleteTx transaction did not commit", "job_id", p.result.ID, "state", p.result.State)
 		}
 		if p.result.Delay == 0 && !p.result.State.Terminal() {
 			f.wake(p.job.Queue)

@@ -14,15 +14,15 @@ import (
 type attemptKey struct{}
 
 // attempt is the state a running job's context carries: its output from
-// SetOutput, and whether CompleteTx finalized it.
+// SetOutput, and the completion CompleteTx wrote, if it did.
 type attempt struct {
-	codec   Codec
-	row     *driver.JobRow
-	archive bool
+	codec Codec
+	// completion is the attempt's result if it succeeds, without output.
+	completion driver.JobFinalize
 
 	mu        sync.Mutex
 	output    json.RawMessage
-	completed bool
+	completed *driver.JobFinalize
 }
 
 func (a *attempt) get() json.RawMessage {
@@ -31,13 +31,13 @@ func (a *attempt) get() json.RawMessage {
 	return a.output
 }
 
-func (a *attempt) completedTx() bool {
+func (a *attempt) completedTx() *driver.JobFinalize {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.completed
 }
 
-// ErrNotInJob is returned by SetOutput outside a worker.
+// ErrNotInJob is returned by SetOutput and CompleteTx outside a worker.
 var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 
 // SetOutput records the job's result, which is stored with the finalized

@@ -165,6 +165,38 @@ edges AS (
 )`
 }
 
+// workflowPromoteReadySQL promotes pending jobs none of whose dependencies
+// is still live. It starts from the edges, the working set of unfinished
+// workflows, so it costs nothing without them, and skips rows a finalize
+// holds: that finalize decides them.
+var workflowPromoteReadySQL = `
+WITH ready AS (
+  SELECT j.id FROM {{schema}}.hopper_jobs j
+  WHERE j.id IN (SELECT d.job_id FROM {{schema}}.hopper_job_deps d)
+    AND j.state = 'pending'
+    AND NOT EXISTS (
+      SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
+      WHERE d.job_id = j.id)
+  LIMIT $1
+  FOR UPDATE OF j SKIP LOCKED
+),
+promoted AS (
+  UPDATE {{schema}}.hopper_jobs j
+  SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
+  FROM ready WHERE j.id = ready.id AND j.state = 'pending'
+  RETURNING pg_notify($2, j.queue)
+)
+SELECT count(*) FROM promoted`
+
+// WorkflowPromoteReady implements driver.Executor.
+func (e *Executor) WorkflowPromoteReady(ctx context.Context, limit int) (int64, error) {
+	var n int64
+	if err := e.Conn.QueryRow(ctx, workflowPromoteReadySQL, max(limit, 1), driver.ChannelInsert).Scan(&n); err != nil {
+		return 0, fmt.Errorf("hopper: promote ready workflow jobs: %w", err)
+	}
+	return n, nil
+}
+
 // workflowJobInsertSQL inserts a workflow's jobs with the IDs generated up
 // front, pending when they have dependencies. RETURNING follows input order.
 var workflowJobInsertSQL = `

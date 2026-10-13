@@ -70,7 +70,7 @@ func newTestFinalizer(exec finalizeExecutor, t tuning, applied func()) (*finaliz
 
 func submitN(f *finalizer, n int) {
 	for i := range n {
-		f.submit(&driver.JobRow{Queue: "default"}, driver.JobFinalize{ID: driver.JobID{byte(i), byte(i >> 8)}, State: driver.JobStateCompleted})
+		f.submit(pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{ID: driver.JobID{byte(i), byte(i >> 8)}, State: driver.JobStateCompleted}})
 	}
 }
 

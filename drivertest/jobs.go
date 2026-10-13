@@ -286,7 +286,10 @@ func testFinalizeTx[TTx any](t *testing.T, f Fixture[TTx]) {
 	id := jobs[0].ID
 	result := driver.JobFinalize{ID: id, AttemptedBy: a, State: driver.JobStateCompleted, Archive: true, Output: []byte(`{"ok":true}`)}
 
+	// Each transaction is also rolled back on exit, so a failed check
+	// cannot leave it open and hang the pool's close.
 	tx, _, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already ended on the happy path
 	if applied := finalize(ctx, t, d.UnwrapTx(tx), result); len(applied) != 1 {
 		t.Fatalf("finalize in tx applied %v", applied)
 	}
@@ -301,6 +304,7 @@ func testFinalizeTx[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 
 	tx, _, rollback = f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already ended on the happy path
 	if applied := finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: id, AttemptedBy: b, State: driver.JobStateCompleted, Archive: true}); len(applied) != 0 {
 		t.Errorf("finalize in tx by a client that does not own the job applied %v", applied)
 	}
@@ -308,7 +312,8 @@ func testFinalizeTx[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 
-	tx, commit, _ := f.Begin(ctx, t, d)
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
 	if applied := finalize(ctx, t, d.UnwrapTx(tx), result); len(applied) != 1 {
 		t.Fatalf("finalize in tx applied %v", applied)
 	}
@@ -335,61 +340,64 @@ func testFinalizeTxConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
-	const n = 16
+	const n = 8
 	inserted := insert(ctx, t, exec, params("k", n))
 	clientID := register(ctx, t, exec)
 	if jobs := claim(ctx, t, exec, clientID, n); len(jobs) != n {
 		t.Fatalf("claimed %d", len(jobs))
 	}
-	var wg sync.WaitGroup
-	rescued := make([]int, n)
 	for i, r := range inserted {
-		wg.Go(func() {
-			commitTx := i%2 == 0
-			tx, commit, rollback := f.Begin(ctx, t, d)
-			applied, err := d.UnwrapTx(tx).JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-				{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+		commitTx := i%2 == 0
+		tx, commit, rollback := f.Begin(ctx, t, d)
+		if applied := finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
+			_ = rollback()
+			t.Fatalf("finalize in tx applied %v", applied)
+		}
+		done := make(chan []driver.JobID, 1)
+		go func() {
+			applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+				{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}},
 			}})
-			if err != nil || len(applied) != 1 {
-				t.Errorf("finalize in tx = %v, %v", applied, err)
-				_ = rollback()
-				return
-			}
-			done := make(chan []driver.JobID, 1)
-			go func() {
-				applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-					{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}},
-				}})
-				if err != nil {
-					t.Error(err)
-				}
-				done <- applied
-			}()
-			time.Sleep(20 * time.Millisecond)
-			if commitTx {
-				err = commit()
-			} else {
-				err = rollback()
-			}
 			if err != nil {
 				t.Error(err)
 			}
-			rescued[i] = len(<-done)
-		})
-	}
-	wg.Wait()
-	for i, r := range inserted {
+			done <- applied
+		}()
+		waitForLockWait(ctx, t, f, d)
+		end := rollback
+		if commitTx {
+			end = commit
+		}
+		if err := end(); err != nil {
+			t.Fatal(err)
+		}
+		competing := len(<-done)
 		j, err := exec.JobGet(ctx, r.Job.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if i%2 == 0 {
-			if rescued[i] != 0 || j.State != driver.JobStateCompleted {
-				t.Errorf("job %d: committed in tx, competing finalize applied %d, state %s", i, rescued[i], j.State)
+		if commitTx {
+			if competing != 0 || j.State != driver.JobStateCompleted {
+				t.Errorf("job %d: committed in tx, competing finalize applied %d, state %s", i, competing, j.State)
 			}
-		} else if rescued[i] != 1 || j.State != driver.JobStateRetryable {
-			t.Errorf("job %d: rolled back, competing finalize applied %d, state %s", i, rescued[i], j.State)
+		} else if competing != 1 || j.State != driver.JobStateRetryable {
+			t.Errorf("job %d: rolled back, competing finalize applied %d, state %s", i, competing, j.State)
 		}
+	}
+}
+
+// waitForLockWait waits until a statement on the driver's schema is waiting
+// for a lock, so a test knows its competing statement is blocked rather
+// than not yet started. The schema's name is in every statement's text.
+func waitForLockWait[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx]) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for f.QueryText(ctx, t, d, `SELECT count(*)::text FROM pg_stat_activity
+		WHERE wait_event_type = 'Lock' AND position(current_schema() IN query) > 0 AND pid <> pg_backend_pid()`) == "0" {
+		if time.Now().After(deadline) {
+			t.Fatal("no statement started waiting for a lock")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

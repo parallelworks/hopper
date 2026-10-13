@@ -206,3 +206,72 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("unknown workflow = %v", err)
 	}
 }
+
+// testWorkflowFanInConcurrent finalizes a job's two dependencies in
+// concurrent transactions. Each statement still sees the other dependency
+// live, so neither promotes the dependent; the leader's
+// WorkflowPromoteReady does, and only once both have committed.
+func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Name: "fan-in", Jobs: params("step", 3),
+		Deps: []driver.JobDependency{{Job: 2, DependsOn: 0}, {Job: 2, DependsOn: 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y, dep := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID, wf.Jobs[2].Job.ID
+	if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
+		t.Fatalf("claimed %d", len(jobs))
+	}
+	promote := func() int64 {
+		t.Helper()
+		n, err := exec.WorkflowPromoteReady(ctx, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	completed := func(id driver.JobID) driver.JobFinalize {
+		return driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+	}
+
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
+	if applied := finalize(ctx, t, d.UnwrapTx(tx), completed(x)); len(applied) != 1 {
+		t.Fatalf("finalize in tx applied %v", applied)
+	}
+	done := make(chan []driver.JobID, 1)
+	go func() {
+		applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(y)}})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- applied
+	}()
+	waitForLockWait(ctx, t, f, d)
+	if n := promote(); n != 0 {
+		t.Errorf("promoted %d while a dependency's finalize was uncommitted", n)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	if applied := <-done; len(applied) != 1 {
+		t.Fatalf("concurrent finalize applied %v", applied)
+	}
+	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStatePending {
+		t.Fatalf("dependent after both finalizes = %+v, %v; the race should leave it pending", j, err)
+	}
+	if n := promote(); n != 1 {
+		t.Errorf("promoted %d, want 1", n)
+	}
+	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateAvailable {
+		t.Errorf("dependent after promote = %+v, %v", j, err)
+	}
+	if n := promote(); n != 0 {
+		t.Errorf("second promote = %d", n)
+	}
+}

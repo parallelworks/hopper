@@ -44,6 +44,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			c.rescue(ctx)
 			c.expire(ctx)
 			c.settleBatches(ctx)
+			c.promoteReady(ctx)
 			c.age(ctx)
 			c.pruneClients(ctx)
 			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval {
@@ -292,6 +293,26 @@ func (c *Client[TTx]) settleBatches(ctx context.Context) {
 	}
 }
 
+// promoteReady promotes workflow jobs whose last dependencies finished in
+// concurrent transactions, none of which saw the others commit.
+func (c *Client[TTx]) promoteReady(ctx context.Context) {
+	for {
+		n, err := c.exec.WorkflowPromoteReady(ctx, c.tuning.rescueBatch)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.logger.ErrorContext(ctx, "hopper: promote ready workflow jobs", "error", err)
+			}
+			return
+		}
+		if n > 0 {
+			c.logger.InfoContext(ctx, "hopper: promoted workflow jobs whose dependencies finished concurrently", "count", n)
+		}
+		if n < int64(c.tuning.rescueBatch) {
+			return
+		}
+	}
+}
+
 // stuck reports whether a rescue candidate qualifies by RescueStuckAfter,
 // as opposed to by a lost lease.
 func (c *Client[TTx]) stuck(j *driver.JobRow) bool {
@@ -347,7 +368,7 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) {
 		}
 		return
 	}
-	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
-		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
+	if len(res.Created) > 0 || len(res.Dropped) > 0 || len(res.Deferred) > 0 || res.Pruned > 0 {
+		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "deferred", res.Deferred, "pruned", res.Pruned)
 	}
 }

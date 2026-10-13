@@ -479,3 +479,51 @@ func waitMaintain(ctx context.Context, t *testing.T, exec driver.Executor, done 
 	}
 	return res
 }
+
+// testHistoryMaintainWhileInUse runs maintenance while a transaction that
+// wrote history (a worker's CompleteTx) is still open. Dropping a partition
+// past retention needs that transaction to end; maintenance puts the drop
+// off instead of waiting for it, which would queue every other history
+// write behind the drop, and drops it once the transaction is over.
+func testHistoryMaintainWhileInUse[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	p := driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, FailedRetention: 7 * 24 * time.Hour}
+	if _, err := exec.HistoryMaintain(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	const old = "hopper_job_history_completed_2020010100"
+	f.Exec(ctx, t, d, `CREATE TABLE `+old+` PARTITION OF hopper_job_history_completed
+		FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`)
+	insert(ctx, t, exec, params("k", 2))
+	clientID := register(ctx, t, exec)
+	jobs := claim(ctx, t, exec, clientID, 2)
+	if len(jobs) != 2 {
+		t.Fatalf("claimed %d", len(jobs))
+	}
+
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
+	finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	mctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	res, err := exec.HistoryMaintain(mctx, p)
+	if err != nil {
+		t.Fatalf("maintenance while history is in use: %v", err)
+	}
+	if len(res.Dropped) != 0 || len(res.Deferred) != 1 || res.Deferred[0] != old {
+		t.Errorf("maintenance while history is in use = %+v", res)
+	}
+	// Other finalizes are not queued behind a waiting drop.
+	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: jobs[1].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
+		t.Errorf("finalize during maintenance applied %v", applied)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	res, err = exec.HistoryMaintain(ctx, p)
+	if err != nil || len(res.Dropped) != 1 || res.Dropped[0] != old || len(res.Deferred) != 0 {
+		t.Errorf("maintenance after the transaction = %+v, %v", res, err)
+	}
+}

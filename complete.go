@@ -22,10 +22,17 @@ var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt"
 //
 // The completion is fenced like every finalize: if the attempt no longer
 // owns the job, nothing is written and ErrJobFenced is returned, and the
-// worker should roll tx back. When the worker then returns nil, the client
-// does not finalize the job again. A worker whose transaction does not
-// commit must return an error, so the job is retried; returning nil would
-// leave the job running until this client's lease ends.
+// worker should roll tx back. Once the worker returns, the client cannot
+// tell whether tx committed, so it sends the attempt's other outcome, also
+// fenced: the worker's error, or a failure if it returned nil. If tx
+// committed, the job is finished and that outcome is dropped, whatever the
+// worker returned, and the job.completed event fires. If tx did not commit,
+// the attempt fails as that outcome says and the job is retried.
+//
+// Call it last, just before the commit. From CompleteTx until tx ends, tx
+// holds the job's row, its batch's row and a lock on the history table, so
+// the finalizing of sibling jobs in the same batch or workflow, and the
+// dropping of expired history partitions, wait until then.
 //
 //	func (w *Worker) Work(ctx context.Context, job *hopper.Job[Args]) error {
 //		tx, err := w.pool.Begin(ctx)
@@ -46,28 +53,28 @@ func CompleteTx[TTx any, T JobArgs](ctx context.Context, tx TTx, job *Job[T]) er
 	if !ok {
 		return ErrNotInJob
 	}
-	if job == nil || job.JobRow == nil || job.ID != a.row.ID {
-		return fmt.Errorf("hopper: complete job: ctx belongs to job %s, not this one", a.row.ID)
+	id := a.completion.ID
+	if job == nil || job.JobRow == nil || job.ID != id {
+		return fmt.Errorf("hopper: complete job: ctx belongs to job %s, not this one", id)
 	}
 	c, ok := ClientFromContext[TTx](ctx)
 	if !ok {
-		return fmt.Errorf("hopper: complete job %s: the transaction is not of the type its client uses", a.row.ID)
+		return fmt.Errorf("hopper: complete job %s: the transaction is not of the type its client uses", id)
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	applied, err := c.driver.UnwrapTx(tx).JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{
-		ID:          a.row.ID,
-		AttemptedBy: a.row.AttemptedBy,
-		State:       driver.JobStateCompleted,
-		Output:      a.output,
-		Archive:     a.archive,
-	}}})
+	// The statement can wait on row locks for as long as another
+	// transaction holds them, so a.mu is not held across it: SetOutput
+	// from another goroutine must not block on the database.
+	result := a.completion
+	result.Output = a.get()
+	applied, err := c.driver.UnwrapTx(tx).JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{result}})
 	if err != nil {
 		return err
 	}
 	if len(applied) == 0 {
 		return ErrJobFenced
 	}
-	a.completed = true
+	a.mu.Lock()
+	a.completed = &result
+	a.mu.Unlock()
 	return nil
 }

@@ -95,6 +95,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Stats", testStats[TTx]},
 		{"Notify", testNotify[TTx]},
 		{"HistoryMaintain", testHistoryMaintain[TTx]},
+		{"HistoryMaintainWhileInUse", testHistoryMaintainWhileInUse[TTx]},
 		{"Now", testNow[TTx]},
 		{"Subscriptions", testSubscriptions[TTx]},
 		{"Publish", testPublish[TTx]},
@@ -107,6 +108,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Batches", testBatches[TTx]},
 		{"BatchesConcurrent", testBatchesConcurrent[TTx]},
 		{"Workflows", testWorkflows[TTx]},
+		{"WorkflowFanInConcurrent", testWorkflowFanInConcurrent[TTx]},
 		{"Streams", testStreams[TTx]},
 		{"Maintain", testMaintain[TTx]},
 	}

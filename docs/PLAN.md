@@ -741,12 +741,19 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   owns the job, nothing is written and `ErrJobFenced` is returned. History, awaited
   jobs (`pg_notify` is transactional), batches and workflow dependents all take effect
   when `tx` commits.
-- When the worker then returns nil, the client submits nothing to the finalizer and
-  emits `job.completed` itself. When it returns an error, the error is finalized as
-  usual: if `tx` committed, the fence drops it (the job is already finished), and if
-  `tx` rolled back, the attempt fails and retries. A worker that rolls back and still
-  returns nil leaves its job running until the client's lease ends, so it must
-  return an error instead.
+- After the worker returns, the client cannot tell whether `tx` committed, so it
+  submits the attempt's other outcome to the finalizer as usual: the worker's error,
+  or `the worker returned nil, but the transaction it completed the job in did not
+  commit` if it returned nil. That result is fenced like any other. If `tx`
+  committed, the job is gone from the live table, the result is dropped, and the
+  client emits `job.completed` instead; this is the common case, and it costs one
+  index probe in a batched statement. If `tx` did not commit, the result applies:
+  the attempt failed, and the job retries (or is discarded on its last attempt), so
+  no job is left running because a worker ignored a failed commit.
+- From `CompleteTx` until `tx` ends, `tx` holds the job's row, its batch's row and a
+  lock on the history table, so sibling finalizes in the same batch or workflow and
+  the drop of an expired history partition wait for it. `CompleteTx` belongs last,
+  just before the commit.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure
@@ -831,7 +838,8 @@ can briefly overlap during a partition.
 
 Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
 partitions ahead of time and dropping expired ones, removing stale `hopper_clients`
-rows, and sweeping the batch progress that clients did not settle (§11).
+rows, sweeping the batch progress that clients did not settle, and promoting
+workflow jobs whose last dependencies finished in concurrent transactions (§11).
 
 A client with `Config.NeverLead` never attempts the lease. It claims and works jobs
 like any other, so an install can include processes that should do work but not run
@@ -1225,7 +1233,16 @@ observability without new machinery.
   outcome). Cancelled dependents go to history with a "dependency failed" error and
   count as batch failures. Every finalizing statement (the batched finalize,
   cancelling a waiting job, expiring) ends with the same tail, so batches and
-  dependents behave the same however a job finishes. Workflows are inspectable with
+  dependents behave the same however a job finishes.
+  - **Concurrent dependencies.** Two dependencies of one job finalized by concurrent
+    transactions (two clients, or a `CompleteTx` held open while a sibling
+    finalizes) each see the other still live, so neither statement promotes the
+    dependent. The leader therefore also promotes, on every pass, pending jobs none of
+    whose dependencies is still live (`WorkflowPromoteReady`, in batches, skipping rows
+    a finalize holds). It starts from `hopper_job_deps`, so it costs nothing without
+    unfinished workflows, and it delays such a dependent by at most one leader
+    interval.
+  Workflows are inspectable with
   `WorkflowGet`, `hopper workflows get` and, as a DAG, in `hopperui`.
 
 ## 12. Migrations

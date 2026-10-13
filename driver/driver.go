@@ -221,6 +221,13 @@ type Executor interface {
 	// WorkflowGet returns a workflow's progress, its jobs (live and
 	// finished) and its edges.
 	WorkflowGet(ctx context.Context, id JobID) (*WorkflowRow, error)
+	// WorkflowPromoteReady makes up to limit pending jobs whose
+	// dependencies have all finalized claimable, and returns how many. The
+	// statement that finalizes a job promotes its dependents itself, but two
+	// dependencies finalized by concurrent transactions each see the other
+	// still live, and neither promotes; the leader calls this to finish
+	// what they left.
+	WorkflowPromoteReady(ctx context.Context, limit int) (int64, error)
 
 	// PeriodicInsert inserts the job for a periodic slot if that slot has
 	// not been inserted yet, atomically, and reports whether it did. A slot
@@ -709,6 +716,10 @@ type HistoryMaintainResult struct {
 	// Created and Dropped name storage units (partitions on Postgres).
 	Created []string
 	Dropped []string
+	// Deferred names storage units past retention that were in use, such as
+	// by a transaction that wrote history and has not ended; they are
+	// dropped by a later pass.
+	Deferred []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64
 }

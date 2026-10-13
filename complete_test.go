@@ -23,8 +23,9 @@ func (ledger) Kind() string { return "ledger" }
 
 // ledgerWorker writes a ledger row for each attempt and completes the job in
 // the same transaction. fail picks attempts that misbehave after the
-// completion: "rollback" rolls back and returns an error, "error" commits
-// and returns an error anyway.
+// completion: "rollback" rolls back and returns an error, "rollback-nil"
+// rolls back and returns nil, and "error" commits and returns an error
+// anyway.
 type ledgerWorker struct {
 	hopper.WorkerDefaults[ledger]
 	pool *pgxpool.Pool
@@ -59,6 +60,8 @@ func (w *ledgerWorker) Work(ctx context.Context, job *hopper.Job[ledger]) error 
 	switch mode {
 	case "rollback":
 		return errors.New("rolled back after completing")
+	case "rollback-nil":
+		return nil
 	case "error":
 		if err := tx.Commit(ctx); err != nil {
 			return err
@@ -97,15 +100,17 @@ func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
 
-func (h *recordingHandler) contains(sub string) bool {
+// matching returns the recorded messages that contain sub.
+func (h *recordingHandler) matching(sub string) []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	var out []string
 	for _, m := range h.messages {
 		if strings.Contains(m, sub) {
-			return true
+			out = append(out, m)
 		}
 	}
-	return false
+	return out
 }
 
 func TestCompleteTx(t *testing.T) {
@@ -174,11 +179,24 @@ func TestCompleteTx(t *testing.T) {
 		return errors.Is(err, hopper.ErrNotFound)
 	})
 
-	// The client did not finalize the jobs again: a second finalize would
-	// have been fenced and logged.
+	// The completion was reported once, for each job, and nothing the
+	// client sent after it was applied or taken for a lost job.
+	select {
+	case ev := <-events:
+		if ev.Job.ID != res.Job.ID {
+			t.Errorf("second completed event for %s", ev.Job.ID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("no completed event for the DeleteCompleted job")
+	}
 	time.Sleep(50 * time.Millisecond)
-	if logs.contains("result dropped") {
-		t.Errorf("the client finalized a job CompleteTx had completed: %v", logs.messages)
+	select {
+	case ev := <-events:
+		t.Errorf("extra completed event for %s", ev.Job.ID)
+	default:
+	}
+	if warned := logs.matching(""); len(warned) > 0 {
+		t.Errorf("warnings: %v", warned)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -198,12 +216,30 @@ func TestCompleteTxWhenTheTransactionDoesNotCommit(t *testing.T) {
 			return "rollback"
 		case job.Args.N == 2:
 			return "error"
+		case job.Args.N == 3 && job.Attempt == 1:
+			return "rollback-nil"
 		}
 		return ""
 	}}
 	workers := hopper.NewWorkers()
 	hopper.AddWorker(workers, w)
-	c := h.started(workers, 2)
+	logs := &recordingHandler{}
+	c := h.client(&hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers: workers,
+		Logger:  slog.New(logs),
+	})
+	events := make(chan hopper.Event, 20)
+	ectx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		for ev := range c.Events(ectx, hopper.EventJobCompleted, hopper.EventJobFailed) {
+			events <- ev
+		}
+	}()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	// A rolled-back completion leaves the attempt to fail as usual, and the
 	// retry completes.
@@ -219,16 +255,47 @@ func TestCompleteTxWhenTheTransactionDoesNotCommit(t *testing.T) {
 		t.Errorf("ledger rows = %d, want only the second attempt's", n)
 	}
 
+	// A worker that rolls back and returns nil anyway does not leave its
+	// job running: the attempt fails, and the retry completes.
+	swallowed, err := c.Insert(ctx, ledger{N: 3}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job = waitForJob(t, c, swallowed.Job.ID, hopper.JobStateCompleted)
+	if job.Attempt != 2 || len(job.Errors) != 1 || !strings.Contains(job.Errors[0].Error, "did not commit") {
+		t.Errorf("job whose worker swallowed the rollback = %+v", job)
+	}
+	if len(logs.matching("CompleteTx transaction did not commit")) == 0 {
+		t.Error("no warning that the CompleteTx transaction did not commit")
+	}
+
 	// An error after a committed completion changes nothing: the job is
-	// already finished.
+	// already finished, and it is reported as completed, not failed.
 	committed, err := c.Insert(ctx, ledger{N: 2}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitForJob(t, c, committed.Job.ID, hopper.JobStateCompleted)
-	time.Sleep(100 * time.Millisecond)
+	deadline := time.After(5 * time.Second)
+	for done := false; !done; {
+		select {
+		case ev := <-events:
+			if ev.Job.ID != committed.Job.ID {
+				continue
+			}
+			if ev.Kind != hopper.EventJobCompleted {
+				t.Errorf("event for the committed job = %s", ev.Kind)
+			}
+			done = true
+		case <-deadline:
+			t.Fatal("no completed event for the committed job")
+		}
+	}
 	if job, err = c.JobGet(ctx, committed.Job.ID); err != nil || job.State != hopper.JobStateCompleted || job.Attempt != 1 || len(job.Errors) != 0 {
 		t.Errorf("committed job = %+v, %v", job, err)
+	}
+	if len(logs.matching("result dropped")) > 0 {
+		t.Errorf("a committed completion was reported as a failure: %v", logs.matching(""))
 	}
 }
 
@@ -353,9 +420,13 @@ func TestCompleteTxExactlyOnceAcrossCrash(t *testing.T) {
 	workers := hopper.NewWorkers()
 	hopper.AddWorker(workers, &ledgerWorker{pool: h.pool})
 
+	// The victim's finalizer never flushes, and its lease is long enough
+	// that a loaded machine cannot lose it before the crash.
 	slowFinalizer := fastTuning
 	slowFinalizer.FinalizeInterval = time.Hour
 	slowFinalizer.FinalizeBatch = 10000
+	slowFinalizer.LeaseTTL = time.Minute
+	slowFinalizer.LeaseRenew = 20 * time.Second
 	victim := h.startedWith(workers, 8, slowFinalizer)
 	const n = 40
 	params := make([]hopper.InsertParams, n)
@@ -367,6 +438,9 @@ func TestCompleteTxExactlyOnceAcrossCrash(t *testing.T) {
 	}
 	waitFor(t, func() bool { return h.count("SELECT count(*) FROM ledger") == n })
 	victim.Abandon()
+	if _, err := h.pool.Exec(ctx, "UPDATE hopper_clients SET expires_at = now() - interval '1s' WHERE id = $1", victim.ClientID()); err != nil {
+		t.Fatal(err)
+	}
 
 	// A job the victim left running would be rescued and run again here.
 	h.started(workers, 8)
@@ -376,5 +450,61 @@ func TestCompleteTxExactlyOnceAcrossCrash(t *testing.T) {
 	}
 	if done := h.count("SELECT count(*) FROM hopper_job_history WHERE state = 'completed' AND attempt = 1"); done != n {
 		t.Errorf("%d jobs completed on their first attempt, want %d", done, n)
+	}
+}
+
+type fanIn struct {
+	Name string `json:"name"`
+}
+
+func (fanIn) Kind() string { return "fan_in" }
+
+// TestCompleteTxFanIn completes one of a job's two dependencies with
+// CompleteTx and keeps its transaction open until the other dependency's
+// finalize is waiting on it. Neither statement sees the other dependency
+// finished, so neither promotes the dependent; the leader does.
+func TestCompleteTxFanIn(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	completed := make(chan struct{})
+	var ran sync.Map
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[fanIn]) error {
+		ran.Store(job.Args.Name, true)
+		switch job.Args.Name {
+		case "x":
+			tx, err := h.pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+			if err := hopper.CompleteTx(ctx, tx, job); err != nil {
+				return err
+			}
+			close(completed)
+			for h.count(`SELECT count(*) FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND position(current_schema() IN query) > 0`) == 0 {
+				time.Sleep(5 * time.Millisecond)
+			}
+			return tx.Commit(ctx)
+		case "y":
+			<-completed
+		}
+		return nil
+	})
+	c := h.started(workers, 4)
+
+	wf := hopper.NewWorkflow("fan-in", nil)
+	x := wf.Add(fanIn{Name: "x"}, nil)
+	y := wf.Add(fanIn{Name: "y"}, nil)
+	wf.Add(fanIn{Name: "after"}, hopper.After(x, y))
+	res, err := c.InsertWorkflow(ctx, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, c, res.Jobs[2].Job.ID, hopper.JobStateCompleted)
+	if _, ok := ran.Load("after"); !ok {
+		t.Error("the dependent completed without running")
 	}
 }

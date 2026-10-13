@@ -13,32 +13,47 @@ import (
 )
 
 // execute runs one claimed job and turns its outcome into a finalize result.
-// It never panics and never blocks past the job's timeout. It reports false
-// when there is nothing to finalize: the worker completed the job with
-// CompleteTx and returned nil.
+// It never panics and never blocks past the job's timeout.
+//
+// A job the worker completed with CompleteTx is finished once the worker's
+// transaction commits, which the client cannot see. Its result is the
+// outcome for the case that it did not commit, the worker's error or
+// errNotCommitted; the fence drops it if it did.
 //
 // The job's context descends from the lease generation (cancelled by a hard
 // stop or fencing) and can also be cancelled by JobCancel, with cause
 // ErrJobCancelled, and by the timeout, with cause ErrJobTimeout.
-func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) (driver.JobFinalize, bool) {
+func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) pending {
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	a := &attempt{codec: c.cfg.Codec, row: row, archive: !qcfg.DeleteCompleted}
+	a := &attempt{codec: c.cfg.Codec, completion: completedResult(row, qcfg)}
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	c.trackRunning(row.ID, cancel)
 	defer c.untrackRunning(row.ID)
 
 	unit, err := c.runWorker(jobCtx, row)
+	completed := a.completedTx()
+	if completed != nil && err == nil {
+		err = errNotCommitted
+	}
 	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err)
 	if f.State.Terminal() {
 		f.Output = a.get()
 	}
-	if err == nil && a.completedTx() {
-		c.finalized(row, f)
-		return f, false
+	if completed == nil {
+		c.logOutcome(ctx, row, f, err)
 	}
-	return f, true
+	return pending{job: row, result: f, completedTx: completed}
+}
+
+// errNotCommitted fails an attempt whose worker completed it with
+// CompleteTx and returned nil, but whose transaction did not commit.
+var errNotCommitted = errors.New("hopper: the worker returned nil, but the transaction it completed the job in did not commit")
+
+// completedResult is the result of an attempt that succeeded.
+func completedResult(row *driver.JobRow, qcfg QueueConfig) driver.JobFinalize {
+	return driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy, State: driver.JobStateCompleted, Archive: !qcfg.DeleteCompleted}
 }
 
 func (c *Client[TTx]) runWorker(ctx context.Context, row *driver.JobRow) (workUnit, error) {
@@ -90,12 +105,10 @@ func safeWork(ctx context.Context, work func(ctx context.Context) error) (err er
 // when the job never reached a worker. ctx is the lease generation and
 // jobCtx the job's own context.
 func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, qcfg QueueConfig, unit workUnit, err error) driver.JobFinalize {
-	f := driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy}
 	if err == nil {
-		f.State = driver.JobStateCompleted
-		f.Archive = !qcfg.DeleteCompleted
-		return f
+		return completedResult(row, qcfg)
 	}
+	f := driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy}
 
 	var snooze *SnoozeError
 	if errors.As(err, &snooze) {
@@ -118,10 +131,8 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 	switch {
 	case errors.As(err, &cancel):
 		f.State = driver.JobStateDiscarded
-		c.logger.InfoContext(ctx, "hopper: job cancelled by worker", "job_id", row.ID, "kind", row.Kind, "error", err)
 	case errors.Is(context.Cause(jobCtx), ErrJobCancelled):
 		f.State = driver.JobStateCancelled
-		c.logger.InfoContext(ctx, "hopper: job cancelled", "job_id", row.ID, "kind", row.Kind)
 	case ctx.Err() != nil && row.Attempt < row.MaxAttempts:
 		// The client is stopping (or was fenced) and cancelled the job. That
 		// is not the job's fault: retry immediately elsewhere. On its last
@@ -129,13 +140,30 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 		f.State = driver.JobStateRetryable
 	case row.Attempt >= row.MaxAttempts:
 		f.State = driver.JobStateDiscarded
-		c.logger.ErrorContext(ctx, "hopper: job discarded", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "error", err)
 	default:
 		f.State = driver.JobStateRetryable
 		f.Delay = c.retryDelay(row, unit)
-		c.logger.WarnContext(ctx, "hopper: job failed", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "retry_in", f.Delay, "error", err)
 	}
 	return f
+}
+
+// logOutcome logs a failed attempt's outcome. A retry because the client
+// is stopping is not the job's fault and is not logged.
+func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driver.JobFinalize, err error) {
+	if f.Error == nil {
+		return
+	}
+	var cancel *CancelError
+	switch {
+	case errors.As(err, &cancel):
+		c.logger.InfoContext(ctx, "hopper: job cancelled by worker", "job_id", row.ID, "kind", row.Kind, "error", err)
+	case f.State == driver.JobStateCancelled:
+		c.logger.InfoContext(ctx, "hopper: job cancelled", "job_id", row.ID, "kind", row.Kind)
+	case f.State == driver.JobStateDiscarded:
+		c.logger.ErrorContext(ctx, "hopper: job discarded", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "error", err)
+	case ctx.Err() == nil:
+		c.logger.WarnContext(ctx, "hopper: job failed", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "retry_in", f.Delay, "error", err)
+	}
 }
 
 func (c *Client[TTx]) retryDelay(row *driver.JobRow, unit workUnit) time.Duration {
