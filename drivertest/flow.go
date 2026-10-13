@@ -427,7 +427,15 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		}
 		late <- res
 	}()
-	time.Sleep(200 * time.Millisecond)
+	// Commit as soon as the second settle waits for the row, so that its
+	// wait stays well within its lock timeout on a slow machine.
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if f.QueryText(ctx, t, d, `SELECT count(*)::text FROM pg_stat_activity
+		    WHERE wait_event_type = 'Lock' AND position(current_schema() IN query) > 0
+		      AND query LIKE '%hopper_batch_progress%'`) != "0" {
+			break
+		}
+	}
 	if err := commitA(); err != nil {
 		t.Fatal(err)
 	}
