@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 )
@@ -24,8 +25,9 @@ const (
 )
 
 // UniqueOpts makes a job unique among live jobs (those not yet finalized) of
-// its kind. The zero value is unique by kind alone: at most one live job of
-// the kind at a time.
+// its kind, and among its finished jobs in the states Finished names. The
+// zero value is unique by kind alone: at most one live job of the kind at a
+// time.
 type UniqueOpts struct {
 	// ByArgs includes the args in the key: the fields tagged
 	// `hopper:"unique"`, or the whole args if no field is tagged.
@@ -38,6 +40,36 @@ type UniqueOpts struct {
 	ByPeriod time.Duration
 	// OnConflict is what to do when the job exists.
 	OnConflict UniqueConflict
+	// Finished also counts finished jobs with the key as duplicates when
+	// their state is one of these (JobStateCompleted, JobStateCanceled,
+	// JobStateDiscarded), for as long as history keeps them
+	// (Config.CompletedRetention, Config.FailedRetention). With ByPeriod a
+	// finished job counts only for the rest of its period, which is part of
+	// the key. A finished duplicate is reported like a live one, and is
+	// never replaced. Looking in history costs an index lookup per history
+	// partition, so it grows with retention (docs/operations.md).
+	//
+	// A duplicate that finalizes while the insert runs is still found,
+	// except in a caller's transaction (InsertTx, InsertManyTx) at
+	// repeatable read or serializable, which does not see a duplicate
+	// finalized after its snapshot.
+	Finished []JobState
+}
+
+// finished validates Finished and returns it without repeats.
+func (o *UniqueOpts) finished() ([]JobState, error) {
+	var out []JobState
+	for _, s := range o.Finished {
+		switch s {
+		case JobStateCompleted, JobStateCanceled, JobStateDiscarded:
+		default:
+			return nil, fmt.Errorf("hopper: UniqueOpts.Finished has %q, which is not a finished state", s)
+		}
+		if !slices.Contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	return out, nil
 }
 
 // maxUniqueKey bounds the stored key. Keys are readable text, not hashes.

@@ -52,12 +52,18 @@
   session connection: point the listener at a direct address with
   `hopperpgx.Config.ListenConnConfig`, or accept polling (the client logs
   once and polls every `PollInterval`, one second by default).
-- **`statement_timeout`.** After the v13 upgrade the leader builds an index
-  on each existing history partition with `CREATE INDEX CONCURRENTLY`, which
+- **`statement_timeout`.** After the v13 and v14 upgrades the leader builds
+  indexes on each existing history partition with `CREATE INDEX CONCURRENTLY`, which
   runs under the pool's `statement_timeout` and waits for every older
   transaction in the database. A build that runs past the timeout is retried
   at doubling intervals with a warning; raise the timeout for hopper's role
-  until the warnings stop.
+  until the warnings stop. Until a partition has its unique-key index, an insert
+  with `UniqueOpts.Finished` reads that partition in full.
+- **`UniqueOpts.Finished`.** Each such job is looked up in every history
+  partition of the outcomes it counts, one index lookup each, so the cost
+  grows with retention. With the default 24 hours of completed history, a
+  batch of 100 jobs counting completed duplicates took about twice as long
+  as one without; with seven days, about seven times as long.
 - **Streams.** The stream log is partitioned by day and dropped after
   `StreamRetention`, like history. Consumers are delivered by the leader,
   in transaction-commit order per batch, and a transaction that commits

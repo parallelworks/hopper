@@ -222,6 +222,21 @@ fields tagged `hopper:"unique"` (or all fields), `ByQueue` the queue, and
 `ByPeriod` a time bucket ("one per hour"). `UniqueReplace` updates the
 existing job's args and schedule, which gives debouncing.
 
+Only live jobs count unless `Finished` names finished states too. To run
+a report at most once per day, even when the first run has already
+completed:
+
+```go
+Unique: &hopper.UniqueOpts{
+    ByArgs:   true,
+    ByPeriod: 24 * time.Hour,
+    Finished: []hopper.JobState{hopper.JobStateCompleted},
+},
+```
+
+A finished job counts while history keeps it (`CompletedRetention`,
+`FailedRetention`), and is reported as the duplicate, never replaced.
+
 ## Periodic jobs
 
 ```go

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -97,6 +98,15 @@ func (b *Batch[TTx]) insert(ctx context.Context, exec driver.Executor, inTx bool
 	results, err := b.c.insertMany(ctx, exec, params, inTx)
 	if err != nil {
 		return nil, err
+	}
+	// A job found finished (UniqueOpts.Finished) counted toward the batch at
+	// once, and may have been its last. In the caller's transaction, the
+	// leader settles the batch once it commits, and settles it here too if
+	// this attempt fails: the jobs are inserted either way.
+	if !inTx && slices.ContainsFunc(results, func(r *InsertResult) bool { return r.Duplicate && r.Job.State.Terminal() }) {
+		if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{id}}); err != nil {
+			b.c.logger.WarnContext(ctx, "hopper: settle batch", "batch_id", id, "error", err)
+		}
 	}
 	return &BatchResult{ID: id, Jobs: results}, nil
 }

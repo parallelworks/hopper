@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -48,7 +49,8 @@ func (c *Client[TTx]) InsertManyTx(ctx context.Context, tx TTx, params []InsertP
 type uniqueRef struct{ kind, key string }
 
 // insertMany builds driver params, folds duplicates within the batch, runs
-// one statement per conflict action, and wakes workers.
+// one statement per conflict action (and per round of repeated keys that
+// count different finished states), and wakes workers.
 //
 // inTx says the executor is the caller's transaction. Those inserts notify
 // from inside the transaction, so the notification is delivered on commit.
@@ -92,44 +94,58 @@ func (c *Client[TTx]) insertDirect(ctx context.Context, exec driver.Executor, pa
 	}
 
 	// Within a batch, later inputs with the same unique key resolve to the
-	// first, as they would if inserted one at a time.
+	// one before, as they would if inserted one at a time. One that counts
+	// other finished states than the one before may not resolve to the same
+	// job, so it is inserted in a later round instead, which sees what the
+	// earlier rounds did.
 	results := make([]*InsertResult, len(params))
-	byAction := map[driver.ConflictAction][]int{}
+	var rounds []map[driver.ConflictAction][]int
 	dupOf := make([]int, len(params))
-	first := map[uniqueRef]int{}
+	type keyState struct{ last, round int }
+	seen := map[uniqueRef]keyState{}
 	for i, dp := range dparams {
 		dupOf[i] = -1
+		round := 0
 		if dp.UniqueKey != "" {
 			ref := uniqueRef{dp.Kind, dp.UniqueKey}
-			if j, seen := first[ref]; seen {
-				dupOf[i] = j
-				continue
+			if s, ok := seen[ref]; ok {
+				if sameStates(dparams[s.last].UniqueFinished, dp.UniqueFinished) {
+					dupOf[i] = s.last
+					seen[ref] = keyState{i, s.round}
+					continue
+				}
+				round = s.round + 1
 			}
-			first[ref] = i
+			seen[ref] = keyState{i, round}
 		}
-		byAction[actions[i]] = append(byAction[actions[i]], i)
+		if round == len(rounds) {
+			rounds = append(rounds, map[driver.ConflictAction][]int{})
+		}
+		rounds[round][actions[i]] = append(rounds[round][actions[i]], i)
 	}
 
-	for action, idx := range byAction {
-		sub := make([]driver.JobInsertParams, len(idx))
-		for k, i := range idx {
-			sub[k] = dparams[i]
-		}
-		opts := driver.JobInsertOpts{Notify: inTx, OnConflict: action}
-		var (
-			rows []driver.JobInsertResult
-			err  error
-		)
-		if !unique && c.caps.Copy && len(sub) >= c.tuning.copyThreshold {
-			rows, err = exec.JobInsertCopy(ctx, sub, opts)
-		} else {
-			rows, err = exec.JobInsertMany(ctx, sub, opts)
-		}
-		if err != nil {
-			return nil, err
-		}
-		for k, r := range rows {
-			results[idx[k]] = &InsertResult{Job: r.Job, Duplicate: r.Duplicate}
+	for _, byAction := range rounds {
+		for action, idx := range byAction {
+			sub := make([]driver.JobInsertParams, len(idx))
+			for k, i := range idx {
+				sub[k] = dparams[i]
+			}
+			opts := driver.JobInsertOpts{Notify: inTx, OnConflict: action}
+			var (
+				rows []driver.JobInsertResult
+				err  error
+			)
+			if !unique && c.caps.Copy && len(sub) >= c.tuning.copyThreshold {
+				rows, err = exec.JobInsertCopy(ctx, sub, opts)
+			} else {
+				rows, err = exec.JobInsertMany(ctx, sub, opts)
+			}
+			if err != nil {
+				return nil, err
+			}
+			for k, r := range rows {
+				results[idx[k]] = &InsertResult{Job: r.Job, Duplicate: r.Duplicate}
+			}
 		}
 	}
 	for i, j := range dupOf {
@@ -141,7 +157,8 @@ func (c *Client[TTx]) insertDirect(ctx context.Context, exec driver.Executor, pa
 	if !inTx {
 		queues := map[string]struct{}{}
 		for _, r := range results {
-			if !r.Duplicate || actions[0] == driver.ConflictReplace {
+			// A finished duplicate is never replaced, so nothing changed.
+			if !r.Duplicate || (actions[0] == driver.ConflictReplace && r.Job.FinalizedAt.IsZero()) {
 				queues[r.Job.Queue] = struct{}{}
 			}
 		}
@@ -151,6 +168,12 @@ func (c *Client[TTx]) insertDirect(ctx context.Context, exec driver.Executor, pa
 		}
 	}
 	return results, nil
+}
+
+// sameStates reports whether a and b, each without repeats, hold the same
+// states.
+func sameStates(a, b []driver.JobState) bool {
+	return len(a) == len(b) && !slices.ContainsFunc(a, func(s driver.JobState) bool { return !slices.Contains(b, s) })
 }
 
 func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.JobInsertParams, driver.ConflictAction, error) {
@@ -220,6 +243,9 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 	action := driver.ConflictSkip
 	if opts.Unique != nil {
 		if dp.UniqueKey, err = opts.Unique.key(p.Args, args, opts.Queue, now); err != nil {
+			return driver.JobInsertParams{}, 0, err
+		}
+		if dp.UniqueFinished, err = opts.Unique.finished(); err != nil {
 			return driver.JobInsertParams{}, 0, err
 		}
 		if opts.Unique.OnConflict == UniqueReplace {

@@ -363,7 +363,7 @@ SELECT %s, finalized_at, output FROM (
   SELECT %s, seq, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE batch_id = $1
   UNION ALL
   SELECT %s, seq, finalized_at, output FROM {{schema}}.hopper_job_history WHERE batch_id = $1
-) u ORDER BY seq`, JobColumns(""), JobColumns(""), historyColumns())
+) u ORDER BY seq`, JobColumns(""), JobColumns(""), historyColumns(""))
 
 // WorkflowGet implements driver.Executor.
 func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.WorkflowRow, error) {

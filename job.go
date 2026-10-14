@@ -55,8 +55,7 @@ type InsertOpts struct {
 	// Metadata is a JSON object stored with the job, for trace context and
 	// similar. It is not passed to the worker as args.
 	Metadata json.RawMessage
-	// Unique makes the job unique among live jobs of its kind. See
-	// UniqueOpts.
+	// Unique makes the job unique among jobs of its kind. See UniqueOpts.
 	Unique *UniqueOpts
 	// TTL bounds how long the job may wait to run, measured from its
 	// insert: before its first attempt, between retries, and while snoozed.
@@ -121,8 +120,9 @@ type InsertParams struct {
 // InsertResult is the outcome of inserting one job.
 type InsertResult struct {
 	Job *JobRow
-	// Duplicate reports that a live job with the same unique key already
-	// existed. Job is then that existing job.
+	// Duplicate reports that a job with the same unique key already
+	// existed: a live one, or a finished one UniqueOpts.Finished counts. Job
+	// is then that existing job.
 	Duplicate bool
 }
 

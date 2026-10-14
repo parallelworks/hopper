@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,13 +32,13 @@ func JobColumns(prefix string) string {
 
 // historyColumns lists hopper_job_history columns in JobColumns order.
 // History has no snooze_reason, because a finalized job is not waiting.
-func historyColumns() string {
-	return strings.Replace(JobColumns(""), "snooze_reason", "NULL::text AS snooze_reason", 1)
+func historyColumns(prefix string) string {
+	return strings.Replace(JobColumns(prefix), prefix+"snooze_reason", "NULL::text AS snooze_reason", 1)
 }
 
 // scanJob scans a row of JobColumns, plus finalized_at and output when
-// history is true, plus a trailing duplicate flag when dup is non-nil.
-func scanJob(row Row, history bool, dup *bool) (*driver.JobRow, error) {
+// history is true, plus trailing columns into extra.
+func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 	var (
 		j                                driver.JobRow
 		state                            string
@@ -60,10 +61,7 @@ func scanJob(row Row, history bool, dup *bool) (*driver.JobRow, error) {
 	if history {
 		dest = append(dest, &finalizedAt, &output)
 	}
-	if dup != nil {
-		dest = append(dest, dup)
-	}
-	if err := row.Scan(dest...); err != nil {
+	if err := row.Scan(append(dest, extra...)...); err != nil {
 		return nil, err
 	}
 	j.State = driver.JobState(state)
@@ -86,8 +84,8 @@ func scanJob(row Row, history bool, dup *bool) (*driver.JobRow, error) {
 }
 
 var (
-	liveJobs    = collect(func(r Row) (*driver.JobRow, error) { return scanJob(r, false, nil) })
-	historyJobs = collect(func(r Row) (*driver.JobRow, error) { return scanJob(r, true, nil) })
+	liveJobs    = collect(func(r Row) (*driver.JobRow, error) { return scanJob(r, false) })
+	historyJobs = collect(func(r Row) (*driver.JobRow, error) { return scanJob(r, true) })
 )
 
 var scanInsertResults = collect(func(r Row) (driver.JobInsertResult, error) {
@@ -173,6 +171,13 @@ func (e *Executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 	if len(params) == 0 {
 		return nil, nil
 	}
+	if slices.ContainsFunc(params, countsHistory) {
+		return e.jobInsertCheckingHistory(ctx, params, opts)
+	}
+	return e.jobInsert(ctx, params, opts)
+}
+
+func (e *Executor) jobInsert(ctx context.Context, params []driver.JobInsertParams, opts driver.JobInsertOpts) ([]driver.JobInsertResult, error) {
 	n := len(params)
 	var (
 		kinds, queues, uniqueKeys, ordering, partitions = make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
@@ -226,6 +231,183 @@ func (e *Executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 		return nil, fmt.Errorf("hopper: insert jobs: inserted %d rows for %d inputs", len(results), n)
 	}
 	return results, nil
+}
+
+func countsHistory(p driver.JobInsertParams) bool {
+	return p.UniqueKey != "" && len(p.UniqueFinished) > 0
+}
+
+// jobInsertCheckingHistory inserts a batch in which some jobs count finished
+// duplicates in history. It inserts the batch as usual, which reports or
+// replaces live duplicates, and then looks in history for the jobs it
+// inserted, deleting each one whose duplicate it finds there, in the same
+// transaction, before any worker can claim it. Looking after the insert
+// rather than before also finds a duplicate finalized while the insert ran:
+// its live row was gone, and its history row not yet in the insert's
+// snapshot, but the insert's conflict check waited for that finalize to
+// commit, and the look, a statement of its own at read committed, takes a
+// snapshot that includes it. A duplicate already in history costs a row
+// inserted and deleted, which is less than looking it up twice.
+func (e *Executor) jobInsertCheckingHistory(ctx context.Context, params []driver.JobInsertParams, opts driver.JobInsertOpts) ([]driver.JobInsertResult, error) {
+	var results []driver.JobInsertResult
+	insert := func(conn Conn) error {
+		var err error
+		results, err = (&Executor{Conn: conn, Schema: e.Schema, InTx: true}).jobInsert(ctx, params, opts)
+		if err != nil {
+			return err
+		}
+		found, err := uniqueHistory(ctx, conn, params, results)
+		if err != nil {
+			return err
+		}
+		for i, job := range found {
+			if job != nil {
+				results[i] = driver.JobInsertResult{Job: job, Duplicate: true}
+			}
+		}
+		return recordInBatches(ctx, conn, params, results)
+	}
+	var err error
+	if e.InTx {
+		err = insert(e.Conn)
+	} else {
+		err = e.withTx(ctx, func(tx Tx) error {
+			// The look needs a snapshot of its own, which only read
+			// committed takes per statement. The server's default
+			// (default_transaction_isolation) may be stricter.
+			if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+				return fmt.Errorf("hopper: insert jobs: %w", err)
+			}
+			return insert(tx)
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// inBatch reports whether a job of a batch was found finished in history.
+func inBatch(params []driver.JobInsertParams, results []driver.JobInsertResult) bool {
+	for i, r := range results {
+		if r.Job != nil && !params[i].BatchID.IsZero() && r.Duplicate && !r.Job.FinalizedAt.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
+// recordInBatches counts each job of a batch that was found finished in
+// history as that job's outcome, done and, unless it completed, failed, in
+// the batch's progress, as its finalize would have. The job never joins the
+// batch, which would otherwise wait for it forever. BatchSettle completes a
+// batch this leaves with nothing pending.
+func recordInBatches(ctx context.Context, conn Conn, params []driver.JobInsertParams, results []driver.JobInsertResult) error {
+	if !inBatch(params, results) {
+		return nil
+	}
+	var (
+		batches []driver.JobID
+		failed  []bool
+	)
+	for i, r := range results {
+		if r.Job != nil && !params[i].BatchID.IsZero() && r.Duplicate && !r.Job.FinalizedAt.IsZero() {
+			batches = append(batches, params[i].BatchID)
+			failed = append(failed, r.Job.State != driver.JobStateCompleted)
+		}
+	}
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO {{schema}}.hopper_batch_progress (batch_id, done, failed)
+		SELECT f.batch_id, count(*), count(*) FILTER (WHERE f.failed)
+		FROM unnest($1::uuid[], $2::boolean[]) AS f(batch_id, failed)
+		GROUP BY f.batch_id`, uuidArray(batches), boolArray(failed)); err != nil {
+		return fmt.Errorf("hopper: insert jobs: record finished duplicates in their batch: %w", err)
+	}
+	return nil
+}
+
+// uniqueHistorySQL finds the latest duplicate in history of each job just
+// inserted, and deletes the job. It reads the outcome table %[1]s, which
+// holds every state the jobs count.
+const uniqueHistorySQL = `
+WITH p AS (
+  SELECT p.ord, p.kind, p.unique_key, p.inserted, string_to_array(p.finished, ',')::{{schema}}.hopper_job_state[] AS states
+  FROM unnest($1::int[], $2::text[], $3::text[], $4::text[], $5::uuid[]) AS p(ord, kind, unique_key, finished, inserted)
+), hit AS (
+  SELECT p.ord, p.inserted, h.*
+  FROM p CROSS JOIN LATERAL (
+    SELECT %[2]s, x.finalized_at, x.output FROM {{schema}}.%[1]s x
+    WHERE x.kind = p.kind AND x.unique_key = p.unique_key AND x.state = ANY(p.states)
+    ORDER BY x.finalized_at DESC
+    LIMIT 1
+  ) h
+), del AS (
+  DELETE FROM {{schema}}.hopper_jobs j USING hit WHERE j.id = hit.inserted
+)
+SELECT %[3]s, finalized_at, output, ord FROM hit`
+
+// uniqueHistoryQueries reads only the completed or the failed outcome table
+// when the jobs count states of one alone, so the other's partitions are
+// neither planned nor probed.
+var uniqueHistoryQueries = map[string]string{
+	"hopper_job_history":           fmt.Sprintf(uniqueHistorySQL, "hopper_job_history", historyColumns("x."), JobColumns("")),
+	"hopper_job_history_completed": fmt.Sprintf(uniqueHistorySQL, "hopper_job_history_completed", historyColumns("x."), JobColumns("")),
+	"hopper_job_history_failed":    fmt.Sprintf(uniqueHistorySQL, "hopper_job_history_failed", historyColumns("x."), JobColumns("")),
+}
+
+// uniqueHistory looks in history for a duplicate of each job inserted (not
+// a duplicate itself) that counts history, deletes each job it finds one
+// for, and returns the duplicates by input, nil where there was none.
+func uniqueHistory(ctx context.Context, conn Conn, params []driver.JobInsertParams, inserted []driver.JobInsertResult) ([]*driver.JobRow, error) {
+	var (
+		ords              []int
+		kinds, keys, fin  []string
+		ids               []driver.JobID
+		completed, failed bool
+	)
+	for i, p := range params {
+		if !countsHistory(p) || inserted[i].Duplicate {
+			continue
+		}
+		states := make([]string, len(p.UniqueFinished))
+		for k, s := range p.UniqueFinished {
+			states[k] = string(s)
+			if s == driver.JobStateCompleted {
+				completed = true
+			} else {
+				failed = true
+			}
+		}
+		ords, ids = append(ords, i), append(ids, inserted[i].Job.ID)
+		kinds, keys, fin = append(kinds, p.Kind), append(keys, p.UniqueKey), append(fin, strings.Join(states, ","))
+	}
+	found := make([]*driver.JobRow, len(params))
+	if len(ords) == 0 {
+		return found, nil
+	}
+	table := "hopper_job_history"
+	if !failed {
+		table = "hopper_job_history_completed"
+	} else if !completed {
+		table = "hopper_job_history_failed"
+	}
+	type hit struct {
+		ord int
+		job *driver.JobRow
+	}
+	hits, err := collect(func(r Row) (hit, error) {
+		var h hit
+		var err error
+		h.job, err = scanJob(r, true, &h.ord)
+		return h, err
+	})(conn.Query(ctx, uniqueHistoryQueries[table], intArray(ords), textArray(kinds), textArray(keys), textArray(fin), uuidArray(ids)))
+	if err != nil {
+		return nil, fmt.Errorf("hopper: insert jobs: find duplicates in history: %w", err)
+	}
+	for _, h := range hits {
+		found[h.ord] = h.job
+	}
+	return found, nil
 }
 
 // JobInsertCopy implements driver.Executor for transports without COPY.
@@ -514,11 +696,11 @@ var jobGetQuery = fmt.Sprintf(`
 SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE id = $1
 UNION ALL
 SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history WHERE id = $1
-LIMIT 1`, JobColumns(""), historyColumns())
+LIMIT 1`, JobColumns(""), historyColumns(""))
 
 // JobGet implements driver.Executor.
 func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
-	job, err := scanJob(e.Conn.QueryRow(ctx, jobGetQuery, uuidParam(id)), true, nil)
+	job, err := scanJob(e.Conn.QueryRow(ctx, jobGetQuery, uuidParam(id)), true)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound
 	}
@@ -530,7 +712,7 @@ func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow,
 
 var (
 	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM {{schema}}.hopper_jobs`, JobColumns(""))
-	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, historyColumns())
+	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, historyColumns(""))
 	jobListFilterSQL  = ` WHERE ($1 = '' OR queue = $1) AND (cardinality($2::text[]) = 0 OR kind = ANY($2::text[]))
   AND (cardinality($3::text[]) = 0 OR state::text = ANY($3::text[]))`
 	// A key's live jobs are found through the claim's ordering-key indexes,
@@ -649,14 +831,14 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 			return err
 		}
 		if driver.JobState(state) == driver.JobStateRunning {
-			job, err = scanJob(tx.QueryRow(ctx, jobCancelRunningSQL, uuidParam(id)), false, nil)
+			job, err = scanJob(tx.QueryRow(ctx, jobCancelRunningSQL, uuidParam(id)), false)
 			if err != nil {
 				return err
 			}
 			_, err = tx.Exec(ctx, NotifySQL, driver.ChannelControl, textArray([]string{"cancel:" + id.String()}))
 			return err
 		}
-		job, err = scanJob(tx.QueryRow(ctx, jobCancelWaitingSQL, uuidParam(id), driver.ChannelDone, driver.ChannelInsert), true, nil)
+		job, err = scanJob(tx.QueryRow(ctx, jobCancelWaitingSQL, uuidParam(id), driver.ChannelDone, driver.ChannelInsert), true)
 		return err
 	})
 	if err != nil {
@@ -670,7 +852,7 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 
 // jobDeleteHistorySQL removes a finalized job from history.
 var jobDeleteHistorySQL = fmt.Sprintf(`DELETE FROM {{schema}}.hopper_job_history WHERE id = $1
-RETURNING %s, finalized_at, output`, historyColumns())
+RETURNING %s, finalized_at, output`, historyColumns(""))
 
 // JobDelete implements driver.Executor. A JobRetry that is moving the job
 // from history back to the live table makes the history delete wait for it
@@ -686,7 +868,7 @@ func (e *Executor) JobDelete(ctx context.Context, id driver.JobID) (*driver.JobR
 			err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
 			switch {
 			case errors.Is(err, ErrNoRows):
-				job, err = scanJob(tx.QueryRow(ctx, jobDeleteHistorySQL, uuidParam(id)), true, nil)
+				job, err = scanJob(tx.QueryRow(ctx, jobDeleteHistorySQL, uuidParam(id)), true)
 				if errors.Is(err, ErrNoRows) {
 					if second {
 						return driver.ErrNotFound
@@ -699,7 +881,7 @@ func (e *Executor) JobDelete(ctx context.Context, id driver.JobID) (*driver.JobR
 			case driver.JobState(state) == driver.JobStateRunning:
 				return driver.ErrJobRunning
 			default:
-				job, err = scanJob(tx.QueryRow(ctx, jobDeleteWaitingSQL, uuidParam(id), driver.ChannelDone, driver.ChannelInsert), true, nil)
+				job, err = scanJob(tx.QueryRow(ctx, jobDeleteWaitingSQL, uuidParam(id), driver.ChannelDone, driver.ChannelInsert), true)
 				return err
 			}
 		}
@@ -756,7 +938,7 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 		err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
 		switch {
 		case errors.Is(err, ErrNoRows):
-			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id)), false, nil)
+			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id)), false)
 			if errors.Is(err, ErrNoRows) {
 				return driver.ErrNotFound
 			}
@@ -769,7 +951,7 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 		case driver.JobState(state) == driver.JobStateRunning:
 			return driver.ErrJobRunning
 		}
-		job, err = scanJob(tx.QueryRow(ctx, jobRetryLiveSQL, uuidParam(id)), false, nil)
+		job, err = scanJob(tx.QueryRow(ctx, jobRetryLiveSQL, uuidParam(id)), false)
 		return err
 	})
 	if err != nil {

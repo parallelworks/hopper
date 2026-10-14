@@ -369,16 +369,18 @@ func indexOf(s, sub string) int {
 	return -1
 }
 
-// testHistoryOrderingIndex checks that maintenance builds and attaches the
-// ordering-key index of every history partition (schema v13), including
-// one a canceled build left invalid, while leaders overlap and history is
-// read throughout: no attach may deadlock with a reader.
-func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
+// testHistoryIndexes checks that maintenance builds and attaches the
+// ordering-key (schema v13) and unique-key (v14) indexes of every history
+// partition, including ones a canceled build left invalid, while leaders
+// overlap and history is read throughout: no attach may deadlock with a
+// reader.
+func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
 	p := params("k", 2)
 	p[0].OrderingKey = "lane"
+	p[1].UniqueKey = "once"
 	insert(ctx, t, exec, p)
 	clientID := register(ctx, t, exec)
 	for _, j := range claim(ctx, t, exec, clientID, 2) {
@@ -386,13 +388,7 @@ func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	unattached := func() string {
 		t.Helper()
-		return f.QueryText(ctx, t, d, `
-			SELECT count(*)::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-			WHERE i.inhparent IN ('hopper_job_history_completed'::regclass, 'hopper_job_history_failed'::regclass)
-			  AND NOT EXISTS (
-			    SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
-			    WHERE x.indrelid = c.oid
-			      AND xi.inhparent IN ('hopper_job_history_completed_ordering'::regclass, 'hopper_job_history_failed_ordering'::regclass))`)
+		return f.QueryText(ctx, t, d, unattachedHistoryIndexes)
 	}
 	if n := unattached(); n == "0" {
 		t.Fatal("no partition is missing its index before maintenance")
@@ -401,14 +397,18 @@ func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.HistoryIndex(ctx, skipped); err != nil {
 		t.Fatal(err)
 	}
-	if v := f.QueryText(ctx, t, d, "SELECT (to_regclass('hopper_job_history_completed_default_ordering') IS NULL AND to_regclass('hopper_job_history_failed_default_ordering') IS NULL)::text"); v != "true" {
+	if v := f.QueryText(ctx, t, d, `SELECT count(to_regclass(n))::text FROM unnest(ARRAY[
+		'hopper_job_history_completed_default_ordering', 'hopper_job_history_failed_default_ordering',
+		'hopper_job_history_completed_default_unique', 'hopper_job_history_failed_default_unique']) AS n`); v != "0" {
 		t.Error("a skipped partition was indexed")
 	}
 
 	// What a canceled CREATE INDEX CONCURRENTLY leaves: an invalid index
 	// under the name maintenance uses.
-	f.Exec(ctx, t, d, "CREATE INDEX hopper_job_history_completed_default_ordering ON hopper_job_history_completed_default (kind)")
-	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_completed_default_ordering'::regclass")
+	for _, index := range []string{"hopper_job_history_completed_default_ordering", "hopper_job_history_completed_default_unique"} {
+		f.Exec(ctx, t, d, "CREATE INDEX "+index+" ON hopper_job_history_completed_default (kind)")
+		f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = $1::regclass", index)
+	}
 
 	maintainWhileReading(ctx, t, exec)
 	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
@@ -417,7 +417,10 @@ func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	if n := unattached(); n != "0" {
 		t.Errorf("%s partitions without an attached index", n)
 	}
-	for _, parent := range []string{"hopper_job_history_completed_ordering", "hopper_job_history_failed_ordering"} {
+	for _, parent := range []string{
+		"hopper_job_history_completed_ordering", "hopper_job_history_failed_ordering",
+		"hopper_job_history_completed_unique", "hopper_job_history_failed_unique",
+	} {
 		if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = $1::regclass", parent); v != "true" {
 			t.Errorf("%s valid = %s", parent, v)
 		}
@@ -425,9 +428,15 @@ func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	if def := f.QueryText(ctx, t, d, "SELECT pg_get_indexdef('hopper_job_history_completed_default_ordering'::regclass)"); !strings.Contains(def, "(ordering_key, id) WHERE (ordering_key IS NOT NULL)") {
 		t.Errorf("rebuilt index = %s", def)
 	}
+	if def := f.QueryText(ctx, t, d, "SELECT pg_get_indexdef('hopper_job_history_completed_default_unique'::regclass)"); !strings.Contains(def, "(kind, unique_key, finalized_at) WHERE (unique_key IS NOT NULL)") {
+		t.Errorf("rebuilt index = %s", def)
+	}
 	jobs, err := exec.JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10})
 	if err != nil || len(jobs) != 1 || jobs[0].OrderingKey != "lane" {
 		t.Errorf("history by key = %+v, %v", jobs, err)
+	}
+	if res := insert(ctx, t, exec, []driver.JobInsertParams{onceAgain}); !res[0].Duplicate || res[0].Job.State != driver.JobStateCompleted {
+		t.Errorf("history by unique key = %+v", res[0].Job)
 	}
 
 	// What retention dropping the last partition without an index leaves:
@@ -441,10 +450,25 @@ func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+// unattachedHistoryIndexes counts the indexes history partitions lack.
+const unattachedHistoryIndexes = `
+	SELECT count(*)::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+	CROSS JOIN (VALUES ('_ordering'), ('_unique')) AS s(suffix)
+	WHERE i.inhparent IN ('hopper_job_history_completed'::regclass, 'hopper_job_history_failed'::regclass)
+	  AND NOT EXISTS (
+	    SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
+	    WHERE x.indrelid = c.oid AND xi.inhparent = to_regclass(i.inhparent::regclass::text || s.suffix))`
+
+// onceAgain repeats a unique job that counts its completed duplicates.
+var onceAgain = driver.JobInsertParams{
+	Kind: "k", Queue: "default", Priority: 2, MaxAttempts: 3, UniqueKey: "once",
+	UniqueFinished: []driver.JobState{driver.JobStateCompleted},
+}
+
 // maintainWhileReading runs the history maintenance and indexing of three
-// overlapping leaders while eight readers list a key's jobs from history, and
-// fails the test on any error either side returns: no attach may deadlock
-// with a reader.
+// overlapping leaders while eight readers list a key's jobs from history and
+// look for a unique key's duplicates there, and fails the test on any error
+// either side returns: no attach may deadlock with a reader.
 func maintainWhileReading(ctx context.Context, t *testing.T, exec driver.Executor) {
 	t.Helper()
 	var (
@@ -461,6 +485,10 @@ func maintainWhileReading(ctx context.Context, t *testing.T, exec driver.Executo
 				default:
 				}
 				if _, err := exec.JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10}); err != nil {
+					readErrs <- err
+					return
+				}
+				if _, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{onceAgain}, driver.JobInsertOpts{}); err != nil {
 					readErrs <- err
 					return
 				}
