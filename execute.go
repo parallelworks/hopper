@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
-	"math/rand/v2"
 	"runtime/debug"
 	"time"
 
@@ -184,21 +182,39 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 	f.Archive = true
 
 	var cancel *CancelError
+	byWorker := errors.As(err, &cancel)
 	switch {
-	case errors.As(err, &cancel):
-		f.State = driver.JobStateDiscarded
-	case errors.Is(context.Cause(jobCtx), ErrJobCanceled):
+	case !byWorker && errors.Is(context.Cause(jobCtx), ErrJobCanceled):
 		f.State = driver.JobStateCanceled
-	case ctx.Err() != nil && row.Attempt < row.MaxAttempts:
+		return f
+	case !byWorker && ctx.Err() != nil && row.Attempt < row.MaxAttempts:
 		// The client is stopping (or was fenced) and canceled the job. That
 		// is not the job's fault: retry immediately elsewhere. On its last
 		// attempt it is dead-lettered instead, as a rescued job would be.
 		f.State = driver.JobStateRetryable
-	case row.Attempt >= row.MaxAttempts:
+		return f
+	}
+	if ctx.Err() == nil {
+		switch o := c.onError(ctx, row, err); {
+		case o.Discard:
+			f.State = driver.JobStateDiscarded
+			return f
+		case o.Snooze > 0:
+			return driver.JobFinalize{
+				ID: row.ID, AttemptedBy: row.AttemptedBy, State: driver.JobStateScheduled,
+				Delay: o.Snooze, Snooze: true, SnoozeReason: err.Error(),
+			}
+		case !o.RetryAt.IsZero() && row.Attempt < row.MaxAttempts:
+			f.State = driver.JobStateRetryable
+			f.Delay = max(time.Until(o.RetryAt), 0)
+			return f
+		}
+	}
+	if byWorker || row.Attempt >= row.MaxAttempts {
 		f.State = driver.JobStateDiscarded
-	default:
+	} else {
 		f.State = driver.JobStateRetryable
-		f.Delay = c.retryDelay(row, unit)
+		f.Delay = c.retryDelay(row, qcfg, unit)
 	}
 	return f
 }
@@ -206,12 +222,17 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 // logOutcome logs a failed attempt's outcome. A retry because the client
 // is stopping is not the job's fault and is not logged.
 func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driver.JobFinalize, err error) {
+	var snooze *SnoozeError
+	if f.Snooze && !errors.As(err, &snooze) {
+		c.logger.InfoContext(ctx, "hopper: job failed; snoozed by Config.OnError", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "snooze", f.Delay, "error", err)
+		return
+	}
 	if f.Error == nil {
 		return
 	}
 	var cancel *CancelError
 	switch {
-	case errors.As(err, &cancel):
+	case errors.As(err, &cancel) && f.State == driver.JobStateDiscarded:
 		c.logger.InfoContext(ctx, "hopper: job canceled by worker", "job_id", row.ID, "kind", row.Kind, "error", err)
 	case f.State == driver.JobStateCanceled:
 		c.logger.InfoContext(ctx, "hopper: job canceled", "job_id", row.ID, "kind", row.Kind)
@@ -220,27 +241,4 @@ func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driv
 	case ctx.Err() == nil:
 		c.logger.WarnContext(ctx, "hopper: job failed", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "retry_in", f.Delay, "error", err)
 	}
-}
-
-func (c *Client[TTx]) retryDelay(row *driver.JobRow, unit workUnit) time.Duration {
-	if unit != nil {
-		if at := unit.NextRetry(); !at.IsZero() {
-			return max(time.Until(at), 0)
-		}
-	}
-	return defaultBackoff(row.Attempt)
-}
-
-// maxBackoff caps the default retry delay.
-const maxBackoff = 24 * time.Hour
-
-// defaultBackoff returns attempt^4 + 5s with ±10% jitter, capped at 24h.
-// attempt is the attempt that just failed, starting at 1.
-func defaultBackoff(attempt int) time.Duration {
-	secs := math.Pow(float64(attempt), 4) + 5
-	secs *= 0.9 + rand.Float64()*0.2
-	if secs > maxBackoff.Seconds() {
-		return maxBackoff
-	}
-	return time.Duration(secs * float64(time.Second))
 }
