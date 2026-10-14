@@ -85,7 +85,7 @@ retention never runs a `DELETE`.
 | Outcome | Default | Config |
 | --- | --- | --- |
 | completed | 24 hours | `Config.CompletedRetention` |
-| cancelled, discarded | 7 days | `Config.FailedRetention` |
+| canceled, discarded | 7 days | `Config.FailedRetention` |
 
 Negative values keep history forever. Retention is applied by the leader, so
 set it the same on every replica. `QueueConfig.DeleteCompleted` skips history
@@ -104,7 +104,7 @@ for a queue's completed jobs entirely, for maximum throughput.
   re-registers under a new client ID. Results still in flight are applied
   only if the job was not rescued meanwhile, so a job never runs two attempts
   at once for long. A job on its last attempt is left running: nothing will
-  run it again, so cancelling it would only throw its work away. Its result
+  run it again, so canceling it would only throw its work away. Its result
   is recorded if it lands before the leader's rescue, and otherwise the job
   stays dead-lettered as `client lost` although its work finished.
 - **Long jobs.** When jobs are long calls to another system, raise
@@ -117,13 +117,13 @@ for a queue's completed jobs entirely, for maximum throughput.
   the given duration, whatever its client's state.
 - **Graceful stop.** `Stop` (or `Run` when its context ends) stops claiming,
   gives up leadership, waits for running jobs, flushes results and releases
-  the lease. If the stop context expires first, running jobs are cancelled;
+  the lease. If the stop context expires first, running jobs are canceled;
   those that return in time are finalized as `retryable` and run again
   immediately elsewhere, and the rest are rescued after the TTL.
 
 ## Dead letters
 
-Cancelled and discarded jobs stay in history for `FailedRetention`. Inspect
+Canceled and discarded jobs stay in history for `FailedRetention`. Inspect
 them with `client.Jobs` or `hopper jobs list -state discarded`, and re-drive
 one with `client.JobRetry` or `hopper jobs retry <id>`.
 

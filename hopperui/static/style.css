@@ -43,7 +43,7 @@ dd { margin: 0; }
 .state.available, .state.scheduled, .state.pending { color: var(--wait); }
 .state.running { color: var(--run); }
 .state.retryable, .state.paused { color: var(--warn); }
-.state.cancelled, .state.discarded { color: var(--bad); }
+.state.canceled, .state.discarded { color: var(--bad); }
 svg.dag { display: block; max-width: 100%; margin: 0 0 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
 svg.dag line { stroke: var(--dim); stroke-width: 1.5; }
 svg.dag marker path { fill: var(--dim); }
@@ -53,5 +53,5 @@ svg.dag .node text.sub, svg.dag .node tspan.sub { fill: var(--dim); font-size: 1
 svg.dag .node.completed rect { stroke: var(--ok); }
 svg.dag .node.running rect { stroke: var(--run); }
 svg.dag .node.retryable rect { stroke: var(--warn); }
-svg.dag .node.cancelled rect, svg.dag .node.discarded rect { stroke: var(--bad); }
+svg.dag .node.canceled rect, svg.dag .node.discarded rect { stroke: var(--bad); }
 svg.dag a { text-decoration: none; }

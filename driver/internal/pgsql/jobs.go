@@ -409,7 +409,7 @@ finished AS (
   DELETE FROM {{schema}}.hopper_jobs j
   USING r
   WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by
-    AND r.state IN ('completed', 'cancelled', 'discarded')
+    AND r.state IN ('completed', 'canceled', 'discarded')
   RETURNING ` + finishedColumns(`CASE WHEN r.error IS NULL THEN j.errors
          ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END`, "r.output", "r.archive", "r.state", "$9") + `
 ),
@@ -459,7 +459,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 	)
 	for i, f := range params.Jobs {
 		switch f.State {
-		case driver.JobStateCompleted, driver.JobStateCancelled, driver.JobStateDiscarded,
+		case driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded,
 			driver.JobStateRetryable, driver.JobStateScheduled:
 		default:
 			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
@@ -574,12 +574,12 @@ var (
 UPDATE {{schema}}.hopper_jobs SET cancel_requested_at = coalesce(cancel_requested_at, now())
 WHERE id = $1 AND state = 'running'
 RETURNING %s`, JobColumns(""))
-	// jobCancelWaitingSQL finalizes a waiting job as cancelled, with
+	// jobCancelWaitingSQL finalizes a waiting job as canceled, with
 	// everything that entails for its batch and its dependents.
 	jobCancelWaitingSQL = `
 WITH RECURSIVE finished AS (
   DELETE FROM {{schema}}.hopper_jobs j WHERE j.id = $1 AND j.state <> 'running'
-  RETURNING ` + finishedColumns(appendErrorSQL("hopper: cancelled"), "NULL::jsonb", "true", "'cancelled'::text", "$2") + `
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: canceled"), "NULL::jsonb", "true", "'canceled'::text", "$2") + `
 ),
 ` + finalizeTailSQL("$2", "$3") + `
 SELECT ` + finishedSelectColumns + ` FROM finished`
@@ -686,7 +686,7 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 }
 
 // jobMarkOrderingKeySQL marks the key's running job (through the unique
-// index on running ordering keys) so that its finalize honours the wake.
+// index on running ordering keys) so that its finalize honors the wake.
 const jobMarkOrderingKeySQL = `
 UPDATE {{schema}}.hopper_jobs SET wake_requested_at = now()
 WHERE queue = $1 AND ordering_key = $2 AND state = 'running'`

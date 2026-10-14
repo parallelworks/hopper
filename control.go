@@ -19,14 +19,14 @@ var (
 	// ErrUniqueConflict is returned by JobRetry when a live job holds the
 	// same unique key.
 	ErrUniqueConflict = driver.ErrUniqueConflict
-	// ErrJobCancelled is the cause of a job's context cancellation after
+	// ErrJobCanceled is the cause of a job's context cancellation after
 	// JobCancel. Check it with context.Cause.
-	ErrJobCancelled = errors.New("hopper: job cancelled")
+	ErrJobCanceled = errors.New("hopper: job canceled")
 )
 
-// JobCancel cancels a job. A waiting job moves to history as cancelled. A
-// running job, on any client, has its context cancelled (with cause
-// ErrJobCancelled) and finalizes as cancelled unless it completes anyway. A
+// JobCancel cancels a job. A waiting job moves to history as canceled. A
+// running job, on any client, has its context canceled (with cause
+// ErrJobCanceled) and finalizes as canceled unless it completes anyway. A
 // finalized job is returned unchanged. The job as it is afterwards is
 // returned.
 func (c *Client[TTx]) JobCancel(ctx context.Context, id JobID) (*JobRow, error) {
@@ -40,7 +40,7 @@ func (c *Client[TTx]) JobCancel(ctx context.Context, id JobID) (*JobRow, error) 
 	return job, nil
 }
 
-// JobRetry makes a job run again as soon as possible: a cancelled or
+// JobRetry makes a job run again as soon as possible: a canceled or
 // discarded job is re-driven from history with one more attempt allowed if
 // it had run out, and a waiting job has its schedule brought forward. An
 // explicit retry overrides the wait, so the job's TTL no longer applies:
@@ -284,7 +284,7 @@ const (
 	EventJobCompleted  EventKind = "job.completed"
 	EventJobFailed     EventKind = "job.failed" // an attempt failed; the job will retry
 	EventJobSnoozed    EventKind = "job.snoozed"
-	EventJobCancelled  EventKind = "job.cancelled"
+	EventJobCanceled   EventKind = "job.canceled"
 	EventJobDiscarded  EventKind = "job.discarded"
 	EventJobRescued    EventKind = "job.rescued"
 	EventLeaderElected EventKind = "leader.elected"
@@ -299,7 +299,7 @@ type Event struct {
 	// Job is set for job events: the row as claimed, before the outcome.
 	Job *JobRow
 	// Error is the attempt's error text for failed, discarded and
-	// cancelled jobs, and the snooze reason, if any, for snoozed jobs.
+	// canceled jobs, and the snooze reason, if any, for snoozed jobs.
 	Error string
 	// ClientID is the client the event happened on.
 	ClientID int64
@@ -388,7 +388,7 @@ func (c *Client[TTx]) cancelLocal(id JobID) {
 	cancel := c.running[id]
 	c.runningMu.Unlock()
 	if cancel != nil {
-		cancel(ErrJobCancelled)
+		cancel(ErrJobCanceled)
 	}
 }
 

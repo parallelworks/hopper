@@ -133,7 +133,7 @@ type SnoozeError struct {
 	Duration time.Duration
 	// Reason is stored on the job while it waits, as JobRow.SnoozeReason,
 	// for operators, and is the Error of the job.snoozed event. It is
-	// cleared when the job runs again. A job that expires or is cancelled
+	// cleared when the job runs again. A job that expires or is canceled
 	// while it waits keeps the reason in the error it is finalized with.
 	Reason string
 }
@@ -159,9 +159,9 @@ type CancelError struct {
 
 func (e *CancelError) Error() string {
 	if e.Err == nil {
-		return "hopper: job cancelled by worker"
+		return "hopper: job canceled by worker"
 	}
-	return "hopper: job cancelled by worker: " + e.Err.Error()
+	return "hopper: job canceled by worker: " + e.Err.Error()
 }
 
 func (e *CancelError) Unwrap() error { return e.Err }

@@ -31,21 +31,21 @@ func TestJobCancelRunning(t *testing.T) {
 	if err != nil || job.State != hopper.JobStateRunning || job.CancelRequestedAt.IsZero() {
 		t.Fatalf("JobCancel = %+v, %v", job, err)
 	}
-	job = waitForJob(t, a, res.Job.ID, hopper.JobStateCancelled)
+	job = waitForJob(t, a, res.Job.ID, hopper.JobStateCanceled)
 	if len(job.Errors) != 1 || !errors.Is(context.Canceled, context.Canceled) || job.Errors[0].Error != "context canceled" {
-		t.Errorf("cancelled job = %+v", job)
+		t.Errorf("canceled job = %+v", job)
 	}
 	if h.count("SELECT count(*) FROM hopper_jobs") != 0 {
-		t.Error("cancelled job still live")
+		t.Error("canceled job still live")
 	}
 
-	// A waiting job is cancelled outright.
+	// A waiting job is canceled outright.
 	waiting, err := b.Insert(ctx, noop{}, &hopper.InsertOpts{ScheduledAt: time.Now().Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	job, err = a.JobCancel(ctx, waiting.Job.ID)
-	if err != nil || job.State != hopper.JobStateCancelled {
+	if err != nil || job.State != hopper.JobStateCanceled {
 		t.Errorf("cancel waiting = %+v, %v", job, err)
 	}
 	if _, err := a.JobCancel(ctx, hopper.JobID{1}); !errors.Is(err, hopper.ErrNotFound) {
@@ -71,7 +71,7 @@ func TestJobCancelSurvivesMissedNotification(t *testing.T) {
 	if _, err := h.pool.Exec(ctx, "UPDATE hopper_jobs SET cancel_requested_at = now() WHERE id = $1", [16]byte(res.Job.ID)); err != nil {
 		t.Fatal(err)
 	}
-	waitForJob(t, c, res.Job.ID, hopper.JobStateCancelled)
+	waitForJob(t, c, res.Job.ID, hopper.JobStateCanceled)
 }
 
 func TestJobRetryRedrivesFromHistory(t *testing.T) {

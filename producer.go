@@ -133,7 +133,7 @@ const claimTimeout = 30 * time.Second
 // claimAndStart claims up to limit jobs and starts each on its own
 // goroutine. The statement runs on a context that ctx does not cancel: a
 // claim interrupted mid-flight can leave rows marked running that this
-// client never sees, which then wait for rescue, and cancelling a query
+// client never sees, which then wait for rescue, and canceling a query
 // also costs the pool a connection. Stopping waits for the claim instead,
 // which takes milliseconds, and every claimed job is started.
 func (p *producer) claimAndStart(ctx context.Context, limit int) (int, time.Duration, error) {

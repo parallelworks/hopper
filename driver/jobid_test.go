@@ -31,7 +31,7 @@ func TestJobIDRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if back.ID != id {
-		t.Fatalf("unmarshalled %v, want %v", back.ID, id)
+		t.Fatalf("unmarshaled %v, want %v", back.ID, id)
 	}
 
 	var scanned JobID
@@ -73,7 +73,7 @@ func TestParseJobIDRejectsGarbage(t *testing.T) {
 
 func TestJobStateTerminal(t *testing.T) {
 	t.Parallel()
-	for _, s := range []JobState{JobStateCompleted, JobStateCancelled, JobStateDiscarded} {
+	for _, s := range []JobState{JobStateCompleted, JobStateCanceled, JobStateDiscarded} {
 		if !s.Terminal() {
 			t.Errorf("%s should be terminal", s)
 		}

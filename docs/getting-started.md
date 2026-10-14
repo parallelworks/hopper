@@ -163,7 +163,7 @@ client, err := hopper.NewClient(driver, &hopper.Config{
     Workers: workers,
 })
 
-// Run blocks until ctx is cancelled, then drains. It fits errgroup.
+// Run blocks until ctx is canceled, then drains. It fits errgroup.
 g.Go(func() error { return client.Run(ctx) })
 ```
 

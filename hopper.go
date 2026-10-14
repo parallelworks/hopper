@@ -44,7 +44,7 @@ const (
 	JobStateRunning   = driver.JobStateRunning
 	JobStateRetryable = driver.JobStateRetryable
 	JobStateCompleted = driver.JobStateCompleted
-	JobStateCancelled = driver.JobStateCancelled
+	JobStateCanceled  = driver.JobStateCanceled
 	JobStateDiscarded = driver.JobStateDiscarded
 )
 

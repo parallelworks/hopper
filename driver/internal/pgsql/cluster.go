@@ -349,7 +349,7 @@ func (e *Executor) Stats(ctx context.Context) (*driver.Stats, error) {
 			q.Retryable = d.Count
 		case driver.JobStateRunning:
 			q.Running = d.Count
-		case driver.JobStatePending, driver.JobStateCompleted, driver.JobStateCancelled, driver.JobStateDiscarded:
+		case driver.JobStatePending, driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded:
 		}
 		if d.Oldest != nil {
 			if age := time.Duration(*d.Oldest * float64(time.Second)); age > q.OldestAvailable {

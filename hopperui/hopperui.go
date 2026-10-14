@@ -143,7 +143,7 @@ func (u *ui[TTx]) fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, hopper.ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
 	case errors.Is(err, context.Canceled):
-		http.Error(w, "cancelled", 499)
+		http.Error(w, "canceled", 499)
 	default:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
@@ -271,7 +271,7 @@ type jobsData struct {
 
 var allStates = []hopper.JobState{
 	hopper.JobStatePending, hopper.JobStateAvailable, hopper.JobStateScheduled, hopper.JobStateRunning,
-	hopper.JobStateRetryable, hopper.JobStateCompleted, hopper.JobStateCancelled, hopper.JobStateDiscarded,
+	hopper.JobStateRetryable, hopper.JobStateCompleted, hopper.JobStateCanceled, hopper.JobStateDiscarded,
 }
 
 func (u *ui[TTx]) jobs(w http.ResponseWriter, r *http.Request) {

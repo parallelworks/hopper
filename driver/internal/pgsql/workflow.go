@@ -11,10 +11,10 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
-// Every statement that finalizes jobs (the batched finalize, cancelling a
+// Every statement that finalizes jobs (the batched finalize, canceling a
 // waiting job, expiring) produces a CTE named finished, in the shape
 // finishedColumns builds, and ends with finalizeTailSQL, which does
-// everything a finalized job entails: cancelling the dependents of a failed
+// everything a finalized job entails: canceling the dependents of a failed
 // job, archiving, recording batch progress and completing batches, promoting
 // dependents whose dependencies are all finished, and dropping satisfied
 // edges.
@@ -107,14 +107,14 @@ const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
 ` + archivedSQL
 
 // finalizeTailSQL returns the CTEs that follow a finished CTE; the statement
-// must start with WITH RECURSIVE. Cancelled dependents that were awaited
+// must start with WITH RECURSIVE. Canceled dependents that were awaited
 // are announced on the done channel, and promoted jobs and callbacks on
 // the insert channel. Jobs without a batch or dependents cost index probes
 // on small tables and nothing else.
 func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 	return `cascade AS (
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN finished f ON d.depends_on = f.id
-  WHERE f.final_state IN ('cancelled', 'discarded') AND d.on_failure = 'cancel'
+  WHERE f.final_state IN ('canceled', 'discarded') AND d.on_failure = 'cancel'
   UNION
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN cascade c ON d.depends_on = c.job_id
   WHERE d.on_failure = 'cancel'
@@ -122,12 +122,12 @@ func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 cascaded AS (
   DELETE FROM {{schema}}.hopper_jobs j USING (SELECT DISTINCT job_id FROM cascade) c
   WHERE j.id = c.job_id AND j.state = 'pending'
-  RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "NULL::jsonb", "true", "'cancelled'::text", doneChannelParam) + `
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "NULL::jsonb", "true", "'canceled'::text", doneChannelParam) + `
 ),
 done AS (SELECT * FROM finished UNION ALL SELECT * FROM cascaded),
 ` + archivedSQL + `,
 batch_counts AS (
-  SELECT batch_id, count(*) AS n, count(*) FILTER (WHERE final_state IN ('cancelled', 'discarded')) AS f
+  SELECT batch_id, count(*) AS n, count(*) FILTER (WHERE final_state IN ('canceled', 'discarded')) AS f
   FROM done WHERE batch_id IS NOT NULL GROUP BY batch_id
 ),
 ready AS (

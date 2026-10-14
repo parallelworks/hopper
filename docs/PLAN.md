@@ -181,7 +181,7 @@ client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{
 // client is a *hopper.Client[pgx.Tx]. The driver fixes the transaction type,
 // so InsertTx only accepts a transaction from the right engine.
 
-// Run blocks until ctx is cancelled, then drains gracefully. It fits errgroup.
+// Run blocks until ctx is canceled, then drains gracefully. It fits errgroup.
 g.Go(func() error { return client.Run(ctx) })
 
 // Or manage the lifecycle explicitly:
@@ -215,7 +215,7 @@ report, err := hopper.Await[ReportURL](ctx, client, res.Job.ID) // worker called
 
 ```go
 client.JobCancel(ctx, id)            // works on any live job, including one running on another pod
-client.JobRetry(ctx, id)             // re-drive a discarded or cancelled job from history
+client.JobRetry(ctx, id)             // re-drive a discarded or canceled job from history
 client.JobRetryOrderingKey(ctx, "billing", "customer:42") // wake a key's snoozed and retrying jobs
 job, err := client.JobGet(ctx, id)   // live or historical
 
@@ -383,8 +383,8 @@ CREATE TYPE hopper_job_state AS ENUM (
   'running',
   'retryable',   -- failed; will run again at scheduled_at
   'completed',
-  'cancelled',
-  'discarded'    -- out of attempts, expired, or cancelled by the worker: the dead-letter state
+  'canceled',
+  'discarded'    -- out of attempts, expired, or canceled by the worker: the dead-letter state
 );
 
 -- Live jobs only. Finalized jobs move to hopper_job_history, so this table
@@ -436,7 +436,7 @@ CREATE TABLE hopper_job_history (
 CREATE TABLE hopper_job_history_completed PARTITION OF hopper_job_history
   FOR VALUES IN ('completed') PARTITION BY RANGE (finalized_at);            -- hourly partitions
 CREATE TABLE hopper_job_history_failed PARTITION OF hopper_job_history
-  FOR VALUES IN ('cancelled', 'discarded') PARTITION BY RANGE (finalized_at); -- daily partitions
+  FOR VALUES IN ('canceled', 'discarded') PARTITION BY RANGE (finalized_at); -- daily partitions
 -- Schema v1 gives each a DEFAULT partition so finalize works before the leader
 -- (M2) manages time partitions. The leader creates future time partitions only,
 -- because attaching a partition scans the DEFAULT partition for overlapping rows.
@@ -513,7 +513,7 @@ index inserts stay local like a sequence.
   internal identity column, `seq`, provides the tie-break for claim order and for
   strict ordering keys. It is never exposed in the API.
 - **In Go**, IDs are `hopper.JobID`, a `[16]byte` type in the core package with
-  `String`, `ParseJobID`, text and JSON marshalling, and `sql.Scanner` /
+  `String`, `ParseJobID`, text and JSON marshaling, and `sql.Scanner` /
   `driver.Valuer` support. The core adds no UUID dependency.
 - **Internal IDs stay compact.** `hopper_clients.id` remains a `bigint`, because it
   never leaves the database and is written into every running job.
@@ -522,13 +522,13 @@ index inserts stay local like a sequence.
 
 ```
 insert ──► available ─┐                        ┌──► completed  ─┐
-insert ──► scheduled ─┼─► (claim) running ─────┼──► cancelled   ├──► moved to hopper_job_history
+insert ──► scheduled ─┼─► (claim) running ─────┼──► canceled   ├──► moved to hopper_job_history
            retryable ─┘        │    │          └──► discarded  ─┘        │
                ▲               │    └──► retryable / scheduled (snooze)  │
                └───────────────┘                                        │
   rescuer: running, owner's lease expired ──► retryable (or discarded)   │
   JobRetry ◄─────────────────────────────────────────────────────────────┘
-  JobCancel: any live state; running jobs are signalled and finalize as cancelled
+  JobCancel: any live state; running jobs are signaled and finalize as canceled
 ```
 
 `available`, `scheduled` and `retryable` all mean "claim once `scheduled_at <= now()`".
@@ -656,7 +656,7 @@ RETURNING j.*;
 ### 7.4 Execute
 - Each queue runs a bounded pool of goroutines. Workers are started only once a slot is
   free, so there is no unbounded fan-out.
-- Each job gets a context that is cancelled on timeout (the worker's `Timeout()` or the
+- Each job gets a context that is canceled on timeout (the worker's `Timeout()` or the
   queue default), on `JobCancel`, on lease loss (§7.6), or on a hard stop.
 - A panic is recovered and recorded as an error with its stack trace, then treated as
   a normal failure.
@@ -693,7 +693,7 @@ retry AS (
   RETURNING j.id),
 done AS (
   DELETE FROM hopper_jobs j USING r
-  WHERE j.id = r.id AND r.state IN ('completed','cancelled','discarded')
+  WHERE j.id = r.id AND r.state IN ('completed','canceled','discarded')
     AND j.state = 'running' AND j.attempted_by = r.attempted_by
   RETURNING j.*, r.state AS final_state, r.error, r.output, r.archive),
 archived AS (INSERT INTO hopper_job_history SELECT … , now() FROM done WHERE archive)
@@ -709,7 +709,7 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
 - Retry delays are sent as durations and applied to database `now()`; error
   timestamps are set by the database too (§7.1).
 - Queues with `DeleteCompleted: true` delete completed jobs without writing history.
-  Cancelled and discarded jobs are always archived, because history is the
+  Canceled and discarded jobs are always archived, because history is the
   dead-letter queue (§7.10).
 - Outcomes:
   - **success:** `completed`.
@@ -725,9 +725,9 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
     current wait. A client of the previous release clears it in none of these, so
     during a rolling deploy a running or retrying row can still hold one; reads
     therefore report the reason only for a `scheduled` row. History has no such
-    column, but a snoozed job that expires or is cancelled keeps the reason in the
+    column, but a snoozed job that expires or is canceled keeps the reason in the
     error it is finalized with
-    (`hopper: expired while snoozed: <reason>`, `hopper: cancelled while snoozed:
+    (`hopper: expired while snoozed: <reason>`, `hopper: canceled while snoozed:
     <reason>`).
   - **`hopper.Cancel(err)`:** `discarded` immediately.
 - `backoff(n) = n^4 + 5s ± 10% jitter`, capped at 24h. It can be overridden per worker
@@ -786,7 +786,7 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
 - If a job has `await = true`, the finalize statement sends `pg_notify('hopper_done', id)`
   from its `RETURNING` clause, and `Await` returns as soon as the transaction commits.
   `Await` on a client without a listener (one that is not started) polls at
-  `PollInterval`. A cancelled or discarded job surfaces as `*JobFailedError`.
+  `PollInterval`. A canceled or discarded job surfaces as `*JobFailedError`.
 
 ### 7.6 Liveness and rescue
 Liveness is tracked **per client, not per job**. Each client holds a lease row in
@@ -811,7 +811,7 @@ the largest source of write amplification in heartbeat-based designs.
   the client has lost its lease. It cancels the context of every in-flight job that has
   attempts left and re-registers under a new ID. A job on its last attempt keeps
   running, because the rescuer discards it instead of running it again, so no second
-  attempt can overlap it and cancelling would only lose its work. Results still in flight are submitted anyway: the finalize fence (§7.5)
+  attempt can overlap it and canceling would only lose its work. Results still in flight are submitted anyway: the finalize fence (§7.5)
   rejects any whose job was rescued meanwhile and applies the rest, which is equivalent
   to a rescue. A leader that finds its own jobs among the rescue candidates fences
   itself first, so it does not re-claim them under the lapsed ID before its lease loop
@@ -823,14 +823,14 @@ the largest source of write amplification in heartbeat-based designs.
   rescuing.
 
 ### 7.7 Cancellation
-`JobCancel` on a waiting job moves it straight to history as `cancelled`. On a
+`JobCancel` on a waiting job moves it straight to history as `canceled`. On a
 running job, it sets `cancel_requested_at` and sends
 `pg_notify('hopper_control', 'cancel:<id>')`. The owning client cancels the job's
-context immediately, with cause `hopper.ErrJobCancelled`. Each lease renewal also
+context immediately, with cause `hopper.ErrJobCanceled`. Each lease renewal also
 returns any cancel requests for that client's running jobs (through the small running
-index), which covers missed notifications. The job finalizes as `cancelled` if the
+index), which covers missed notifications. The job finalizes as `canceled` if the
 worker returns an error after the request, and as `completed` if it finishes anyway.
-`JobRetry` re-drives a cancelled or discarded job from history (with one more attempt
+`JobRetry` re-drives a canceled or discarded job from history (with one more attempt
 allowed if it had run out, and a fresh `seq`) or brings a waiting job forward; either
 way it clears the job's TTL (§7.3). It refuses a running job and a job whose unique key
 is held by a live job.
@@ -915,7 +915,7 @@ acknowledged.
 | Outcome | Job queues | Subscription queues |
 | --- | --- | --- |
 | `completed` | archived for 24h | deleted on ack (`DeleteCompleted: true`) |
-| `cancelled`, `discarded` | archived for 7d (the dead-letter queue) | archived for 7d (the dead-letter queue) |
+| `canceled`, `discarded` | archived for 7d (the dead-letter queue) | archived for 7d (the dead-letter queue) |
 
 `DeleteCompleted` is configurable per queue; the retention periods
 (`CompletedRetention`, `FailedRetention`, and `StreamRetention` for the stream log,
@@ -942,14 +942,14 @@ rates:
   see each other's notifications, which only causes spurious wake-ups.
 
 ### 7.12 Shutdown
-`Stop(ctx)` and `Run` (when its context is cancelled) shut down in three steps:
+`Stop(ctx)` and `Run` (when its context is canceled) shut down in three steps:
 1. Stop claiming and give up leadership.
 2. Wait for running jobs to finish, then flush the finalizer.
 3. If `ctx` expires first, cancel all job contexts, wait a short grace period, flush
    whatever finished, release the lease and return `ctx.Err()`. Jobs that are still
    unfinished are rescued by another client (at-least-once).
 
-A job that returns because its context was cancelled by the stop is finalized as
+A job that returns because its context was canceled by the stop is finalized as
 `retryable` with no delay, so it runs again immediately on another client. The
 interrupted attempt still counts, as it does for a rescued job. The lease keeps being
 renewed until the finalizer has flushed, so a long drain cannot let it lapse.
@@ -1044,7 +1044,7 @@ itself, a 15 s fdatasync latency probe on the data volume at 9,000 syncs/s; the
 59 MB, which by design (no truncation, §7.3) stayed that size for the remaining
 90 minutes without any effect on throughput or latency. A first attempt used an
 `emptyDir` with a `sizeLimit`, which the kubelet enforces with an XFS project quota;
-quota accounting made 8 KB appends 27 times slower and serialised the finalizers on
+quota accounting made 8 KB appends 27 times slower and serialized the finalizers on
 the partition's extension lock, so the data volume has no size limit.
 
 ### 8.3 Benchmark harness
@@ -1133,7 +1133,7 @@ observability without new machinery.
   - A failing delivery blocks its key while it retries. Later messages for that key
     wait until it succeeds or is dead-lettered, and dead-lettering unblocks the key.
   - `JobRetryOrderingKey(queue, key)` wakes a key, for a producer whose newer job should
-    not wait behind an older one's delay, without cancelling the job in it. It makes the
+    not wait behind an older one's delay, without canceling the job in it. It makes the
     key's waiting jobs (scheduled or retryable, TTL not passed) runnable now, in batches
     of 1000 locked in `seq` order through the same index. A job that was already due
     keeps its `scheduled_at`, so it keeps its claim order and aging. It does not
@@ -1192,9 +1192,9 @@ observability without new machinery.
   on_complete, metadata, completed_at)`. Jobs carry `batch_id`. `client.NewBatch(opts)`,
   `Add`, `Insert`/`InsertTx` and `BatchGet` are the API.
   - **Progress is appended.** Every statement that finalizes jobs (the batched
-    finalize, cancelling a waiting job, expiring) inserts one `hopper_batch_progress`
+    finalize, canceling a waiting job, expiring) inserts one `hopper_batch_progress`
     row per batch among them: how many of its jobs it finalized, and how many of those
-    were cancelled or discarded (failures). It takes no lock another statement waits
+    were canceled or discarded (failures). It takes no lock another statement waits
     for. Until schema v10 it counted the batch down on the batch row instead, so every
     finalize of a batch's jobs queued on that row, and a transaction that finalized a
     job and stayed open, as `CompleteTx` does, held up all of its siblings' finalizes
@@ -1258,11 +1258,11 @@ observability without new machinery.
   a job is the one that acts on its dependents: it promotes those whose dependencies
   have all left the live table (including the ones finalized in the same statement)
   to `available` and notifies their queues, and it cancels, transitively, the
-  dependents of a cancelled or discarded job whose edge says `cancel` (the default;
+  dependents of a canceled or discarded job whose edge says `cancel` (the default;
   `ignore` lets the dependent run once its dependencies have finished, whatever their
-  outcome). Cancelled dependents go to history with a "dependency failed" error and
+  outcome). Canceled dependents go to history with a "dependency failed" error and
   count as batch failures. Every finalizing statement (the batched finalize,
-  cancelling a waiting job, expiring) ends with the same tail, so batches and
+  canceling a waiting job, expiring) ends with the same tail, so batches and
   dependents behave the same however a job finishes.
   - **Concurrent dependencies.** Two dependencies of one job finalized by concurrent
     transactions (two clients, or a `CompleteTx` held open while a sibling
@@ -1314,6 +1314,9 @@ observability without new machinery.
   something this release's statements use, the upgrade test produces the jobs and
   traffic before and during the migration through the SQL producer contract and
   version-independent statements, and starts this release's client once it is done.
+  Schema v12, which renames the `cancelled` state to `canceled`, is the one exception:
+  a release before it fails to cancel jobs on the new schema, so all clients move to it
+  together.
 
 ## 13. Observability and operations
 

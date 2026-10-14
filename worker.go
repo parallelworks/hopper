@@ -16,7 +16,7 @@ type Worker[T JobArgs] interface {
 	// and Cancel(err) to discard now.
 	Work(ctx context.Context, job *Job[T]) error
 	// Timeout returns how long the job may run before its context is
-	// cancelled: 0 for the client's default, or a negative duration for no
+	// canceled: 0 for the client's default, or a negative duration for no
 	// timeout.
 	Timeout(job *Job[T]) time.Duration
 	// NextRetry returns when a failed job runs again, or the zero time for

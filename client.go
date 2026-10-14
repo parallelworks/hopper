@@ -44,7 +44,7 @@ type Client[TTx any] struct {
 	claimCancel, workCancel, finCancel, bgCancel context.CancelFunc
 
 	// gen is the lease generation: jobs run under a context that is
-	// cancelled when the lease is lost, so a fenced client stops its work.
+	// canceled when the lease is lost, so a fenced client stops its work.
 	genMu     sync.Mutex
 	genCtx    context.Context
 	genCancel context.CancelFunc
@@ -158,12 +158,12 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Each phase has its own context, cancelled in order by Stop.
+	// Each phase has its own context, canceled in order by Stop.
 	base := context.WithoutCancel(ctx)
-	c.claimCtx, c.claimCancel = context.WithCancel(base) //nolint:gosec // cancelled in Stop
-	c.workCtx, c.workCancel = context.WithCancel(base)   //nolint:gosec // cancelled in Stop
-	c.finCtx, c.finCancel = context.WithCancel(base)     //nolint:gosec // cancelled in Stop
-	c.bgCtx, c.bgCancel = context.WithCancel(base)       //nolint:gosec // cancelled in Stop
+	c.claimCtx, c.claimCancel = context.WithCancel(base) //nolint:gosec // canceled in Stop
+	c.workCtx, c.workCancel = context.WithCancel(base)   //nolint:gosec // canceled in Stop
+	c.finCtx, c.finCancel = context.WithCancel(base)     //nolint:gosec // canceled in Stop
+	c.bgCtx, c.bgCancel = context.WithCancel(base)       //nolint:gosec // canceled in Stop
 	c.newGeneration()
 
 	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.wakeQueue, c.finalized)
@@ -273,8 +273,8 @@ func (c *Client[TTx]) finalized(job *driver.JobRow, result driver.JobFinalize) {
 		kind = EventJobFailed
 	case driver.JobStateScheduled:
 		kind = EventJobSnoozed
-	case driver.JobStateCancelled:
-		kind = EventJobCancelled
+	case driver.JobStateCanceled:
+		kind = EventJobCanceled
 	case driver.JobStateDiscarded:
 		kind = EventJobDiscarded
 	case driver.JobStatePending, driver.JobStateAvailable, driver.JobStateRunning:
@@ -330,13 +330,13 @@ func (c *Client[TTx]) register(ctx context.Context) (int64, error) {
 func (c *Client[TTx]) newGeneration() {
 	c.genMu.Lock()
 	defer c.genMu.Unlock()
-	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // cancelled by fence or Stop
+	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // canceled by fence or Stop
 }
 
 // jobContext returns the context a claimed job runs under. A job with
 // attempts left runs under the lease generation, so that a client which
 // loses its lease stops it before another client runs it again. A job on its
-// last attempt will not run again, so cancelling it would only discard its
+// last attempt will not run again, so canceling it would only discard its
 // work: it runs under the work context, which only a hard stop cancels.
 func (c *Client[TTx]) jobContext(row *driver.JobRow) context.Context {
 	if row.Attempt >= row.MaxAttempts {
@@ -355,7 +355,7 @@ func (c *Client[TTx]) generation() context.Context {
 // Stop shuts the client down in three steps: stop claiming and give up
 // leadership; wait for running jobs to finish and flush their results;
 // release the lease. If ctx expires during the wait, every job's context is
-// cancelled, whatever finishes within a short grace period is flushed, and
+// canceled, whatever finishes within a short grace period is flushed, and
 // ctx's error is returned. Jobs still running then are rescued by another
 // client once this one's lease expires.
 func (c *Client[TTx]) Stop(ctx context.Context) error {
@@ -395,7 +395,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	var stopErr error
 	if !c.waitForJobs(ctx) {
 		stopErr = ctx.Err()
-		c.logger.WarnContext(ctx, "hopper: stop deadline reached; cancelling running jobs")
+		c.logger.WarnContext(ctx, "hopper: stop deadline reached; canceling running jobs")
 		c.workCancel()
 		graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.tuning.stopGrace)
 		c.waitForJobs(graceCtx)
@@ -441,13 +441,13 @@ func (c *Client[TTx]) waitForJobs(ctx context.Context) bool {
 	}
 }
 
-// Run starts the client and blocks until ctx is cancelled, then stops it,
+// Run starts the client and blocks until ctx is canceled, then stops it,
 // waiting up to Config.StopTimeout for running jobs. It returns nil after a
 // clean drain, so it fits errgroup.
 func (c *Client[TTx]) Run(ctx context.Context) error {
 	if err := c.Start(ctx); err != nil {
 		if ctx.Err() != nil {
-			// Cancelled during startup: a clean stop, nothing to drain.
+			// Canceled during startup: a clean stop, nothing to drain.
 			return nil
 		}
 		return err
@@ -556,12 +556,12 @@ func (c *Client[TTx]) fence(ctx context.Context, id int64) {
 	c.genCancel()
 	newID, err := c.register(ctx)
 	if err != nil {
-		// Keep the cancelled generation: nothing runs until the next
+		// Keep the canceled generation: nothing runs until the next
 		// renewal attempt succeeds in registering.
 		c.logger.ErrorContext(ctx, "hopper: re-register client", "error", err)
 		return
 	}
 	c.clientID.Store(newID)
-	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // cancelled by fence or Stop
+	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // canceled by fence or Stop
 	c.pokeLeader()
 }

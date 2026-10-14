@@ -163,7 +163,7 @@ func TestUI(t *testing.T) {
 	code, _ = post(admin, "/jobs/"+job.Job.ID.String()+"/cancel", nil, true)
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())
-	want(200, body, code, "cancelled", "/retry")
+	want(200, body, code, "canceled", "/retry")
 	code, _ = post(admin, "/jobs/"+job.Job.ID.String()+"/retry", nil, true)
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())

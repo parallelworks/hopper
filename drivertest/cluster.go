@@ -334,7 +334,7 @@ func testNotify[TTx any](t *testing.T, f Fixture[TTx]) {
 	if got := next(time.Second); got[driver.ChannelControl+":pause:p"] != 1 || got[driver.ChannelControl+":resume:p"] != 1 {
 		t.Errorf("control notifications = %v", got)
 	}
-	// Cancelling a running job announces it too, and a finalize of an
+	// Canceling a running job announces it too, and a finalize of an
 	// awaited job announces its ID on the done channel.
 	res := insert(ctx, t, exec, []driver.JobInsertParams{{Kind: "k", Queue: "default", Priority: 2, MaxAttempts: 1, Await: true}})
 	clientID := register(ctx, t, exec)
@@ -344,7 +344,7 @@ func testNotify[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.JobCancel(ctx, res[0].Job.ID); err != nil {
 		t.Fatal(err)
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: res[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCancelled})
+	finalize(ctx, t, exec, driver.JobFinalize{ID: res[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCanceled})
 	deadline := time.Now().Add(2 * time.Second)
 	var sawCancel, sawDone bool
 	for !sawCancel || !sawDone {
