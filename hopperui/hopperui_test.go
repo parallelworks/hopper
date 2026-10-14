@@ -130,9 +130,14 @@ func TestUI(t *testing.T) {
 	code, body = get(readOnly, "/jobs?queue=naps")
 	want(200, body, code, `title="snoozed: mail server &lt;busy&gt;"`)
 	_, body = get(readOnly, "/jobs/"+job.Job.ID.String())
-	if strings.Contains(body, "snooze reason") {
-		t.Error("job that never snoozed shows a snooze reason")
+	if strings.Contains(body, "snooze reason") || strings.Contains(body, "<dt>progress</dt>") {
+		t.Error("job that never snoozed or recorded progress shows a snooze reason or progress")
 	}
+	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET progress = '{"step": "fetch <1>", "cursor": {"page": 2}, "at": "2026-01-02T03:04:05Z"}' WHERE id = $1`, [16]byte(snoozed.Job.ID)); err != nil {
+		t.Fatal(err)
+	}
+	code, body = get(readOnly, "/jobs/"+snoozed.Job.ID.String())
+	want(200, body, code, `<dt>progress</dt><dd>finished <code>fetch &lt;1&gt;</code>, cursor <code>{&#34;page&#34;: 2}</code>`)
 	code, body = get(readOnly, "/jobs/not-an-id")
 	want(400, body, code)
 	code, body = get(readOnly, "/jobs/"+hopper.JobID{1}.String())
@@ -168,6 +173,19 @@ func TestUI(t *testing.T) {
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())
 	want(200, body, code, "available")
+	if strings.Contains(body, "from the start") {
+		t.Error("a job without progress offers a run from the start")
+	}
+	// A job with progress can also be run from the start, which clears it.
+	code, body = get(admin, "/jobs/"+snoozed.Job.ID.String())
+	want(200, body, code, `<input type="hidden" name="from" value="start"><button>run now from the start</button>`)
+	code, _ = post(admin, "/jobs/"+snoozed.Job.ID.String()+"/retry", url.Values{"from": {"start"}}, true)
+	want(303, "", code)
+	code, body = get(admin, "/jobs/"+snoozed.Job.ID.String())
+	want(200, body, code, "available")
+	if strings.Contains(body, "<dt>progress</dt>") {
+		t.Error("progress kept after a run from the start")
+	}
 	// A browser's cross-site request is refused before it reaches an action.
 	{
 		req, _ := http.NewRequest(http.MethodPost, admin.URL+"/hopper/jobs/"+job.Job.ID.String()+"/delete", nil)

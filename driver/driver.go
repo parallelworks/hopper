@@ -31,6 +31,10 @@ var ErrJobRunning = errors.New("hopper: job is running")
 // uniqueness of a live job with the same key.
 var ErrUniqueConflict = errors.New("hopper: a live job with the same unique key exists")
 
+// ErrJobLocked is returned by JobRecordProgress with NoWait when another
+// transaction holds the job's row.
+var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
+
 // Driver binds the core to a storage engine. TTx is the engine's transaction
 // type (pgx.Tx for hopperpgx), so that transactional inserts only accept a
 // transaction from the right engine.
@@ -132,6 +136,11 @@ type Executor interface {
 	// produced it; the IDs that were applied are returned, and the caller
 	// treats the rest as fenced.
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
+	// JobRecordProgress stores a running job's progress, fenced like a
+	// finalize: only while the job is running in the given attempt of the
+	// given client. It returns the progress as stored, or nil if the attempt
+	// no longer owns the job.
+	JobRecordProgress(ctx context.Context, params JobRecordProgressParams) (*Progress, error)
 	// JobGet returns a job by ID, live or from history.
 	JobGet(ctx context.Context, id JobID) (*JobRow, error)
 	// JobList returns jobs matching the filter in ID order (descending with
@@ -147,8 +156,9 @@ type Executor interface {
 	// out), and a waiting job has its schedule brought forward. Either way
 	// the job's TTL is cleared, as an operator overriding the wait. It returns
 	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
-	// holds the same unique key.
-	JobRetry(ctx context.Context, id JobID) (*JobRow, error)
+	// holds the same unique key. The job keeps its progress unless
+	// params.FromStart.
+	JobRetry(ctx context.Context, params JobRetryParams) (*JobRow, error)
 	// JobDelete removes a job that is not running and returns it as it was
 	// last stored. A waiting job is canceled as JobCancel does, so its
 	// batch, its dependents and anyone awaiting it see it finish, but no
@@ -397,10 +407,51 @@ type JobRow struct {
 	// scheduled: the claim, any other finalize, a retry and a replacing
 	// insert clear it, and a row in another state never reports one.
 	SnoozeReason string
+	// Progress is the last step the job's worker recorded, or nil. It
+	// survives retries, snoozes and a JobRetry from history.
+	Progress *Progress
 	// FinalizedAt is set for jobs in history.
 	FinalizedAt time.Time
 	// Output is the value recorded by the worker, for jobs in history.
 	Output json.RawMessage
+}
+
+// Progress is how far a job's worker got: the last step it finished, and a
+// cursor within the work that follows.
+type Progress struct {
+	// Step is the last step finished, or empty before the first.
+	Step string `json:"step"`
+	// Cursor is a JSON value marking a position within the work after Step,
+	// or nil.
+	Cursor json.RawMessage `json:"cursor,omitempty"`
+	// RecordedAt is the database time at which it was recorded.
+	RecordedAt time.Time `json:"at"`
+}
+
+// JobRetryParams selects the job to retry.
+type JobRetryParams struct {
+	ID JobID
+	// FromStart clears the job's progress, so that it runs all its steps
+	// again.
+	FromStart bool
+}
+
+// JobRecordProgressParams is a running job's new progress.
+type JobRecordProgressParams struct {
+	ID JobID
+	// AttemptedBy and Attempt identify the attempt, which must still own
+	// the job.
+	AttemptedBy int64
+	Attempt     int
+	// Step is the last step finished. With KeepStep the stored step is
+	// kept and Step is ignored.
+	Step     string
+	KeepStep bool
+	// Cursor is a JSON value, or nil for none.
+	Cursor json.RawMessage
+	// NoWait returns ErrJobLocked at once, instead of waiting, if another
+	// transaction holds the job's row.
+	NoWait bool
 }
 
 // AttemptError records one failed attempt.

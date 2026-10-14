@@ -151,6 +151,25 @@ func (w *TransferWorker) Work(ctx context.Context, job *hopper.Job[Transfer]) er
 }
 ```
 
+A long job made of several steps resumes where it left off. `hopper.RunSteps` runs
+named steps in order, starting after the last one the job's progress records as
+finished, and records each as it finishes; a step that works through many items
+records a cursor within itself with `hopper.RecordCursor`, which the next attempt reads
+with `hopper.StepCursor[C]`. `RecordStepTx` and `RecordCursorTx` record in the worker's
+own transaction, so a step's writes and the record that it finished commit together.
+The progress is `JobRow.Progress` (last step, cursor, time), kept through retries,
+snoozes and `JobRetry`, unless `hopper.FromStart()` is passed to it (§7.5).
+
+```go
+func (w *Importer) Work(ctx context.Context, job *hopper.Job[ImportArgs]) error {
+    return hopper.RunSteps(ctx, job,
+        hopper.NamedStep("download", w.download),
+        hopper.NamedStep("load", w.load), // RecordCursor(ctx, job, page) as it goes
+        hopper.NamedStep("notify", w.notify),
+    )
+}
+```
+
 Workers are registered before the client that runs them exists, so a worker or
 subscriber that needs the client, to insert follow-up jobs, publish or query, takes it
 from its context: `hopper.ClientFromContext[pgx.Tx](ctx)` returns the client running the
@@ -223,6 +242,7 @@ report, err := hopper.Await[ReportURL](ctx, client, res.Job.ID) // worker called
 ```go
 client.JobCancel(ctx, id)            // works on any live job, including one running on another pod
 client.JobRetry(ctx, id)             // re-drive a discarded or canceled job from history
+client.JobRetry(ctx, id, hopper.FromStart()) // ... clearing its progress, to run all its steps again
 client.JobRetryOrderingKey(ctx, "billing", "customer:42") // wake a key's snoozed and retrying jobs
 client.JobDelete(ctx, id)            // remove a job that is not running, live or from history
 client.JobCancelTx(ctx, tx, id)      // ...Tx variants commit with the caller's own changes
@@ -426,7 +446,8 @@ CREATE TABLE hopper_jobs (
   await               boolean     NOT NULL DEFAULT false,   -- notify waiters on finalize
   created_at          timestamptz NOT NULL DEFAULT now(),
   snooze_reason       text,                      -- why a snoozed job waits (schema v9); live table only
-  wake_requested_at   timestamptz                -- JobRetryOrderingKey reached the job while it ran (schema v10); live table only
+  wake_requested_at   timestamptz,               -- JobRetryOrderingKey reached the job while it ran (schema v10); live table only
+  progress            jsonb                      -- last step finished, cursor and time (schema v15); kept in history
 ) WITH (fillfactor = 70);
 
 -- Claim path: the only index the hot query touches.
@@ -533,7 +554,8 @@ indexes, for its waiting jobs and its running one, and its pending jobs through 
 dependency edges, which only live workflow jobs have, so a key listing reads neither
 the whole queue nor a new index on the hot table. Schema v14 adds the history index on
 `(kind, unique_key, finalized_at)` for finding a unique key's finished jobs (§7.2),
-declared and built the same way.
+declared and built the same way. Schema v15 adds `progress` to `hopper_jobs` and
+history (§7.5).
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -865,6 +887,31 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   its dependents, which completes the batch or starts the dependent if a sibling
   finalized at the same time missed this job. `CompleteTx` belongs last, just before
   the commit.
+- **Progress.** `RecordStep` and `RecordCursor` write the job's `progress` column
+  (`{"step", "cursor", "at"}`, the time `statement_timestamp()`) with one `UPDATE`
+  fenced like a finalize: `state = 'running'`, the attempt's client and its attempt
+  number. A fenced write changes nothing and returns `ErrJobFenced`. They run on the
+  pool and are not batched: a step is long next to its write, and the write must be
+  durable before the worker goes on. `RecordStepTx` and `RecordCursorTx` run the same
+  statement through `Driver.UnwrapTx(tx)`, so the progress commits with the step's
+  writes. Until `tx` ends it holds the job's row. A write on the pool would then wait
+  for the worker itself, so once a transaction of the attempt's has written the row
+  (`CompleteTx`, `RecordStepTx`, `RecordCursorTx`), a pool write locks the row with
+  `NOWAIT` first and fails with `ErrJobLocked` instead of waiting, and the attempt's
+  result goes to the finalize statement that skips held rows. An attempt's writes are
+  serialized, so `job.Progress` ends as the last one stored. The claim, retries,
+  snoozes and the archive keep `progress`, and `JobRetry` carries it back from
+  history, so a re-driven job resumes too; `JobRetry(ctx, id, hopper.FromStart())`
+  (`hopper jobs retry -from-start`, and a button in the web UI) clears it, to run a
+  finished job over or repair one whose recorded step was renamed. A replacing insert
+  (`UniqueReplace`) clears it too, since the job's new args make its old progress
+  meaningless; a running job is not replaced and keeps it. A value that is not in the
+  form hopper writes, such as one set by hand, reads as what can be made of it (none,
+  if it is not an object), so it never fails a claim. `RunSteps` resumes after
+  `Progress.Step`, and discards the job (`Cancel`) if that step is not among the steps
+  it was given, or if a step has no name or is listed twice, since every attempt would
+  fail the same way. `hoppertest.Work` keeps progress in memory, and
+  `WorkOpts.Progress` starts a job part way through.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure
@@ -1516,7 +1563,7 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease, backdate an attempt, count rows). Engine internals such as partition management stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |

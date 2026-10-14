@@ -119,12 +119,14 @@
 {{if $.CanAct}}<p class="actions">
   {{if $.Data.Live}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/cancel"><button>cancel</button></form>{{end}}
   {{if ne (print .State) "running"}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/retry"><button>{{if $.Data.Live}}run now{{else}}retry{{end}}</button></form>
+  {{if .Progress}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/retry"><input type="hidden" name="from" value="start"><button>{{if $.Data.Live}}run now{{else}}retry{{end}} from the start</button></form>{{end}}
   <details class="confirm"><summary>delete</summary><form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/delete"><button>delete permanently</button></form></details>{{end}}
 </p>{{end}}
 <dl>
   <dt>created</dt><dd>{{ts .CreatedAt}}</dd>
   <dt>scheduled</dt><dd>{{ts .ScheduledAt}}</dd>
   {{if .SnoozeReason}}<dt>snooze reason</dt><dd>{{.SnoozeReason}}</dd>{{end}}
+  {{with .Progress}}<dt>progress</dt><dd>{{if .Step}}finished <code>{{.Step}}</code>{{else}}no step finished{{end}}{{with .Cursor}}, cursor <code>{{printf "%s" .}}</code>{{end}} ({{ts .RecordedAt}})</dd>{{end}}
   {{if not .AttemptedAt.IsZero}}<dt>attempted</dt><dd>{{ts .AttemptedAt}} by client {{.AttemptedBy}}</dd>{{end}}
   {{if not .FinalizedAt.IsZero}}<dt>finalized</dt><dd>{{ts .FinalizedAt}}</dd>{{end}}
   {{if not .ExpiresAt.IsZero}}<dt>expires</dt><dd>{{ts .ExpiresAt}}</dd>{{end}}

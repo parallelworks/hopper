@@ -17,12 +17,34 @@ type attemptKey struct{}
 // SetOutput, and the completion CompleteTx wrote, if it did.
 type attempt struct {
 	codec Codec
+	// exec is the client's pool, and attempt the job's attempt number, for
+	// recording progress. progressMu serializes the attempt's progress
+	// writes, so that job.Progress ends as the last one stored.
+	exec       driver.Executor
+	attempt    int
+	progressMu sync.Mutex
 	// completion is the attempt's result if it succeeds, without output.
 	completion driver.JobFinalize
 
 	mu        sync.Mutex
 	output    json.RawMessage
 	completed *driver.JobFinalize
+	// heldByTx reports that a transaction of the worker's wrote the job's
+	// row (CompleteTx, RecordStepTx, RecordCursorTx), which it may still
+	// hold.
+	heldByTx bool
+}
+
+func (a *attempt) markHeldByTx() {
+	a.mu.Lock()
+	a.heldByTx = true
+	a.mu.Unlock()
+}
+
+func (a *attempt) txHeld() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.heldByTx
 }
 
 func (a *attempt) get() json.RawMessage {
@@ -37,7 +59,8 @@ func (a *attempt) completedTx() *driver.JobFinalize {
 	return a.completed
 }
 
-// ErrNotInJob is returned by SetOutput and CompleteTx outside a worker.
+// ErrNotInJob is returned by SetOutput, CompleteTx, RecordStep and
+// RecordCursor outside a worker.
 var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 
 // SetOutput records the job's result, which is stored with the finalized
@@ -46,8 +69,8 @@ var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 // DeleteCompleted. A job finalized with CompleteTx stores the output set
 // before that call.
 func SetOutput(ctx context.Context, v any) error {
-	a, ok := ctx.Value(attemptKey{}).(*attempt)
-	if !ok {
+	a, _ := ctx.Value(attemptKey{}).(*attempt)
+	if a == nil {
 		return ErrNotInJob
 	}
 	data, err := a.codec.Marshal(v)

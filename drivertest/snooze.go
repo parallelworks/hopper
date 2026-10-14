@@ -126,7 +126,7 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 
 	// JobRetry runs the job now, so the reason no longer applies.
-	if j, err := exec.JobRetry(ctx, id); err != nil || j.State != driver.JobStateAvailable || storedReason(ctx, t, f, d, id) != "" {
+	if j, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: id}); err != nil || j.State != driver.JobStateAvailable || storedReason(ctx, t, f, d, id) != "" {
 		t.Errorf("JobRetry = %+v, %v", j, err)
 	}
 
@@ -151,7 +151,7 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	if j := get(); j.SnoozeReason != "" {
 		t.Errorf("history row has reason %q", j.SnoozeReason)
 	}
-	if _, err := exec.JobRetry(ctx, id); err != nil {
+	if _, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: id}); err != nil {
 		t.Fatal(err)
 	}
 	snooze("fifth")
@@ -161,7 +161,7 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		t.Errorf("expired = %+v, %v", expired, err)
 	}
 	// A reason left on a job that is not snoozed is not taken for one.
-	if _, err := exec.JobRetry(ctx, id); err != nil {
+	if _, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: id}); err != nil {
 		t.Fatal(err)
 	}
 	leaveReason(ctx, t, f, d, id)

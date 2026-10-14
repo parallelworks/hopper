@@ -306,6 +306,44 @@ res, err := client.Insert(ctx, RenderReport{ID: 7}, &hopper.InsertOpts{Await: tr
 url, err := hopper.Await[string](ctx, client, res.Job.ID)
 ```
 
+## Resumable steps
+
+A long job made of several steps resumes where it left off when it is
+retried, snoozed or re-driven with `JobRetry`:
+
+```go
+func (w *ImportWorker) Work(ctx context.Context, job *hopper.Job[Import]) error {
+    return hopper.RunSteps(ctx, job,
+        hopper.NamedStep("download", w.download),
+        hopper.NamedStep("load", w.load),
+        hopper.NamedStep("notify", w.notify),
+    )
+}
+
+func (w *ImportWorker) load(ctx context.Context, job *hopper.Job[Import]) error {
+    page, _, err := hopper.StepCursor[int](job.JobRow) // 0 on the first try
+    if err != nil {
+        return err
+    }
+    for ; page < job.Args.Pages; page++ {
+        if err := w.loadPage(ctx, page); err != nil {
+            return err
+        }
+        if err := hopper.RecordCursor(ctx, job, page+1); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+`RunSteps` skips the steps the job already finished and records each one as
+it finishes. `RecordStepTx` and `RecordCursorTx` record in your own
+transaction, so a step's writes and its progress commit together. The
+progress is `job.Progress`, shown by `hopper jobs get` and the web UI.
+`client.JobRetry(ctx, id, hopper.FromStart())` re-runs a job from its first
+step.
+
 ## Operate
 
 ```go
@@ -337,4 +375,8 @@ if job.Args.UserID != 42 { ... }
 hoppertest.RequireNotInsertedTx[SendEmail](ctx, t, client, tx, nil)
 
 err := hoppertest.Work(ctx, t, workers, SendEmail{UserID: 42}, nil)
+
+// A step worker, resumed after its "download" step:
+err = hoppertest.Work(ctx, t, workers, Import{Pages: 3},
+    &hoppertest.WorkOpts{Progress: &hopper.Progress{Step: "download"}})
 ```
