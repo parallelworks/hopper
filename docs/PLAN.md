@@ -561,6 +561,7 @@ insert ──► scheduled ─┼─► (claim) running ─────┼──
   rescuer: running, owner's lease expired ──► retryable (or discarded)   │
   JobRetry ◄─────────────────────────────────────────────────────────────┘
   JobCancel: any live state; running jobs are signaled and finalize as canceled
+  JobDelete: any state but running; a waiting job is canceled without a history row
 ```
 
 `available`, `scheduled` and `retryable` all mean "claim once `scheduled_at <= now()`".
@@ -814,6 +815,10 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
     (with one warning) while the client's other results keep flushing. Once `tx`
     ends, the job is reported completed if it committed, or the result applies. A job
     that moved on without this attempt (rescued) is dropped like any fenced result.
+    Every other result goes in a statement that does not skip held rows, which is
+    cheaper. If that statement has not finished within 2 s, which a row held by a
+    caller's transaction (§7.7) causes, the batch is written again with `SKIP LOCKED`,
+    and a result left out is read again and retried in the same way.
   - **Unknown.** If the read fails, the result goes the same way, and the fence and a
     second read decide.
 - From `CompleteTx` until `tx` ends, `tx` holds the job's row and those of workflow
@@ -892,8 +897,8 @@ is held by a live job.
 
 `JobDelete` removes a job that is not running and refuses a running one (cancel it,
 then delete it once it has finished). A finalized job's history row is deleted. A
-waiting job is first canceled by the statement `JobCancel` runs, in the same
-transaction, then its history row is deleted: its batch counts it as failed, its
+waiting job is canceled by the statement `JobCancel` runs, except that it keeps no
+history row: its batch counts it as failed, its
 dependents react as to a cancel, and `Await` on it returns `ErrNotFound` instead of
 waiting for a job that no longer exists. There is no bulk delete: retention drops
 history by partition (§7.10), and an admin tool deletes chosen jobs with `JobDelete`
@@ -904,7 +909,15 @@ statements in the caller's transaction, so the control call commits or rolls bac
 the caller's own changes. Nothing reaches other processes before the commit: the
 cancel request of a running job is a `pg_notify` in the transaction (with the lease
 renewal as the fallback), and a retry wakes its queue with a `pg_notify` in the
-transaction, instead of the client's own wake-up that `JobRetry` uses.
+transaction, instead of the client's own wake-up that `JobRetry` uses. The mark a
+key's wake leaves on its running job is dated by `statement_timestamp()`, not
+`now()`, so that a transaction older than the attempt still marks it. Until the
+transaction ends it holds the rows it changed, so a running job that `JobCancelTx` or
+`JobRetryOrderingKeyTx` reached cannot finalize. Its result alone waits: a finalize
+statement that does not skip held rows gets 2 s, after which the batch is written again
+skipping them (the statement `CompleteTx` results use, §7.5), and a held job's result is
+tried again every 250 ms while the job is still running in its attempt. These calls
+still belong late in the transaction, as `CompleteTx` does.
 
 ### 7.8 Leader election
 Leadership is a lease row in `hopper_leader`:
@@ -1456,7 +1469,8 @@ observability without new machinery.
   out by dependency depth), subscriptions, stream consumers and clients. Retry, cancel,
   delete (behind a confirmation), pause, resume and seek are offered only when the application supplies
   `Config.Authorize`, which is asked before every action; without it the UI is
-  read-only. It is server-rendered HTML with no scripts and no external assets, so it
+  read-only. Actions are POSTs, and a browser's cross-site request to one is refused
+  (`http.CrossOriginProtection`). It is server-rendered HTML with no scripts and no external assets, so it
   works behind any proxy and needs no build step. The client it is given need not be
   started.
 

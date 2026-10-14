@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 type stubExec struct {
 	mu        sync.Mutex
 	sizes     []int
+	skipped   []bool
 	release   chan struct{}
 	started   chan int
 	failAbove int
@@ -38,6 +40,7 @@ func (e *stubExec) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 	n := len(params.Jobs)
 	e.mu.Lock()
 	e.sizes = append(e.sizes, n)
+	e.skipped = append(e.skipped, params.SkipLocked)
 	e.mu.Unlock()
 	if e.started != nil {
 		e.started <- n
@@ -156,8 +159,10 @@ func TestFinalizerSplitsTimedOutFlush(t *testing.T) {
 	}
 	stop()
 	sizes := exec.batches()
-	// 16 fails, then 8+8 fail, then 4×4 fail, then 8×2 succeed: 15 statements.
-	want := map[int]int{16: 1, 8: 2, 4: 4, 2: 8}
+	// 16 fails, as if waiting on a held row, and is written again skipping
+	// held rows; that fails too, then 8+8 fail, then 4×4 fail, then 8×2
+	// succeed: 16 statements, all but the first skipping held rows.
+	want := map[int]int{16: 2, 8: 2, 4: 4, 2: 8}
 	got := map[int]int{}
 	for _, n := range sizes {
 		got[n]++
@@ -167,8 +172,14 @@ func TestFinalizerSplitsTimedOutFlush(t *testing.T) {
 			t.Fatalf("flushes by size %v, want %v", got, want)
 		}
 	}
-	if len(sizes) != 15 {
-		t.Fatalf("%d flushes %v, want 15", len(sizes), sizes)
+	if len(sizes) != 16 {
+		t.Fatalf("%d flushes %v, want 16", len(sizes), sizes)
+	}
+	exec.mu.Lock()
+	skipped := exec.skipped
+	exec.mu.Unlock()
+	if skipped[0] || slices.Contains(skipped[1:], false) {
+		t.Errorf("statements skipping held rows = %v, want all but the first", skipped)
 	}
 }
 

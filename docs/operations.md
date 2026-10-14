@@ -147,7 +147,9 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
   path of your application (`http.StripPrefix`) to browse queues, jobs,
   workflows, subscriptions, consumers and clients. Pass `Config.Authorize` to
   enable retry, cancel, delete, pause, resume and seek; without it the UI is
-  read-only.
+  read-only. A browser's cross-site request to an action is refused
+  (`http.CrossOriginProtection`), so another site cannot act with an
+  operator's cookies.
 - `pg_stat_activity` shows the listener connection as
   `hopper-listener:<schema>`.
 

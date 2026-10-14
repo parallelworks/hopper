@@ -940,7 +940,8 @@ func testList[TTx any](t *testing.T, f Fixture[TTx]) {
 // dependents go on as after a cancel.
 func testJobDelete[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
-	exec := f.NewDriver(t).Executor()
+	d := f.NewDriver(t)
+	exec := d.Executor()
 	clientID := register(ctx, t, exec)
 	gone := func(id driver.JobID) {
 		t.Helper()
@@ -990,6 +991,88 @@ func testJobDelete[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if b, err := exec.BatchGet(ctx, wf.ID); err != nil || b.CompletedAt.IsZero() || b.Failed != 2 {
 		t.Errorf("workflow batch after the delete = %+v, %v", b, err)
+	}
+
+	// In a caller's transaction, a refused delete leaves the transaction
+	// usable for the next one.
+	tx, commit, _ := f.Begin(ctx, t, d)
+	txExec := d.UnwrapTx(tx)
+	if _, err := txExec.JobDelete(ctx, running); !errors.Is(err, driver.ErrJobRunning) {
+		t.Errorf("delete running in a transaction = %v, want ErrJobRunning", err)
+	}
+	if job, err := txExec.JobDelete(ctx, second); err != nil || job.ID != second {
+		t.Errorf("delete after a refused delete in a transaction = %+v, %v", job, err)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	gone(second)
+}
+
+// testJobDeleteRacesRetry deletes a finalized job while a transaction that
+// retries it is open: once the retry commits, the delete finds the job live
+// again and deletes it there, instead of reporting it unknown and leaving
+// it to run.
+func testJobDeleteRacesRetry[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	id := insert(ctx, t, exec, params("a", 1))[0].Job.ID
+	if _, err := exec.JobCancel(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	tx, commit, _ := f.Begin(ctx, t, d)
+	if _, err := d.UnwrapTx(tx).JobRetry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	var deleted *driver.JobRow
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		deleted, err = exec.JobDelete(ctx, id)
+		done <- err
+	}()
+	waitForLockWait(ctx, t, f, d)
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil || deleted.State != driver.JobStateCanceled {
+		t.Errorf("delete racing a retry = %+v, %v", deleted, err)
+	}
+	if _, err := exec.JobGet(ctx, id); !errors.Is(err, driver.ErrNotFound) {
+		t.Errorf("job after a delete that raced its retry: %v, want ErrNotFound", err)
+	}
+}
+
+// testRetryOrderingKeyTx wakes a key in a transaction that began before the
+// attempt of the key's running job: the mark is that attempt's, so the
+// snooze the attempt ends in runs at once.
+func testRetryOrderingKeyTx[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	p := params("k", 1)
+	p[0].OrderingKey = "a"
+	job := insert(ctx, t, exec, p)[0].Job.ID
+	tx, commit, _ := f.Begin(ctx, t, d)
+	txExec := d.UnwrapTx(tx)
+	if _, err := txExec.Now(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if jobs := claim(ctx, t, exec, clientID, 1); len(jobs) != 1 || jobs[0].ID != job {
+		t.Fatalf("claim = %+v", jobs)
+	}
+	if n, err := txExec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: "default", OrderingKey: "a", Limit: 10}); err != nil || n != 0 {
+		t.Fatalf("JobRetryOrderingKey in a transaction = %d, %v", n, err)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	finalize(ctx, t, exec, driver.JobFinalize{ID: job, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true})
+	if due := f.QueryText(ctx, t, d, "SELECT (scheduled_at <= now())::text FROM hopper_jobs WHERE id = $1::uuid", job.String()); due != "true" {
+		t.Error("a wake in a transaction older than the attempt was lost")
 	}
 }
 

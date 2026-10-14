@@ -788,3 +788,116 @@ func TestControlTx(t *testing.T) {
 		t.Errorf("job after a committed delete: %v, want ErrNotFound", err)
 	}
 }
+
+// TestHeldRowDoesNotStallFinalizer holds a running job's row in a caller's
+// transaction (JobCancelTx, not committed) while the job finishes: its
+// result waits for the transaction, and other jobs' results do not.
+func TestHeldRowDoesNotStallFinalizer(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	w := newBlocker()
+	workers := hopper.NewWorkers()
+	hopper.AddWorker(workers, w)
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[failing]) error { return nil })
+	c := h.started(workers, 2)
+
+	held, err := c.Insert(ctx, noop{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-w.started
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := c.JobCancelTx(ctx, tx, held.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	w.release <- struct{}{}
+
+	other, err := c.Insert(ctx, failing{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		job, err := c.JobGet(ctx, other.Job.ID)
+		if err == nil && job.State == hopper.JobStateCompleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("another job's result waited for the held row")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if job, err := c.JobGet(ctx, held.Job.ID); err != nil || job.State != hopper.JobStateRunning {
+		t.Fatalf("held job = %+v, %v, want running until the transaction ends", job, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, c, held.Job.ID, hopper.JobStateCompleted, hopper.JobStateCanceled)
+}
+
+// TestJobRetryTxSchedulesAtStatementTime retries a job in a transaction
+// that began a while before: the job is due from the retry, not from the
+// transaction's start, so it does not jump ahead of jobs scheduled since.
+func TestJobRetryTxSchedulesAtStatementTime(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	c := h.client(&hopper.Config{})
+	res, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{ScheduledAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var began time.Time
+	if err := tx.QueryRow(ctx, "SELECT now()").Scan(&began); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	job, err := c.JobRetryTx(ctx, tx, res.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := job.ScheduledAt.Sub(began); d < 400*time.Millisecond {
+		t.Errorf("retried job due %s after the transaction began, want the retry's time", d)
+	}
+}
+
+// TestJobDeleteWaitingWritesNoHistory deletes a waiting job while another
+// transaction keeps every insert out of the history its cancel would go
+// to: the delete does not wait, as it writes no history row.
+func TestJobDeleteWaitingWritesNoHistory(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	c := h.client(&hopper.Config{})
+	res, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{ScheduledAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "LOCK TABLE hopper_job_history_failed IN SHARE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if job, err := c.JobDelete(dctx, res.Job.ID); err != nil || job.State != hopper.JobStateCanceled {
+		t.Fatalf("JobDelete = %+v, %v", job, err)
+	}
+	if _, err := c.JobGet(ctx, res.Job.ID); !errors.Is(err, hopper.ErrNotFound) {
+		t.Errorf("deleted job: %v, want ErrNotFound", err)
+	}
+}

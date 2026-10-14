@@ -43,6 +43,10 @@ func (c *Client[TTx]) JobCancel(ctx context.Context, id JobID) (*JobRow, error) 
 // JobCancelTx is JobCancel inside the caller's transaction, so the cancel
 // commits or rolls back with the caller's own changes. A running job's
 // client is told when the transaction commits.
+//
+// Until tx ends it holds the job's row, so a running job that finishes
+// meanwhile has its result wait for tx; its client's other results do not.
+// Call it late in tx, as CompleteTx.
 func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, id JobID) (*JobRow, error) {
 	return c.driver.UnwrapTx(tx).JobCancel(ctx, id)
 }
@@ -79,16 +83,18 @@ func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id JobID) (*JobRow
 
 // JobDelete removes a job that is not running, from the live table or from
 // history, and returns it as it was last stored. A waiting job is canceled
-// first, in the same transaction, so that its batch counts it as failed, its
-// dependents react as they do to a cancel, and Await on it returns
-// ErrNotFound rather than waiting forever. It returns ErrJobRunning for a
+// as JobCancel does, but keeps no history row: its batch counts it as
+// failed, its dependents react as they do to a cancel, and Await on it
+// returns ErrNotFound rather than waiting forever. It returns ErrJobRunning for a
 // running job (cancel it, then delete it once it has finished) and
 // ErrNotFound for an unknown one.
 func (c *Client[TTx]) JobDelete(ctx context.Context, id JobID) (*JobRow, error) {
 	return c.exec.JobDelete(ctx, id)
 }
 
-// JobDeleteTx is JobDelete inside the caller's transaction.
+// JobDeleteTx is JobDelete inside the caller's transaction. Until tx ends
+// it holds the job's row and, for a waiting job, those of the workflow
+// dependents it cancels or promotes.
 func (c *Client[TTx]) JobDeleteTx(ctx context.Context, tx TTx, id JobID) (*JobRow, error) {
 	return c.driver.UnwrapTx(tx).JobDelete(ctx, id)
 }
@@ -115,6 +121,10 @@ func (c *Client[TTx]) JobRetryOrderingKey(ctx context.Context, queue, orderingKe
 
 // JobRetryOrderingKeyTx is JobRetryOrderingKey inside the caller's
 // transaction. The queue is woken when the transaction commits.
+//
+// Until tx ends it holds the rows of the jobs it woke and of the key's
+// running job, whose result waits for tx; its client's other results do
+// not. Call it late in tx, as CompleteTx.
 func (c *Client[TTx]) JobRetryOrderingKeyTx(ctx context.Context, tx TTx, queue, orderingKey string) (int, error) {
 	queue = cmp.Or(queue, QueueDefault)
 	exec := c.driver.UnwrapTx(tx)

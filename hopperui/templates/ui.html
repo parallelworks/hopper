@@ -118,8 +118,8 @@
 </p>
 {{if $.CanAct}}<p class="actions">
   {{if $.Data.Live}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/cancel"><button>cancel</button></form>{{end}}
-  {{if ne (print .State) "running"}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/retry"><button>{{if $.Data.Live}}run now{{else}}retry{{end}}</button></form>{{end}}
-  {{if ne (print .State) "running"}}<details class="confirm"><summary>delete</summary><form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/delete"><button>delete permanently</button></form></details>{{end}}
+  {{if ne (print .State) "running"}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/retry"><button>{{if $.Data.Live}}run now{{else}}retry{{end}}</button></form>
+  <details class="confirm"><summary>delete</summary><form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/delete"><button>delete permanently</button></form></details>{{end}}
 </p>{{end}}
 <dl>
   <dt>created</dt><dd>{{ts .CreatedAt}}</dd>

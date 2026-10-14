@@ -139,6 +139,10 @@ const flushTimeout = 30 * time.Second
 // still open waits before the finalizer tries it again.
 const heldRetry = 250 * time.Millisecond
 
+// heldWait bounds a finalize statement that waits for held rows before
+// the batch is written again skipping them (write).
+const heldWait = 2 * time.Second
+
 // flush writes one batch: the results of jobs not completed with CompleteTx
 // in one statement, and the other outcomes of those that were, whose rows a
 // worker's transaction may still hold, in another that skips held rows.
@@ -172,6 +176,13 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 // The statement itself runs on a context that ctx does not cancel: a result
 // that reached the finalizer belongs to a job that has finished, and the
 // stop signal must not cut its write short.
+//
+// A statement that does not skip held rows gets heldWait: a caller's
+// transaction that ran a control call such as JobCancelTx on a job and has
+// not committed holds its row, and the statement would wait for it with
+// every other result of the batch. Past heldWait the batch is written again
+// skipping held rows, and a held job's result is tried again later
+// (notWritten), so that the transaction holds up only its own job.
 func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool) {
 	if len(batch) == 0 {
 		return
@@ -184,9 +195,17 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 	}
 	backoff := 50 * time.Millisecond
 	for {
-		opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
+		timeout := flushTimeout
+		if !skipLocked {
+			timeout = heldWait
+		}
+		opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		applied, err := f.exec.JobFinalizeMany(opCtx, driver.JobFinalizeParams{Jobs: jobs, NoBatches: noBatches, SkipLocked: skipLocked})
 		cancel()
+		if !skipLocked && errors.Is(err, context.DeadlineExceeded) {
+			skipLocked = true
+			continue
+		}
 		if err == nil {
 			finished := f.afterFlush(ctx, batch, applied)
 			if !noBatches {
@@ -261,13 +280,9 @@ func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []d
 	for _, p := range batch {
 		if ok != nil {
 			if _, was := ok[p.result.ID]; !was {
-				if p.completedTx != nil {
-					if p, done := f.notWritten(ctx, p); done {
-						finished = append(finished, p)
-					}
-					continue
+				if p, done := f.notWritten(ctx, p); done {
+					finished = append(finished, p)
 				}
-				f.logger.WarnContext(ctx, "hopper: result dropped: job no longer owned by this attempt", "job_id", p.result.ID)
 				continue
 			}
 		}
@@ -282,24 +297,26 @@ func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []d
 	return finished
 }
 
-// notWritten handles the other outcome of a job completed with CompleteTx
-// that the statement did not apply. If the job finished in this attempt,
-// the transaction committed after all, and the completion is reported. If
-// the job is still running in this attempt, the transaction has not ended:
-// the result is tried again later, so that a worker that returned without
-// ending it holds up only its own job. Otherwise the job has moved on, and
-// the result is dropped.
+// notWritten handles a result the statement did not apply. If the job is
+// still running in this attempt, a transaction holds its row: the result is
+// tried again later. A job completed with CompleteTx that finished in this
+// attempt had its transaction commit after all, and the completion is
+// reported. Otherwise the job has moved on, and the result is dropped.
 func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
-	switch readTx(ctx, f.exec, p.job) {
-	case txCommitted:
+	switch state := readTx(ctx, f.exec, p.job); {
+	case state == txCommitted && p.completedTx != nil:
 		f.applied(p.job, *p.completedTx)
 		return p, true
-	case txLost:
+	case state == txCommitted, state == txLost:
 		f.logger.WarnContext(ctx, "hopper: result dropped: job no longer owned by this attempt", "job_id", p.result.ID)
 		return p, false
 	}
 	if p.waits++; p.waits == 1 {
-		f.logger.WarnContext(ctx, "hopper: the transaction a worker completed its job in is still open after the worker returned; the job's result waits for it", "job_id", p.result.ID)
+		if p.completedTx != nil {
+			f.logger.WarnContext(ctx, "hopper: the transaction a worker completed its job in is still open after the worker returned; the job's result waits for it", "job_id", p.result.ID)
+		} else {
+			f.logger.WarnContext(ctx, "hopper: another transaction holds a finished job's row, such as one that called JobCancelTx and has not committed; the job's result waits for it", "job_id", p.result.ID)
+		}
 	}
 	time.AfterFunc(heldRetry, func() { f.submit(p) })
 	return p, false
