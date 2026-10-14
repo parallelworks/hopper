@@ -68,6 +68,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 	}{
 		{"InsertMany", testInsertMany[TTx]},
 		{"InsertUnique", testInsertUnique[TTx]},
+		{"InsertUniqueFinished", testInsertUniqueFinished[TTx]},
+		{"InsertUniqueFinishedRacesFinalize", testInsertUniqueFinishedRacesFinalize[TTx]},
 		{"InsertCopy", testInsertCopy[TTx]},
 		{"InsertTx", testInsertTx[TTx]},
 		{"Claim", testClaim[TTx]},
@@ -103,7 +105,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Notify", testNotify[TTx]},
 		{"HistoryMaintain", testHistoryMaintain[TTx]},
 		{"HistoryMaintainWhileInUse", testHistoryMaintainWhileInUse[TTx]},
-		{"HistoryOrderingIndex", testHistoryOrderingIndex[TTx]},
+		{"HistoryIndexes", testHistoryIndexes[TTx]},
 		{"Now", testNow[TTx]},
 		{"Subscriptions", testSubscriptions[TTx]},
 		{"Publish", testPublish[TTx]},

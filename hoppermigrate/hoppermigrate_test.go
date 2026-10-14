@@ -27,7 +27,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 13
+	const latest = 14
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -316,10 +316,10 @@ func TestUpAfterHistoryOrderingAs12(t *testing.T) {
 	}
 }
 
-// TestDownDropsUnattachedOrderingIndexes downgrades past v13 with a
-// partition's ordering index built but never attached, as an interrupted
-// build leaves it.
-func TestDownDropsUnattachedOrderingIndexes(t *testing.T) {
+// TestDownDropsUnattachedHistoryIndexes downgrades past v14 and v13 with a
+// partition's unique-key and ordering-key indexes built but never attached,
+// as an interrupted build leaves them.
+func TestDownDropsUnattachedHistoryIndexes(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	pool := testdb.EmptyPool(t, 0)
@@ -328,17 +328,32 @@ func TestDownDropsUnattachedOrderingIndexes(t *testing.T) {
 	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "CREATE INDEX hopper_job_history_completed_default_ordering ON hopper_job_history_completed_default (ordering_key, id) WHERE ordering_key IS NOT NULL"); err != nil {
-		t.Fatal(err)
+	for _, q := range []string{
+		"CREATE INDEX hopper_job_history_completed_default_ordering ON hopper_job_history_completed_default (ordering_key, id) WHERE ordering_key IS NOT NULL",
+		"CREATE INDEX hopper_job_history_completed_default_unique ON hopper_job_history_completed_default (kind, unique_key, finalized_at) WHERE unique_key IS NOT NULL",
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	indexes := func(suffix string) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relname LIKE 'hopper_job_history%' || $1", suffix).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 13}); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if u, o := indexes("unique"), indexes("ordering"); u != 0 || o != 3 {
+		t.Errorf("after Down to v13: %d unique-key indexes, want 0, and %d ordering-key indexes, want 3", u, o)
 	}
 	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 12}); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
-	var n int
-	if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relname LIKE 'hopper_job_history%ordering'").Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 {
+	if n := indexes("ordering"); n != 0 {
 		t.Errorf("%d ordering indexes after Down, want 0", n)
 	}
 }

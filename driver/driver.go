@@ -421,6 +421,10 @@ type JobInsertParams struct {
 	Metadata    json.RawMessage
 	// UniqueKey is empty for non-unique jobs.
 	UniqueKey string
+	// UniqueFinished lists finished states in which a job in history with
+	// the same kind and UniqueKey is a duplicate too. The insert must find
+	// one that finalizes while it runs, at read committed isolation.
+	UniqueFinished []JobState
 	// OrderingKey, if set, serializes the job with others of the same key
 	// in its queue: at most one runs at a time, oldest first.
 	OrderingKey string
@@ -436,7 +440,8 @@ type JobInsertParams struct {
 	Await bool
 }
 
-// ConflictAction says what to do when a unique key matches a live job.
+// ConflictAction says what to do when a unique key matches a live job. A
+// job in history is never replaced.
 type ConflictAction int
 
 // Conflict actions.
@@ -460,8 +465,9 @@ type JobInsertOpts struct {
 // JobInsertResult is the outcome of inserting one job.
 type JobInsertResult struct {
 	Job *JobRow
-	// Duplicate is true when a live job with the same unique key already
-	// existed. Job is then that existing job.
+	// Duplicate is true when a job with the same unique key already
+	// existed: a live one, or one in history in a UniqueFinished state. Job
+	// is then that existing job.
 	Duplicate bool
 }
 

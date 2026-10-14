@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -31,8 +32,8 @@ func JobColumns(prefix string) string {
 
 // historyColumns lists hopper_job_history columns in JobColumns order.
 // History has no snooze_reason, because a finalized job is not waiting.
-func historyColumns() string {
-	return strings.Replace(JobColumns(""), "snooze_reason", "NULL::text AS snooze_reason", 1)
+func historyColumns(prefix string) string {
+	return strings.Replace(JobColumns(prefix), prefix+"snooze_reason", "NULL::text AS snooze_reason", 1)
 }
 
 // scanJob scans a row of JobColumns, plus finalized_at and output when
@@ -173,6 +174,13 @@ func (e *Executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 	if len(params) == 0 {
 		return nil, nil
 	}
+	if slices.ContainsFunc(params, countsHistory) {
+		return e.jobInsertCheckingHistory(ctx, params, opts)
+	}
+	return e.jobInsert(ctx, params, opts)
+}
+
+func (e *Executor) jobInsert(ctx context.Context, params []driver.JobInsertParams, opts driver.JobInsertOpts) ([]driver.JobInsertResult, error) {
 	n := len(params)
 	var (
 		kinds, queues, uniqueKeys, ordering, partitions = make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
@@ -227,6 +235,160 @@ func (e *Executor) JobInsertMany(ctx context.Context, params []driver.JobInsertP
 	}
 	return results, nil
 }
+
+func countsHistory(p driver.JobInsertParams) bool {
+	return p.UniqueKey != "" && len(p.UniqueFinished) > 0
+}
+
+// jobInsertCheckingHistory inserts a batch in which some jobs count finished
+// duplicates in history. Those whose duplicate is in history already are not
+// inserted. A duplicate can also finalize while the insert runs: its live
+// row is then gone, and its history row is not in the insert's snapshot. The
+// insert's conflict check waits for that finalize to commit, so a second
+// look at history, in a statement of its own and therefore with a new
+// snapshot at read committed, finds it, and the job just inserted is deleted
+// in the same transaction, before any worker can claim it.
+func (e *Executor) jobInsertCheckingHistory(ctx context.Context, params []driver.JobInsertParams, opts driver.JobInsertOpts) ([]driver.JobInsertResult, error) {
+	results := make([]driver.JobInsertResult, len(params))
+	found, err := uniqueHistory(ctx, e.Conn, params, nil)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		rest []int
+		sub  []driver.JobInsertParams
+	)
+	for i, job := range found {
+		if job != nil {
+			results[i] = driver.JobInsertResult{Job: job, Duplicate: true}
+		} else {
+			rest = append(rest, i)
+			sub = append(sub, params[i])
+		}
+	}
+	if len(sub) == 0 {
+		return results, nil
+	}
+	insert := func(conn Conn) error {
+		inserted, err := (&Executor{Conn: conn, Schema: e.Schema, InTx: true}).jobInsert(ctx, sub, opts)
+		if err != nil {
+			return err
+		}
+		ids := make([]driver.JobID, len(sub))
+		for k, r := range inserted {
+			if !r.Duplicate {
+				ids[k] = r.Job.ID
+			}
+		}
+		found, err := uniqueHistory(ctx, conn, sub, ids)
+		if err != nil {
+			return err
+		}
+		for k, i := range rest {
+			results[i] = inserted[k]
+			if found[k] != nil {
+				results[i] = driver.JobInsertResult{Job: found[k], Duplicate: true}
+			}
+		}
+		return nil
+	}
+	if e.InTx {
+		err = insert(e.Conn)
+	} else {
+		err = e.withTx(ctx, func(tx Tx) error { return insert(tx) })
+	}
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// uniqueHistorySQL finds each job's latest duplicate in history. Before the
+// insert, it skips a job with a live duplicate, which the insert reports or
+// replaces. After it, it deletes the job each input names as inserted.
+const uniqueHistorySQL = `
+WITH p AS (
+  SELECT * FROM unnest($1::int[], $2::text[], $3::text[], $4::text[], $5::uuid[]) AS p(ord, kind, unique_key, finished, inserted)%[2]s
+), hit AS (
+  SELECT p.ord, p.inserted, h.*
+  FROM p CROSS JOIN LATERAL (
+    SELECT %[1]s, x.finalized_at, x.output FROM {{schema}}.hopper_job_history x
+    WHERE x.kind = p.kind AND x.unique_key = p.unique_key
+      AND x.state = ANY(string_to_array(p.finished, ',')::{{schema}}.hopper_job_state[])
+    ORDER BY x.finalized_at DESC
+    LIMIT 1
+  ) h
+)%[3]s
+SELECT %[4]s, finalized_at, output, ord FROM hit`
+
+var (
+	uniqueHistoryQuery = fmt.Sprintf(uniqueHistorySQL, historyColumns("x."), `
+  WHERE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs j WHERE j.kind = p.kind AND j.unique_key = p.unique_key)`, "", JobColumns(""))
+	uniqueHistoryDeleteQuery = fmt.Sprintf(uniqueHistorySQL, historyColumns("x."), "", `, del AS (
+  DELETE FROM {{schema}}.hopper_jobs j USING hit WHERE j.id = hit.inserted
+)`, JobColumns(""))
+)
+
+// uniqueHistory returns, for each input that counts history and has no live
+// duplicate, its latest duplicate there, or nil. With inserted, it looks
+// only at the inputs with an ID there, and deletes the job of that ID for
+// each one it finds.
+func uniqueHistory(ctx context.Context, conn Conn, params []driver.JobInsertParams, inserted []driver.JobID) ([]*driver.JobRow, error) {
+	var (
+		ords             []int
+		kinds, keys, fin []string
+		ids              []driver.JobID
+	)
+	for i, p := range params {
+		if !countsHistory(p) || (inserted != nil && inserted[i].IsZero()) {
+			continue
+		}
+		states := make([]string, len(p.UniqueFinished))
+		for k, s := range p.UniqueFinished {
+			states[k] = string(s)
+		}
+		ords = append(ords, i)
+		kinds, keys, fin = append(kinds, p.Kind), append(keys, p.UniqueKey), append(fin, strings.Join(states, ","))
+		if inserted != nil {
+			ids = append(ids, inserted[i])
+		} else {
+			ids = append(ids, driver.JobID{})
+		}
+	}
+	found := make([]*driver.JobRow, len(params))
+	if len(ords) == 0 {
+		return found, nil
+	}
+	query := uniqueHistoryQuery
+	if inserted != nil {
+		query = uniqueHistoryDeleteQuery
+	}
+	rows, err := conn.Query(ctx, query, intArray(ords), textArray(kinds), textArray(keys), textArray(fin), uuidArray(ids))
+	if err != nil {
+		return nil, fmt.Errorf("hopper: insert jobs: find duplicates in history: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ord int
+		job, err := scanJob(trailing{rows, []any{&ord}}, true, nil)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: insert jobs: find duplicates in history: %w", err)
+		}
+		found[ord] = job
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hopper: insert jobs: find duplicates in history: %w", err)
+	}
+	return found, nil
+}
+
+// trailing scans extra columns after the ones its caller asks for.
+type trailing struct {
+	Row
+	extra []any
+}
+
+func (r trailing) Scan(dest ...any) error { return r.Row.Scan(append(dest, r.extra...)...) }
 
 // JobInsertCopy implements driver.Executor for transports without COPY.
 func (e *Executor) JobInsertCopy(context.Context, []driver.JobInsertParams, driver.JobInsertOpts) ([]driver.JobInsertResult, error) {
@@ -514,7 +676,7 @@ var jobGetQuery = fmt.Sprintf(`
 SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE id = $1
 UNION ALL
 SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history WHERE id = $1
-LIMIT 1`, JobColumns(""), historyColumns())
+LIMIT 1`, JobColumns(""), historyColumns(""))
 
 // JobGet implements driver.Executor.
 func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
@@ -530,7 +692,7 @@ func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow,
 
 var (
 	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM {{schema}}.hopper_jobs`, JobColumns(""))
-	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, historyColumns())
+	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, historyColumns(""))
 	jobListFilterSQL  = ` WHERE ($1 = '' OR queue = $1) AND (cardinality($2::text[]) = 0 OR kind = ANY($2::text[]))
   AND (cardinality($3::text[]) = 0 OR state::text = ANY($3::text[]))`
 	// A key's live jobs are found through the claim's ordering-key indexes,
@@ -670,7 +832,7 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 
 // jobDeleteHistorySQL removes a finalized job from history.
 var jobDeleteHistorySQL = fmt.Sprintf(`DELETE FROM {{schema}}.hopper_job_history WHERE id = $1
-RETURNING %s, finalized_at, output`, historyColumns())
+RETURNING %s, finalized_at, output`, historyColumns(""))
 
 // JobDelete implements driver.Executor. A JobRetry that is moving the job
 // from history back to the live table makes the history delete wait for it

@@ -436,7 +436,7 @@ CREATE INDEX hopper_jobs_claim ON hopper_jobs (queue, priority, scheduled_at, se
 -- Running set: rescue, cancel delivery, global limits. Bounded by total concurrency.
 CREATE INDEX hopper_jobs_running ON hopper_jobs (queue, attempted_by) WHERE state = 'running';
 
--- Uniqueness applies only while a job is live.
+-- Uniqueness among live jobs. History counts only when UniqueOpts.Finished asks.
 CREATE UNIQUE INDEX hopper_jobs_unique ON hopper_jobs (kind, unique_key) WHERE unique_key IS NOT NULL;
 
 -- Finalized jobs. Two-level partitioning: by outcome, then by time, so retention is
@@ -463,6 +463,10 @@ CREATE TABLE hopper_job_history_failed PARTITION OF hopper_job_history
 -- with readers of hopper_job_history.
 CREATE INDEX hopper_job_history_completed_ordering ON ONLY hopper_job_history_completed (ordering_key, id)
   WHERE ordering_key IS NOT NULL;
+-- A unique key's finished jobs, for UniqueOpts.Finished (schema v14). Declared and
+-- built like the ordering-key index.
+CREATE INDEX hopper_job_history_completed_unique ON ONLY hopper_job_history_completed (kind, unique_key, finalized_at)
+  WHERE unique_key IS NOT NULL;
 CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id)
   WHERE ordering_key IS NOT NULL;
 
@@ -525,7 +529,9 @@ spells the canceled state `canceled` (§12). Schema v13 adds the history index o
 leader. On the live table, a key's lane is found through the claim's two ordering-key
 indexes, for its waiting jobs and its running one, and its pending jobs through their
 dependency edges, which only live workflow jobs have, so a key listing reads neither
-the whole queue nor a new index on the hot table.
+the whole queue nor a new index on the hot table. Schema v14 adds the history index on
+`(kind, unique_key, finalized_at)` for finding a unique key's finished jobs (§7.2),
+declared and built the same way.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -591,6 +597,22 @@ skew between pods cannot cause early or duplicate execution.
   `UniqueReplace` updates the args, metadata, priority, attempts and `scheduled_at` of a
   non-running duplicate, which gives debouncing. Within one batch, later inputs with the
   same key resolve to the first.
+- **Finished duplicates:** `UniqueOpts.Finished` names finished states (completed,
+  canceled, discarded) whose jobs in history also count as duplicates, for as long as
+  retention keeps them; with `ByPeriod` that is the rest of the period, which is part
+  of the key. The plain insert statement is unchanged, so jobs without `Finished` pay
+  nothing. A batch with such jobs first looks each one up in history through the v14
+  index, skipping those with a live duplicate, which the insert reports or replaces as
+  before; a finished duplicate is reported and never replaced. The rest are inserted
+  as usual, and a second statement in the same transaction looks again for the jobs
+  just inserted, deleting any whose duplicate it now finds. That second look covers a
+  duplicate finalized while the insert ran: its finalize deletes the live row and
+  writes the history row in one transaction, so the insert's snapshot sees neither,
+  but the insert's conflict check waits for that transaction on the live row, and the
+  next statement's snapshot at read committed includes it. A pool insert runs the
+  insert and the second look in a transaction of its own, so no worker claims a job
+  about to be deleted. A caller's transaction at repeatable read or serializable
+  keeps its snapshot, and misses a duplicate finalized after it.
 - **Wake-up:** an insert inside a caller's transaction sends
   `pg_notify('hopper_insert', queue)` in the same pipelined batch as the insert, once
   per queue. Postgres delivers notifications only on commit and collapses identical
@@ -940,8 +962,9 @@ and it doesn't pin a connection. Leader-only duties are idempotent, because two 
 can briefly overlap during a partition.
 
 Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
-partitions ahead of time and dropping expired ones, building the ordering-key index
-of any history partition that lacks one (after the v13 upgrade), removing stale
+partitions ahead of time and dropping expired ones, building the ordering-key and
+unique-key indexes of any history partition that lacks them (after the v13 and v14
+upgrades), removing stale
 `hopper_clients` rows, sweeping the batch progress that clients did not settle, and
 promoting workflow jobs whose last dependencies finished in concurrent transactions
 (§11).
@@ -1418,9 +1441,9 @@ observability without new machinery.
   statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
   constraints, and so on). A migration runs in a transaction, where `CONCURRENTLY` is
   not allowed and a partitioned table cannot take it at all, so an index on history
-  is declared `ON ONLY` and built per partition by the leader (schema v13). A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v13 for the
-  `SHARE` lock that declaring the history index takes, which finalizes wait for), because a lock
+  is declared `ON ONLY` and built per partition by the leader (schema v13 and v14). A change that needs `ACCESS EXCLUSIVE`, such as adding a
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v13 and v14
+  for the `SHARE` lock that declaring a history index takes, which finalizes wait for), because a lock
   request queued behind an open transaction on the table would hold up every claim
   behind it; claims wait at most one try at a time. Between tries it sleeps a jittered,
   growing interval capped at a second, raises a `NOTICE` every 10 seconds while it
@@ -1481,7 +1504,7 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease, backdate an attempt, count rows). Engine internals such as partition management stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |

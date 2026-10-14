@@ -222,6 +222,9 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 		if dp.UniqueKey, err = opts.Unique.key(p.Args, args, opts.Queue, now); err != nil {
 			return driver.JobInsertParams{}, 0, err
 		}
+		if dp.UniqueFinished, err = opts.Unique.finished(); err != nil {
+			return driver.JobInsertParams{}, 0, err
+		}
 		if opts.Unique.OnConflict == UniqueReplace {
 			action = driver.ConflictReplace
 		}

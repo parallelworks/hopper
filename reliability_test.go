@@ -157,6 +157,72 @@ func TestUniqueInsertConcurrent(t *testing.T) {
 	}
 }
 
+// A unique job that counts finished duplicates is not inserted again once
+// its duplicate has completed, through every insert call.
+func TestUniqueFinished(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[noop]) error { return nil })
+	c := h.started(workers, 2)
+	once := func(n int) hopper.InsertParams {
+		return hopper.InsertParams{Args: noop{N: n}, Opts: &hopper.InsertOpts{
+			Await:  true,
+			Unique: &hopper.UniqueOpts{ByArgs: true, Finished: []hopper.JobState{hopper.JobStateCompleted, hopper.JobStateCompleted}},
+		}}
+	}
+	first, err := c.Insert(ctx, once(1).Args, once(1).Opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hopper.Await[struct{}](ctx, c, first.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	again, err := c.Insert(ctx, once(1).Args, once(1).Opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Duplicate || again.Job.ID != first.Job.ID || again.Job.State != hopper.JobStateCompleted {
+		t.Errorf("insert after completion = %+v", again.Job)
+	}
+	batch, err := c.InsertMany(ctx, []hopper.InsertParams{once(2), once(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch[0].Duplicate || !batch[1].Duplicate || batch[1].Job.ID != first.Job.ID {
+		t.Errorf("batch = %+v, %+v", batch[0], batch[1])
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // committed on the happy path
+	inTx, err := c.InsertTx(ctx, tx, once(1).Args, once(1).Opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !inTx.Duplicate || inTx.Job.ID != first.Job.ID {
+		t.Errorf("insert in tx after completion = %+v", inTx.Job)
+	}
+
+	// A job without Finished ignores history.
+	plain, err := c.Insert(ctx, noop{N: 1}, &hopper.InsertOpts{Unique: &hopper.UniqueOpts{ByArgs: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.Duplicate {
+		t.Errorf("history counted without Finished: %+v", plain.Job)
+	}
+	if _, err := c.Insert(ctx, noop{N: 3}, &hopper.InsertOpts{Unique: &hopper.UniqueOpts{Finished: []hopper.JobState{hopper.JobStateRunning}}}); err == nil {
+		t.Error("Finished accepted a state that is not finished")
+	}
+}
+
 func TestRescueAfterClientCrash(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -670,10 +736,10 @@ func TestLeaderKeepsLeaseWhileIndexingHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	const unindexed = `SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		CROSS JOIN (VALUES ('_ordering'), ('_unique')) AS s(suffix)
 		WHERE i.inhparent IN ('hopper_job_history_completed'::regclass, 'hopper_job_history_failed'::regclass)
 		  AND NOT EXISTS (SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
-		    WHERE x.indrelid = c.oid
-		      AND xi.inhparent IN ('hopper_job_history_completed_ordering'::regclass, 'hopper_job_history_failed_ordering'::regclass))`
+		    WHERE x.indrelid = c.oid AND xi.inhparent = to_regclass(i.inhparent::regclass::text || s.suffix))`
 	// A concurrent build also waits for every older snapshot elsewhere in
 	// the database, such as other packages' tests queued for the migration
 	// lock, so it can take longer than waitFor allows.
