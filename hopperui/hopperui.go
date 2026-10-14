@@ -84,6 +84,7 @@ func New[TTx any](client *hopper.Client[TTx], cfg *Config) http.Handler {
 		"dur":    func(d time.Duration) string { return d.Round(time.Second).String() },
 		"now":    time.Now,
 		"short":  shorten,
+		"last":   func(i int, logs []hopper.AttemptLog) bool { return i == len(logs)-1 },
 	}).ParseFS(templateFS, "templates/ui.html"))
 
 	mux := http.NewServeMux()

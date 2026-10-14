@@ -410,6 +410,9 @@ type JobRow struct {
 	// Progress is the last step the job's worker recorded, or nil. It
 	// survives retries, snoozes and a JobRetry from history.
 	Progress *Progress
+	// Logs are the log lines of the job's latest attempts, oldest first.
+	// Only JobGet reads them.
+	Logs []AttemptLog
 	// FinalizedAt is set for jobs in history.
 	FinalizedAt time.Time
 	// Output is the value recorded by the worker, for jobs in history.
@@ -426,6 +429,13 @@ type Progress struct {
 	Cursor json.RawMessage `json:"cursor,omitempty"`
 	// RecordedAt is the database time at which it was recorded.
 	RecordedAt time.Time `json:"at"`
+}
+
+// AttemptLog is the log output of one attempt of a job.
+type AttemptLog struct {
+	Attempt int `json:"attempt"`
+	// Log is the attempt's lines, each ending in a newline.
+	Log string `json:"log"`
 }
 
 // JobRetryParams selects the job to retry.
@@ -743,6 +753,9 @@ type JobFinalizeParams struct {
 	// as a worker's CompleteTx that has not ended, instead of waiting for
 	// it. A skipped job is not among the applied.
 	SkipLocked bool
+	// KeepLogs is the most attempt logs a job keeps, the latest; a job given
+	// another drops its oldest. Zero keeps them all.
+	KeepLogs int
 }
 
 // WorkflowPromoteParams selects the jobs WorkflowPromoteReady considers.
@@ -788,6 +801,8 @@ type JobFinalize struct {
 	Error *AttemptError
 	// Output is stored with the finalized job.
 	Output json.RawMessage
+	// Log is appended to the job's logs, if not nil.
+	Log *AttemptLog
 	// Archive controls whether a terminal job is written to history. Canceled
 	// and discarded jobs are always archived; completed jobs may skip it.
 	Archive bool

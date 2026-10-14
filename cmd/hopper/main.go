@@ -292,6 +292,12 @@ func printJob(w io.Writer, j *hopper.JobRow) {
 	for _, e := range j.Errors {
 		fmt.Fprintf(w, "error #%d:      %s (%s)\n", e.Attempt, e.Error, e.At.Local().Format(time.RFC3339))
 	}
+	for _, l := range j.Logs {
+		fmt.Fprintf(w, "log #%d:\n", l.Attempt)
+		for line := range strings.Lines(l.Log) {
+			fmt.Fprintf(w, "  %s", line)
+		}
+	}
 }
 
 func (c *cli) queues(ctx context.Context, args []string) error {

@@ -344,6 +344,24 @@ progress is `job.Progress`, shown by `hopper jobs get` and the web UI.
 `client.JobRetry(ctx, id, hopper.FromStart())` re-runs a job from its first
 step.
 
+## Job logs
+
+Log through `hopper.Logger(ctx)` to keep a job's lines with the job:
+
+```go
+func (w *ImportWorker) Work(ctx context.Context, job *hopper.Job[Import]) error {
+    log := hopper.Logger(ctx)
+    log.Info("loading", "pages", job.Args.Pages)
+    ...
+}
+```
+
+The lines go to `Config.Logger`, with the job's ID, kind and attempt, as
+they happen. Each attempt's lines are also stored with the job when the
+attempt finishes, up to 32 KiB per attempt for the latest 10 attempts
+(`Config.JobLogs`), and kept for as long as the job is: `hopper jobs get`
+and the web UI show them, and `client.JobGet` returns them in `job.Logs`.
+
 ## Operate
 
 ```go

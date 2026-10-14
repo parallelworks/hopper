@@ -27,7 +27,10 @@ import (
 func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) pending {
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	a := &attempt{codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt}
+	a := &attempt{
+		codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt,
+		kind: row.Kind, baseLogger: c.logger, logs: c.cfg.JobLogs,
+	}
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	c.trackRunning(row.ID, cancel)
@@ -51,6 +54,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	if f.State.Terminal() {
 		f.Output = a.get()
 	}
+	f.Log = a.keptLog()
 	if known {
 		c.logOutcome(ctx, row, f, err)
 	}

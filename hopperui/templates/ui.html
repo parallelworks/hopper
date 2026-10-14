@@ -145,6 +145,9 @@
 
 {{.Trace}}{{end}}</pre></td></tr>{{end}}
 </tbody></table>{{end}}
+{{with .Logs}}{{$logs := .}}<h2>Logs</h2>
+{{range $i, $l := .}}<details class="log"{{if last $i $logs}} open{{end}}><summary>attempt {{$l.Attempt}}</summary><pre>{{$l.Log}}</pre></details>
+{{end}}{{end}}
 {{end}}
 {{end}}
 

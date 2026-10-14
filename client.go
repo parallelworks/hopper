@@ -167,6 +167,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.newGeneration()
 
 	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.wakeQueue, c.finalized)
+	c.finalizer.keepLogs = c.cfg.JobLogs.MaxAttempts
 	go c.finalizer.run(c.finCtx)
 
 	// Producers start with the cluster's current pause and limit state, so

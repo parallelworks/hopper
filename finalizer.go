@@ -25,6 +25,8 @@ type finalizer struct {
 	logger   *slog.Logger
 	interval time.Duration
 	maxBatch int
+	// keepLogs is how many attempt logs a job keeps.
+	keepLogs int
 	// wake is called with the queue of a result that made a job claimable
 	// again right away, so the local producer need not wait for its poll.
 	wake func(queue string)
@@ -204,7 +206,7 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 			timeout = heldWait
 		}
 		opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
-		applied, err := f.exec.JobFinalizeMany(opCtx, driver.JobFinalizeParams{Jobs: jobs, NoBatches: noBatches, SkipLocked: skipLocked})
+		applied, err := f.exec.JobFinalizeMany(opCtx, driver.JobFinalizeParams{Jobs: jobs, NoBatches: noBatches, SkipLocked: skipLocked, KeepLogs: f.keepLogs})
 		cancel()
 		if !skipLocked && errors.Is(err, context.DeadlineExceeded) {
 			skipLocked = true
