@@ -56,9 +56,10 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	}
 }
 
-// releasedSchema is the schema version of the latest release (v0.6.0). A
-// release that ships a new schema version updates it.
-const releasedSchema = 11
+// releasedSchema is the schema version of the latest release (v0.7.0). A
+// release that ships a new schema version updates it in its release PR
+// (docs/releasing.md).
+const releasedSchema = 13
 
 func upgradeUnderTraffic(t *testing.T, from int) {
 	ctx := context.Background()

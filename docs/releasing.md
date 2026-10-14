@@ -37,7 +37,9 @@ and [goreleaser](https://goreleaser.com) (`.github/workflows/release.yml`).
 Nothing else is needed for a normal release. A minor release should still
 have the §8.2 targets re-run on the reference hardware and the results
 table in [PLAN.md](PLAN.md) brought up to date before the release PR is
-merged.
+merged. A release that ships a new schema version also sets
+`releasedSchema` in `hoppermigrate/upgrade_test.go` to it in the release PR,
+so that the upgrade test keeps starting from the schema users run.
 
 ## Setup
 
