@@ -370,7 +370,7 @@ func indexOf(s, sub string) int {
 }
 
 // testHistoryOrderingIndex checks that maintenance builds and attaches the
-// ordering-key index of every history partition (schema v12), including
+// ordering-key index of every history partition (schema v13), including
 // one a cancelled build left invalid, while leaders overlap and history is
 // read throughout: no attach may deadlock with a reader.
 func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {

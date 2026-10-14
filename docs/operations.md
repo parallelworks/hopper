@@ -52,7 +52,7 @@
   session connection: point the listener at a direct address with
   `hopperpgx.Config.ListenConnConfig`, or accept polling (the client logs
   once and polls every `PollInterval`, one second by default).
-- **`statement_timeout`.** After the v12 upgrade the leader builds an index
+- **`statement_timeout`.** After the v13 upgrade the leader builds an index
   on each existing history partition with `CREATE INDEX CONCURRENTLY`, which
   runs under the pool's `statement_timeout` and waits for every older
   transaction in the database. A build that runs past the timeout is retried

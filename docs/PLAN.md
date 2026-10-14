@@ -445,7 +445,7 @@ CREATE TABLE hopper_job_history_failed PARTITION OF hopper_job_history
 -- (M2) manages time partitions. The leader creates future time partitions only,
 -- because attaching a partition scans the DEFAULT partition for overlapping rows.
 
--- A key's lane in history, for JobList with an ordering key (schema v12). Declared
+-- A key's lane in history, for JobList with an ordering key (schema v13). Declared
 -- ON ONLY each outcome table; the leader builds each existing partition's index
 -- CONCURRENTLY and attaches it, and a partition created later gets its index when
 -- it is attached, while still empty. hopper_job_history itself has none: the attach
@@ -509,7 +509,7 @@ name and edges of a batch, and a `batch_id` index on history (§11). Schema v5 (
 the stream log `hopper_stream_events` (partitioned by day) and `hopper_stream_consumers`
 (§10). Schema v11 adds `hopper_batch_progress (id, batch_id, done, failed)`, where
 finalizing statements record batch progress (§11), with `vacuum_truncate = false`
-like `hopper_jobs`, since every finalize of a batch's jobs writes to it. Schema v12 adds
+like `hopper_jobs`, since every finalize of a batch's jobs writes to it. Schema v12 spells the canceled state `canceled` (§12). Schema v13 adds
 the history index on `(ordering_key, id)` for listing one key's lane (§4.4), declared
 `ON ONLY` the completed and failed outcome tables and built per partition by the
 leader. On the live table, a key's lane is found through the claim's two ordering-key
@@ -879,7 +879,7 @@ can briefly overlap during a partition.
 
 Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
 partitions ahead of time and dropping expired ones, building the ordering-key index
-of any history partition that lacks one (after the v12 upgrade), removing stale
+of any history partition that lacks one (after the v13 upgrade), removing stale
 `hopper_clients` rows, sweeping the batch progress that clients did not settle, and
 promoting workflow jobs whose last dependencies finished in concurrent transactions
 (§11).
@@ -1349,8 +1349,8 @@ observability without new machinery.
   block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
   constraints, and so on). A migration runs in a transaction, where `CONCURRENTLY` is
   not allowed and a partitioned table cannot take it at all, so an index on history
-  is declared `ON ONLY` and built per partition by the leader (schema v12). A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v12 for the
+  is declared `ON ONLY` and built per partition by the leader (schema v13). A change that needs `ACCESS EXCLUSIVE`, such as adding a
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v13 for the
   `SHARE` lock that declaring the history index takes, which finalizes wait for), because a lock
   request queued behind an open transaction on the table would hold up every claim
   behind it; claims wait at most one try at a time. Between tries it sleeps a jittered,

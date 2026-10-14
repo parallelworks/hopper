@@ -1,4 +1,4 @@
--- hopper schema v12: list a key's finished jobs without reading all history.
+-- hopper schema v13: list a key's finished jobs without reading all history.
 --
 -- JobList with an ordering key reads history through this index. Building it
 -- on the history tables directly would lock every history partition against

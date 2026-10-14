@@ -191,7 +191,7 @@ func (e *Executor) dropPartition(ctx context.Context, name, lockTimeout string) 
 }
 
 // orderingIndexes pairs each history outcome table with its ON ONLY
-// ordering-key index (schema v12).
+// ordering-key index (schema v13).
 var orderingIndexes = map[string]string{
 	"hopper_job_history_completed": "hopper_job_history_completed_ordering",
 	"hopper_job_history_failed":    "hopper_job_history_failed_ordering",
@@ -228,7 +228,7 @@ func tryHistoryIndexLock(ctx context.Context, tx Conn, name string) (bool, error
 // HistoryIndex implements driver.Executor. It builds the ordering-key index
 // of every history partition that has none attached yet, concurrently so
 // that finalizes keep moving rows into history, and attaches it. Partitions
-// created since v12 get theirs when they are attached, so this finds work
+// created since v13 get theirs when they are attached, so this finds work
 // only after the upgrade, once per partition. An index a cancelled build
 // left invalid is dropped and built again. A build cancelled by the
 // session's statement timeout is reported, and the pass goes on to the next
