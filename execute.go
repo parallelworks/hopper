@@ -44,11 +44,14 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 			err = errNotCommitted
 		}
 	}
-	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err)
+	// A job completed with CompleteTx whose read failed may have committed:
+	// its failure is neither logged nor shown to Config.OnError.
+	known := completed == nil || state != txUnknown
+	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err, known)
 	if f.State.Terminal() {
 		f.Output = a.get()
 	}
-	if completed == nil || state != txUnknown {
+	if known {
 		c.logOutcome(ctx, row, f, err)
 	}
 	return pending{job: row, result: f, completedTx: completed}
@@ -157,21 +160,18 @@ func safeWork(ctx context.Context, work func(ctx context.Context) error) (err er
 
 // outcome maps a worker's return value to a state transition. unit is nil
 // when the job never reached a worker. ctx is the lease generation and
-// jobCtx the job's own context.
-func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, qcfg QueueConfig, unit workUnit, err error) driver.JobFinalize {
+// jobCtx the job's own context. known is false when the attempt may have
+// succeeded after all, and then Config.OnError is not called.
+func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, qcfg QueueConfig, unit workUnit, err error, known bool) driver.JobFinalize {
 	if err == nil {
 		return completedResult(row, qcfg)
 	}
-	f := driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy}
 
 	var snooze *SnoozeError
 	if errors.As(err, &snooze) {
-		f.State = driver.JobStateScheduled
-		f.Delay = snooze.Duration
-		f.Snooze = true
-		f.SnoozeReason = snooze.Reason
-		return f
+		return snoozed(row, snooze.Duration, snooze.Reason)
 	}
+	f := driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy}
 
 	attemptErr := &driver.AttemptError{Attempt: row.Attempt, Error: err.Error()}
 	var panicked *PanicError
@@ -183,8 +183,9 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 
 	var cancel *CancelError
 	byWorker := errors.As(err, &cancel)
+	canceled := errors.Is(context.Cause(jobCtx), ErrJobCanceled)
 	switch {
-	case !byWorker && errors.Is(context.Cause(jobCtx), ErrJobCanceled):
+	case !byWorker && canceled:
 		f.State = driver.JobStateCanceled
 		return f
 	case !byWorker && ctx.Err() != nil && row.Attempt < row.MaxAttempts:
@@ -194,16 +195,24 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 		f.State = driver.JobStateRetryable
 		return f
 	}
-	if ctx.Err() == nil {
-		switch o := c.onError(ctx, row, err); {
+	// A job canceled with JobCancel stays finished even if its worker
+	// returned Cancel: the hook must not reschedule it.
+	if known && !canceled && ctx.Err() == nil {
+		o := c.onError(ctx, row, err)
+		// So does a JobCancel that arrived while the hook ran.
+		if errors.Is(context.Cause(jobCtx), ErrJobCanceled) {
+			f.State = driver.JobStateCanceled
+			if byWorker {
+				f.State = driver.JobStateDiscarded
+			}
+			return f
+		}
+		switch {
 		case o.Discard:
 			f.State = driver.JobStateDiscarded
 			return f
 		case o.Snooze > 0:
-			return driver.JobFinalize{
-				ID: row.ID, AttemptedBy: row.AttemptedBy, State: driver.JobStateScheduled,
-				Delay: o.Snooze, Snooze: true, SnoozeReason: err.Error(),
-			}
+			return snoozed(row, o.Snooze, err.Error())
 		case !o.RetryAt.IsZero() && row.Attempt < row.MaxAttempts:
 			f.State = driver.JobStateRetryable
 			f.Delay = max(time.Until(o.RetryAt), 0)
@@ -217,6 +226,15 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 		f.Delay = c.retryDelay(row, qcfg, unit)
 	}
 	return f
+}
+
+// snoozed is the result of an attempt snoozed for d, which gives the attempt
+// back.
+func snoozed(row *driver.JobRow, d time.Duration, reason string) driver.JobFinalize {
+	return driver.JobFinalize{
+		ID: row.ID, AttemptedBy: row.AttemptedBy, State: driver.JobStateScheduled,
+		Delay: d, Snooze: true, SnoozeReason: reason,
+	}
 }
 
 // logOutcome logs a failed attempt's outcome. A retry because the client

@@ -157,11 +157,15 @@ type messageUnit[T any] struct {
 func (u *messageUnit[T]) Work(ctx context.Context) error { return u.fn(ctx, u.msg) }
 func (u *messageUnit[T]) Timeout() time.Duration         { return 0 }
 
-func (u *messageUnit[T]) NextRetry() time.Time {
+// NextRetry leaves the delay to the retry policies; an ordered delivery's
+// is capped by retryCap.
+func (u *messageUnit[T]) NextRetry() time.Time { return time.Time{} }
+
+func (u *messageUnit[T]) retryCap() time.Duration {
 	if u.msg.OrderingKey == "" {
-		return time.Time{}
+		return 0
 	}
-	return time.Now().Add(min(defaultBackoff(u.msg.Attempt), orderedBackoffCap))
+	return orderedBackoffCap
 }
 
 // PublishOpts customizes a publish. A nil *PublishOpts means the defaults.

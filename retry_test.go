@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -160,13 +161,16 @@ func TestOnErrorNotCalled(t *testing.T) {
 		}
 		started <- struct{}{}
 		<-ctx.Done()
+		if job.Args.Msg == "cancel" {
+			return hopper.Cancel(context.Cause(ctx))
+		}
 		return context.Cause(ctx)
 	})
 	c := h.startedWithConfig(&hopper.Config{
 		Workers: workers,
 		OnError: func(_ context.Context, job *hopper.JobRow, err error) hopper.ErrorOutcome {
 			calls.add(job.ID, err)
-			return hopper.ErrorOutcome{Discard: true}
+			return hopper.ErrorOutcome{RetryAt: time.Now().Add(time.Hour)}
 		},
 	})
 	snoozed, err := c.Insert(ctx, failing{Msg: "snooze"}, nil)
@@ -183,7 +187,18 @@ func TestOnErrorNotCalled(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForJob(t, c, canceled.Job.ID, hopper.JobStateCanceled)
-	for _, id := range []hopper.JobID{snoozed.Job.ID, canceled.Job.ID} {
+	// A worker that answers JobCancel with Cancel is discarded, and the hook
+	// does not get to reschedule it.
+	workerCanceled, err := c.Insert(ctx, failing{Msg: "cancel"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if _, err := c.JobCancel(ctx, workerCanceled.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, c, workerCanceled.Job.ID, hopper.JobStateDiscarded)
+	for _, id := range []hopper.JobID{snoozed.Job.ID, canceled.Job.ID, workerCanceled.Job.ID} {
 		if errs := calls.get(id); len(errs) != 0 {
 			t.Errorf("OnError called for job %s with %v", id, errs)
 		}
@@ -206,6 +221,34 @@ func TestOnErrorPanicKeepsOutcome(t *testing.T) {
 	}
 	if job := waitForJob(t, c, res.Job.ID, hopper.JobStateRetryable); h.retryIn(job) > 7*time.Second {
 		t.Errorf("retried in %s, want the default backoff", h.retryIn(job))
+	}
+}
+
+// panicRetry is a RetryPolicy that panics.
+type panicRetry struct{}
+
+func (panicRetry) NextRetry(*hopper.JobRow) time.Time { panic("policy") }
+
+func TestRetryPolicyPanicPassesOn(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[failing]) error { return errors.New("x") })
+	c := h.startedWithConfig(&hopper.Config{
+		Workers: workers,
+		Queues: map[string]hopper.QueueConfig{
+			hopper.QueueDefault: {MaxWorkers: 1, RetryPolicy: panicRetry{}},
+		},
+		RetryPolicy: fixedRetry(time.Hour),
+	})
+	res, err := c.Insert(ctx, failing{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := waitForJob(t, c, res.Job.ID, hopper.JobStateRetryable)
+	if d := h.retryIn(job); d < 59*time.Minute || d > time.Hour {
+		t.Errorf("retried in %s, want the client policy's hour", d)
 	}
 }
 
@@ -295,5 +338,69 @@ func TestExponentialRetry(t *testing.T) {
 	}
 	if d := time.Until((hopper.ExponentialRetry{}).NextRetry(&hopper.JobRow{Attempt: 1})); d < 800*time.Millisecond || d > 1100*time.Millisecond {
 		t.Errorf("zero ExponentialRetry retried in %s, want about a second", d)
+	}
+	// A ceiling at the largest Duration must not overflow into the past.
+	if d := time.Until((hopper.ExponentialRetry{Max: math.MaxInt64}).NextRetry(&hopper.JobRow{Attempt: 100})); d < 24*time.Hour {
+		t.Errorf("uncapped ExponentialRetry retried in %s, want far in the future", d)
+	}
+}
+
+func TestOrderedDeliveriesRetryUnderTheirCap(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	workers := hopper.NewWorkers()
+	hopper.Subscribe(workers, hopper.Subscription{Name: "billing", Pattern: "allocation.*"}, func(context.Context, *hopper.Message[allocationCreated]) error {
+		return errors.New("x")
+	})
+	c := h.startedWithConfig(&hopper.Config{Workers: workers, RetryPolicy: fixedRetry(time.Hour)})
+	for _, c2 := range []struct {
+		key      string
+		min, max time.Duration
+	}{
+		{"", 59 * time.Minute, time.Hour},                      // the policy
+		{"k", 4*time.Minute + 59*time.Second, 5 * time.Minute}, // the policy, under the ordered cap
+	} {
+		res, err := c.Publish(ctx, allocationCreated{ID: 1}, &hopper.PublishOpts{OrderingKey: c2.key})
+		if err != nil || len(res.Deliveries) != 1 {
+			t.Fatalf("publish = %+v, %v", res, err)
+		}
+		job := waitForJob(t, c, res.Deliveries[0].Job.ID, hopper.JobStateRetryable)
+		if d := h.retryIn(job); d < c2.min || d > c2.max {
+			t.Errorf("ordering key %q: retried in %s, want %s to %s", c2.key, d, c2.min, c2.max)
+		}
+	}
+}
+
+func TestOnErrorLosesToJobCancel(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	inHook, release := make(chan hopper.JobID, 1), make(chan struct{})
+	hadClient := make(chan bool, 1)
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[failing]) error { return errors.New("x") })
+	c := h.startedWithConfig(&hopper.Config{
+		Workers: workers,
+		OnError: func(ctx context.Context, job *hopper.JobRow, _ error) hopper.ErrorOutcome {
+			_, ok := hopper.ClientFromContext[pgxTx](ctx)
+			hadClient <- ok
+			inHook <- job.ID
+			<-release
+			return hopper.ErrorOutcome{RetryAt: time.Now().Add(time.Hour)}
+		},
+	})
+	res, err := c.Insert(ctx, failing{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-inHook
+	if _, err := c.JobCancel(ctx, res.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitForJob(t, c, res.Job.ID, hopper.JobStateCanceled)
+	if !<-hadClient {
+		t.Error("ClientFromContext found no client in OnError's context")
 	}
 }
