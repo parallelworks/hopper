@@ -6,6 +6,25 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.7.0](https://github.com/parallelworks/hopper/compare/v0.6.0...v0.7.0) (2026-10-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **core:** the canceled job state is spelled canceled ([#57](https://github.com/parallelworks/hopper/issues/57))
+
+### Features
+
+* **control:** list jobs by ordering key and newest first ([#53](https://github.com/parallelworks/hopper/issues/53)) ([c1e8247](https://github.com/parallelworks/hopper/commit/c1e824776ec75b5af9af1f4d73f69d3dea023777))
+* **control:** wake an ordering key's waiting jobs ([#51](https://github.com/parallelworks/hopper/issues/51)) ([1c1e704](https://github.com/parallelworks/hopper/commit/1c1e704270d55365d416de05192849cd2ab81411))
+* **core:** a worker can complete its job in its own transaction ([#55](https://github.com/parallelworks/hopper/issues/55)) ([9f1a2df](https://github.com/parallelworks/hopper/commit/9f1a2df36accbddd1bfa112c557e3a8fb08cfb39))
+* **core:** the canceled job state is spelled canceled ([#57](https://github.com/parallelworks/hopper/issues/57)) ([062c055](https://github.com/parallelworks/hopper/commit/062c05544393499d855b3ea0838d5b9c44d84ec3))
+
+
+### Bug fixes
+
+* **core:** batch finalizes no longer queue on the batch row ([#56](https://github.com/parallelworks/hopper/issues/56)) ([0adf7bc](https://github.com/parallelworks/hopper/commit/0adf7bc6148f12b27468c916f63cf90368095252))
+
 ## [0.6.0](https://github.com/parallelworks/hopper/compare/v0.5.0...v0.6.0) (2026-10-13)
 
 
