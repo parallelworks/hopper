@@ -11,7 +11,7 @@ import (
 )
 
 // DependencyFailure says what happens to a step when a step it depends on
-// is cancelled or discarded.
+// is canceled or discarded.
 type DependencyFailure = driver.DependencyFailure
 
 const (
@@ -25,7 +25,7 @@ const (
 
 // WorkflowOpts sets a workflow's completion callbacks and metadata. A
 // workflow is a batch, so the callbacks are those of BatchOpts: OnSuccess
-// when every step completed, OnFailure when any was cancelled or
+// when every step completed, OnFailure when any was canceled or
 // discarded, OnComplete either way.
 type WorkflowOpts struct {
 	OnSuccess  JobArgs

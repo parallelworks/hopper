@@ -248,7 +248,7 @@ func testBatches[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 
 	// A batch whose jobs all succeed runs the success callback, and one
-	// whose waiting job is cancelled counts that as a failure.
+	// whose waiting job is canceled counts that as a failure.
 	id2, err := exec.BatchInsert(ctx, driver.BatchInsertParams{Total: 2, OnSuccess: cb("done2"), OnFailure: cb("alert2")})
 	if err != nil {
 		t.Fatal(err)
@@ -263,10 +263,10 @@ func testBatches[TTx any](t *testing.T, f Fixture[TTx]) {
 	finalize(ctx, t, exec, driver.JobFinalize{ID: running[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	b, _ = exec.BatchGet(ctx, id2)
 	if b.Pending != 0 || b.Failed != 1 {
-		t.Errorf("batch with a cancelled job = %+v", b)
+		t.Errorf("batch with a canceled job = %+v", b)
 	}
 	if got := list("done2", "alert2"); len(got) != 1 || got[0].Kind != "alert2" {
-		t.Errorf("callbacks for the cancelled batch = %v", got)
+		t.Errorf("callbacks for the canceled batch = %v", got)
 	}
 	if _, err := exec.BatchGet(ctx, driver.JobID{7}); err == nil {
 		t.Error("unknown batch found")

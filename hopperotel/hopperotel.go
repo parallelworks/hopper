@@ -172,7 +172,7 @@ func outcomeOf(err error) string {
 	case errors.As(err, &snooze):
 		return "snoozed"
 	case errors.As(err, &cancel):
-		return "cancelled"
+		return "canceled"
 	default:
 		return "failed"
 	}

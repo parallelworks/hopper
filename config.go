@@ -30,14 +30,14 @@ type Config struct {
 	Logger *slog.Logger
 	// Codec encodes args and outputs. Defaults to JSONCodec.
 	Codec Codec
-	// JobTimeout is how long a job may run before its context is cancelled,
+	// JobTimeout is how long a job may run before its context is canceled,
 	// unless its worker's Timeout says otherwise. Defaults to one minute.
 	JobTimeout time.Duration
 	// MaxAttempts is the default number of attempts before a job is
 	// discarded. Defaults to 25.
 	MaxAttempts int
 	// StopTimeout bounds how long Run waits for running jobs after its
-	// context is cancelled, before cancelling them. Defaults to 30 seconds.
+	// context is canceled, before canceling them. Defaults to 30 seconds.
 	StopTimeout time.Duration
 	// PollInterval is how often an idle producer checks its queue for work
 	// that arrived without a wake-up. Defaults to one second.
@@ -52,7 +52,7 @@ type Config struct {
 	// Defaults to 24 hours; negative keeps them forever. Retention is
 	// enforced by the leader, so the leader's setting applies cluster-wide.
 	CompletedRetention time.Duration
-	// FailedRetention is how long cancelled and discarded jobs stay in
+	// FailedRetention is how long canceled and discarded jobs stay in
 	// history, which is the dead-letter queue. Defaults to 7 days; negative
 	// keeps them forever.
 	FailedRetention time.Duration
@@ -85,7 +85,7 @@ type QueueConfig struct {
 	// queue. Required.
 	MaxWorkers int
 	// DeleteCompleted deletes completed jobs instead of archiving them to
-	// history, for maximum throughput. Cancelled and discarded jobs are
+	// history, for maximum throughput. Canceled and discarded jobs are
 	// always archived, because history is the dead-letter queue.
 	DeleteCompleted bool
 
@@ -232,7 +232,7 @@ type tuning struct {
 	// and the producers stop claiming.
 	finalizeBatch  int
 	finalizeBuffer int
-	// stopGrace is how long a hard stop waits for cancelled jobs to return
+	// stopGrace is how long a hard stop waits for canceled jobs to return
 	// before flushing what has finished and giving up on the rest.
 	stopGrace time.Duration
 	// copyThreshold is the InsertMany batch size from which the COPY path

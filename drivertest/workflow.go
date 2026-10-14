@@ -124,7 +124,7 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("callbacks = %v", cbs)
 	}
 
-	// A failure cascades: e -> f -> g are cancelled below e, while h, which
+	// A failure cascades: e -> f -> g are canceled below e, while h, which
 	// ignores f's failure, runs once f has finished.
 	wf2, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Name: "chain", Jobs: params("chain", 4),
@@ -142,14 +142,14 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatalf("claimed %v, want e", running)
 	}
 	finalize(ctx, t, exec, driver.JobFinalize{ID: e.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}})
-	if state(ff.ID) != driver.JobStateCancelled || state(g.ID) != driver.JobStateCancelled {
-		t.Errorf("after e failed: f %s g %s, want cancelled", state(ff.ID), state(g.ID))
+	if state(ff.ID) != driver.JobStateCanceled || state(g.ID) != driver.JobStateCanceled {
+		t.Errorf("after e failed: f %s g %s, want canceled", state(ff.ID), state(g.ID))
 	}
 	if state(h.ID) != driver.JobStateAvailable {
 		t.Errorf("h = %s, want available (ignores f's failure)", state(h.ID))
 	}
 	if j, _ := exec.JobGet(ctx, g.ID); len(j.Errors) != 1 || !strings.Contains(j.Errors[0].Error, "dependency failed") || j.Errors[0].At.IsZero() {
-		t.Errorf("cancelled dependent errors = %+v", j.Errors)
+		t.Errorf("canceled dependent errors = %+v", j.Errors)
 	}
 	row, _ = exec.WorkflowGet(ctx, wf2.ID)
 	if row.Batch.Pending != 1 || row.Batch.Failed != 3 {
@@ -171,18 +171,18 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("alert metadata = %s", cbs["wf-alert2"].Metadata)
 	}
 
-	// Cancelling a pending job cascades too, and counts as a failure.
+	// Canceling a pending job cascades too, and counts as a failure.
 	wf3, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Jobs: params("pair", 3), Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}, {Job: 2, DependsOn: 1}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if j, err := exec.JobCancel(ctx, wf3.Jobs[1].Job.ID); err != nil || j.State != driver.JobStateCancelled {
+	if j, err := exec.JobCancel(ctx, wf3.Jobs[1].Job.ID); err != nil || j.State != driver.JobStateCanceled {
 		t.Fatalf("cancel pending = %+v, %v", j, err)
 	}
-	if state(wf3.Jobs[2].Job.ID) != driver.JobStateCancelled {
-		t.Errorf("dependent of a cancelled job = %s", state(wf3.Jobs[2].Job.ID))
+	if state(wf3.Jobs[2].Job.ID) != driver.JobStateCanceled {
+		t.Errorf("dependent of a canceled job = %s", state(wf3.Jobs[2].Job.ID))
 	}
 	running = claim(ctx, t, exec, clientID, 10)
 	if len(running) != 1 {

@@ -128,9 +128,9 @@ func TestWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(callbacks) == 1 })
-	cj := waitForJob(t, c, res.Jobs[2].Job.ID, hopper.JobStateCancelled)
+	cj := waitForJob(t, c, res.Jobs[2].Job.ID, hopper.JobStateCanceled)
 	if len(cj.Errors) != 1 || cj.Errors[0].Error != "hopper: dependency failed" {
-		t.Errorf("cancelled step = %+v", cj.Errors)
+		t.Errorf("canceled step = %+v", cj.Errors)
 	}
 	if log.ran("c") || !log.ran("d") {
 		t.Errorf("ran %v; c must not run, d must", log.order)

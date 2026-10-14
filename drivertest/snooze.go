@@ -141,11 +141,11 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		t.Errorf("replacing insert = %+v, %v", res, err)
 	}
 
-	// A finalized job is not waiting, but the error it is cancelled or
+	// A finalized job is not waiting, but the error it is canceled or
 	// expires with keeps the reason it was waiting for.
 	snooze("fourth")
-	if j, err := exec.JobCancel(ctx, id); err != nil || j.State != driver.JobStateCancelled || j.SnoozeReason != "" ||
-		j.Errors[len(j.Errors)-1].Error != "hopper: cancelled while snoozed: fourth" {
+	if j, err := exec.JobCancel(ctx, id); err != nil || j.State != driver.JobStateCanceled || j.SnoozeReason != "" ||
+		j.Errors[len(j.Errors)-1].Error != "hopper: canceled while snoozed: fourth" {
 		t.Errorf("JobCancel = %+v, %v", j, err)
 	}
 	if j := get(); j.SnoozeReason != "" {
@@ -165,7 +165,7 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		t.Fatal(err)
 	}
 	leaveReason(ctx, t, f, d, id)
-	if j, err := exec.JobCancel(ctx, id); err != nil || j.Errors[len(j.Errors)-1].Error != "hopper: cancelled" {
+	if j, err := exec.JobCancel(ctx, id); err != nil || j.Errors[len(j.Errors)-1].Error != "hopper: canceled" {
 		t.Errorf("JobCancel of an available job = %+v, %v", j, err)
 	}
 }

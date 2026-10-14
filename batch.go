@@ -10,7 +10,7 @@ import (
 )
 
 // BatchOpts sets a batch's callbacks. Each is inserted as a job when the
-// batch completes: OnSuccess if no job of the batch was cancelled or
+// batch completes: OnSuccess if no job of the batch was canceled or
 // discarded, OnFailure otherwise, and OnComplete either way. Callback
 // metadata gains "batch_id" and "batch_failed" (the number of failed jobs).
 type BatchOpts struct {

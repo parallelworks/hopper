@@ -189,7 +189,7 @@ func testFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		driver.JobFinalize{ID: id(2), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: 30 * time.Second, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}},
 		driver.JobFinalize{ID: id(3), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Minute, Snooze: true},
 		driver.JobFinalize{ID: id(4), AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: false, Error: &driver.AttemptError{Attempt: 1, Error: "fatal", Trace: "stack"}},
-		driver.JobFinalize{ID: id(5), AttemptedBy: clientID, State: driver.JobStateCancelled},
+		driver.JobFinalize{ID: id(5), AttemptedBy: clientID, State: driver.JobStateCanceled},
 	)
 	if len(applied) != 6 {
 		t.Fatalf("applied %d, want 6", len(applied))
@@ -225,7 +225,7 @@ func testFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	if j := get(4); j.State != driver.JobStateDiscarded || len(j.Errors) != 1 || j.Errors[0].Trace != "stack" {
 		t.Errorf("job 4 (discarded is always archived) = %+v", j)
 	}
-	if j := get(5); j.State != driver.JobStateCancelled || j.FinalizedAt.IsZero() {
+	if j := get(5); j.State != driver.JobStateCanceled || j.FinalizedAt.IsZero() {
 		t.Errorf("job 5 = %+v", j)
 	}
 	if live, hist := f.CountLive(ctx, t, d), f.CountHistory(ctx, t, d); live != 2 || hist != 3 {
@@ -457,12 +457,12 @@ func testCancel[TTx any](t *testing.T, f Fixture[TTx]) {
 		waiting = inserted[2].Job.ID
 	}
 	job, err := exec.JobCancel(ctx, waiting)
-	if err != nil || job.State != driver.JobStateCancelled || job.FinalizedAt.IsZero() || len(job.Errors) != 1 {
-		t.Errorf("cancelled waiting job = %+v, %v", job, err)
+	if err != nil || job.State != driver.JobStateCanceled || job.FinalizedAt.IsZero() || len(job.Errors) != 1 {
+		t.Errorf("canceled waiting job = %+v, %v", job, err)
 	}
 	job, err = exec.JobCancel(ctx, running[0].ID)
 	if err != nil || job.State != driver.JobStateRunning || job.CancelRequestedAt.IsZero() {
-		t.Errorf("cancelled running job = %+v, %v", job, err)
+		t.Errorf("canceled running job = %+v, %v", job, err)
 	}
 	res, err := exec.ClientRenew(ctx, driver.ClientRenewParams{ClientID: clientID, TTL: time.Hour})
 	if err != nil || !res.Renewed || len(res.CancelRequested) != 1 || res.CancelRequested[0] != running[0].ID {
@@ -471,7 +471,7 @@ func testCancel[TTx any](t *testing.T, f Fixture[TTx]) {
 	if again, err := exec.JobCancel(ctx, running[0].ID); err != nil || !again.CancelRequestedAt.Equal(job.CancelRequestedAt) {
 		t.Errorf("second cancel = %+v, %v", again, err)
 	}
-	if fin, err := exec.JobCancel(ctx, waiting); err != nil || fin.State != driver.JobStateCancelled {
+	if fin, err := exec.JobCancel(ctx, waiting); err != nil || fin.State != driver.JobStateCanceled {
 		t.Errorf("cancel of finalized job = %+v, %v", fin, err)
 	}
 	if _, err := exec.JobCancel(ctx, driver.JobID{9}); !errors.Is(err, driver.ErrNotFound) {
@@ -526,7 +526,7 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.JobRetry(ctx, inserted[0].Job.ID); !errors.Is(err, driver.ErrUniqueConflict) {
 		t.Errorf("retry with a live duplicate = %v", err)
 	}
-	if got, err := exec.JobGet(ctx, inserted[0].Job.ID); err != nil || got.State != driver.JobStateCancelled {
+	if got, err := exec.JobGet(ctx, inserted[0].Job.ID); err != nil || got.State != driver.JobStateCanceled {
 		t.Errorf("history row after refused retry = %+v, %v", got, err)
 	}
 	if _, err := exec.JobRetry(ctx, driver.JobID{9}); !errors.Is(err, driver.ErrNotFound) {
@@ -600,7 +600,7 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 	wake("wf", 10, 0)
 	states := map[int]driver.JobState{
 		0: driver.JobStateRunning, 2: driver.JobStateScheduled, 3: driver.JobStateScheduled,
-		4: driver.JobStateCancelled, 5: driver.JobStateAvailable, 6: driver.JobStateScheduled,
+		4: driver.JobStateCanceled, 5: driver.JobStateAvailable, 6: driver.JobStateScheduled,
 	}
 	for i, want := range states {
 		if got := get(id(i)).State; got != want {

@@ -63,7 +63,7 @@ type Capabilities struct {
 const (
 	// ChannelInsert carries the queue name of a committed insert.
 	ChannelInsert = "hopper_insert"
-	// ChannelLeader is signalled when a leader resigns, so a replacement is
+	// ChannelLeader is signaled when a leader resigns, so a replacement is
 	// elected without waiting for the lease to expire.
 	ChannelLeader = "hopper_leader"
 	// ChannelControl carries operator actions: "cancel:<job id>",
@@ -73,7 +73,7 @@ const (
 	// ChannelDone carries the ID of a finalized job that was inserted with
 	// Await, so waiters return as soon as the finalize commits.
 	ChannelDone = "hopper_done"
-	// ChannelStream is signalled when events are appended to the stream
+	// ChannelStream is signaled when events are appended to the stream
 	// log, with the topic as payload, so the leader pumps consumers at once.
 	ChannelStream = "hopper_stream"
 )
@@ -132,12 +132,12 @@ type Executor interface {
 	JobGet(ctx context.Context, id JobID) (*JobRow, error)
 	// JobList returns jobs matching the filter in ID order, after the cursor.
 	JobList(ctx context.Context, params JobListParams) ([]*JobRow, error)
-	// JobCancel cancels a job. A waiting job moves to history as cancelled.
+	// JobCancel cancels a job. A waiting job moves to history as canceled.
 	// A running job gets a cancel request that its client picks up through
 	// ChannelControl and on its next lease renewal. A finalized job is
 	// returned unchanged. The job as it is afterwards is returned.
 	JobCancel(ctx context.Context, id JobID) (*JobRow, error)
-	// JobRetry makes a job available now: a cancelled or discarded job is
+	// JobRetry makes a job available now: a canceled or discarded job is
 	// moved back from history (with one more attempt allowed if it had run
 	// out), and a waiting job has its schedule brought forward. Either way
 	// the job's TTL is cleared, as an operator overriding the wait. It returns
@@ -329,15 +329,15 @@ const (
 	JobStateRunning   JobState = "running"
 	JobStateRetryable JobState = "retryable" // failed; runs again at scheduled_at
 	JobStateCompleted JobState = "completed"
-	JobStateCancelled JobState = "cancelled"
-	JobStateDiscarded JobState = "discarded" // out of attempts or cancelled by the worker: dead-lettered
+	JobStateCanceled  JobState = "canceled"
+	JobStateDiscarded JobState = "discarded" // out of attempts or canceled by the worker: dead-lettered
 )
 
 // Terminal reports whether the state is final, meaning the job has left the
 // live table.
 func (s JobState) Terminal() bool {
 	switch s {
-	case JobStateCompleted, JobStateCancelled, JobStateDiscarded:
+	case JobStateCompleted, JobStateCanceled, JobStateDiscarded:
 		return true
 	default:
 		return false
@@ -502,7 +502,7 @@ func (l QueueLimits) Limited() bool {
 type BatchInsertParams struct {
 	Total int
 	// Callbacks are inserted when the batch completes: OnSuccess if no job
-	// was cancelled or discarded, OnFailure otherwise, and OnComplete
+	// was canceled or discarded, OnFailure otherwise, and OnComplete
 	// either way. Each callback's Metadata gains a "batch_id".
 	OnSuccess, OnFailure, OnComplete *JobInsertParams
 	Metadata                         json.RawMessage
@@ -537,7 +537,7 @@ type BatchRow struct {
 	Name string
 	// Pending counts the batch's jobs not yet finalized.
 	Pending int
-	// Failed counts its jobs that were cancelled or discarded.
+	// Failed counts its jobs that were canceled or discarded.
 	Failed int
 	Total  int
 	// CompletedAt is set once every job has been finalized.
@@ -547,7 +547,7 @@ type BatchRow struct {
 }
 
 // DependencyFailure says what happens to a dependent job when the job it
-// depends on is cancelled or discarded.
+// depends on is canceled or discarded.
 type DependencyFailure string
 
 const (
@@ -691,7 +691,7 @@ type JobFinalize struct {
 	// AttemptedBy is the client that claimed the attempt. The engine applies
 	// the result only if the job is still running and owned by this client.
 	AttemptedBy int64
-	// State is the state to move to: completed, cancelled or discarded (the
+	// State is the state to move to: completed, canceled or discarded (the
 	// job moves to history) or retryable or scheduled (it stays live).
 	State JobState
 	// Delay is how long from database now() the job waits before it can be
@@ -707,7 +707,7 @@ type JobFinalize struct {
 	Error *AttemptError
 	// Output is stored with the finalized job.
 	Output json.RawMessage
-	// Archive controls whether a terminal job is written to history. Cancelled
+	// Archive controls whether a terminal job is written to history. Canceled
 	// and discarded jobs are always archived; completed jobs may skip it.
 	Archive bool
 }
@@ -730,7 +730,7 @@ type LeaderParams struct {
 type HistoryMaintainParams struct {
 	// CompletedRetention is how long completed jobs are kept.
 	CompletedRetention time.Duration
-	// FailedRetention is how long cancelled and discarded jobs are kept.
+	// FailedRetention is how long canceled and discarded jobs are kept.
 	FailedRetention time.Duration
 	// StreamRetention is how long stream events are kept.
 	StreamRetention time.Duration

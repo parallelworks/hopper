@@ -225,7 +225,7 @@ func TestFencedClientCancelsJobsAndReregisters(t *testing.T) {
 	}
 	waitFor(t, func() bool { return c.ClientID() != oldID })
 
-	// The running job's context was cancelled, and the job runs again under
+	// The running job's context was canceled, and the job runs again under
 	// the new lease.
 	waitFor(t, func() bool {
 		job, err := c.JobGet(ctx, res.Job.ID)
@@ -234,7 +234,7 @@ func TestFencedClientCancelsJobsAndReregisters(t *testing.T) {
 	waitFor(t, func() bool { w.rec.mu.Lock(); defer w.rec.mu.Unlock(); return w.rec.seen[res.Job.ID] >= 2 })
 	close(w.release)
 	// The job completes on its second or later attempt with one error per
-	// earlier one (the cancelled attempt's own error, or the leader's
+	// earlier one (the canceled attempt's own error, or the leader's
 	// rescue, whichever lands first). Which client ID finishes it depends
 	// on timing: the re-claim may happen under the new lease, or under the
 	// lapsing ID before this client notices, which fencing allows since
@@ -247,13 +247,13 @@ func TestFencedClientCancelsJobsAndReregisters(t *testing.T) {
 }
 
 // lastAttemptWorker reports when it starts, waits to be released, and records
-// whether its context was cancelled while it waited.
+// whether its context was canceled while it waited.
 type lastAttemptWorker struct {
 	hopper.WorkerDefaults[noop]
-	started   chan struct{}
-	release   chan struct{}
-	runs      atomic.Int64
-	cancelled atomic.Bool
+	started  chan struct{}
+	release  chan struct{}
+	runs     atomic.Int64
+	canceled atomic.Bool
 }
 
 func (w *lastAttemptWorker) Work(ctx context.Context, _ *hopper.Job[noop]) error {
@@ -263,7 +263,7 @@ func (w *lastAttemptWorker) Work(ctx context.Context, _ *hopper.Job[noop]) error
 	case <-w.release:
 		return nil
 	case <-ctx.Done():
-		w.cancelled.Store(true)
+		w.canceled.Store(true)
 		return ctx.Err()
 	}
 }
@@ -297,8 +297,8 @@ func TestFencedClientLetsALastAttemptFinish(t *testing.T) {
 	// is asserted.
 	close(w.release)
 	job := waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted, hopper.JobStateDiscarded)
-	if w.cancelled.Load() {
-		t.Errorf("the last attempt was cancelled when the lease was lost; job = %+v", job)
+	if w.canceled.Load() {
+		t.Errorf("the last attempt was canceled when the lease was lost; job = %+v", job)
 	}
 	if runs := w.runs.Load(); runs != 1 {
 		t.Errorf("job ran %d times, want 1", runs)

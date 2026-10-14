@@ -75,7 +75,7 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "state:         available") {
 		t.Errorf("jobs get = %q", got)
 	}
-	if got := hopperCmd("jobs", "cancel", id); !strings.Contains(got, "state:         cancelled") {
+	if got := hopperCmd("jobs", "cancel", id); !strings.Contains(got, "state:         canceled") {
 		t.Errorf("jobs cancel = %q", got)
 	}
 	if got := hopperCmd("jobs", "retry", id); !strings.Contains(got, "state:         available") {

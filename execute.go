@@ -23,9 +23,9 @@ import (
 // worker's error or errNotCommitted, which the finalizer writes without
 // waiting on a transaction that has not ended.
 //
-// The job's context descends from the lease generation (cancelled by a hard
-// stop or fencing) and can also be cancelled by JobCancel, with cause
-// ErrJobCancelled, and by the timeout, with cause ErrJobTimeout.
+// The job's context descends from the lease generation (canceled by a hard
+// stop or fencing) and can also be canceled by JobCancel, with cause
+// ErrJobCanceled, and by the timeout, with cause ErrJobTimeout.
 func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) pending {
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -187,10 +187,10 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 	switch {
 	case errors.As(err, &cancel):
 		f.State = driver.JobStateDiscarded
-	case errors.Is(context.Cause(jobCtx), ErrJobCancelled):
-		f.State = driver.JobStateCancelled
+	case errors.Is(context.Cause(jobCtx), ErrJobCanceled):
+		f.State = driver.JobStateCanceled
 	case ctx.Err() != nil && row.Attempt < row.MaxAttempts:
-		// The client is stopping (or was fenced) and cancelled the job. That
+		// The client is stopping (or was fenced) and canceled the job. That
 		// is not the job's fault: retry immediately elsewhere. On its last
 		// attempt it is dead-lettered instead, as a rescued job would be.
 		f.State = driver.JobStateRetryable
@@ -212,9 +212,9 @@ func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driv
 	var cancel *CancelError
 	switch {
 	case errors.As(err, &cancel):
-		c.logger.InfoContext(ctx, "hopper: job cancelled by worker", "job_id", row.ID, "kind", row.Kind, "error", err)
-	case f.State == driver.JobStateCancelled:
-		c.logger.InfoContext(ctx, "hopper: job cancelled", "job_id", row.ID, "kind", row.Kind)
+		c.logger.InfoContext(ctx, "hopper: job canceled by worker", "job_id", row.ID, "kind", row.Kind, "error", err)
+	case f.State == driver.JobStateCanceled:
+		c.logger.InfoContext(ctx, "hopper: job canceled", "job_id", row.ID, "kind", row.Kind)
 	case f.State == driver.JobStateDiscarded:
 		c.logger.ErrorContext(ctx, "hopper: job discarded", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "error", err)
 	case ctx.Err() == nil:

@@ -3,6 +3,7 @@ package hoppermigrate_test
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -202,5 +203,51 @@ func TestDownFoldsBatchProgress(t *testing.T) {
 	}
 	if pending != 0 || !completed || callbacks != 1 {
 		t.Errorf("batch with nothing left after down: pending = %d, completed = %t, callbacks = %d", pending, completed, callbacks)
+	}
+}
+
+// TestCanceledStateRename moves a job canceled under v11 across v12 and back:
+// the rename carries the stored row and the history partition with it.
+func TestCanceledStateRename(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 11}); err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	if err := pool.QueryRow(ctx, `SELECT hopper_insert('rename', '{}')::text`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	const columns = `id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
+	  attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id, expires_at,
+	  cancel_requested_at, await, created_at`
+	if _, err := pool.Exec(ctx, `WITH j AS (DELETE FROM hopper_jobs WHERE id = $1::uuid RETURNING *)
+	    INSERT INTO hopper_job_history (`+columns+`, finalized_at)
+	    SELECT `+strings.ReplaceAll(columns, "state", "'cancelled'")+`, now() FROM j`, id); err != nil {
+		t.Fatal(err)
+	}
+	state := func() (state, partition string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT state::text, tableoid::regclass::text FROM hopper_job_history WHERE id = $1::uuid`, id).
+			Scan(&state, &partition); err != nil {
+			t.Fatal(err)
+		}
+		return state, partition
+	}
+
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 12}); err != nil {
+		t.Fatal(err)
+	}
+	if s, p := state(); s != "canceled" || !strings.HasPrefix(p, "hopper_job_history_failed") {
+		t.Errorf("after v12: state %q in %s, want canceled in the failed partition", s, p)
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 11}); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := state(); s != "cancelled" {
+		t.Errorf("after down to v11: state %q, want cancelled", s)
 	}
 }

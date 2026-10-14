@@ -75,7 +75,7 @@ func (e *JobFailedError) Error() string {
 }
 
 // Await blocks until the job is finalized and returns its output decoded
-// into T, or a *JobFailedError if it was cancelled or discarded. Insert the
+// into T, or a *JobFailedError if it was canceled or discarded. Insert the
 // job with InsertOpts.Await so that the finalize is announced and Await
 // returns as soon as it commits; otherwise, and on a client that is not
 // started, Await polls every Config.PollInterval. A completed job without

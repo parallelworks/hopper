@@ -105,7 +105,7 @@ func run[TTx any](ctx context.Context, d driver.Driver[TTx], opts *Options, up b
 		return nil, fmt.Errorf("hoppermigrate: acquire lock: %w", err)
 	}
 	defer func() {
-		// A fresh context so the lock is released even when ctx is cancelled.
+		// A fresh context so the lock is released even when ctx is canceled.
 		if cerr := exec.Close(context.WithoutCancel(ctx)); cerr != nil && err == nil {
 			err = fmt.Errorf("hoppermigrate: release lock: %w", cerr)
 		}
