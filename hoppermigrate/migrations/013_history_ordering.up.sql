@@ -22,6 +22,20 @@
 -- transaction that wrote history would hold them all up, so the indexes are
 -- declared the way v9 added snooze_reason: with a short lock_timeout per try.
 
+-- A database migrated while this migration was numbered 12 recorded version
+-- 12 without the canceled-state rename, and already has these indexes. The
+-- rename is finished here, and the indexes are declared only if missing; on
+-- any other database both do nothing.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+             WHERE t.typname = 'hopper_job_state' AND t.typnamespace = current_schema()::regnamespace
+               AND e.enumlabel = 'cancelled') THEN
+    ALTER TYPE hopper_job_state RENAME VALUE 'cancelled' TO 'canceled';
+  END IF;
+END
+$$;
+
 SELECT set_config('lock_timeout', '50ms', true);
 
 DO $$
@@ -32,9 +46,9 @@ DECLARE
 BEGIN
   LOOP
     BEGIN
-      CREATE INDEX hopper_job_history_completed_ordering ON ONLY hopper_job_history_completed (ordering_key, id)
+      CREATE INDEX IF NOT EXISTS hopper_job_history_completed_ordering ON ONLY hopper_job_history_completed (ordering_key, id)
         WHERE ordering_key IS NOT NULL;
-      CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id)
+      CREATE INDEX IF NOT EXISTS hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id)
         WHERE ordering_key IS NOT NULL;
       RETURN;
     EXCEPTION WHEN lock_not_available THEN

@@ -509,8 +509,9 @@ name and edges of a batch, and a `batch_id` index on history (§11). Schema v5 (
 the stream log `hopper_stream_events` (partitioned by day) and `hopper_stream_consumers`
 (§10). Schema v11 adds `hopper_batch_progress (id, batch_id, done, failed)`, where
 finalizing statements record batch progress (§11), with `vacuum_truncate = false`
-like `hopper_jobs`, since every finalize of a batch's jobs writes to it. Schema v12 spells the canceled state `canceled` (§12). Schema v13 adds
-the history index on `(ordering_key, id)` for listing one key's lane (§4.4), declared
+like `hopper_jobs`, since every finalize of a batch's jobs writes to it. Schema v12
+spells the canceled state `canceled` (§12). Schema v13 adds the history index on
+`(ordering_key, id)` for listing one key's lane (§4.4), declared
 `ON ONLY` the completed and failed outcome tables and built per partition by the
 leader. On the live table, a key's lane is found through the claim's two ordering-key
 indexes, for its waiting jobs and its running one, and its pending jobs through their
@@ -903,7 +904,7 @@ partition that a build holds is deferred by its `lock_timeout` in the same way. 
 a term leaves an invalid index, which the next build drops and builds again. Should
 retention drop the last partition without an index before it is built, the outcome
 table's index is revalidated by attaching one of its partitions' indexes again. A
-build that runs past the session's `statement_timeout` is cancelled by it: its
+build that runs past the session's `statement_timeout` is canceled by it: its
 leftover is dropped, the pass goes on to the other partitions, and the leader retries
 that partition at doubling intervals, up to 64 maintenance intervals, warning each
 time that the timeout should be raised for hopper's role. The build cannot lift the
@@ -1343,10 +1344,15 @@ observability without new machinery.
   transaction-local `search_path` for the embedded unqualified DDL, and schema v8
   binds SQL producer functions to that namespace. Down to zero leaves the
   namespace intact. Raw SQL users must set the target path themselves.
-- Every schema change ships with an upgrade test that migrates from the previous version
-  to the latest while jobs wait in every state, inserts keep arriving and claims keep
-  polling, then works them all with a client (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that
-  block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
+- Every schema change ships with an upgrade test that migrates to the latest version
+  from the previous one, and from the latest release's, while jobs wait in every state,
+  inserts keep arriving, claims keep polling, finalizes keep moving jobs into history
+  and a transaction that wrote both stays open, then works them all with a client
+  (`TestUpgradeUnderTraffic`). Migration versions are numbers only, so the latest is
+  also pinned in `TestMigrationsAreWellFormed`: two branches that each add the next
+  version conflict there instead of both merging. Migrations that touch `hopper_jobs`
+  or history must not take locks that block claims or finalizes for longer than one
+  statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
   constraints, and so on). A migration runs in a transaction, where `CONCURRENTLY` is
   not allowed and a partitioned table cannot take it at all, so an index on history
   is declared `ON ONLY` and built per partition by the leader (schema v13). A change that needs `ACCESS EXCLUSIVE`, such as adding a

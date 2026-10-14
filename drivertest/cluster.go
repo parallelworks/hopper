@@ -371,7 +371,7 @@ func indexOf(s, sub string) int {
 
 // testHistoryOrderingIndex checks that maintenance builds and attaches the
 // ordering-key index of every history partition (schema v13), including
-// one a cancelled build left invalid, while leaders overlap and history is
+// one a canceled build left invalid, while leaders overlap and history is
 // read throughout: no attach may deadlock with a reader.
 func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
@@ -405,7 +405,7 @@ func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Error("a skipped partition was indexed")
 	}
 
-	// What a cancelled CREATE INDEX CONCURRENTLY leaves: an invalid index
+	// What a canceled CREATE INDEX CONCURRENTLY leaves: an invalid index
 	// under the name maintenance uses.
 	f.Exec(ctx, t, d, "CREATE INDEX hopper_job_history_completed_default_ordering ON hopper_job_history_completed_default (kind)")
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_completed_default_ordering'::regclass")

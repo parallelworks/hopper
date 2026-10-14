@@ -229,8 +229,8 @@ func tryHistoryIndexLock(ctx context.Context, tx Conn, name string) (bool, error
 // of every history partition that has none attached yet, concurrently so
 // that finalizes keep moving rows into history, and attaches it. Partitions
 // created since v13 get theirs when they are attached, so this finds work
-// only after the upgrade, once per partition. An index a cancelled build
-// left invalid is dropped and built again. A build cancelled by the
+// only after the upgrade, once per partition. An index a canceled build
+// left invalid is dropped and built again. A build canceled by the
 // session's statement timeout is reported, and the pass goes on to the next
 // partition.
 func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexParams) (driver.HistoryIndexResult, error) {
@@ -250,18 +250,27 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 		if err != nil {
 			return res, fmt.Errorf("hopper: list unindexed partitions of %s: %w", parent, err)
 		}
+		// The outcome table's index can be valid only once every partition
+		// has its index, so it is checked only after a pass that left none
+		// out.
+		complete := true
 		for _, leaf := range leaves {
 			if slices.Contains(params.Skip, leaf) {
+				complete = false
 				continue
 			}
 			done, err := e.indexHistoryPartitionLocked(ctx, parent, leaf, parentIndex)
 			if errors.Is(err, errStatementTimeout) {
 				res.TimedOut = append(res.TimedOut, leaf)
+				complete = false
 				continue
 			}
 			if err != nil || !done {
 				return res, err
 			}
+		}
+		if !complete {
+			continue
 		}
 		if err := e.revalidateOrderingIndex(ctx, parentIndex); err != nil {
 			return res, err
@@ -271,7 +280,7 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 }
 
 // errStatementTimeout marks a build the session's statement_timeout
-// cancelled.
+// canceled.
 var errStatementTimeout = errors.New("hopper: index build exceeded statement_timeout")
 
 // indexHistoryPartitionLocked indexes one partition under
