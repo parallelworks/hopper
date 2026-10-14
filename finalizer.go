@@ -57,6 +57,9 @@ type pending struct {
 	// transaction, and the job is read again if the write skips it.
 	completedTx *driver.JobFinalize
 	committed   bool
+	// heldByTx reports that a transaction of the worker's wrote the job's
+	// row (RecordStepTx, RecordCursorTx), which may still hold it.
+	heldByTx bool
 	// waits counts the flushes that found the worker's transaction still
 	// open.
 	waits int
@@ -143,20 +146,21 @@ const heldRetry = 250 * time.Millisecond
 // the batch is written again skipping them (write).
 const heldWait = 2 * time.Second
 
-// flush writes one batch: the results of jobs not completed with CompleteTx
-// in one statement, and the other outcomes of those that were, whose rows a
-// worker's transaction may still hold, in another that skips held rows.
-// Completions the client saw commit are reported without a write.
+// flush writes one batch: the results of jobs whose rows no worker's
+// transaction wrote in one statement, and those whose rows one may still
+// hold (CompleteTx, RecordStepTx, RecordCursorTx, or a row found held
+// before) in another that skips held rows. Completions the client saw
+// commit are reported without a write.
 func (f *finalizer) flush(ctx context.Context, batch []pending) {
 	var plain, tx, committed []pending
 	for _, p := range batch {
 		switch {
-		case p.completedTx == nil:
-			plain = append(plain, p)
 		case p.committed:
 			committed = append(committed, p)
-		default:
+		case p.completedTx != nil || p.heldByTx || p.waits > 0:
 			tx = append(tx, p)
+		default:
+			plain = append(plain, p)
 		}
 	}
 	f.write(ctx, plain, false)
@@ -314,6 +318,8 @@ func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
 	if p.waits++; p.waits == 1 {
 		if p.completedTx != nil {
 			f.logger.WarnContext(ctx, "hopper: the transaction a worker completed its job in is still open after the worker returned; the job's result waits for it", "job_id", p.result.ID)
+		} else if p.heldByTx {
+			f.logger.WarnContext(ctx, "hopper: a transaction a worker recorded its job's progress in is still open after the worker returned; the job's result waits for it", "job_id", p.result.ID)
 		} else {
 			f.logger.WarnContext(ctx, "hopper: another transaction holds a finished job's row, such as one that called JobCancelTx and has not committed; the job's result waits for it", "job_id", p.result.ID)
 		}

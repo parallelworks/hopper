@@ -341,6 +341,8 @@ func (w *ImportWorker) load(ctx context.Context, job *hopper.Job[Import]) error 
 it finishes. `RecordStepTx` and `RecordCursorTx` record in your own
 transaction, so a step's writes and its progress commit together. The
 progress is `job.Progress`, shown by `hopper jobs get` and the web UI.
+`client.JobRetry(ctx, id, hopper.FromStart())` re-runs a job from its first
+step.
 
 ## Operate
 

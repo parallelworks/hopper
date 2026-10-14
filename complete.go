@@ -49,24 +49,24 @@ var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt"
 //		return tx.Commit(ctx)
 //	}
 func CompleteTx[TTx any, T JobArgs](ctx context.Context, tx TTx, job *Job[T]) error {
-	a, ok := ctx.Value(attemptKey{}).(*attempt)
-	if !ok {
+	a, _ := ctx.Value(attemptKey{}).(*attempt)
+	if a == nil {
 		return ErrNotInJob
 	}
 	id := a.completion.ID
 	if job == nil || job.JobRow == nil || job.ID != id {
 		return fmt.Errorf("hopper: complete job: ctx belongs to job %s, not this one", id)
 	}
-	c, ok := ClientFromContext[TTx](ctx)
-	if !ok {
-		return fmt.Errorf("hopper: complete job %s: the transaction is not of the type its client uses", id)
+	exec, err := txExecutor(ctx, tx, id)
+	if err != nil {
+		return err
 	}
 	// The statement can wait on row locks for as long as another
 	// transaction holds them, so a.mu is not held across it: SetOutput
 	// from another goroutine must not block on the database.
 	result := a.completion
 	result.Output = a.get()
-	applied, err := c.driver.UnwrapTx(tx).JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{result}, NoBatches: job.BatchID.IsZero()})
+	applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{result}, NoBatches: job.BatchID.IsZero()})
 	if err != nil {
 		return err
 	}
@@ -75,6 +75,7 @@ func CompleteTx[TTx any, T JobArgs](ctx context.Context, tx TTx, job *Job[T]) er
 	}
 	a.mu.Lock()
 	a.completed = &result
+	a.heldByTx = true
 	a.mu.Unlock()
 	return nil
 }

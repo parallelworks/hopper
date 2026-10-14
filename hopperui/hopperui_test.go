@@ -173,6 +173,19 @@ func TestUI(t *testing.T) {
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())
 	want(200, body, code, "available")
+	if strings.Contains(body, "from the start") {
+		t.Error("a job without progress offers a run from the start")
+	}
+	// A job with progress can also be run from the start, which clears it.
+	code, body = get(admin, "/jobs/"+snoozed.Job.ID.String())
+	want(200, body, code, `<input type="hidden" name="from" value="start"><button>run now from the start</button>`)
+	code, _ = post(admin, "/jobs/"+snoozed.Job.ID.String()+"/retry", url.Values{"from": {"start"}}, true)
+	want(303, "", code)
+	code, body = get(admin, "/jobs/"+snoozed.Job.ID.String())
+	want(200, body, code, "available")
+	if strings.Contains(body, "<dt>progress</dt>") {
+		t.Error("progress kept after a run from the start")
+	}
 	// A browser's cross-site request is refused before it reaches an action.
 	{
 		req, _ := http.NewRequest(http.MethodPost, admin.URL+"/hopper/jobs/"+job.Job.ID.String()+"/delete", nil)

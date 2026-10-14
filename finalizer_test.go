@@ -236,3 +236,27 @@ func (e *failNExec) JobFinalizeMany(_ context.Context, params driver.JobFinalize
 	}
 	return ids, nil
 }
+
+// A result whose row a worker's transaction wrote (RecordStepTx) goes to the
+// statement that skips held rows, while the others do not.
+func TestFinalizerSkipsRowsHeldByTx(t *testing.T) {
+	exec := &stubExec{started: make(chan int, 4)}
+	tun := tuning{finalizeInterval: time.Minute, finalizeBatch: 2, finalizeBuffer: 4}
+	f, stop := newTestFinalizer(exec, tun, nil)
+	defer stop()
+	f.submit(pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{ID: driver.JobID{1}, State: driver.JobStateCompleted}, heldByTx: true})
+	f.submit(pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{ID: driver.JobID{2}, State: driver.JobStateCompleted}})
+	for range 2 {
+		select {
+		case <-exec.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("batch not flushed")
+		}
+	}
+	exec.mu.Lock()
+	skipped, sizes := slices.Clone(exec.skipped), slices.Clone(exec.sizes)
+	exec.mu.Unlock()
+	if len(sizes) != 2 || sizes[0] != 1 || sizes[1] != 1 || skipped[0] || !skipped[1] {
+		t.Errorf("statements of sizes %v skipping held rows %v, want a plain one and one that skips", sizes, skipped)
+	}
+}

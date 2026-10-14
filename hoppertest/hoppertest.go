@@ -162,7 +162,8 @@ type WorkOpts struct {
 	Priority hopper.Priority
 	Metadata json.RawMessage
 	// Progress is the job's progress from an earlier attempt, to test
-	// resuming. RecordStep and RecordCursor update it in memory.
+	// resuming. Work runs the job with a copy, which RecordStep and
+	// RecordCursor update in memory; Progress itself is left as it is.
 	Progress *hopper.Progress
 }
 

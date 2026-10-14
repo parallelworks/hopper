@@ -165,6 +165,7 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
 hopper [-schema NAME] migrate up|down|version
 hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
 hopper jobs get|retry|cancel|delete <id>
+hopper jobs retry -from-start <id>
 hopper queues list|pause|resume [name]
 hopper clients list
 hopper stats

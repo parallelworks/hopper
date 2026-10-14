@@ -119,7 +119,9 @@ func (w *Workers) Work(ctx context.Context, job *JobRow, codec Codec) error {
 	if err != nil {
 		return fmt.Errorf("hopper: decode args for %q: %w", job.Kind, err)
 	}
-	ctx = context.WithValue(ctx, inlineKey{}, true)
+	// A worker run inline from inside another job's attempt is not that
+	// attempt: SetOutput and CompleteTx refuse, and progress stays in job.
+	ctx = context.WithValue(context.WithValue(ctx, attemptKey{}, (*attempt)(nil)), inlineKey{}, true)
 	if timeout := unit.Timeout(); timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeoutCause(ctx, timeout, ErrJobTimeout)

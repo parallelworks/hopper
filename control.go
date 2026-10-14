@@ -55,10 +55,11 @@ func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, id JobID) (*JobRo
 // discarded job is re-driven from history with one more attempt allowed if
 // it had run out, and a waiting job has its schedule brought forward. An
 // explicit retry overrides the wait, so the job's TTL no longer applies:
-// a job past its deadline still runs. It returns ErrJobRunning for a
+// a job past its deadline still runs. The job resumes from its progress
+// (RecordStep), unless FromStart is given. It returns ErrJobRunning for a
 // running job.
-func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID) (*JobRow, error) {
-	job, err := c.exec.JobRetry(ctx, id)
+func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID, opts ...RetryOption) (*JobRow, error) {
+	job, err := c.exec.JobRetry(ctx, retryParams(id, opts))
 	if err != nil {
 		return nil, err
 	}
@@ -69,9 +70,9 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID) (*JobRow, error) {
 
 // JobRetryTx is JobRetry inside the caller's transaction. The job's queue
 // is woken when the transaction commits.
-func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id JobID) (*JobRow, error) {
+func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id JobID, opts ...RetryOption) (*JobRow, error) {
 	exec := c.driver.UnwrapTx(tx)
-	job, err := exec.JobRetry(ctx, id)
+	job, err := exec.JobRetry(ctx, retryParams(id, opts))
 	if err != nil {
 		return nil, err
 	}
@@ -79,6 +80,24 @@ func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id JobID) (*JobRow
 		return nil, err
 	}
 	return job, nil
+}
+
+// RetryOption changes what JobRetry and JobRetryTx do.
+type RetryOption func(*driver.JobRetryParams)
+
+// FromStart clears the job's progress, so that it runs all its steps again
+// instead of resuming after the last one it finished: to run a finished job
+// over, or one whose recorded step its worker no longer has.
+func FromStart() RetryOption {
+	return func(p *driver.JobRetryParams) { p.FromStart = true }
+}
+
+func retryParams(id JobID, opts []RetryOption) driver.JobRetryParams {
+	p := driver.JobRetryParams{ID: id}
+	for _, o := range opts {
+		o(&p)
+	}
+	return p
 }
 
 // JobDelete removes a job that is not running, from the live table or from

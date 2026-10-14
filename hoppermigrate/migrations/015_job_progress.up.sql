@@ -7,7 +7,9 @@
 -- Adding a nullable column with no default changes only the catalog, but it
 -- needs an ACCESS EXCLUSIVE lock on each table, every history partition
 -- included, so it is added the way v9 added snooze_reason: with a short
--- lock_timeout per try, in a loop.
+-- lock_timeout per try, in a loop. History goes first: while a try works
+-- through its partitions it holds up only finalizes, and hopper_jobs, which
+-- every claim needs, is locked last, for the one ALTER that ends the try.
 
 SELECT set_config('lock_timeout', '50ms', true);
 
@@ -19,8 +21,8 @@ DECLARE
 BEGIN
   LOOP
     BEGIN
-      ALTER TABLE hopper_jobs ADD COLUMN progress jsonb;
       ALTER TABLE hopper_job_history ADD COLUMN progress jsonb;
+      ALTER TABLE hopper_jobs ADD COLUMN progress jsonb;
       RETURN;
     EXCEPTION WHEN lock_not_available THEN
       tries := tries + 1;

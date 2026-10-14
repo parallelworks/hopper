@@ -98,6 +98,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"ListOrderingKeyLane", testListOrderingKeyLane[TTx]},
 		{"JobRecordProgress", testJobRecordProgress[TTx]},
 		{"JobRecordProgressRacesFinalize", testJobRecordProgressRacesFinalize[TTx]},
+		{"JobProgressReset", testJobProgressReset[TTx]},
 		{"JobDelete", testJobDelete[TTx]},
 		{"JobDeleteRacesClaim", testJobDeleteRacesClaim[TTx]},
 		{"JobDeleteRacesRetry", testJobDeleteRacesRetry[TTx]},

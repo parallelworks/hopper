@@ -54,7 +54,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	if known {
 		c.logOutcome(ctx, row, f, err)
 	}
-	return pending{job: row, result: f, completedTx: completed}
+	return pending{job: row, result: f, completedTx: completed, heldByTx: a.txHeld()}
 }
 
 // errNotCommitted fails an attempt whose worker completed it with

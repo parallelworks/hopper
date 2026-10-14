@@ -158,7 +158,7 @@ records a cursor within itself with `hopper.RecordCursor`, which the next attemp
 with `hopper.StepCursor[C]`. `RecordStepTx` and `RecordCursorTx` record in the worker's
 own transaction, so a step's writes and the record that it finished commit together.
 The progress is `JobRow.Progress` (last step, cursor, time), kept through retries,
-snoozes and `JobRetry` (§7.5).
+snoozes and `JobRetry`, unless `hopper.FromStart()` is passed to it (§7.5).
 
 ```go
 func (w *Importer) Work(ctx context.Context, job *hopper.Job[ImportArgs]) error {
@@ -242,6 +242,7 @@ report, err := hopper.Await[ReportURL](ctx, client, res.Job.ID) // worker called
 ```go
 client.JobCancel(ctx, id)            // works on any live job, including one running on another pod
 client.JobRetry(ctx, id)             // re-drive a discarded or canceled job from history
+client.JobRetry(ctx, id, hopper.FromStart()) // ... clearing its progress, to run all its steps again
 client.JobRetryOrderingKey(ctx, "billing", "customer:42") // wake a key's snoozed and retrying jobs
 client.JobDelete(ctx, id)            // remove a job that is not running, live or from history
 client.JobCancelTx(ctx, tx, id)      // ...Tx variants commit with the caller's own changes
@@ -893,14 +894,24 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   pool and are not batched: a step is long next to its write, and the write must be
   durable before the worker goes on. `RecordStepTx` and `RecordCursorTx` run the same
   statement through `Driver.UnwrapTx(tx)`, so the progress commits with the step's
-  writes. Until `tx` ends it holds the job's row; the job's own finalize waits for it
-  (the 2 s wait, then `SKIP LOCKED`, above), and a rescue's finalize skips it. No
-  statement clears `progress`: the claim, retries, snoozes and the archive keep it, and
-  `JobRetry` carries it back from history, so a re-driven job resumes too. A replacing
-  insert (`UniqueReplace`) keeps it as well, since it changes the job's input, not how
-  far the job got. `RunSteps` resumes after `Progress.Step`, and fails the attempt if
-  that step is not among the steps it was given. `hoppertest.Work` keeps progress in
-  memory, and `WorkOpts.Progress` starts a job part way through.
+  writes. Until `tx` ends it holds the job's row. A write on the pool would then wait
+  for the worker itself, so once a transaction of the attempt's has written the row
+  (`CompleteTx`, `RecordStepTx`, `RecordCursorTx`), a pool write locks the row with
+  `NOWAIT` first and fails with `ErrJobLocked` instead of waiting, and the attempt's
+  result goes to the finalize statement that skips held rows. An attempt's writes are
+  serialized, so `job.Progress` ends as the last one stored. The claim, retries,
+  snoozes and the archive keep `progress`, and `JobRetry` carries it back from
+  history, so a re-driven job resumes too; `JobRetry(ctx, id, hopper.FromStart())`
+  (`hopper jobs retry -from-start`, and a button in the web UI) clears it, to run a
+  finished job over or repair one whose recorded step was renamed. A replacing insert
+  (`UniqueReplace`) clears it too, since the job's new args make its old progress
+  meaningless; a running job is not replaced and keeps it. A value that is not in the
+  form hopper writes, such as one set by hand, reads as what can be made of it (none,
+  if it is not an object), so it never fails a claim. `RunSteps` resumes after
+  `Progress.Step`, and discards the job (`Cancel`) if that step is not among the steps
+  it was given, or if a step has no name or is listed twice, since every attempt would
+  fail the same way. `hoppertest.Work` keeps progress in memory, and
+  `WorkOpts.Progress` starts a job part way through.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure

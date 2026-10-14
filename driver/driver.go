@@ -31,6 +31,10 @@ var ErrJobRunning = errors.New("hopper: job is running")
 // uniqueness of a live job with the same key.
 var ErrUniqueConflict = errors.New("hopper: a live job with the same unique key exists")
 
+// ErrJobLocked is returned by JobRecordProgress with NoWait when another
+// transaction holds the job's row.
+var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
+
 // Driver binds the core to a storage engine. TTx is the engine's transaction
 // type (pgx.Tx for hopperpgx), so that transactional inserts only accept a
 // transaction from the right engine.
@@ -152,8 +156,9 @@ type Executor interface {
 	// out), and a waiting job has its schedule brought forward. Either way
 	// the job's TTL is cleared, as an operator overriding the wait. It returns
 	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
-	// holds the same unique key.
-	JobRetry(ctx context.Context, id JobID) (*JobRow, error)
+	// holds the same unique key. The job keeps its progress unless
+	// params.FromStart.
+	JobRetry(ctx context.Context, params JobRetryParams) (*JobRow, error)
 	// JobDelete removes a job that is not running and returns it as it was
 	// last stored. A waiting job is canceled as JobCancel does, so its
 	// batch, its dependents and anyone awaiting it see it finish, but no
@@ -423,6 +428,14 @@ type Progress struct {
 	RecordedAt time.Time `json:"at"`
 }
 
+// JobRetryParams selects the job to retry.
+type JobRetryParams struct {
+	ID JobID
+	// FromStart clears the job's progress, so that it runs all its steps
+	// again.
+	FromStart bool
+}
+
 // JobRecordProgressParams is a running job's new progress.
 type JobRecordProgressParams struct {
 	ID JobID
@@ -436,6 +449,9 @@ type JobRecordProgressParams struct {
 	KeepStep bool
 	// Cursor is a JSON value, or nil for none.
 	Cursor json.RawMessage
+	// NoWait returns ErrJobLocked at once, instead of waiting, if another
+	// transaction holds the job's row.
+	NoWait bool
 }
 
 // AttemptError records one failed attempt.

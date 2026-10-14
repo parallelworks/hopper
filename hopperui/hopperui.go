@@ -355,7 +355,11 @@ func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
 		if !u.authorize(w, r, ActionRetry) {
 			return
 		}
-		job, err = u.client.JobRetry(r.Context(), id)
+		var opts []hopper.RetryOption
+		if r.FormValue("from") == "start" {
+			opts = append(opts, hopper.FromStart())
+		}
+		job, err = u.client.JobRetry(r.Context(), id, opts...)
 	case "cancel":
 		if !u.authorize(w, r, ActionCancel) {
 			return

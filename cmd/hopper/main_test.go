@@ -98,6 +98,12 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, `progress:      step "fetch", cursor 3 (`) {
 		t.Errorf("jobs get with progress = %q", got)
 	}
+	if got := hopperCmd("jobs", "retry", id); !strings.Contains(got, "progress:") {
+		t.Errorf("jobs retry dropped the progress: %q", got)
+	}
+	if got := hopperCmd("jobs", "retry", "-from-start", id); strings.Contains(got, "progress:") || !strings.Contains(got, "state:         available") {
+		t.Errorf("jobs retry -from-start = %q", got)
+	}
 	if got := hopperCmd("jobs", "cancel", id); !strings.Contains(got, "state:         canceled") {
 		t.Errorf("jobs cancel = %q", got)
 	}

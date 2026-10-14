@@ -3,6 +3,7 @@ package drivertest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -101,7 +102,7 @@ func testJobRecordProgress[TTx any](t *testing.T, f Fixture[TTx]) {
 	if p := progress(); p == nil || p.Step != "notify" || string(p.Cursor) != `"c"` {
 		t.Errorf("history progress = %+v", p)
 	}
-	retried, err := exec.JobRetry(ctx, id)
+	retried, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,5 +181,97 @@ func testJobRecordProgressRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if j, err := exec.JobGet(ctx, id); err != nil || j.Progress != nil {
 		t.Errorf("job after both = %+v, %v", j, err)
+	}
+}
+
+// testJobProgressReset checks what clears progress and what a hand-written
+// value reads as, and that NoWait does not wait for a held row.
+func testJobProgressReset[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	p := params("k", 2)
+	p[0].UniqueKey = "u"
+	inserted := insert(ctx, t, exec, p)
+	if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
+		t.Fatal("claim")
+	}
+	for _, r := range inserted {
+		if got, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: r.Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "a"}); err != nil || got == nil {
+			t.Fatalf("record = %+v, %v", got, err)
+		}
+	}
+	get := func(id driver.JobID) *driver.JobRow {
+		t.Helper()
+		j, err := exec.JobGet(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return j
+	}
+
+	// NoWait fails at once on a row another transaction holds.
+	tx, _, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already ended on the happy path
+	if got, err := d.UnwrapTx(tx).JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "b"}); err != nil || got == nil {
+		t.Fatalf("record in tx = %+v, %v", got, err)
+	}
+	start := time.Now()
+	if _, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "c", NoWait: true}); !errors.Is(err, driver.ErrJobLocked) || time.Since(start) > 5*time.Second {
+		t.Errorf("NoWait on a held row = %v after %s, want ErrJobLocked at once", err, time.Since(start))
+	}
+	if err := rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "c", NoWait: true}); err != nil || got == nil || got.Step != "c" {
+		t.Errorf("NoWait on a free row = %+v, %v", got, err)
+	}
+
+	// A replacing insert gives the waiting job new args, and clears its
+	// progress; a running job is not replaced and keeps it.
+	rep, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{{Kind: "k", Queue: "default", Priority: 2, MaxAttempts: 3, UniqueKey: "u"}}, driver.JobInsertOpts{OnConflict: driver.ConflictReplace})
+	if err != nil || rep[0].Job.Progress == nil {
+		t.Fatalf("replace of a running job = %+v, %v", rep, err)
+	}
+	finalize(ctx, t, exec, driver.JobFinalize{ID: inserted[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	rep, err = exec.JobInsertMany(ctx, []driver.JobInsertParams{{Kind: "k", Queue: "default", Priority: 2, MaxAttempts: 3, UniqueKey: "u", Args: json.RawMessage(`{"i": 9}`)}}, driver.JobInsertOpts{OnConflict: driver.ConflictReplace})
+	if err != nil || rep[0].Job.Progress != nil || argsN(rep[0].Job) != 9 {
+		t.Errorf("replace of a waiting job = %+v, %v", rep[0].Job, err)
+	}
+
+	// JobRetry keeps progress; FromStart clears it, live and from history.
+	if _, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "d"}); err != nil {
+		t.Fatal(err)
+	}
+	finalize(ctx, t, exec, driver.JobFinalize{ID: inserted[1].Job.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	if j, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[1].Job.ID, FromStart: true}); err != nil || j.Progress != nil {
+		t.Errorf("JobRetry FromStart from history = %+v, %v", j, err)
+	}
+	f.Exec(ctx, t, d, `UPDATE hopper_jobs SET progress = '{"step": "e"}' WHERE id = $1`, inserted[0].Job.ID.String())
+	if j, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[0].Job.ID}); err != nil || j.Progress == nil || j.Progress.Step != "e" {
+		t.Errorf("JobRetry of a waiting job = %+v, %v", j, err)
+	}
+	if j, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[0].Job.ID, FromStart: true}); err != nil || j.Progress != nil {
+		t.Errorf("JobRetry FromStart of a waiting job = %+v, %v", j, err)
+	}
+
+	// Values written by hand read as what can be made of them, and never
+	// fail the read.
+	for value, want := range map[string]*driver.Progress{
+		`"fetch"`: nil,
+		`null`:    nil,
+		`[1]`:     nil,
+		`{"step": 3, "cursor": null, "at": "yesterday"}`:                  {},
+		`{"step": "s", "cursor": {"p": 1}, "at": "2026-01-02T03:04:05Z"}`: {Step: "s", Cursor: json.RawMessage(`{"p": 1}`), RecordedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)},
+	} {
+		f.Exec(ctx, t, d, `UPDATE hopper_jobs SET progress = $1::jsonb WHERE id = $2`, value, inserted[0].Job.ID.String())
+		got := get(inserted[0].Job.ID).Progress
+		if (got == nil) != (want == nil) || (got != nil && (got.Step != want.Step || string(got.Cursor) != string(want.Cursor) || !got.RecordedAt.Equal(want.RecordedAt))) {
+			t.Errorf("progress %s reads as %+v, want %+v", value, got, want)
+		}
+	}
+	if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
+		t.Errorf("claim with a hand-written progress = %d jobs, want 2", len(jobs))
 	}
 }

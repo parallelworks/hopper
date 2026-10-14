@@ -493,13 +493,13 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	if len(jobs) != 2 {
 		t.Fatal("claim")
 	}
-	if _, err := exec.JobRetry(ctx, jobs[0].ID); !errors.Is(err, driver.ErrJobRunning) {
+	if _, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: jobs[0].ID}); !errors.Is(err, driver.ErrJobRunning) {
 		t.Errorf("retry of running job = %v", err)
 	}
 	// A retry overrides the wait, so a TTL that has passed no longer
 	// applies: the job is neither discarded nor skipped by the claim.
 	time.Sleep(10 * time.Millisecond)
-	if job, err := exec.JobRetry(ctx, inserted[2].Job.ID); err != nil || job.State != driver.JobStateAvailable || !job.ExpiresAt.IsZero() {
+	if job, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[2].Job.ID}); err != nil || job.State != driver.JobStateAvailable || !job.ExpiresAt.IsZero() {
 		t.Errorf("retry of scheduled job = %+v, %v", job, err)
 	}
 	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 0 {
@@ -512,7 +512,7 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 		driver.JobFinalize{ID: inserted[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}},
 		driver.JobFinalize{ID: inserted[1].Job.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}},
 	)
-	job, err := exec.JobRetry(ctx, inserted[0].Job.ID)
+	job, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[0].Job.ID})
 	if err != nil || job.State != driver.JobStateAvailable || job.Attempt != 1 || job.MaxAttempts != 3 || len(job.Errors) != 1 || job.UniqueKey != "u" {
 		t.Errorf("re-driven job = %+v, %v", job, err)
 	}
@@ -524,13 +524,13 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	insert(ctx, t, exec, []driver.JobInsertParams{p[0]})
-	if _, err := exec.JobRetry(ctx, inserted[0].Job.ID); !errors.Is(err, driver.ErrUniqueConflict) {
+	if _, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[0].Job.ID}); !errors.Is(err, driver.ErrUniqueConflict) {
 		t.Errorf("retry with a live duplicate = %v", err)
 	}
 	if got, err := exec.JobGet(ctx, inserted[0].Job.ID); err != nil || got.State != driver.JobStateCanceled {
 		t.Errorf("history row after refused retry = %+v, %v", got, err)
 	}
-	if _, err := exec.JobRetry(ctx, driver.JobID{9}); !errors.Is(err, driver.ErrNotFound) {
+	if _, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: driver.JobID{9}}); !errors.Is(err, driver.ErrNotFound) {
 		t.Errorf("retry of unknown job = %v", err)
 	}
 }
@@ -1022,7 +1022,7 @@ func testJobDeleteRacesRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	tx, commit, _ := f.Begin(ctx, t, d)
-	if _, err := d.UnwrapTx(tx).JobRetry(ctx, id); err != nil {
+	if _, err := d.UnwrapTx(tx).JobRetry(ctx, driver.JobRetryParams{ID: id}); err != nil {
 		t.Fatal(err)
 	}
 	var deleted *driver.JobRow

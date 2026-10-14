@@ -81,10 +81,7 @@ func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 		j.BatchID = batchID.ID
 	}
 	if progress != "" {
-		j.Progress = new(driver.Progress)
-		if err := json.Unmarshal([]byte(progress), j.Progress); err != nil {
-			return nil, fmt.Errorf("pgsql: job %s progress: %w", j.ID, err)
-		}
+		j.Progress = decodeProgress(string(progress))
 	}
 	return &j, nil
 }
@@ -137,6 +134,7 @@ const (
   max_attempts = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.max_attempts ELSE EXCLUDED.max_attempts END,
   scheduled_at = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.scheduled_at ELSE EXCLUDED.scheduled_at END,
   state        = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.state        ELSE EXCLUDED.state        END,
+  progress     = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.progress     ELSE NULL                  END,
   snooze_reason = NULL`
 )
 
@@ -708,14 +706,27 @@ LIMIT 1`, JobColumns(""), historyColumns(""))
 // attempt. A cursor of NULL leaves the key out, rather than storing a JSON
 // null. The time is the statement's, which in a caller's transaction is not
 // the transaction's start.
-const jobRecordProgressSQL = `
+//
+// With NoWait, the row is locked first with NOWAIT, and the update applies
+// the fence again to the row as locked.
+const jobRecordProgressSQL = `%s
 UPDATE {{schema}}.hopper_jobs
 SET progress = jsonb_build_object(
       'step', CASE WHEN $5 THEN coalesce(progress->>'step', '') ELSE $4::text END,
       'at', statement_timestamp())
     || CASE WHEN $6::jsonb IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('cursor', $6::jsonb) END
-WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND attempt = $3
+WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND attempt = $3%s
 RETURNING progress::text`
+
+var (
+	jobRecordProgressQuery       = fmt.Sprintf(jobRecordProgressSQL, "", "")
+	jobRecordProgressNoWaitQuery = fmt.Sprintf(jobRecordProgressSQL, `
+WITH locked AS (
+  SELECT id FROM {{schema}}.hopper_jobs
+  WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND attempt = $3
+  FOR UPDATE NOWAIT
+)`, " AND id IN (SELECT id FROM locked)")
+)
 
 // JobRecordProgress implements driver.Executor.
 func (e *Executor) JobRecordProgress(ctx context.Context, params driver.JobRecordProgressParams) (*driver.Progress, error) {
@@ -724,20 +735,49 @@ func (e *Executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 		c := string(params.Cursor)
 		cursor = &c
 	}
+	query := jobRecordProgressQuery
+	if params.NoWait {
+		query = jobRecordProgressNoWaitQuery
+	}
 	var stored string
-	err := e.Conn.QueryRow(ctx, jobRecordProgressSQL, uuidParam(params.ID), params.AttemptedBy, params.Attempt,
+	err := e.Conn.QueryRow(ctx, query, uuidParam(params.ID), params.AttemptedBy, params.Attempt,
 		params.Step, params.KeepStep, cursor).Scan(&stored)
 	if errors.Is(err, ErrNoRows) {
 		return nil, nil
 	}
+	if lockNotAvailable(err) {
+		return nil, driver.ErrJobLocked
+	}
 	if err != nil {
 		return nil, fmt.Errorf("hopper: record job progress: %w", err)
 	}
-	var p driver.Progress
-	if err := json.Unmarshal([]byte(stored), &p); err != nil {
-		return nil, fmt.Errorf("hopper: record job progress: %w", err)
+	return decodeProgress(stored), nil
+}
+
+// decodeProgress reads a progress value, keeping what it can of one that
+// is not in the form JobRecordProgress writes, such as one written by hand:
+// a row must still scan, or a claim that took it would fail with the claim
+// already applied. A value that is not an object reads as none.
+func decodeProgress(stored string) *driver.Progress {
+	var v struct {
+		Step   any             `json:"step"`
+		Cursor json.RawMessage `json:"cursor"`
+		At     any             `json:"at"`
 	}
-	return &p, nil
+	if !strings.HasPrefix(strings.TrimSpace(stored), "{") || json.Unmarshal([]byte(stored), &v) != nil {
+		return nil
+	}
+	p := &driver.Progress{Cursor: v.Cursor}
+	if s, ok := v.Step.(string); ok {
+		p.Step = s
+	}
+	if s, ok := v.At.(string); ok {
+		p.RecordedAt, _ = time.Parse(time.RFC3339Nano, s)
+	}
+	if string(p.Cursor) == "null" {
+		p.Cursor = nil
+	}
+	return p
 }
 
 // JobGet implements driver.Executor.
@@ -946,7 +986,7 @@ const jobRunNowSQL = `state = 'available', scheduled_at = least(scheduled_at, st
 
 var (
 	jobRetryLiveSQL = fmt.Sprintf(`
-UPDATE {{schema}}.hopper_jobs SET `+jobRunNowSQL+`, expires_at = NULL
+UPDATE {{schema}}.hopper_jobs SET `+jobRunNowSQL+`, expires_at = NULL, progress = CASE WHEN $2 THEN NULL ELSE progress END
 WHERE id = $1 AND state <> 'running'
 RETURNING %s`, JobColumns(""))
 	// jobRetryHistorySQL moves a finalized job back to the live table with
@@ -958,7 +998,7 @@ INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, attempt, m
   errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, progress)
 SELECT id, kind, queue, 'available', priority, attempt,
   CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END, statement_timestamp(), args, metadata,
-  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, progress
+  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, CASE WHEN $2 THEN NULL ELSE progress END
 FROM h
 RETURNING %s`, JobColumns(""))
 )
@@ -973,14 +1013,15 @@ func isUniqueViolation(err error) bool {
 }
 
 // JobRetry implements driver.Executor.
-func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
+func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (*driver.JobRow, error) {
+	id := params.ID
 	var job *driver.JobRow
 	err := e.withTx(ctx, func(tx Tx) error {
 		var state string
 		err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
 		switch {
 		case errors.Is(err, ErrNoRows):
-			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id)), false)
+			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id), params.FromStart), false)
 			if errors.Is(err, ErrNoRows) {
 				return driver.ErrNotFound
 			}
@@ -993,7 +1034,7 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 		case driver.JobState(state) == driver.JobStateRunning:
 			return driver.ErrJobRunning
 		}
-		job, err = scanJob(tx.QueryRow(ctx, jobRetryLiveSQL, uuidParam(id)), false)
+		job, err = scanJob(tx.QueryRow(ctx, jobRetryLiveSQL, uuidParam(id), params.FromStart), false)
 		return err
 	})
 	if err != nil {
