@@ -654,6 +654,43 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 	return job, nil
 }
 
+// jobDeleteHistorySQL removes a finalized job from history.
+var jobDeleteHistorySQL = fmt.Sprintf(`DELETE FROM {{schema}}.hopper_job_history WHERE id = $1
+RETURNING %s, finalized_at, output`, historyColumns())
+
+// JobDelete implements driver.Executor.
+func (e *Executor) JobDelete(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
+	var job *driver.JobRow
+	err := e.withTx(ctx, func(tx Tx) error {
+		var state string
+		err := tx.QueryRow(ctx, "SELECT state FROM {{schema}}.hopper_jobs WHERE id = $1 FOR UPDATE", uuidParam(id)).Scan(&state)
+		switch {
+		case errors.Is(err, ErrNoRows):
+			// Finalized already, or unknown.
+		case err != nil:
+			return err
+		case driver.JobState(state) == driver.JobStateRunning:
+			return driver.ErrJobRunning
+		default:
+			if _, err := scanJob(tx.QueryRow(ctx, jobCancelWaitingSQL, uuidParam(id), driver.ChannelDone, driver.ChannelInsert), true, nil); err != nil {
+				return err
+			}
+		}
+		job, err = scanJob(tx.QueryRow(ctx, jobDeleteHistorySQL, uuidParam(id)), true, nil)
+		if errors.Is(err, ErrNoRows) {
+			return driver.ErrNotFound
+		}
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, driver.ErrNotFound) || errors.Is(err, driver.ErrJobRunning) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("hopper: delete job: %w", err)
+	}
+	return job, nil
+}
+
 // jobRunNowSQL is the SET list that makes a waiting job runnable now and
 // drops the reason it was waiting. A job that was already due keeps its
 // scheduled_at, so it keeps its place in claim order and its aging.

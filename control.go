@@ -14,7 +14,7 @@ import (
 
 // Sentinel errors from control operations.
 var (
-	// ErrJobRunning is returned by JobRetry for a running job.
+	// ErrJobRunning is returned by JobRetry and JobDelete for a running job.
 	ErrJobRunning = driver.ErrJobRunning
 	// ErrUniqueConflict is returned by JobRetry when a live job holds the
 	// same unique key.
@@ -40,6 +40,13 @@ func (c *Client[TTx]) JobCancel(ctx context.Context, id JobID) (*JobRow, error) 
 	return job, nil
 }
 
+// JobCancelTx is JobCancel inside the caller's transaction, so the cancel
+// commits or rolls back with the caller's own changes. A running job's
+// client is told when the transaction commits.
+func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, id JobID) (*JobRow, error) {
+	return c.driver.UnwrapTx(tx).JobCancel(ctx, id)
+}
+
 // JobRetry makes a job run again as soon as possible: a canceled or
 // discarded job is re-driven from history with one more attempt allowed if
 // it had run out, and a waiting job has its schedule brought forward. An
@@ -56,6 +63,36 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID) (*JobRow, error) {
 	return job, nil
 }
 
+// JobRetryTx is JobRetry inside the caller's transaction. The job's queue
+// is woken when the transaction commits.
+func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id JobID) (*JobRow, error) {
+	exec := c.driver.UnwrapTx(tx)
+	job, err := exec.JobRetry(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := exec.Notify(ctx, driver.ChannelInsert, []string{job.Queue}); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// JobDelete removes a job that is not running, from the live table or from
+// history, and returns it as it was last stored. A waiting job is canceled
+// first, in the same transaction, so that its batch counts it as failed, its
+// dependents react as they do to a cancel, and Await on it returns
+// ErrNotFound rather than waiting forever. It returns ErrJobRunning for a
+// running job (cancel it, then delete it once it has finished) and
+// ErrNotFound for an unknown one.
+func (c *Client[TTx]) JobDelete(ctx context.Context, id JobID) (*JobRow, error) {
+	return c.exec.JobDelete(ctx, id)
+}
+
+// JobDeleteTx is JobDelete inside the caller's transaction.
+func (c *Client[TTx]) JobDeleteTx(ctx context.Context, tx TTx, id JobID) (*JobRow, error) {
+	return c.driver.UnwrapTx(tx).JobDelete(ctx, id)
+}
+
 // retryOrderingKeyBatch bounds how many jobs one statement of
 // JobRetryOrderingKey locks and rewrites.
 const retryOrderingKeyBatch = 1000
@@ -67,26 +104,42 @@ const retryOrderingKeyBatch = 1000
 // interrupted; if its attempt ends in a snooze or a retry, it runs again at
 // once instead of after its delay. It returns how many waiting jobs it woke.
 func (c *Client[TTx]) JobRetryOrderingKey(ctx context.Context, queue, orderingKey string) (int, error) {
+	queue = cmp.Or(queue, QueueDefault)
+	total, err := retryOrderingKey(ctx, c.exec, queue, orderingKey)
+	if total > 0 {
+		c.wakeQueue(queue)
+		c.notifier.mark(queue)
+	}
+	return total, err
+}
+
+// JobRetryOrderingKeyTx is JobRetryOrderingKey inside the caller's
+// transaction. The queue is woken when the transaction commits.
+func (c *Client[TTx]) JobRetryOrderingKeyTx(ctx context.Context, tx TTx, queue, orderingKey string) (int, error) {
+	queue = cmp.Or(queue, QueueDefault)
+	exec := c.driver.UnwrapTx(tx)
+	total, err := retryOrderingKey(ctx, exec, queue, orderingKey)
+	if err != nil || total == 0 {
+		return total, err
+	}
+	return total, exec.Notify(ctx, driver.ChannelInsert, []string{queue})
+}
+
+func retryOrderingKey(ctx context.Context, exec driver.Executor, queue, orderingKey string) (int, error) {
 	if orderingKey == "" {
 		return 0, errors.New("hopper: ordering key is required")
 	}
-	queue = cmp.Or(queue, QueueDefault)
 	total := 0
 	for {
-		n, err := c.exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: queue, OrderingKey: orderingKey, Limit: retryOrderingKeyBatch})
+		n, err := exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: queue, OrderingKey: orderingKey, Limit: retryOrderingKeyBatch})
 		if err != nil {
 			return total, err
 		}
 		total += n
 		if n < retryOrderingKeyBatch {
-			break
+			return total, nil
 		}
 	}
-	if total > 0 {
-		c.wakeQueue(queue)
-		c.notifier.mark(queue)
-	}
-	return total, nil
 }
 
 // JobFilter selects jobs for Jobs. Empty fields match everything.

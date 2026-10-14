@@ -93,6 +93,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"SnoozeReasonConcurrent", testSnoozeReasonConcurrent[TTx]},
 		{"List", testList[TTx]},
 		{"ListOrderingKeyLane", testListOrderingKeyLane[TTx]},
+		{"JobDelete", testJobDelete[TTx]},
+		{"JobDeleteRacesClaim", testJobDeleteRacesClaim[TTx]},
 		{"Queues", testQueues[TTx]},
 		{"Periodic", testPeriodic[TTx]},
 		{"Stats", testStats[TTx]},

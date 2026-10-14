@@ -632,3 +632,159 @@ func TestPeriodicJobsRunOnceAcrossLeaders(t *testing.T) {
 		t.Errorf("%d slots produced more than one job after failover", dup)
 	}
 }
+
+func TestJobDeleteEndsAwait(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	c := h.client(&hopper.Config{})
+	res, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{Await: true, ScheduledAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	awaited := make(chan error, 1)
+	go func() {
+		_, err := hopper.Await[struct{}](ctx, c, res.Job.ID)
+		awaited <- err
+	}()
+	job, err := c.JobDelete(ctx, res.Job.ID)
+	if err != nil || job.State != hopper.JobStateCanceled {
+		t.Fatalf("JobDelete = %+v, %v", job, err)
+	}
+	select {
+	case err := <-awaited:
+		if !errors.Is(err, hopper.ErrNotFound) {
+			t.Errorf("Await on a deleted job = %v, want ErrNotFound", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Await still waiting on a deleted job")
+	}
+	if _, err := c.JobDelete(ctx, res.Job.ID); !errors.Is(err, hopper.ErrNotFound) {
+		t.Errorf("second delete = %v, want ErrNotFound", err)
+	}
+}
+
+// TestControlTx runs each control call in a transaction that rolls back,
+// which must leave the job as it was and tell no process anything, and
+// then in one that commits.
+func TestControlTx(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	w := newBlocker()
+	workers := hopper.NewWorkers()
+	hopper.AddWorker(workers, w)
+	// The producer polls only once a minute, so a committed retry starts its
+	// job only if the transaction woke the queue.
+	c := h.client(&hopper.Config{
+		Queues:       map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers:      workers,
+		PollInterval: time.Minute,
+	})
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	started := func(want hopper.JobID) {
+		t.Helper()
+		select {
+		case id := <-w.started:
+			if id != want {
+				t.Fatalf("started %s, want %s", id, want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("job %s did not start", want)
+		}
+	}
+	inTx := func(commit bool, call func(tx pgxTx) error) {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := call(tx); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if commit {
+			err = tx.Commit(ctx)
+		} else {
+			err = tx.Rollback(ctx)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	state := func(id hopper.JobID) hopper.JobState {
+		t.Helper()
+		job, err := c.JobGet(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return job.State
+	}
+
+	// JobCancelTx on a job running on this very client.
+	running, err := c.Insert(ctx, noop{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started(running.Job.ID)
+	inTx(false, func(tx pgxTx) error { _, err := c.JobCancelTx(ctx, tx, running.Job.ID); return err })
+	time.Sleep(3 * fastTuning.LeaseRenew)
+	if s := state(running.Job.ID); s != hopper.JobStateRunning {
+		t.Fatalf("job after a rolled-back cancel = %s, want running", s)
+	}
+	inTx(true, func(tx pgxTx) error { _, err := c.JobCancelTx(ctx, tx, running.Job.ID); return err })
+	waitForJob(t, c, running.Job.ID, hopper.JobStateCanceled)
+
+	// JobRetryTx brings a scheduled job forward.
+	later, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{ScheduledAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inTx(false, func(tx pgxTx) error { _, err := c.JobRetryTx(ctx, tx, later.Job.ID); return err })
+	if s := state(later.Job.ID); s != hopper.JobStateScheduled {
+		t.Fatalf("job after a rolled-back retry = %s, want scheduled", s)
+	}
+	// The insert woke the queue too; let that claim pass first.
+	time.Sleep(time.Second)
+	inTx(true, func(tx pgxTx) error { _, err := c.JobRetryTx(ctx, tx, later.Job.ID); return err })
+	started(later.Job.ID)
+	w.release <- struct{}{}
+	waitForJob(t, c, later.Job.ID, hopper.JobStateCompleted)
+
+	// JobRetryOrderingKeyTx wakes a key's scheduled job.
+	keyed, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{OrderingKey: "k", ScheduledAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inTx(false, func(tx pgxTx) error { _, err := c.JobRetryOrderingKeyTx(ctx, tx, "", "k"); return err })
+	if s := state(keyed.Job.ID); s != hopper.JobStateScheduled {
+		t.Fatalf("job after a rolled-back key wake = %s, want scheduled", s)
+	}
+	time.Sleep(time.Second)
+	inTx(true, func(tx pgxTx) error {
+		n, err := c.JobRetryOrderingKeyTx(ctx, tx, "", "k")
+		if err == nil && n != 1 {
+			t.Errorf("JobRetryOrderingKeyTx woke %d, want 1", n)
+		}
+		return err
+	})
+	started(keyed.Job.ID)
+	w.release <- struct{}{}
+	waitForJob(t, c, keyed.Job.ID, hopper.JobStateCompleted)
+
+	// JobDeleteTx.
+	doomed, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{ScheduledAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inTx(false, func(tx pgxTx) error { _, err := c.JobDeleteTx(ctx, tx, doomed.Job.ID); return err })
+	if s := state(doomed.Job.ID); s != hopper.JobStateScheduled {
+		t.Fatalf("job after a rolled-back delete = %s, want scheduled", s)
+	}
+	inTx(true, func(tx pgxTx) error { _, err := c.JobDeleteTx(ctx, tx, doomed.Job.ID); return err })
+	if _, err := c.JobGet(ctx, doomed.Job.ID); !errors.Is(err, hopper.ErrNotFound) {
+		t.Errorf("job after a committed delete: %v, want ErrNotFound", err)
+	}
+}

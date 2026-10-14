@@ -42,6 +42,7 @@ type Action string
 const (
 	ActionRetry  Action = "retry"
 	ActionCancel Action = "cancel"
+	ActionDelete Action = "delete"
 	ActionPause  Action = "pause"
 	ActionResume Action = "resume"
 	ActionSeek   Action = "seek"
@@ -353,6 +354,16 @@ func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		job, err = u.client.JobCancel(r.Context(), id)
+	case "delete":
+		if !u.authorize(w, r, ActionDelete) {
+			return
+		}
+		if _, err := u.client.JobDelete(r.Context(), id); err != nil {
+			u.fail(w, err)
+			return
+		}
+		u.back(w, r, "/jobs", fmt.Sprintf("job %s deleted", id))
+		return
 	default:
 		http.NotFound(w, r)
 		return

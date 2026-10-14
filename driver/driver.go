@@ -145,6 +145,12 @@ type Executor interface {
 	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
 	// holds the same unique key.
 	JobRetry(ctx context.Context, id JobID) (*JobRow, error)
+	// JobDelete removes a job that is not running and returns it as it was
+	// last stored. A waiting job is canceled first, in the same transaction,
+	// so its batch, its dependents and anyone awaiting it see it finish;
+	// then its history row is removed. It returns ErrJobRunning for a running
+	// job and ErrNotFound for an unknown one.
+	JobDelete(ctx context.Context, id JobID) (*JobRow, error)
 	// JobRetryOrderingKey wakes an ordering key in a queue. Up to Limit of
 	// its jobs waiting on their schedule (scheduled or retryable, oldest
 	// first, TTL not passed) become runnable now, keeping their TTL and
