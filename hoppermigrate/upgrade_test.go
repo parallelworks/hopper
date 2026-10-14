@@ -24,26 +24,48 @@ func (upgradeJob) Kind() string { return "upgrade" }
 
 // TestUpgradeUnderTraffic migrates from the previous schema version to the
 // latest while jobs wait in every state, a producer keeps inserting, a
-// claim keeps polling and a producer's transaction stays open on
-// hopper_jobs, and checks that the migration never holds claims up and that
-// a client then works every job. Every schema change ships with this test
-// covering it, because migrations that touch hopper_jobs must not block
-// claims for longer than one statement.
+// claim keeps polling, a finalize keeps moving jobs into history and a
+// producer's transaction stays open on hopper_jobs and history, and checks
+// that the migration never holds claims or finalizes up and that a client
+// then works every job. Every schema change ships with this test covering
+// it, because migrations that touch hopper_jobs or history must not block
+// claims or finalizes for longer than one statement.
 //
 // This release's statements need the latest schema, so the previous
 // release's side, before and during the migration, is played by the SQL
 // producer contract and by statements every schema version accepts
 // (docs/PLAN.md §12).
+//
+// It starts from the previous schema version, and from the schema of the
+// latest release, the upgrade users run, which can apply several migrations
+// in one Up.
 func TestUpgradeUnderTraffic(t *testing.T) {
 	t.Parallel()
 	if hoppermigrate.Latest() < 2 {
 		t.Skip("only one schema version")
 	}
+	from := map[string]int{"previous": hoppermigrate.Latest() - 1}
+	if releasedSchema < hoppermigrate.Latest()-1 {
+		from["released"] = releasedSchema
+	}
+	for name, version := range from {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			upgradeUnderTraffic(t, version)
+		})
+	}
+}
+
+// releasedSchema is the schema version of the latest release (v0.6.0). A
+// release that ships a new schema version updates it.
+const releasedSchema = 11
+
+func upgradeUnderTraffic(t *testing.T, from int) {
 	ctx := context.Background()
 	pool := testdb.EmptyPool(t, 0)
 	d := testdb.Driver(pool)
 	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
-	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Target: hoppermigrate.Latest() - 1, Logger: opts.Logger}); err != nil {
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Target: from, Logger: opts.Logger}); err != nil {
 		t.Fatal(err)
 	}
 	exec := func(query string, args ...any) {
@@ -84,6 +106,13 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	exec(`WITH j AS (DELETE FROM hopper_jobs WHERE state = 'completed' RETURNING *)
 	      INSERT INTO hopper_job_history (` + historyColumns + `, finalized_at, output)
 	      SELECT ` + historyColumns + `, now(), NULL FROM j`)
+	// archive moves the jobs a condition picks into history as completed,
+	// the way a finalize does, in a form every version accepts.
+	archive := func(where string) string {
+		return `WITH j AS (DELETE FROM hopper_jobs WHERE ` + where + ` RETURNING *)
+		  INSERT INTO hopper_job_history (` + historyColumns + `, finalized_at, output)
+		  SELECT ` + strings.Replace(historyColumns, "state", "'completed'", 1) + `, now(), NULL FROM j`
+	}
 
 	// A batch of five jobs as the previous release inserts it, with a
 	// callback, two of which that release has finalized and counted down in
@@ -101,10 +130,11 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	exec(`DELETE FROM hopper_jobs WHERE (args->>'n')::int IN (300010, 300020)`)
 	exec(`UPDATE hopper_batches SET pending = 3 WHERE id = $1::uuid`, batch)
 
-	// A producer's transaction that has inserted a job stays open across
-	// the start of the migration, as an InsertTx inside a longer unit of
-	// work would. A migration that queues for a lock behind it holds up
-	// every claim for as long.
+	// A producer's transaction that has inserted a job, and archived a
+	// finished one into history as a worker's CompleteTx does, stays open
+	// across the start of the migration, as a longer unit of work would. A
+	// migration that queues for a lock behind it holds up every claim, or
+	// every finalize, for as long.
 	held, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -113,12 +143,16 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	if _, err := held.Exec(ctx, `SELECT hopper_insert('upgrade', '{"n": 100000}', '{"max_attempts": 3}')`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := held.Exec(ctx, archive(`(args->>'n')::int = 5`)); err != nil {
+		t.Fatal(err)
+	}
 	const holdFor = 2 * time.Second
 
 	var (
-		stop    = make(chan struct{})
-		wg      sync.WaitGroup
-		slowest atomic.Int64
+		stop            = make(chan struct{})
+		wg              sync.WaitGroup
+		slowest         atomic.Int64
+		slowestFinalize atomic.Int64
 	)
 	wg.Go(func() {
 		for i := 200; ; i += 10 {
@@ -154,6 +188,27 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 		}
 	})
 	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			start := time.Now()
+			// A finalize's move of a job into history. It takes the jobs
+			// inserted during the migration, which the rest of the test
+			// does not count.
+			if _, err := pool.Exec(ctx, archive(`id = (SELECT id FROM hopper_jobs WHERE state = 'available'
+			    AND (args->>'n')::int BETWEEN 200 AND 99999 ORDER BY seq LIMIT 1 FOR UPDATE SKIP LOCKED)`)); err != nil {
+				t.Errorf("finalize during the migration: %v", err)
+				return
+			}
+			if took := int64(time.Since(start)); took > slowestFinalize.Load() {
+				slowestFinalize.Store(took)
+			}
+		}
+	})
+	wg.Go(func() {
 		time.Sleep(holdFor)
 		if err := held.Commit(ctx); err != nil {
 			t.Errorf("commit the held transaction: %v", err)
@@ -163,7 +218,7 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	// The migration gives up on its own only after 10 minutes, too long
 	// for a test; a loop that never gets the lock fails here instead. How
 	// long it takes otherwise depends on the load on the host, so only the
-	// claims' wait is bounded tightly.
+	// claims' and finalizes' waits are bounded tightly.
 	upCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	start := time.Now()
@@ -174,17 +229,24 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Up under traffic: %v", err)
 	}
-	if res.Version != hoppermigrate.Latest() || len(res.Applied) != 1 {
+	if res.Version != hoppermigrate.Latest() || len(res.Applied) != hoppermigrate.Latest()-from {
 		t.Errorf("Up = %+v", res)
 	}
-	// A migration that locks hopper_jobs waits for the held transaction,
-	// which shows the test reached its lock; one that leaves the table
-	// alone has nothing to wait for.
-	if latest := hoppermigrate.Migrations()[hoppermigrate.Latest()-1]; namesJobs(latest.Up) && took < holdFor*9/10 {
+	// A migration that locks hopper_jobs or history waits for the held
+	// transaction, which shows the test reached its lock; one that leaves
+	// both alone has nothing to wait for.
+	locks := false
+	for _, m := range hoppermigrate.Migrations()[from:] {
+		locks = locks || namesHeldTables(m.Up)
+	}
+	if locks && took < holdFor*9/10 {
 		t.Errorf("migration took %s, less than the held transaction's %s: it was not held up", took, holdFor)
 	}
 	if s := time.Duration(slowest.Load()); s > holdFor/2 {
 		t.Errorf("a claim waited %s during the migration", s)
+	}
+	if s := time.Duration(slowestFinalize.Load()); s > holdFor/2 {
+		t.Errorf("a finalize waited %s during the migration", s)
 	}
 
 	// This release's client works every job: the waiting ones, those
@@ -254,11 +316,12 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 	}
 }
 
-// namesJobs reports whether a migration script names hopper_jobs outside
-// its comments, so that a comment mentioning the table does not count.
-func namesJobs(script string) bool {
+// namesHeldTables reports whether a migration script names hopper_jobs or
+// a history table outside its comments, so that a comment mentioning one
+// does not count.
+func namesHeldTables(script string) bool {
 	for line := range strings.Lines(script) {
-		if code, _, _ := strings.Cut(line, "--"); strings.Contains(code, "hopper_jobs") {
+		if code, _, _ := strings.Cut(line, "--"); strings.Contains(code, "hopper_jobs") || strings.Contains(code, "hopper_job_history") {
 			return true
 		}
 	}
