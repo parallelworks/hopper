@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/parallelworks/hopper/driver"
 )
@@ -204,5 +205,120 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if _, err := exec.WorkflowGet(ctx, driver.JobID{9}); !errors.Is(err, driver.ErrNotFound) {
 		t.Errorf("unknown workflow = %v", err)
+	}
+}
+
+// testWorkflowFanInConcurrent finalizes a job's two dependencies in
+// concurrent transactions. Each statement still sees the other dependency
+// live, so neither promotes the dependent; WorkflowPromoteReady, run by
+// each finalizing client after its statement commits, does once both have
+// committed, and the leader's sweep finds what clients left.
+func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Name: "fan-in", Jobs: params("step", 3),
+		Deps: []driver.JobDependency{{Job: 2, DependsOn: 0}, {Job: 2, DependsOn: 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y, dep := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID, wf.Jobs[2].Job.ID
+	if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
+		t.Fatalf("claimed %d", len(jobs))
+	}
+	promote := func(dependsOn ...driver.JobID) int64 {
+		t.Helper()
+		res, err := exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: dependsOn, Limit: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Promoted
+	}
+	completed := func(id driver.JobID) driver.JobFinalize {
+		return driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+	}
+
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
+	if applied := finalize(ctx, t, d.UnwrapTx(tx), completed(x)); len(applied) != 1 {
+		t.Fatalf("finalize in tx applied %v", applied)
+	}
+	// The other dependency's finalize does not wait for the transaction.
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(y)}}); err != nil || len(applied) != 1 {
+		t.Fatalf("concurrent finalize = %v, %v", applied, err)
+	}
+	if n := promote(y); n != 0 {
+		t.Errorf("promoted %d while a dependency's finalize was uncommitted", n)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStatePending {
+		t.Fatalf("dependent after both finalizes = %+v, %v; the race should leave it pending", j, err)
+	}
+	if n := promote(x); n != 1 {
+		t.Errorf("promoted %d, want 1", n)
+	}
+	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateAvailable {
+		t.Errorf("dependent after promote = %+v, %v", j, err)
+	}
+	if n := promote(x, y); n != 0 {
+		t.Errorf("second promote = %d", n)
+	}
+	if n := promote(); n != 0 {
+		t.Errorf("sweep after the dependent was promoted = %d", n)
+	}
+
+	// The sweep walks the jobs with dependencies a chunk at a time, in ID
+	// order from After. Each of two workflows has a step whose dependency
+	// finished, left pending as a client that stopped before promoting it
+	// would leave it.
+	if jobs := claim(ctx, t, exec, clientID, 1); len(jobs) != 1 || jobs[0].ID != dep {
+		t.Fatalf("claimed %+v, want the fan-in dependent", jobs)
+	}
+	finalize(ctx, t, exec, completed(dep))
+	var steps []driver.JobID
+	for range 2 {
+		wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+			Name: "chain", Jobs: params("chain", 2), Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobs := claim(ctx, t, exec, clientID, 1)
+		if len(jobs) != 1 || jobs[0].ID != wf.Jobs[0].Job.ID {
+			t.Fatalf("claimed %+v", jobs)
+		}
+		finalize(ctx, t, exec, completed(jobs[0].ID))
+		f.Exec(ctx, t, d, `UPDATE hopper_jobs SET state = 'pending' WHERE id = $1::uuid`, wf.Jobs[1].Job.ID.String())
+		steps = append(steps, wf.Jobs[1].Job.ID)
+	}
+	sweep := func(after driver.JobID) driver.WorkflowPromoteResult {
+		t.Helper()
+		res, err := exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{After: after, Limit: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	var after driver.JobID
+	for _, step := range steps {
+		if res := sweep(after); res.Scanned != 1 || res.Promoted != 1 || res.Last != step {
+			t.Errorf("chunk = %+v; want %s promoted", res, step)
+		}
+		after = step
+	}
+	if res := sweep(after); res.Scanned != 0 || res.Promoted != 0 {
+		t.Errorf("chunk past the last = %+v", res)
+	}
+	for _, step := range steps {
+		if j, err := exec.JobGet(ctx, step); err != nil || j.State != driver.JobStateAvailable {
+			t.Errorf("swept step = %+v, %v", j, err)
+		}
 	}
 }

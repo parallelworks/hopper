@@ -165,6 +165,70 @@ edges AS (
 )`
 }
 
+// workflowPromoteSQL promotes the pending jobs among those a CTE named
+// candidates selects none of whose dependencies is still live, skipping rows
+// a finalize holds: that finalize decides them. It returns how many it
+// promoted, how many candidates there were, and the greatest candidate ID.
+func workflowPromoteSQL(candidates string) string {
+	return `
+WITH candidates AS (` + candidates + `),
+ready AS (
+  SELECT j.id FROM {{schema}}.hopper_jobs j
+  WHERE j.id IN (SELECT id FROM candidates)
+    AND j.state = 'pending'
+    AND NOT EXISTS (
+      SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
+      WHERE d.job_id = j.id)
+  FOR UPDATE OF j SKIP LOCKED
+),
+promoted AS (
+  UPDATE {{schema}}.hopper_jobs j
+  SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
+  FROM ready WHERE j.id = ready.id AND j.state = 'pending'
+  RETURNING pg_notify($1, j.queue)
+)
+SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
+  (SELECT id FROM candidates ORDER BY id DESC LIMIT 1)`
+}
+
+// workflowPromoteSweepSQL considers, in ID order, up to $2 jobs with
+// dependencies and an ID after $3. It walks the edges, the working set of
+// unfinished workflows, so it costs nothing without them, and a chunk at a
+// time however many pending steps they have.
+var workflowPromoteSweepSQL = workflowPromoteSQL(`
+  SELECT DISTINCT d.job_id AS id FROM {{schema}}.hopper_job_deps d
+  WHERE d.job_id > $3 ORDER BY d.job_id LIMIT $2
+`)
+
+// workflowPromoteDependentsSQL considers the dependents of the jobs in $2.
+var workflowPromoteDependentsSQL = workflowPromoteSQL(`
+  SELECT DISTINCT d.job_id AS id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY($2::uuid[])
+`)
+
+// WorkflowPromoteReady implements driver.Executor.
+func (e *Executor) WorkflowPromoteReady(ctx context.Context, params driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
+	var (
+		res  driver.WorkflowPromoteResult
+		last nullUUID
+		err  error
+	)
+	switch {
+	case params.DependsOn == nil:
+		err = e.Conn.QueryRow(ctx, workflowPromoteSweepSQL, driver.ChannelInsert, max(params.Limit, 1), uuidParam(params.After)).
+			Scan(&res.Promoted, &res.Scanned, &last)
+	case len(params.DependsOn) == 0:
+		return res, nil
+	default:
+		err = e.Conn.QueryRow(ctx, workflowPromoteDependentsSQL, driver.ChannelInsert, uuidArray(params.DependsOn)).
+			Scan(&res.Promoted, &res.Scanned, &last)
+	}
+	if err != nil {
+		return driver.WorkflowPromoteResult{}, fmt.Errorf("hopper: promote ready workflow jobs: %w", err)
+	}
+	res.Last = last.ID
+	return res, nil
+}
+
 // workflowJobInsertSQL inserts a workflow's jobs with the IDs generated up
 // front, pending when they have dependencies. RETURNING follows input order.
 var workflowJobInsertSQL = `

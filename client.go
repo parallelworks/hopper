@@ -61,9 +61,12 @@ type Client[TTx any] struct {
 	listening  atomic.Bool
 	isLeader   atomic.Bool
 	leaderPoke chan struct{}
-	// settleAfter is where the leader's next batch sweep resumes.
-	settleAfter driver.JobID
-	streamPoke  chan struct{}
+	// settleAfter and promoteAfter are where the leader's next batch and
+	// workflow sweeps resume, and ddlDeferrals counts its consecutive
+	// passes with deferred partition work.
+	settleAfter, promoteAfter driver.JobID
+	ddlDeferrals              int
+	streamPoke                chan struct{}
 
 	events *eventBus
 
@@ -236,7 +239,7 @@ func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig, paused, limit
 		claim: func(ctx context.Context, limit int, limited bool) (driver.JobClaimResult, error) {
 			return c.exec.JobClaim(ctx, driver.JobClaimParams{Queue: name, ClientID: c.clientID.Load(), Limit: limit, Limited: limited})
 		},
-		work:   func(row *driver.JobRow) driver.JobFinalize { return c.execute(c.jobContext(row), row, qcfg) },
+		work:   func(row *driver.JobRow) pending { return c.execute(c.jobContext(row), row, qcfg) },
 		submit: c.finalizer.submit,
 		wake:   make(chan struct{}, 1),
 		freed:  make(chan struct{}, 1),
@@ -249,8 +252,9 @@ func (c *Client[TTx]) startProducer(name string, qcfg QueueConfig, paused, limit
 	c.producerWG.Go(func() { p.run(ctx) })
 }
 
-// finalized is called by the finalizer for each applied result: it emits
-// the job event and wakes local Await callers.
+// finalized is called by the finalizer for each applied result, and for
+// each job a worker completed with CompleteTx: it emits the job event and
+// wakes local Await callers.
 func (c *Client[TTx]) finalized(job *driver.JobRow, result driver.JobFinalize) {
 	var (
 		kind    EventKind

@@ -26,6 +26,14 @@ func (e *stubExec) BatchSettle(context.Context, driver.BatchSettleParams) (drive
 	return driver.BatchSettleResult{}, nil
 }
 
+func (e *stubExec) WorkflowPromoteReady(context.Context, driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
+	return driver.WorkflowPromoteResult{}, nil
+}
+
+func (e *stubExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error) {
+	return nil, driver.ErrNotFound
+}
+
 func (e *stubExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
 	n := len(params.Jobs)
 	e.mu.Lock()
@@ -70,7 +78,7 @@ func newTestFinalizer(exec finalizeExecutor, t tuning, applied func()) (*finaliz
 
 func submitN(f *finalizer, n int) {
 	for i := range n {
-		f.submit(&driver.JobRow{Queue: "default"}, driver.JobFinalize{ID: driver.JobID{byte(i), byte(i >> 8)}, State: driver.JobStateCompleted})
+		f.submit(pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{ID: driver.JobID{byte(i), byte(i >> 8)}, State: driver.JobStateCompleted}})
 	}
 }
 
@@ -193,6 +201,14 @@ type failNExec struct {
 
 func (e *failNExec) BatchSettle(context.Context, driver.BatchSettleParams) (driver.BatchSettleResult, error) {
 	return driver.BatchSettleResult{}, nil
+}
+
+func (e *failNExec) WorkflowPromoteReady(context.Context, driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
+	return driver.WorkflowPromoteResult{}, nil
+}
+
+func (e *failNExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error) {
+	return nil, driver.ErrNotFound
 }
 
 func (e *failNExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {

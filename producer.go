@@ -26,8 +26,8 @@ type producer struct {
 	cooldown     time.Duration
 
 	claim  func(ctx context.Context, limit int, limited bool) (driver.JobClaimResult, error)
-	work   func(row *driver.JobRow) driver.JobFinalize
-	submit func(job *driver.JobRow, result driver.JobFinalize)
+	work   func(row *driver.JobRow) pending
+	submit func(p pending)
 
 	wake  chan struct{} // an insert happened on this client
 	freed chan struct{} // a slot freed up
@@ -156,7 +156,7 @@ func (p *producer) start(job *driver.JobRow) {
 		result := p.work(job)
 		// Submit before freeing the slot, so that a backed-up finalizer
 		// applies back-pressure to claiming instead of piling up results.
-		p.submit(job, result)
+		p.submit(result)
 		p.mu.Lock()
 		p.running--
 		p.mu.Unlock()

@@ -42,12 +42,24 @@ type finalizer struct {
 // finalizeExecutor is the part of driver.Executor the finalizer uses.
 type finalizeExecutor interface {
 	JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error)
+	JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error)
 	BatchSettle(ctx context.Context, params driver.BatchSettleParams) (driver.BatchSettleResult, error)
+	WorkflowPromoteReady(ctx context.Context, params driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error)
 }
 
 type pending struct {
 	job    *driver.JobRow
 	result driver.JobFinalize
+	// completedTx is the completion the worker wrote with CompleteTx, if
+	// it did. committed reports that the client saw it commit: the job is
+	// finished, and there is nothing to write. Otherwise result is the
+	// attempt's other outcome, written without waiting on the worker's
+	// transaction, and the job is read again if the write skips it.
+	completedTx *driver.JobFinalize
+	committed   bool
+	// waits counts the flushes that found the worker's transaction still
+	// open.
+	waits int
 }
 
 func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, wake func(string), applied func(*driver.JobRow, driver.JobFinalize)) *finalizer {
@@ -66,11 +78,11 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, wake fun
 // submit queues a result. It blocks while the buffer is full. A result
 // submitted after the finalizer has stopped is dropped: the job stays
 // running in the database and is rescued once this client's lease expires.
-func (f *finalizer) submit(job *driver.JobRow, result driver.JobFinalize) {
+func (f *finalizer) submit(p pending) {
 	select {
-	case f.in <- pending{job: job, result: result}:
+	case f.in <- p:
 	case <-f.done:
-		f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", result.ID)
+		f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", p.result.ID)
 	}
 }
 
@@ -123,16 +135,44 @@ func (f *finalizer) run(ctx context.Context) {
 // flushTimeout bounds one finalize statement.
 const flushTimeout = 30 * time.Second
 
-// flush writes one batch. While ctx is live it retries with backoff until
-// the write succeeds; a statement that timed out is retried as two halves.
-// Once ctx is done (the client is stopping) it makes one more attempt and
-// then gives the results up; their jobs stay running in the database and
-// are rescued when this client's lease expires.
+// heldRetry is how long a result whose worker's CompleteTx transaction is
+// still open waits before the finalizer tries it again.
+const heldRetry = 250 * time.Millisecond
+
+// flush writes one batch: the results of jobs not completed with CompleteTx
+// in one statement, and the other outcomes of those that were, whose rows a
+// worker's transaction may still hold, in another that skips held rows.
+// Completions the client saw commit are reported without a write.
+func (f *finalizer) flush(ctx context.Context, batch []pending) {
+	var plain, tx, committed []pending
+	for _, p := range batch {
+		switch {
+		case p.completedTx == nil:
+			plain = append(plain, p)
+		case p.committed:
+			committed = append(committed, p)
+		default:
+			tx = append(tx, p)
+		}
+	}
+	f.write(ctx, plain, false)
+	f.write(ctx, tx, true)
+	for _, p := range committed {
+		f.applied(p.job, *p.completedTx)
+	}
+	f.followUp(ctx, committed)
+}
+
+// write writes results in one statement. While ctx is live it retries with
+// backoff until the write succeeds; a statement that timed out is retried
+// as two halves. Once ctx is done (the client is stopping) it makes one more
+// attempt and then gives the results up; their jobs stay running in the
+// database and are rescued when this client's lease expires.
 //
 // The statement itself runs on a context that ctx does not cancel: a result
 // that reached the finalizer belongs to a job that has finished, and the
 // stop signal must not cut its write short.
-func (f *finalizer) flush(ctx context.Context, batch []pending) {
+func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool) {
 	if len(batch) == 0 {
 		return
 	}
@@ -145,12 +185,12 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 	backoff := 50 * time.Millisecond
 	for {
 		opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
-		applied, err := f.exec.JobFinalizeMany(opCtx, driver.JobFinalizeParams{Jobs: jobs, NoBatches: noBatches})
+		applied, err := f.exec.JobFinalizeMany(opCtx, driver.JobFinalizeParams{Jobs: jobs, NoBatches: noBatches, SkipLocked: skipLocked})
 		cancel()
 		if err == nil {
-			f.afterFlush(ctx, batch, applied)
+			finished := f.afterFlush(ctx, batch, applied)
 			if !noBatches {
-				f.settle(ctx, batch)
+				f.followUp(ctx, finished)
 			}
 			return
 		}
@@ -166,39 +206,50 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 		backoff = min(backoff*2, 5*time.Second)
 		if errors.Is(err, context.DeadlineExceeded) && len(batch) > 1 {
 			half := len(batch) / 2
-			f.flush(ctx, batch[:half])
-			f.flush(ctx, batch[half:])
+			f.write(ctx, batch[:half], skipLocked)
+			f.write(ctx, batch[half:], skipLocked)
 			return
 		}
 	}
 }
 
-// settle settles the batches of the jobs a flush finished, once it has
-// committed: a batch whose last jobs this flush and another client's
-// finalized at the same time is completed by whichever of the two settles
-// second.
-func (f *finalizer) settle(ctx context.Context, batch []pending) {
+// followUp settles the batches of jobs that have finished and promotes
+// their dependents, once the statements that finished them have committed:
+// of two clients that finalized a batch's or a dependent's last jobs at the
+// same time, each missing the other's, the one that follows up second
+// completes the batch and promotes the dependent.
+func (f *finalizer) followUp(ctx context.Context, finished []pending) {
 	seen := map[driver.JobID]struct{}{}
-	var ids []driver.JobID
-	for _, p := range batch {
-		if _, dup := seen[p.job.BatchID]; dup || p.job.BatchID.IsZero() || !p.result.State.Terminal() {
+	var batches, jobs []driver.JobID
+	for _, p := range finished {
+		if p.job.BatchID.IsZero() {
 			continue
 		}
-		seen[p.job.BatchID] = struct{}{}
-		ids = append(ids, p.job.BatchID)
+		jobs = append(jobs, p.job.ID)
+		if _, dup := seen[p.job.BatchID]; !dup {
+			seen[p.job.BatchID] = struct{}{}
+			batches = append(batches, p.job.BatchID)
+		}
 	}
-	if len(ids) == 0 {
+	if len(jobs) == 0 {
 		return
 	}
 	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
 	defer cancel()
-	if _, err := f.exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: ids}); err != nil {
-		f.logger.WarnContext(ctx, "hopper: settle batches; the leader will", "count", len(ids), "error", err)
+	if _, err := f.exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: batches}); err != nil {
+		f.logger.WarnContext(ctx, "hopper: settle batches; the leader will", "count", len(batches), "error", err)
+	}
+	if _, err := f.exec.WorkflowPromoteReady(opCtx, driver.WorkflowPromoteParams{DependsOn: jobs}); err != nil {
+		f.logger.WarnContext(ctx, "hopper: promote dependents; the leader will", "count", len(jobs), "error", err)
 	}
 }
 
-// afterFlush logs fenced results and wakes producers for immediate retries.
-func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []driver.JobID) {
+// afterFlush reports applied results, wakes producers for immediate
+// retries, and returns the jobs that finished. A result the statement did
+// not apply was fenced, or, for a job completed with CompleteTx, skipped
+// because the worker's transaction still held its row; the job's row tells
+// which.
+func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []driver.JobID) []pending {
 	var ok map[driver.JobID]struct{}
 	if len(applied) != len(batch) {
 		ok = make(map[driver.JobID]struct{}, len(applied))
@@ -206,9 +257,16 @@ func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []d
 			ok[id] = struct{}{}
 		}
 	}
+	var finished []pending
 	for _, p := range batch {
 		if ok != nil {
 			if _, was := ok[p.result.ID]; !was {
+				if p.completedTx != nil {
+					if p, done := f.notWritten(ctx, p); done {
+						finished = append(finished, p)
+					}
+					continue
+				}
 				f.logger.WarnContext(ctx, "hopper: result dropped: job no longer owned by this attempt", "job_id", p.result.ID)
 				continue
 			}
@@ -217,5 +275,32 @@ func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []d
 			f.wake(p.job.Queue)
 		}
 		f.applied(p.job, p.result)
+		if p.result.State.Terminal() {
+			finished = append(finished, p)
+		}
 	}
+	return finished
+}
+
+// notWritten handles the other outcome of a job completed with CompleteTx
+// that the statement did not apply. If the job finished in this attempt,
+// the transaction committed after all, and the completion is reported. If
+// the job is still running in this attempt, the transaction has not ended:
+// the result is tried again later, so that a worker that returned without
+// ending it holds up only its own job. Otherwise the job has moved on, and
+// the result is dropped.
+func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
+	switch readTx(ctx, f.exec, p.job) {
+	case txCommitted:
+		f.applied(p.job, *p.completedTx)
+		return p, true
+	case txLost:
+		f.logger.WarnContext(ctx, "hopper: result dropped: job no longer owned by this attempt", "job_id", p.result.ID)
+		return p, false
+	}
+	if p.waits++; p.waits == 1 {
+		f.logger.WarnContext(ctx, "hopper: the transaction a worker completed its job in is still open after the worker returned; the job's result waits for it", "job_id", p.result.ID)
+	}
+	time.AfterFunc(heldRetry, func() { f.submit(p) })
+	return p, false
 }

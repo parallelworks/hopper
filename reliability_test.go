@@ -397,9 +397,45 @@ func TestLeaderMaintainsHistoryPartitions(t *testing.T) {
 	waitFor(t, c.IsLeader)
 	// On election the leader creates the partitions for the periods ahead.
 	next := "hopper_job_history_completed_" + time.Now().UTC().Add(time.Hour).Format("2006010215")
-	waitFor(t, func() bool { return h.count("SELECT count(*) FROM pg_tables WHERE tablename = $1", next) == 1 })
+	waitFor(t, func() bool {
+		return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", next) == 1
+	})
 	nextDay := "hopper_job_history_failed_" + time.Now().UTC().Add(24*time.Hour).Format("20060102")
-	waitFor(t, func() bool { return h.count("SELECT count(*) FROM pg_tables WHERE tablename = $1", nextDay) == 1 })
+	waitFor(t, func() bool {
+		return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", nextDay) == 1
+	})
+}
+
+// TestLeaderRetriesDeferredPartitions holds off the attach of the
+// partitions ahead with a transaction that writes to the DEFAULT history
+// partition, as an open CompleteTx does. The leader defers them, and creates
+// them on a later pass once the transaction ends, without waiting for the
+// next maintenance interval.
+func TestLeaderRetriesDeferredPartitions(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "LOCK TABLE hopper_job_history_completed_default IN ROW EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	c := h.started(hopper.NewWorkers(), 1)
+	waitFor(t, c.IsLeader)
+	next := "hopper_job_history_completed_" + time.Now().UTC().Add(time.Hour).Format("2006010215")
+	time.Sleep(3 * fastTuning.LeaderInterval)
+	if h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", next) != 0 {
+		t.Fatal("partition attached while the DEFAULT partition was in use")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		return h.count("SELECT count(*) FROM pg_tables WHERE schemaname = current_schema() AND tablename = $1", next) == 1
+	})
 }
 
 func TestNotificationsWakeOtherClients(t *testing.T) {

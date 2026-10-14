@@ -131,6 +131,26 @@ hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[ResizeImag
 `http.Handle`. Calling `Insert` with an args type that has no registered worker on this
 client is allowed (another service may work it), but `Config.StrictKinds` rejects it.
 
+A worker whose work is in the same database can complete its job in the same
+transaction, so the job runs exactly once even if the process dies right after:
+
+```go
+func (w *TransferWorker) Work(ctx context.Context, job *hopper.Job[Transfer]) error {
+    tx, err := w.pool.Begin(ctx)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback(ctx)
+    if err := w.ledger.Apply(ctx, tx, job.Args); err != nil {
+        return err
+    }
+    if err := hopper.CompleteTx(ctx, tx, job); err != nil {
+        return err
+    }
+    return tx.Commit(ctx)
+}
+```
+
 Workers are registered before the client that runs them exists, so a worker or
 subscriber that needs the client, to insert follow-up jobs, publish or query, takes it
 from its context: `hopper.ClientFromContext[pgx.Tx](ctx)` returns the client running the
@@ -712,8 +732,45 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   - **`hopper.Cancel(err)`:** `discarded` immediately.
 - `backoff(n) = n^4 + 5s ± 10% jitter`, capped at 24h. It can be overridden per worker
   with `NextRetry(job) time.Time` or per queue with a `RetryPolicy`.
-- `CompleteTx(ctx, tx, job)` finalizes inside the worker's own transaction, so the work
-  and its completion commit together. It bypasses the buffer.
+- `hopper.CompleteTx(ctx, tx, job)` completes the job inside the worker's own
+  transaction, so the work and its completion commit together. It runs the finalize
+  statement above for one completed result through `Driver.UnwrapTx(tx)`, bypassing
+  the buffer, with the output `SetOutput` recorded so far and the queue's
+  `DeleteCompleted`; it takes the client from the job's context (§4.1), so it needs
+  no client argument. The fence applies as to any finalize: if the attempt no longer
+  owns the job, nothing is written and `ErrJobFenced` is returned. History, awaited
+  jobs (`pg_notify` is transactional), batches and workflow dependents all take effect
+  when `tx` commits.
+- After the worker returns, the client reads the job (one primary-key read of the
+  live table and history), because a fenced result cannot tell a commit from a rescue
+  that applied once `tx` rolled back.
+  - **Committed.** If the job is in history as this attempt completed it, or gone (a
+    completed job on a `DeleteCompleted` queue), `tx` committed, whatever the worker
+    returned: the client emits `job.completed`, settles the job's batch and promotes
+    its dependents (§11), and writes nothing. This is the common case. Neither the
+    failure log nor the retry policy runs.
+  - **Not committed.** Otherwise the attempt's other outcome applies: the worker's
+    error, or `the worker returned nil, but the transaction it completed the job in did
+    not commit` if it returned nil. The job retries (or is discarded on its last
+    attempt), so no job is left running because a worker ignored a failed commit. The
+    finalizer writes these results in their own statement with `SKIP LOCKED`, because
+    a worker may return before `tx` ends: a job whose row is still held is read again,
+    and if it is still running in this attempt, its result is retried every 250 ms
+    (with one warning) while the client's other results keep flushing. Once `tx`
+    ends, the job is reported completed if it committed, or the result applies. A job
+    that moved on without this attempt (rescued) is dropped like any fenced result.
+  - **Unknown.** If the read fails, the result goes the same way, and the fence and a
+    second read decide.
+- From `CompleteTx` until `tx` ends, `tx` holds the job's row and those of workflow
+  dependents it promotes or cancels, and a lock on the history table that holds off
+  the creation and drop of history partitions (which give up after 200 ms and retry
+  on the next pass, §7.10). Its batch progress is an appended row (§11), so the job's
+  siblings finalize without waiting for it, and the leader's rescue skips rows a
+  transaction holds, so a lost client's open `tx` holds up neither. Once the worker
+  returns and the client has seen `tx` commit, it settles the job's batch and promotes
+  its dependents, which completes the batch or starts the dependent if a sibling
+  finalized at the same time missed this job. `CompleteTx` belongs last, just before
+  the commit.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure
@@ -747,7 +804,9 @@ the largest source of write amplification in heartbeat-based designs.
 - **Rescue.** The leader's rescuer finds `running` jobs whose `attempted_by` has no
   unexpired lease and moves them to `retryable` with the error `client lost` (or to
   `discarded` if they are out of attempts). A crashed pod's jobs run again within about
-  20s.
+  20s. The rescue's finalize skips rows another transaction holds (a `CompleteTx` that
+  has not ended, §7.5) and retries them on the next pass, so one such row cannot hold
+  up the leader's loop and its lease renewal.
 - **Fencing.** If a renewal matches zero rows (after a long GC pause or a partition),
   the client has lost its lease. It cancels the context of every in-flight job that has
   attempts left and re-registers under a new ID. A job on its last attempt keeps
@@ -798,7 +857,8 @@ can briefly overlap during a partition.
 
 Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
 partitions ahead of time and dropping expired ones, removing stale `hopper_clients`
-rows, and sweeping the batch progress that clients did not settle (§11).
+rows, sweeping the batch progress that clients did not settle, and promoting
+workflow jobs whose last dependencies finished in concurrent transactions (§11).
 
 A client with `Config.NeverLead` never attempts the lease. It claims and works jobs
 like any other, so an install can include processes that should do work but not run
@@ -829,13 +889,24 @@ Retention is enforced by dropping whole partitions, so there is no `DELETE`, no 
 tuples and no vacuum work. The leader creates partitions several intervals ahead
 (three hours for `completed`, two days for `failed`), on election and every five
 minutes. A partition is created standalone and then attached, which takes only a
-`SHARE UPDATE EXCLUSIVE` lock on the parent, so finalizes are never blocked by
-maintenance. Only future periods are created and no row is ever moved: rows finalized
-before their period's partition existed (the first period after installation, or
-after a long leader outage) land in a `DEFAULT` partition and are deleted individually
-once past retention. Dropping a partition takes a brief `ACCESS EXCLUSIVE` lock on the
-parent, once per period. Retention periods are set in `Config` and enforced by the
-leader, so the leader's settings apply cluster-wide.
+`SHARE UPDATE EXCLUSIVE` lock on the parent. Only future periods are created and no
+row is ever moved: rows finalized before their period's partition existed (the first
+period after installation, or after a long leader outage) land in a `DEFAULT`
+partition and are deleted individually once past retention. Attaching scans the
+`DEFAULT` partition under an `ACCESS EXCLUSIVE` lock on it, and dropping a partition
+takes a brief `ACCESS EXCLUSIVE` lock on the parent, once per period. A transaction
+that wrote history and is still open (a worker's `CompleteTx`) holds either lock off,
+and while the DDL waits, every finalize that writes to the same table queues behind
+it. Both therefore run under a `lock_timeout`: one that cannot get its lock is
+reported as deferred, and so are the rest of its kind in the same group, untried,
+since they wait for the same lock. Deferred work is retried on the next leader pass
+rather than the next maintenance interval, with the timeout doubling on each
+consecutive deferral from 200 ms to at most 2 s, so that transactions that keep
+overlapping cannot hold retention, or the partitions ahead, off for good. Maintenance
+therefore holds up a group's finalizes for at most that timeout per kind of DDL each
+pass. Deferrals are logged at debug level, and as a warning from the fifth pass in a
+row. Retention periods are set in `Config` and enforced by the leader, so the leader's
+settings apply cluster-wide.
 
 The defaults follow common practice: job queues keep successful jobs briefly and
 failures longer, while brokers such as RabbitMQ and SQS delete a message once it is
@@ -1192,7 +1263,20 @@ observability without new machinery.
   outcome). Cancelled dependents go to history with a "dependency failed" error and
   count as batch failures. Every finalizing statement (the batched finalize,
   cancelling a waiting job, expiring) ends with the same tail, so batches and
-  dependents behave the same however a job finishes. Workflows are inspectable with
+  dependents behave the same however a job finishes.
+  - **Concurrent dependencies.** Two dependencies of one job finalized by concurrent
+    transactions (two clients, or a `CompleteTx` held open while a sibling
+    finalizes) each see the other still live, so neither statement promotes the
+    dependent. `WorkflowPromoteReady` promotes pending jobs none of whose dependencies
+    is still live, skipping rows a finalize holds. After each flush commits, the
+    finalizer runs it on the dependents of the jobs the flush finished (and the client
+    does for a job it saw `CompleteTx` commit), so of the two, the one that follows up
+    second promotes the dependent at once. The leader sweeps up what clients left (a
+    client that stopped between commit and follow-up): it walks `hopper_job_deps` a
+    chunk at a time in ID order, for at most one leader interval per pass, resuming
+    where it stopped, so it costs nothing without unfinished workflows and a bounded
+    amount per pass however many pending steps they have.
+  Workflows are inspectable with
   `WorkflowGet`, `hopper workflows get` and, as a DAG, in `hopperui`.
 
 ## 12. Migrations
@@ -1271,8 +1355,8 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease, backdate an attempt, count rows). Engine internals such as partition management stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. Global and rate limits never exceeded. Ordering keys never run two at once. |
-| Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |
 | Test helpers | The `hoppertest` package: `RequireInserted[T]`, `RequireManyInserted[T]`, `RequireNotInserted[T]` and their `Tx` variants (which look inside the caller's transaction), and `Work[T]`, which runs a worker inline on a synthetic job with no database round trip. |
