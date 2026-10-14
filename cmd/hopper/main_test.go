@@ -102,6 +102,12 @@ func TestCLI(t *testing.T) {
 	if err := json.Unmarshal([]byte(hopperCmd("-json", "jobs", "list", "-state", "available")), &jobs); err != nil || len(jobs) != 1 {
 		t.Errorf("json jobs = %v, %v", jobs, err)
 	}
+	if got := hopperCmd("jobs", "delete", keyed.Job.ID.String()); !strings.Contains(got, "state:         canceled") {
+		t.Errorf("jobs delete = %q", got)
+	}
+	if got := hopperCmd("jobs", "list"); strings.Contains(got, keyed.Job.ID.String()) {
+		t.Errorf("jobs list after delete = %q", got)
+	}
 
 	hopperCmd("queues", "pause", "q1")
 	if got := hopperCmd("queues", "list"); !strings.Contains(got, "q1") || !strings.Contains(got, "since") {

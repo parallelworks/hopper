@@ -79,7 +79,8 @@ func (e *JobFailedError) Error() string {
 // job with InsertOpts.Await so that the finalize is announced and Await
 // returns as soon as it commits; otherwise, and on a client that is not
 // started, Await polls every Config.PollInterval. A completed job without
-// output yields the zero T.
+// output yields the zero T. A job that does not exist, or no longer does
+// (JobDelete), yields ErrNotFound.
 func Await[T any, TTx any](ctx context.Context, c *Client[TTx], id JobID) (T, error) {
 	var zero T
 	ch := c.awaitDone(id)

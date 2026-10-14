@@ -1,6 +1,6 @@
 // Package hopperui is a web UI for hopper: an http.Handler that browses
 // queues, jobs, history, workflows, subscriptions, stream consumers and
-// clients, and can retry, cancel, pause, resume and seek when the
+// clients, and can retry, cancel, delete, pause, resume and seek when the
 // application allows it.
 //
 //	mux.Handle("/hopper/", http.StripPrefix("/hopper", hopperui.New(client, &hopperui.Config{
@@ -42,6 +42,7 @@ type Action string
 const (
 	ActionRetry  Action = "retry"
 	ActionCancel Action = "cancel"
+	ActionDelete Action = "delete"
 	ActionPause  Action = "pause"
 	ActionResume Action = "resume"
 	ActionSeek   Action = "seek"
@@ -101,19 +102,22 @@ func New[TTx any](client *hopper.Client[TTx], cfg *Config) http.Handler {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		http.ServeContent(w, r, "style.css", time.Time{}, bytes.NewReader(styleCSS))
 	})
-	u.mux = mux
+	// Every action is a POST from the UI's own pages; a browser's request
+	// from another site is refused, so that a page elsewhere cannot act with
+	// the operator's credentials.
+	u.handler = http.NewCrossOriginProtection().Handler(mux)
 	return u
 }
 
 type ui[TTx any] struct {
-	client *hopper.Client[TTx]
-	cfg    Config
-	tmpl   *template.Template
-	mux    *http.ServeMux
+	client  *hopper.Client[TTx]
+	cfg     Config
+	tmpl    *template.Template
+	handler http.Handler
 }
 
 func (u *ui[TTx]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	u.mux.ServeHTTP(w, r)
+	u.handler.ServeHTTP(w, r)
 }
 
 // page is what every template receives.
@@ -142,6 +146,10 @@ func (u *ui[TTx]) fail(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, hopper.ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
+	case errors.Is(err, hopper.ErrJobRunning), errors.Is(err, hopper.ErrUniqueConflict):
+		// The page showed the job before it started, or before another job
+		// took its unique key.
+		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, context.Canceled):
 		http.Error(w, "canceled", 499)
 	default:
@@ -353,6 +361,16 @@ func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		job, err = u.client.JobCancel(r.Context(), id)
+	case "delete":
+		if !u.authorize(w, r, ActionDelete) {
+			return
+		}
+		if _, err := u.client.JobDelete(r.Context(), id); err != nil {
+			u.fail(w, err)
+			return
+		}
+		u.back(w, r, "/jobs", fmt.Sprintf("job %s deleted", id))
+		return
 	default:
 		http.NotFound(w, r)
 		return
@@ -437,7 +455,13 @@ func layout(wf *hopper.WorkflowRow) workflowData {
 		data.Height = max(data.Height, y+nodeH+gapY)
 	}
 	for _, e := range wf.Edges {
-		from, to := index[e.DependsOn], index[e.Job]
+		// A job that left history (JobDelete, retention, or a completed job
+		// of a DeleteCompleted queue) has no box to draw an edge to.
+		from, okFrom := index[e.DependsOn]
+		to, okTo := index[e.Job]
+		if !okFrom || !okTo {
+			continue
+		}
 		f, t := data.Nodes[from], data.Nodes[to]
 		data.Edges = append(data.Edges, edge{X1: f.X + nodeW, Y1: f.Y + nodeH/2, X2: t.X, Y2: t.Y + nodeH/2})
 	}

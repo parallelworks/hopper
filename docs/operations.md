@@ -146,8 +146,10 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
 - The `hopperui` module is a web UI: mount `hopperui.New(client, cfg)` under a
   path of your application (`http.StripPrefix`) to browse queues, jobs,
   workflows, subscriptions, consumers and clients. Pass `Config.Authorize` to
-  enable retry, cancel, pause, resume and seek; without it the UI is
-  read-only.
+  enable retry, cancel, delete, pause, resume and seek; without it the UI is
+  read-only. A browser's cross-site request to an action is refused
+  (`http.CrossOriginProtection`), so another site cannot act with an
+  operator's cookies.
 - `pg_stat_activity` shows the listener connection as
   `hopper-listener:<schema>`.
 
@@ -156,7 +158,7 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
 ```sh
 hopper [-schema NAME] migrate up|down|version
 hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
-hopper jobs get|retry|cancel <id>
+hopper jobs get|retry|cancel|delete <id>
 hopper queues list|pause|resume [name]
 hopper clients list
 hopper stats

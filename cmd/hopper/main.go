@@ -2,7 +2,7 @@
 //
 //	hopper migrate up|down|version [-target N]
 //	hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
-//	hopper jobs get|retry|cancel <id>
+//	hopper jobs get|retry|cancel|delete <id>
 //	hopper queues list|pause|resume [name]
 //	hopper queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]
 //	hopper clients list
@@ -54,7 +54,7 @@ const usage = `usage: hopper [-database-url URL] [-schema NAME] [-json] <command
 commands:
   migrate up|down|version [-target N]
   jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
-  jobs get|retry|cancel <id>
+  jobs get|retry|cancel|delete <id>
   queues list
   queues pause|resume <name>
   queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]   (omitted limits are removed)
@@ -216,7 +216,7 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 			}
 			tw.Flush()
 		})
-	case "get", "retry", "cancel":
+	case "get", "retry", "cancel", "delete":
 		if len(args) != 2 {
 			return fmt.Errorf("jobs %s: one job ID is required", args[0])
 		}
@@ -232,6 +232,8 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 			job, err = c.client.JobRetry(ctx, id)
 		case "cancel":
 			job, err = c.client.JobCancel(ctx, id)
+		case "delete":
+			job, err = c.client.JobDelete(ctx, id)
 		}
 		if err != nil {
 			return err

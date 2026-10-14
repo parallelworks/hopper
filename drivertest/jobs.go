@@ -934,3 +934,211 @@ func testList[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("newest first, key k, available = %v", got)
 	}
 }
+
+// testJobDelete deletes jobs in every state: a finalized job leaves history,
+// and a waiting one is canceled on the way out, so that its batch and its
+// dependents go on as after a cancel.
+func testJobDelete[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	gone := func(id driver.JobID) {
+		t.Helper()
+		if _, err := exec.JobGet(ctx, id); !errors.Is(err, driver.ErrNotFound) {
+			t.Errorf("job %s after delete: %v, want ErrNotFound", id, err)
+		}
+	}
+
+	if _, err := exec.JobDelete(ctx, driver.JobID{1}); !errors.Is(err, driver.ErrNotFound) {
+		t.Errorf("delete unknown = %v, want ErrNotFound", err)
+	}
+
+	done := insert(ctx, t, exec, params("a", 1))[0].Job.ID
+	claim(ctx, t, exec, clientID, 1)
+	finalize(ctx, t, exec, driver.JobFinalize{ID: done, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	if job, err := exec.JobDelete(ctx, done); err != nil || job.ID != done || job.State != driver.JobStateCompleted {
+		t.Errorf("delete completed = %+v, %v", job, err)
+	}
+	gone(done)
+
+	running := insert(ctx, t, exec, params("a", 1))[0].Job.ID
+	claim(ctx, t, exec, clientID, 1)
+	if _, err := exec.JobDelete(ctx, running); !errors.Is(err, driver.ErrJobRunning) {
+		t.Errorf("delete running = %v, want ErrJobRunning", err)
+	}
+	if j, err := exec.JobGet(ctx, running); err != nil || j.State != driver.JobStateRunning {
+		t.Errorf("running job after a refused delete = %+v, %v", j, err)
+	}
+
+	// A workflow: deleting its first job, still waiting, cancels the job
+	// that depends on it, and the workflow's batch completes with both
+	// failed.
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Name: "w", Jobs: []driver.JobInsertParams{params("w", 1)[0], params("w", 1)[0]},
+		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID
+	if job, err := exec.JobDelete(ctx, first); err != nil || job.ID != first || job.State != driver.JobStateCanceled {
+		t.Errorf("delete waiting = %+v, %v", job, err)
+	}
+	gone(first)
+	if j, err := exec.JobGet(ctx, second); err != nil || j.State != driver.JobStateCanceled {
+		t.Errorf("dependent of a deleted job = %+v, %v, want canceled", j, err)
+	}
+	if b, err := exec.BatchGet(ctx, wf.ID); err != nil || b.CompletedAt.IsZero() || b.Failed != 2 {
+		t.Errorf("workflow batch after the delete = %+v, %v", b, err)
+	}
+
+	// In a caller's transaction, a refused delete leaves the transaction
+	// usable for the next one.
+	tx, commit, _ := f.Begin(ctx, t, d)
+	txExec := d.UnwrapTx(tx)
+	if _, err := txExec.JobDelete(ctx, running); !errors.Is(err, driver.ErrJobRunning) {
+		t.Errorf("delete running in a transaction = %v, want ErrJobRunning", err)
+	}
+	if job, err := txExec.JobDelete(ctx, second); err != nil || job.ID != second {
+		t.Errorf("delete after a refused delete in a transaction = %+v, %v", job, err)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	gone(second)
+}
+
+// testJobDeleteRacesRetry deletes a finalized job while a transaction that
+// retries it is open: once the retry commits, the delete finds the job live
+// again and deletes it there, instead of reporting it unknown and leaving
+// it to run.
+func testJobDeleteRacesRetry[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	id := insert(ctx, t, exec, params("a", 1))[0].Job.ID
+	if _, err := exec.JobCancel(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	tx, commit, _ := f.Begin(ctx, t, d)
+	if _, err := d.UnwrapTx(tx).JobRetry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	var deleted *driver.JobRow
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		deleted, err = exec.JobDelete(ctx, id)
+		done <- err
+	}()
+	waitForLockWait(ctx, t, f, d)
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil || deleted.State != driver.JobStateCanceled {
+		t.Errorf("delete racing a retry = %+v, %v", deleted, err)
+	}
+	if _, err := exec.JobGet(ctx, id); !errors.Is(err, driver.ErrNotFound) {
+		t.Errorf("job after a delete that raced its retry: %v, want ErrNotFound", err)
+	}
+}
+
+// testRetryOrderingKeyTx wakes a key in a transaction that began before the
+// attempt of the key's running job: the mark is that attempt's, so the
+// snooze the attempt ends in runs at once.
+func testRetryOrderingKeyTx[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	p := params("k", 1)
+	p[0].OrderingKey = "a"
+	job := insert(ctx, t, exec, p)[0].Job.ID
+	tx, commit, _ := f.Begin(ctx, t, d)
+	txExec := d.UnwrapTx(tx)
+	if _, err := txExec.Now(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if jobs := claim(ctx, t, exec, clientID, 1); len(jobs) != 1 || jobs[0].ID != job {
+		t.Fatalf("claim = %+v", jobs)
+	}
+	if n, err := txExec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: "default", OrderingKey: "a", Limit: 10}); err != nil || n != 0 {
+		t.Fatalf("JobRetryOrderingKey in a transaction = %d, %v", n, err)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	finalize(ctx, t, exec, driver.JobFinalize{ID: job, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true})
+	if due := f.QueryText(ctx, t, d, "SELECT (scheduled_at <= now())::text FROM hopper_jobs WHERE id = $1::uuid", job.String()); due != "true" {
+		t.Error("a wake in a transaction older than the attempt was lost")
+	}
+}
+
+// testJobDeleteRacesClaim deletes waiting jobs while claims take them: each
+// job either runs or is deleted, never both, and none is lost.
+func testJobDeleteRacesClaim[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	exec := f.NewDriver(t).Executor()
+	const n = 200
+	inserted := insert(ctx, t, exec, params("a", n))
+	clientID := register(ctx, t, exec)
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		claimed = map[driver.JobID]bool{}
+		deleted = map[driver.JobID]bool{}
+	)
+	wg.Go(func() {
+		for range n {
+			res, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 5})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			for _, j := range res.Jobs {
+				claimed[j.ID] = true
+			}
+			mu.Unlock()
+			if len(res.Jobs) == 0 {
+				return
+			}
+		}
+	})
+	for i := range 4 {
+		wg.Go(func() {
+			for k := i; k < n; k += 4 {
+				id := inserted[k].Job.ID
+				_, err := exec.JobDelete(ctx, id)
+				switch {
+				case err == nil:
+					mu.Lock()
+					deleted[id] = true
+					mu.Unlock()
+				case !errors.Is(err, driver.ErrJobRunning):
+					t.Errorf("delete %s: %v", id, err)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	for _, r := range inserted {
+		id := r.Job.ID
+		switch {
+		case claimed[id] && deleted[id]:
+			t.Errorf("job %s was both claimed and deleted", id)
+		case !claimed[id] && !deleted[id]:
+			t.Errorf("job %s was neither claimed nor deleted", id)
+		case claimed[id]:
+			if j, err := exec.JobGet(ctx, id); err != nil || j.State != driver.JobStateRunning {
+				t.Errorf("claimed job %s = %+v, %v", id, j, err)
+			}
+		default:
+			if _, err := exec.JobGet(ctx, id); !errors.Is(err, driver.ErrNotFound) {
+				t.Errorf("deleted job %s: %v", id, err)
+			}
+		}
+	}
+}

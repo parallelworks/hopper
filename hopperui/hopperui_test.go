@@ -168,6 +168,54 @@ func TestUI(t *testing.T) {
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())
 	want(200, body, code, "available")
+	// A browser's cross-site request is refused before it reaches an action.
+	{
+		req, _ := http.NewRequest(http.MethodPost, admin.URL+"/hopper/jobs/"+job.Job.ID.String()+"/delete", nil)
+		req.Header.Set("X-Admin", "1")
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusForbidden {
+			t.Errorf("cross-site delete = %d, want 403", res.StatusCode)
+		}
+	}
+	code, body = post(readOnly, "/jobs/"+job.Job.ID.String()+"/delete", nil, true)
+	want(403, body, code, "read-only")
+	code, _ = post(admin, "/jobs/"+job.Job.ID.String()+"/delete", nil, true)
+	want(303, "", code)
+	code, body = get(admin, "/jobs/"+job.Job.ID.String())
+	want(404, body, code)
+	busy, err := client.Insert(ctx, ping{N: 3}, &hopper.InsertOpts{Queue: "busy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE hopper_jobs SET state = 'running', attempt = 1, attempted_at = now() WHERE id = $1", [16]byte(busy.Job.ID)); err != nil {
+		t.Fatal(err)
+	}
+	code, body = post(admin, "/jobs/"+busy.Job.ID.String()+"/delete", nil, true)
+	want(409, body, code, "running")
+
+	// A workflow whose jobs were deleted draws only the edges between the
+	// jobs left, and none once every job is gone.
+	code, _ = post(admin, "/jobs/"+wres.Jobs[0].Job.ID.String()+"/delete", nil, true)
+	want(303, "", code)
+	code, body = get(admin, "/workflows/"+wres.ID.String())
+	want(200, body, code, "Workflow ingest")
+	if n := strings.Count(body, `<line `); n != 1 {
+		t.Errorf("edges drawn after deleting the first step = %d, want 1", n)
+	}
+	for _, j := range wres.Jobs[1:] {
+		code, _ = post(admin, "/jobs/"+j.Job.ID.String()+"/delete", nil, true)
+		want(303, "", code)
+	}
+	code, body = get(admin, "/workflows/"+wres.ID.String())
+	want(200, body, code, "Workflow ingest")
+	if n := strings.Count(body, `<line `); n != 0 {
+		t.Errorf("edges drawn after deleting every step = %d, want 0", n)
+	}
 	code, body = post(admin, "/consumers/nobody/seek", url.Values{"to": {"earliest"}}, true)
 	want(404, body, code)
 	code, body = post(admin, "/consumers/nobody/seek", url.Values{"to": {"sideways"}}, true)

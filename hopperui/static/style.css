@@ -34,6 +34,11 @@ button { cursor: pointer; }
 button:hover { border-color: var(--brand); color: var(--brand); }
 form { display: inline; margin: 0; }
 .actions { display: flex; gap: 8px; }
+.confirm { display: inline-flex; gap: 8px; align-items: center; }
+.confirm summary { list-style: none; cursor: pointer; border: 1px solid var(--line); border-radius: 5px; padding: 4px 8px; }
+.confirm summary::-webkit-details-marker { display: none; }
+.confirm summary:hover, .confirm[open] summary { border-color: var(--bad); color: var(--bad); }
+.confirm button { border-color: var(--bad); color: var(--bad); }
 .seek { display: flex; flex-wrap: wrap; gap: 6px; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0 0 12px; }
 dt { color: var(--dim); }

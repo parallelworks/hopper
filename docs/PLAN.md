@@ -224,6 +224,8 @@ report, err := hopper.Await[ReportURL](ctx, client, res.Job.ID) // worker called
 client.JobCancel(ctx, id)            // works on any live job, including one running on another pod
 client.JobRetry(ctx, id)             // re-drive a discarded or canceled job from history
 client.JobRetryOrderingKey(ctx, "billing", "customer:42") // wake a key's snoozed and retrying jobs
+client.JobDelete(ctx, id)            // remove a job that is not running, live or from history
+client.JobCancelTx(ctx, tx, id)      // ...Tx variants commit with the caller's own changes
 job, err := client.JobGet(ctx, id)   // live or historical
 
 for job, err := range client.Jobs(ctx, hopper.JobFilter{
@@ -559,6 +561,7 @@ insert ──► scheduled ─┼─► (claim) running ─────┼──
   rescuer: running, owner's lease expired ──► retryable (or discarded)   │
   JobRetry ◄─────────────────────────────────────────────────────────────┘
   JobCancel: any live state; running jobs are signaled and finalize as canceled
+  JobDelete: any state but running; a waiting job is canceled without a history row
 ```
 
 `available`, `scheduled` and `retryable` all mean "claim once `scheduled_at <= now()`".
@@ -812,6 +815,10 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
     (with one warning) while the client's other results keep flushing. Once `tx`
     ends, the job is reported completed if it committed, or the result applies. A job
     that moved on without this attempt (rescued) is dropped like any fenced result.
+    Every other result goes in a statement that does not skip held rows, which is
+    cheaper. If that statement has not finished within 2 s, which a row held by a
+    caller's transaction (§7.7) causes, the batch is written again with `SKIP LOCKED`,
+    and a result left out is read again and retried in the same way.
   - **Unknown.** If the read fails, the result goes the same way, and the fence and a
     second read decide.
 - From `CompleteTx` until `tx` ends, `tx` holds the job's row and those of workflow
@@ -887,6 +894,30 @@ worker returns an error after the request, and as `completed` if it finishes any
 allowed if it had run out, and a fresh `seq`) or brings a waiting job forward; either
 way it clears the job's TTL (§7.3). It refuses a running job and a job whose unique key
 is held by a live job.
+
+`JobDelete` removes a job that is not running and refuses a running one (cancel it,
+then delete it once it has finished). A finalized job's history row is deleted. A
+waiting job is canceled by the statement `JobCancel` runs, except that it keeps no
+history row: its batch counts it as failed, its
+dependents react as to a cancel, and `Await` on it returns `ErrNotFound` instead of
+waiting for a job that no longer exists. There is no bulk delete: retention drops
+history by partition (§7.10), and an admin tool deletes chosen jobs with `JobDelete`
+over `Jobs`.
+
+`JobCancelTx`, `JobRetryTx`, `JobRetryOrderingKeyTx` and `JobDeleteTx` run the same
+statements in the caller's transaction, so the control call commits or rolls back with
+the caller's own changes. Nothing reaches other processes before the commit: the
+cancel request of a running job is a `pg_notify` in the transaction (with the lease
+renewal as the fallback), and a retry wakes its queue with a `pg_notify` in the
+transaction, instead of the client's own wake-up that `JobRetry` uses. The mark a
+key's wake leaves on its running job is dated by `statement_timestamp()`, not
+`now()`, so that a transaction older than the attempt still marks it. Until the
+transaction ends it holds the rows it changed, so a running job that `JobCancelTx` or
+`JobRetryOrderingKeyTx` reached cannot finalize. Its result alone waits: a finalize
+statement that does not skip held rows gets 2 s, after which the batch is written again
+skipping them (the statement `CompleteTx` results use, §7.5), and a held job's result is
+tried again every 250 ms while the job is still running in its attempt. These calls
+still belong late in the transaction, as `CompleteTx` does.
 
 ### 7.8 Leader election
 Leadership is a lease row in `hopper_leader`:
@@ -1427,7 +1458,7 @@ observability without new machinery.
   and counts attempts by outcome and their duration. `RegisterStats` adds observable
   gauges for queue depth by state, the oldest claimable job's age and live clients from
   `Stats`. Prometheus users export through the OTel exporter.
-- **CLI (`cmd/hopper`, core module):** `migrate up|down|version`, `jobs list|get|retry|cancel`,
+- **CLI (`cmd/hopper`, core module):** `migrate up|down|version`, `jobs list|get|retry|cancel|delete`,
   `queues list|pause|resume|limit`, `clients list`, `workflows get`, `subscriptions list`,
   `streams consumers|seek` and `stats`, all with `-json`. Benchmarks are the separate
   `hopperbench` command.
@@ -1436,9 +1467,10 @@ observability without new machinery.
   (depths, limits, paused state), jobs and history (filtered by queue, state and kind,
   paged by ID), a job's args, metadata, output and errors, workflows as a DAG (SVG, laid
   out by dependency depth), subscriptions, stream consumers and clients. Retry, cancel,
-  pause, resume and seek are offered only when the application supplies
+  delete (behind a confirmation), pause, resume and seek are offered only when the application supplies
   `Config.Authorize`, which is asked before every action; without it the UI is
-  read-only. It is server-rendered HTML with no scripts and no external assets, so it
+  read-only. Actions are POSTs, and a browser's cross-site request to one is refused
+  (`http.CrossOriginProtection`). It is server-rendered HTML with no scripts and no external assets, so it
   works behind any proxy and needs no build step. The client it is given need not be
   started.
 

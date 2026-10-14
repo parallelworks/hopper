@@ -604,6 +604,10 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	return jobs, nil
 }
 
+// jobLockStateSQL locks a live job's row and reads its state, which the
+// control operations branch on.
+const jobLockStateSQL = "SELECT state FROM {{schema}}.hopper_jobs WHERE id = $1 FOR UPDATE"
+
 var (
 	jobCancelRunningSQL = fmt.Sprintf(`
 UPDATE {{schema}}.hopper_jobs SET cancel_requested_at = coalesce(cancel_requested_at, now())
@@ -618,6 +622,16 @@ WITH RECURSIVE finished AS (
 ),
 ` + finalizeTailSQL("$2", "$3") + `
 SELECT ` + finishedSelectColumns + ` FROM finished`
+	// jobDeleteWaitingSQL is jobCancelWaitingSQL without the job's history
+	// row: its batch, its dependents and anyone awaiting it see it canceled,
+	// and nothing of it is kept.
+	jobDeleteWaitingSQL = `
+WITH RECURSIVE finished AS (
+  DELETE FROM {{schema}}.hopper_jobs j WHERE j.id = $1 AND j.state <> 'running'
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: canceled"), "NULL::jsonb", "false", "'canceled'::text", "$2") + `
+),
+` + finalizeTailSQL("$2", "$3") + `
+SELECT ` + finishedSelectColumns + ` FROM finished`
 )
 
 // JobCancel implements driver.Executor.
@@ -625,7 +639,7 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 	var job *driver.JobRow
 	err := e.withTx(ctx, func(tx Tx) error {
 		var state string
-		err := tx.QueryRow(ctx, "SELECT state FROM {{schema}}.hopper_jobs WHERE id = $1 FOR UPDATE", uuidParam(id)).Scan(&state)
+		err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
 		if errors.Is(err, ErrNoRows) {
 			// Not live: finalized already, or unknown.
 			job, err = e.JobGet(ctx, id)
@@ -654,10 +668,57 @@ func (e *Executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 	return job, nil
 }
 
+// jobDeleteHistorySQL removes a finalized job from history.
+var jobDeleteHistorySQL = fmt.Sprintf(`DELETE FROM {{schema}}.hopper_job_history WHERE id = $1
+RETURNING %s, finalized_at, output`, historyColumns())
+
+// JobDelete implements driver.Executor. A JobRetry that is moving the job
+// from history back to the live table makes the history delete wait for it
+// and then find nothing, so before the job is called unknown the live table,
+// where the retry put it, is read once more.
+func (e *Executor) JobDelete(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
+	var job *driver.JobRow
+	err := e.withTx(ctx, func(tx Tx) error {
+		// A finalized job that a JobRetry moves back to the live table while
+		// this waits on its history row is found live on the second look.
+		for second := false; ; second = true {
+			var state string
+			err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
+			switch {
+			case errors.Is(err, ErrNoRows):
+				job, err = scanJob(tx.QueryRow(ctx, jobDeleteHistorySQL, uuidParam(id)), true, nil)
+				if errors.Is(err, ErrNoRows) {
+					if second {
+						return driver.ErrNotFound
+					}
+					continue
+				}
+				return err
+			case err != nil:
+				return err
+			case driver.JobState(state) == driver.JobStateRunning:
+				return driver.ErrJobRunning
+			default:
+				job, err = scanJob(tx.QueryRow(ctx, jobDeleteWaitingSQL, uuidParam(id), driver.ChannelDone, driver.ChannelInsert), true, nil)
+				return err
+			}
+		}
+	})
+	if err != nil {
+		if errors.Is(err, driver.ErrNotFound) || errors.Is(err, driver.ErrJobRunning) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("hopper: delete job: %w", err)
+	}
+	return job, nil
+}
+
 // jobRunNowSQL is the SET list that makes a waiting job runnable now and
 // drops the reason it was waiting. A job that was already due keeps its
-// scheduled_at, so it keeps its place in claim order and its aging.
-const jobRunNowSQL = `state = 'available', scheduled_at = least(scheduled_at, now()), snooze_reason = NULL, wake_requested_at = NULL`
+// scheduled_at, so it keeps its place in claim order and its aging. Now is
+// the statement's time: in a caller's transaction (JobRetryTx) the
+// transaction's began earlier.
+const jobRunNowSQL = `state = 'available', scheduled_at = least(scheduled_at, statement_timestamp()), snooze_reason = NULL, wake_requested_at = NULL`
 
 var (
 	jobRetryLiveSQL = fmt.Sprintf(`
@@ -672,7 +733,7 @@ WITH h AS (DELETE FROM {{schema}}.hopper_job_history WHERE id = $1 RETURNING *)
 INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata,
   errors, unique_key, ordering_key, partition_key, batch_id, await, created_at)
 SELECT id, kind, queue, 'available', priority, attempt,
-  CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END, now(), args, metadata,
+  CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END, statement_timestamp(), args, metadata,
   errors, unique_key, ordering_key, partition_key, batch_id, await, created_at
 FROM h
 RETURNING %s`, JobColumns(""))
@@ -692,7 +753,7 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 	var job *driver.JobRow
 	err := e.withTx(ctx, func(tx Tx) error {
 		var state string
-		err := tx.QueryRow(ctx, "SELECT state FROM {{schema}}.hopper_jobs WHERE id = $1 FOR UPDATE", uuidParam(id)).Scan(&state)
+		err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
 		switch {
 		case errors.Is(err, ErrNoRows):
 			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id)), false, nil)
@@ -721,9 +782,12 @@ func (e *Executor) JobRetry(ctx context.Context, id driver.JobID) (*driver.JobRo
 }
 
 // jobMarkOrderingKeySQL marks the key's running job (through the unique
-// index on running ordering keys) so that its finalize honors the wake.
+// index on running ordering keys) so that its finalize honors the wake. The
+// mark is the statement's time, not the transaction's: in a caller's
+// transaction that began before the attempt, now() would date the mark
+// before attempted_at, and the finalize would take it for a stale one.
 const jobMarkOrderingKeySQL = `
-UPDATE {{schema}}.hopper_jobs SET wake_requested_at = now()
+UPDATE {{schema}}.hopper_jobs SET wake_requested_at = statement_timestamp()
 WHERE queue = $1 AND ordering_key = $2 AND state = 'running'`
 
 // jobRetryOrderingKeySQL locks a batch of the key's waiting jobs in seq
@@ -737,7 +801,7 @@ const jobRetryOrderingKeySQL = `
 WITH waiting AS (
   SELECT id FROM {{schema}}.hopper_jobs
   WHERE queue = $1 AND ordering_key = $2 AND state IN ('scheduled', 'retryable')
-    AND (expires_at IS NULL OR expires_at > now())
+    AND (expires_at IS NULL OR expires_at > statement_timestamp())
   ORDER BY seq
   LIMIT $3
   FOR UPDATE

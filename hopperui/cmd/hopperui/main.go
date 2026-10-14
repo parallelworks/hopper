@@ -33,7 +33,7 @@ func main() {
 		listen  = flag.String("listen", ":8080", "address to serve on")
 		prefix  = flag.String("prefix", "", "path prefix to serve under, such as /hopper")
 		title   = flag.String("title", "hopper", "title shown in the header")
-		actions = flag.Bool("allow-actions", false, "allow retry, cancel, pause, resume and seek for every request")
+		actions = flag.Bool("allow-actions", false, "allow retry, cancel, delete, pause, resume and seek for every request")
 	)
 	schema := flag.String("schema", "hopper", "Postgres schema for Hopper objects")
 	flag.Parse()

@@ -297,6 +297,7 @@ url, err := hopper.Await[string](ctx, client, res.Job.ID)
 client.JobCancel(ctx, id)            // any live job, on any replica
 client.JobRetry(ctx, id)             // re-drive from the dead-letter queue
 client.JobRetryOrderingKey(ctx, queue, key) // run a key's waiting jobs now
+client.JobDelete(ctx, id)            // remove a job that is not running
 job, err := client.JobGet(ctx, id)   // live or historical
 client.Queues().Pause(ctx, "email")
 stats, err := client.Stats(ctx)
