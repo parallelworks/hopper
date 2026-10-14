@@ -19,6 +19,14 @@ type stepped struct {
 
 func (stepped) Kind() string { return "stepped" }
 
+// stepTuning is fastTuning with a lease that a loaded machine does not lose:
+// a lost lease cancels the attempt, which these tests count.
+var stepTuning = func() hopper.Tuning {
+	t := fastTuning
+	t.LeaseTTL = 30 * time.Second
+	return t
+}()
+
 // runLog records the steps that ran, in order.
 type runLog struct {
 	mu  sync.Mutex
@@ -77,7 +85,7 @@ func TestRunStepsResumes(t *testing.T) {
 		Workers:     workers,
 		RetryPolicy: &hopper.ExponentialRetry{Base: time.Millisecond, Max: time.Millisecond},
 	})
-	c.SetTuning(fastTuning)
+	c.SetTuning(stepTuning)
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +145,7 @@ func TestRecordStepTx(t *testing.T) {
 		Workers:     workers,
 		RetryPolicy: &hopper.ExponentialRetry{Base: time.Millisecond, Max: time.Millisecond},
 	})
-	c.SetTuning(fastTuning)
+	c.SetTuning(stepTuning)
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +260,7 @@ func TestRunStepsCompleteTx(t *testing.T) {
 		JobTimeout:  5 * time.Second,
 		RetryPolicy: &hopper.ExponentialRetry{Base: time.Millisecond, Max: time.Millisecond},
 	})
-	c.SetTuning(fastTuning)
+	c.SetTuning(stepTuning)
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +358,7 @@ func TestRunStepsTxHeldAcrossSteps(t *testing.T) {
 		JobTimeout:  time.Minute,
 		RetryPolicy: &hopper.ExponentialRetry{Base: time.Millisecond, Max: time.Millisecond},
 	})
-	c.SetTuning(fastTuning)
+	c.SetTuning(stepTuning)
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +436,7 @@ func TestWorkersWorkInsideAJob(t *testing.T) {
 			return errors.New("progress not kept in the inline job")
 		}
 		if err := hopper.SetOutput(ctx, 1); !errors.Is(err, hopper.ErrNotInJob) {
-			return fmt.Errorf("SetOutput inline = %v, want ErrNotInJob", err)
+			return fmt.Errorf("SetOutput inline = %w, want ErrNotInJob", err)
 		}
 		return nil
 	})

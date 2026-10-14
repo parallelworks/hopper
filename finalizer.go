@@ -316,11 +316,12 @@ func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
 		return p, false
 	}
 	if p.waits++; p.waits == 1 {
-		if p.completedTx != nil {
+		switch {
+		case p.completedTx != nil:
 			f.logger.WarnContext(ctx, "hopper: the transaction a worker completed its job in is still open after the worker returned; the job's result waits for it", "job_id", p.result.ID)
-		} else if p.heldByTx {
+		case p.heldByTx:
 			f.logger.WarnContext(ctx, "hopper: a transaction a worker recorded its job's progress in is still open after the worker returned; the job's result waits for it", "job_id", p.result.ID)
-		} else {
+		default:
 			f.logger.WarnContext(ctx, "hopper: another transaction holds a finished job's row, such as one that called JobCancelTx and has not committed; the job's result waits for it", "job_id", p.result.ID)
 		}
 	}
