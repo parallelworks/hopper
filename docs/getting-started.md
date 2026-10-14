@@ -108,6 +108,11 @@ return hopper.Snooze(10 * time.Minute) // run again later; does not use an attem
 return hopper.Cancel(err)              // discard now, with err recorded
 ```
 
+`Config.RetryPolicy`, for example `hopper.ExponentialRetry{Base: time.Second,
+Max: time.Hour}`, replaces the backoff for workers without their own
+`NextRetry`. `Config.OnError` sees every failed attempt and recovered panic, of
+any kind, and can discard, snooze or reschedule the job.
+
 To show operators why a job is waiting, return the snooze with a reason. It is
 stored on the job as `SnoozeReason` until the job runs again:
 

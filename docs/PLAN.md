@@ -176,6 +176,13 @@ client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{
         hopper.Every(30*time.Second, RefreshCache{}, &hopper.PeriodicOpts{RunOnStart: true}),
     },
     Middleware: []hopper.Middleware{hopperotel.Middleware(otel.GetTracerProvider())},
+    RetryPolicy: hopper.ExponentialRetry{Base: time.Second, Max: time.Hour}, // unless a worker's NextRetry says otherwise
+    OnError: func(ctx context.Context, job *hopper.JobRow, err error) hopper.ErrorOutcome {
+        if errors.Is(err, errRateLimited) {
+            return hopper.ErrorOutcome{Snooze: time.Minute} // any kind; doesn't use up an attempt
+        }
+        return hopper.ErrorOutcome{} // keep the outcome
+    },
     // Logger defaults to slog.Default(); every other field has a production default.
 })
 // client is a *hopper.Client[pgx.Tx]. The driver fixes the transaction type,
@@ -682,7 +689,7 @@ RETURNING j.*;
 - Each job gets a context that is canceled on timeout (the worker's `Timeout()` or the
   queue default), on `JobCancel`, on lease loss (§7.6), or on a hard stop.
 - A panic is recovered and recorded as an error with its stack trace, then treated as
-  a normal failure.
+  a normal failure, which `Config.OnError` sees as a `*PanicError`.
 - `Middleware` (an interface with `Work` and `Insert` methods; `WorkMiddleware` and
   `InsertMiddleware` wrap a function) wraps execution for logging, metrics, tracing
   and custom policy, and wraps inserts, for example to inject trace context into
@@ -753,8 +760,31 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
     (`hopper: expired while snoozed: <reason>`, `hopper: canceled while snoozed:
     <reason>`).
   - **`hopper.Cancel(err)`:** `discarded` immediately.
-- `backoff(n) = n^4 + 5s ± 10% jitter`, capped at 24h. It can be overridden per worker
-  with `NextRetry(job) time.Time` or per queue with a `RetryPolicy`.
+  - `Config.OnError` can change the outcome of an error or a `Cancel` (below).
+- `Config.OnError(ctx, job, err) ErrorOutcome` sees every failed attempt the client
+  runs, of any kind, with the worker's error: a returned error, a recovered panic
+  (`*PanicError`), a timeout, a `Cancel`, or a kind with no worker. It can change the
+  outcome: `Discard` (as `Cancel`), `Snooze` (as `Snooze`, without using up the
+  attempt, with the error as the snooze reason) or `RetryAt` (a retry at that time,
+  using up the attempt; the last attempt is discarded all the same). The zero
+  `ErrorOutcome` keeps the outcome, and a panic in the hook is logged and keeps it
+  too. It is not called for a worker's `Snooze`, a `JobCancel` (even when the worker
+  then returns `Cancel`), or a client that is stopping, none of which is the job
+  failing, nor for a `CompleteTx` attempt whose job could not be read, which may have
+  committed. A job the leader rescues (§7.6) is retried or discarded without it. It
+  runs on the worker's goroutine before the result is buffered, so it should be quick.
+  A `JobCancel` that arrives while it runs wins over what it returns. Its context
+  carries the client (`ClientFromContext`), and it runs after `Middleware`:
+  `hopperotel`'s span records what the worker returned, and the job's events the
+  outcome the hook chose.
+- `backoff(n) = n^4 + 5s ± 10% jitter`, capped at 24h. A failed job's next run is
+  chosen by, in order: `Config.OnError`'s `RetryAt`, the worker's `NextRetry(job)`,
+  the queue's `QueueConfig.RetryPolicy`, the client's `Config.RetryPolicy`, then
+  `backoff`. A `RetryPolicy` (`NextRetry(job *JobRow) time.Time`) that returns the zero
+  time passes to the next, and so does one that panics, which is logged.
+  `hopper.ExponentialRetry{Base, Max}` doubles from `Base` (one second) with ± 10%
+  jitter up to `Max` (24h). Like `MaxAttempts`, these are per client: each client
+  applies its own to the attempts it runs.
 - `hopper.CompleteTx(ctx, tx, job)` completes the job inside the worker's own
   transaction, so the work and its completion commit together. It runs the finalize
   statement above for one completed result through `Driver.UnwrapTx(tx)`, bypassing
@@ -1199,7 +1229,9 @@ observability without new machinery.
     then aborts one of the two statements.
   - Ordered deliveries get a shorter default retry budget (10 attempts, with backoff
     capped at 5 minutes), so a poison message is dead-lettered within about an hour
-    instead of blocking its key for days. The budget is configurable per subscription
+    instead of blocking its key for days. A `RetryPolicy` on the queue or the client
+    applies to them too, under the same cap; only `OnError`'s `RetryAt` can wait
+    longer. The budget is configurable per subscription
     (`Subscription.MaxAttempts`).
   - Keys are independent, so a blocked key never delays other keys. Throughput scales
     with the number of distinct keys.

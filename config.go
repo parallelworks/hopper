@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,6 +37,25 @@ type Config struct {
 	// MaxAttempts is the default number of attempts before a job is
 	// discarded. Defaults to 25.
 	MaxAttempts int
+	// OnError is called for every failed attempt this client runs, of any
+	// kind, with the worker's error: a returned error, a recovered panic
+	// (*PanicError), a timeout (ErrJobTimeout), a Cancel, or a kind with no
+	// worker (*UnknownKindError). It is not called for a Snooze, nor when the
+	// job was canceled with JobCancel or the client is stopping, nor for a
+	// job the leader rescues from a lost client or RescueStuckAfter. What it
+	// returns overrides the outcome; the zero ErrorOutcome keeps it. It runs
+	// on the worker's goroutine, concurrently with other jobs, before the
+	// result is written, so it should return quickly; a panic in it is
+	// logged and keeps the outcome. Its context carries the client
+	// (ClientFromContext) and outlives the job's. It runs after Middleware,
+	// which sees the worker's error, not the outcome OnError chooses; the
+	// job's events report the outcome.
+	OnError func(ctx context.Context, job *JobRow, err error) ErrorOutcome
+	// RetryPolicy chooses when a failed job runs again, for workers whose
+	// NextRetry returns the zero time, unless the queue's RetryPolicy does.
+	// Defaults to attempt^4 + 5 seconds with ±10% jitter, capped at 24
+	// hours.
+	RetryPolicy RetryPolicy
 	// StopTimeout bounds how long Run waits for running jobs after its
 	// context is canceled, before canceling them. Defaults to 30 seconds.
 	StopTimeout time.Duration
@@ -88,6 +108,9 @@ type QueueConfig struct {
 	// history, for maximum throughput. Canceled and discarded jobs are
 	// always archived, because history is the dead-letter queue.
 	DeleteCompleted bool
+	// RetryPolicy overrides Config.RetryPolicy for the queue's jobs on this
+	// client.
+	RetryPolicy RetryPolicy
 
 	// The limits below are cluster-wide: they are recorded on the queue
 	// row when the client starts and enforced for every client. A client
