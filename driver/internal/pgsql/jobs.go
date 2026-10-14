@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -567,12 +568,14 @@ func claimRows(ctx context.Context, conn Conn, query string, args ...any) ([]*dr
 // NULL), and run at once if JobRetryOrderingKey woke the key during the
 // attempt; terminal outcomes go through finalizeTailSQL: history, batches,
 // and workflow dependents. Error timestamps come from database time and
-// awaited jobs announce themselves on the done channel.
+// awaited jobs announce themselves on the done channel. An attempt's log
+// is appended to the job's, which keep the latest $13 attempts.
 var jobFinalizeHeadSQL = `
 WITH RECURSIVE r AS (
   SELECT * FROM unnest(
-    $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::boolean[], $6::jsonb[], $7::jsonb[], $8::boolean[], $11::text[]
-  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason)
+    $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::boolean[], $6::jsonb[], $7::jsonb[], $8::boolean[], $11::text[],
+    $12::jsonb[]
+  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason, log)
 ),
 retry AS (
   UPDATE {{schema}}.hopper_jobs j
@@ -582,6 +585,7 @@ retry AS (
       attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
       errors = CASE WHEN r.error IS NULL THEN j.errors
                     ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END,
+      logs = ` + appendLogSQL + `,
       attempted_by = NULL,
       snooze_reason = CASE WHEN r.snooze AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false)
                            THEN r.snooze_reason END,
@@ -597,23 +601,35 @@ finished AS (
   WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by
     AND r.state IN ('completed', 'canceled', 'discarded')
   RETURNING ` + finishedColumns(`CASE WHEN r.error IS NULL THEN j.errors
-         ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END`, "r.output", "r.archive", "r.state", "$9") + `
+         ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END`, appendLogSQL, "r.output", "r.archive", "r.state", "$9") + `
 ),
 `
 
 var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
 SELECT id FROM retry UNION ALL SELECT id FROM finished`
 
+// appendLogSQL appends an attempt's log, if it has one, to its job's logs,
+// keeping the latest $13. A snooze gives its attempt back, so a job that
+// snoozes again and again would fill its logs with them: a snooze's log
+// replaces the one of the previous snooze of the same attempt number.
+const appendLogSQL = `CASE WHEN r.log IS NULL THEN j.logs
+         ELSE jsonb_path_query_array(
+           CASE WHEN r.snooze
+                THEN jsonb_path_query_array(coalesce(j.logs, '[]'), '$[*] ? (!exists(@.snoozed) || @.attempt != $a)',
+                       jsonb_build_object('a', r.log->'attempt'))
+                ELSE coalesce(j.logs, '[]') END || jsonb_build_array(r.log),
+           '$[last - $keep + 1 to last]', jsonb_build_object('keep', $13::int)) END`
+
 // jobFinalizePlainSQL is jobFinalizeSQL for results whose jobs belong to
 // no batch or workflow (driver.JobFinalizeParams.NoBatches): without the
-// insert channel, so the snooze reasons are $10.
-var jobFinalizePlainSQL = strings.ReplaceAll(jobFinalizeHeadSQL, "$11", "$10") + plainFinalizeTailSQL + `
+// insert channel, so the parameters after it move down one.
+var jobFinalizePlainSQL = strings.NewReplacer("$11", "$10", "$12", "$11", "$13", "$12").Replace(jobFinalizeHeadSQL) + plainFinalizeTailSQL + `
 SELECT id FROM retry UNION ALL SELECT id FROM finished`
 
 // skipLockedSQL makes a finalize statement skip the jobs whose rows another
 // transaction holds (driver.JobFinalizeParams.SkipLocked).
 func skipLockedSQL(query string) string {
-	const unnested = "  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason)\n"
+	const unnested = "  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason, log)\n"
 	if !strings.Contains(query, unnested) {
 		panic("pgsql: finalize statement has no unnested results")
 	}
@@ -642,6 +658,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		errs        = make([][]byte, n)
 		outputs     = make([][]byte, n)
 		archives    = make([]bool, n)
+		logs        = make([][]byte, n)
 	)
 	for i, f := range params.Jobs {
 		switch f.State {
@@ -663,18 +680,27 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		// Only completed jobs may skip history; the failed partitions are the
 		// dead-letter queue.
 		archives[i] = f.Archive || f.State != driver.JobStateCompleted
+		// A finished job that skips history takes its logs with it, so its
+		// log is not sent.
+		if f.Log != nil && (archives[i] || !f.State.Terminal()) {
+			b, err := json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Log: storableText(f.Log.Log)})
+			if err != nil {
+				return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
+			}
+			logs[i] = b
+		}
 	}
 	args := []any{
 		uuidArray(ids), int64Array(attemptedBy), textArray(states), floatArray(delays), boolArray(snoozes),
 		jsonArray(errs), jsonArray(outputs), boolArray(archives), driver.ChannelDone, driver.ChannelInsert,
-		nullableTextArray(reasons),
+		nullableTextArray(reasons), jsonArray(logs), keepLogs(params.KeepLogs),
 	}
 	query := jobFinalizeSQL
 	if params.SkipLocked {
 		query = jobFinalizeSkipLockedSQL
 	}
 	if params.NoBatches {
-		query, args = jobFinalizePlainSQL, append(args[:9], args[10])
+		query, args = jobFinalizePlainSQL, append(args[:9], args[10:]...)
 		if params.SkipLocked {
 			query = jobFinalizePlainSkipLockedSQL
 		}
@@ -684,6 +710,14 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 	}
 	return applied, nil
+}
+
+// keepLogs is the number of attempt logs a finalize keeps for keep.
+func keepLogs(keep int) int32 {
+	if keep <= 0 || keep > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(keep)
 }
 
 // marshalAttemptError encodes an error record without its timestamp, which
@@ -792,6 +826,43 @@ func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow,
 	return job, nil
 }
 
+const jobLogsQuery = `
+SELECT logs FROM {{schema}}.hopper_jobs WHERE id = $1
+UNION ALL
+SELECT logs FROM {{schema}}.hopper_job_history WHERE id = $1
+LIMIT 1`
+
+// JobLogs implements driver.Executor.
+func (e *Executor) JobLogs(ctx context.Context, id driver.JobID) ([]driver.AttemptLog, error) {
+	var logs jsonText
+	err := e.Conn.QueryRow(ctx, jobLogsQuery, uuidParam(id)).Scan(&logs)
+	if errors.Is(err, ErrNoRows) {
+		return nil, driver.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("hopper: get job logs: %w", err)
+	}
+	return decodeLogs(string(logs)), nil
+}
+
+// decodeLogs reads a job's logs, skipping entries that are not in the form
+// the finalize writes, such as ones written by hand.
+func decodeLogs(stored string) []driver.AttemptLog {
+	// Anything but an array (or null) fails to decode into entries.
+	var entries []json.RawMessage
+	if json.Unmarshal([]byte(stored), &entries) != nil {
+		return nil
+	}
+	var logs []driver.AttemptLog
+	for _, raw := range entries {
+		var l driver.AttemptLog
+		if json.Unmarshal(raw, &l) == nil && l.Log != "" {
+			logs = append(logs, l)
+		}
+	}
+	return logs
+}
+
 var (
 	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM {{schema}}.hopper_jobs`, JobColumns(""))
 	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, historyColumns(""))
@@ -882,7 +953,7 @@ RETURNING %s`, JobColumns(""))
 	jobCancelWaitingSQL = `
 WITH RECURSIVE finished AS (
   DELETE FROM {{schema}}.hopper_jobs j WHERE j.id = $1 AND j.state <> 'running'
-  RETURNING ` + finishedColumns(appendErrorSQL("hopper: canceled"), "NULL::jsonb", "true", "'canceled'::text", "$2") + `
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: canceled"), "j.logs", "NULL::jsonb", "true", "'canceled'::text", "$2") + `
 ),
 ` + finalizeTailSQL("$2", "$3") + `
 SELECT ` + finishedSelectColumns + ` FROM finished`
@@ -892,7 +963,7 @@ SELECT ` + finishedSelectColumns + ` FROM finished`
 	jobDeleteWaitingSQL = `
 WITH RECURSIVE finished AS (
   DELETE FROM {{schema}}.hopper_jobs j WHERE j.id = $1 AND j.state <> 'running'
-  RETURNING ` + finishedColumns(appendErrorSQL("hopper: canceled"), "NULL::jsonb", "false", "'canceled'::text", "$2") + `
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: canceled"), "j.logs", "NULL::jsonb", "false", "'canceled'::text", "$2") + `
 ),
 ` + finalizeTailSQL("$2", "$3") + `
 SELECT ` + finishedSelectColumns + ` FROM finished`
@@ -995,10 +1066,10 @@ RETURNING %s`, JobColumns(""))
 	jobRetryHistorySQL = fmt.Sprintf(`
 WITH h AS (DELETE FROM {{schema}}.hopper_job_history WHERE id = $1 RETURNING *)
 INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata,
-  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, progress)
+  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, progress, logs)
 SELECT id, kind, queue, 'available', priority, attempt,
   CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END, statement_timestamp(), args, metadata,
-  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, CASE WHEN $2 THEN NULL ELSE progress END
+  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, CASE WHEN $2 THEN NULL ELSE progress END, logs
 FROM h
 RETURNING %s`, JobColumns(""))
 )
@@ -1102,7 +1173,7 @@ WITH RECURSIVE finished AS (
     WHERE state IN ('available', 'scheduled', 'retryable') AND expires_at <= now()
     LIMIT $1 FOR UPDATE SKIP LOCKED
   )
-  RETURNING ` + finishedColumns(appendErrorSQL("hopper: expired"), "NULL::jsonb", "true", "'discarded'::text", "$2") + `
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: expired"), "j.logs", "NULL::jsonb", "true", "'discarded'::text", "$2") + `
 ),
 ` + finalizeTailSQL("$2", "$3") + `
 SELECT ` + finishedSelectColumns + ` FROM finished`

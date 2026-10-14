@@ -260,3 +260,10 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 func (c *Client[TTx]) JobGet(ctx context.Context, id JobID) (*JobRow, error) {
 	return c.exec.JobGet(ctx, id)
 }
+
+// JobLogs returns the logs a job's worker kept with Logger, of its latest
+// attempts, oldest first, live or from history. It returns ErrNotFound if
+// the job does not exist or its history has been dropped.
+func (c *Client[TTx]) JobLogs(ctx context.Context, id JobID) ([]AttemptLog, error) {
+	return c.exec.JobLogs(ctx, id)
+}

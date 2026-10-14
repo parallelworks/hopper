@@ -170,6 +170,20 @@ func (w *Importer) Work(ctx context.Context, job *hopper.Job[ImportArgs]) error 
 }
 ```
 
+A worker logs through `hopper.Logger(ctx)`, a `*slog.Logger` whose lines go to
+`Config.Logger` with the job's ID, kind and attempt, and are also kept with the job:
+each attempt's lines, in text form, are written with its result, bounded per attempt,
+and a job keeps those of its latest attempts (§7.5). `client.JobLogs(ctx, id)` returns
+them, and `hopper jobs get` and the web UI show them.
+
+```go
+func (w *Importer) Work(ctx context.Context, job *hopper.Job[ImportArgs]) error {
+    log := hopper.Logger(ctx)
+    log.Info("downloading", "url", job.Args.URL)
+    ...
+}
+```
+
 Workers are registered before the client that runs them exists, so a worker or
 subscriber that needs the client, to insert follow-up jobs, publish or query, takes it
 from its context: `hopper.ClientFromContext[pgx.Tx](ctx)` returns the client running the
@@ -203,6 +217,7 @@ client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{
         return hopper.ErrorOutcome{} // keep the outcome
     },
     // Logger defaults to slog.Default(); every other field has a production default.
+    JobLogs: hopper.JobLogsConfig{MaxBytes: 64 << 10}, // per attempt; defaults 32 KiB, latest 10 attempts
 })
 // client is a *hopper.Client[pgx.Tx]. The driver fixes the transaction type,
 // so InsertTx only accepts a transaction from the right engine.
@@ -245,6 +260,7 @@ client.JobRetry(ctx, id)             // re-drive a discarded or canceled job fro
 client.JobRetry(ctx, id, hopper.FromStart()) // ... clearing its progress, to run all its steps again
 client.JobRetryOrderingKey(ctx, "billing", "customer:42") // wake a key's snoozed and retrying jobs
 client.JobDelete(ctx, id)            // remove a job that is not running, live or from history
+client.JobLogs(ctx, id)              // the lines its worker kept with hopper.Logger, per attempt
 client.JobCancelTx(ctx, tx, id)      // ...Tx variants commit with the caller's own changes
 job, err := client.JobGet(ctx, id)   // live or historical
 
@@ -447,7 +463,8 @@ CREATE TABLE hopper_jobs (
   created_at          timestamptz NOT NULL DEFAULT now(),
   snooze_reason       text,                      -- why a snoozed job waits (schema v9); live table only
   wake_requested_at   timestamptz,               -- JobRetryOrderingKey reached the job while it ran (schema v10); live table only
-  progress            jsonb                      -- last step finished, cursor and time (schema v15); kept in history
+  progress            jsonb,                     -- last step finished, cursor and time (schema v15); kept in history
+  logs                jsonb                      -- the latest attempts' log lines (schema v16); kept in history
 ) WITH (fillfactor = 70);
 
 -- Claim path: the only index the hot query touches.
@@ -555,7 +572,7 @@ dependency edges, which only live workflow jobs have, so a key listing reads nei
 the whole queue nor a new index on the hot table. Schema v14 adds the history index on
 `(kind, unique_key, finalized_at)` for finding a unique key's finished jobs (§7.2),
 declared and built the same way. Schema v15 adds `progress` to `hopper_jobs` and
-history (§7.5).
+history (§7.5), and v16 adds `logs` the same way (§7.5).
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -912,6 +929,42 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   it was given, or if a step has no name or is listed twice, since every attempt would
   fail the same way. `hoppertest.Work` keeps progress in memory, and
   `WorkOpts.Progress` starts a job part way through.
+- **Logs.** `hopper.Logger(ctx)` builds the attempt's logger on first use: a
+  `slog.MultiHandler` over `Config.Logger`'s handler, with the job's ID, kind and
+  attempt, and a `TextHandler` writing into the attempt's buffer at
+  `Config.JobLogs.Level` (default Info), with `JobLogs.ReplaceAttr`: `Config.Logger`'s
+  handler options do not reach it, so what that handler redacts is redacted here
+  too, or it is stored with the job. The buffer keeps whole lines up to `MaxBytes`
+  (default 32 KiB); the line that would pass it and every one after are dropped and
+  counted, and the log ends with a line giving the count. The attempt's log
+  (`{"attempt", "log"}`) rides on its result (`JobFinalize.Log`), and the finalize
+  statement appends it to the job's `logs` array, keeping the latest
+  `JobLogs.MaxAttempts` (default 10) with a `jsonpath` slice, in the same `UPDATE` or
+  `DELETE ... RETURNING` that moves the job on: logs cost no statement or round trip
+  of their own, and a job that logged nothing writes `NULL` and keeps what it has. A
+  completed job that skips history (`DeleteCompleted`) sends no log. A snooze gives
+  its attempt back, so the next attempt has the same number: its log is marked
+  `snoozed`, and replaces the log of the previous snooze of that number, so a job
+  that polls by snoozing keeps one, not `MaxAttempts` of them. `MaxBytes` is at most
+  1 MiB and `MaxAttempts` at most 100, which keeps a job's logs well under jsonb's
+  limit. A finished attempt's lines wait in memory with its result: a flush starts
+  once its results hold 8 MiB of logs, which keeps a statement's parameters small,
+  and job goroutines block on submit while the buffered results hold 64 MiB, as they
+  do when the buffer is full, so a slow database cannot make logs exhaust memory.
+  `CompleteTx` writes the lines logged before it. The lines are not streamed to the
+  database while the attempt runs: each write would rewrite the whole value on the
+  hottest table, so a steadily logging job would write the square of its log's size,
+  and live lines are already in `Config.Logger`. The cost is that the lines of an
+  attempt whose result is not written are lost: its client crashed or lost its lease,
+  or it was rescued for running past `RescueStuckAfter`. The rescue's error says which.
+  Retries, snoozes, the archive, cancels, expiry and `JobRetry` from history keep
+  `logs`, and the job's history partition takes them when it is dropped, so they live
+  as long as the job: 24 hours completed, 7 days failed, by default. Only
+  `JobLogs` (`Executor.JobLogs`) reads them: `JobRow` has no logs, so `JobGet`,
+  `Await`, the read after a `CompleteTx`, the claim and listings never carry them.
+  A worker run inline with `Workers.Work` inside an attempt logs as that attempt.
+  A value not in the form hopper writes
+  reads as the entries that are.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure
@@ -1524,7 +1577,8 @@ observability without new machinery.
 
 ## 13. Observability and operations
 
-- **Logging:** `log/slog` throughout, defaulting to `slog.Default()`.
+- **Logging:** `log/slog` throughout, defaulting to `slog.Default()`. A worker's
+  `hopper.Logger(ctx)` lines are also kept with its job, per attempt (§7.5).
 - **Events:** `client.Events(ctx, kinds...)` streams job lifecycle, leadership and lease
   events as an `iter.Seq[Event]`, for tests and custom metrics. Delivery is best-effort:
   a consumer that falls behind by more than a buffer misses events rather than slowing

@@ -166,7 +166,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.bgCtx, c.bgCancel = context.WithCancel(base)       //nolint:gosec // canceled in Stop
 	c.newGeneration()
 
-	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.wakeQueue, c.finalized)
+	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.cfg.JobLogs.MaxAttempts, c.wakeQueue, c.finalized)
 	go c.finalizer.run(c.finCtx)
 
 	// Producers start with the cluster's current pause and limit state, so

@@ -239,10 +239,15 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		var job *hopper.JobRow
+		var (
+			job  *hopper.JobRow
+			logs []hopper.AttemptLog
+		)
 		switch args[0] {
 		case "get":
-			job, err = c.client.JobGet(ctx, id)
+			if job, err = c.client.JobGet(ctx, id); err == nil {
+				logs, err = c.client.JobLogs(ctx, id)
+			}
 		case "retry":
 			job, err = c.client.JobRetry(ctx, id, opts...)
 		case "cancel":
@@ -253,13 +258,17 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return c.print(job, func(w io.Writer) { printJob(w, job) })
+		out := struct {
+			*hopper.JobRow
+			Logs []hopper.AttemptLog `json:",omitempty"`
+		}{job, logs}
+		return c.print(out, func(w io.Writer) { printJob(w, job, logs) })
 	default:
 		return fmt.Errorf("jobs: unknown subcommand %q", args[0])
 	}
 }
 
-func printJob(w io.Writer, j *hopper.JobRow) {
+func printJob(w io.Writer, j *hopper.JobRow, logs []hopper.AttemptLog) {
 	fmt.Fprintf(w, "id:            %s\nkind:          %s\nqueue:         %s\nstate:         %s\npriority:      %d\nattempt:       %d/%d\n",
 		j.ID, j.Kind, j.Queue, j.State, j.Priority, j.Attempt, j.MaxAttempts)
 	fmt.Fprintf(w, "scheduled_at:  %s\ncreated_at:    %s\n", j.ScheduledAt.Local().Format(time.RFC3339), j.CreatedAt.Local().Format(time.RFC3339))
@@ -291,6 +300,19 @@ func printJob(w io.Writer, j *hopper.JobRow) {
 	}
 	for _, e := range j.Errors {
 		fmt.Fprintf(w, "error #%d:      %s (%s)\n", e.Attempt, e.Error, e.At.Local().Format(time.RFC3339))
+	}
+	for _, l := range logs {
+		snoozed := ""
+		if l.Snoozed {
+			snoozed = " (snoozed)"
+		}
+		fmt.Fprintf(w, "log #%d%s:\n", l.Attempt, snoozed)
+		for line := range strings.Lines(l.Log) {
+			fmt.Fprintf(w, "  %s", line)
+			if !strings.HasSuffix(line, "\n") {
+				fmt.Fprintln(w)
+			}
+		}
 	}
 }
 

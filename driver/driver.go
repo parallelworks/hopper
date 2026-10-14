@@ -143,6 +143,9 @@ type Executor interface {
 	JobRecordProgress(ctx context.Context, params JobRecordProgressParams) (*Progress, error)
 	// JobGet returns a job by ID, live or from history.
 	JobGet(ctx context.Context, id JobID) (*JobRow, error)
+	// JobLogs returns the logs of a job's latest attempts, oldest first,
+	// live or from history.
+	JobLogs(ctx context.Context, id JobID) ([]AttemptLog, error)
 	// JobList returns jobs matching the filter in ID order (descending with
 	// NewestFirst), after the cursor.
 	JobList(ctx context.Context, params JobListParams) ([]*JobRow, error)
@@ -426,6 +429,17 @@ type Progress struct {
 	Cursor json.RawMessage `json:"cursor,omitempty"`
 	// RecordedAt is the database time at which it was recorded.
 	RecordedAt time.Time `json:"at"`
+}
+
+// AttemptLog is the log output of one attempt of a job.
+type AttemptLog struct {
+	Attempt int `json:"attempt"`
+	// Snoozed reports that the attempt snoozed, which gives the attempt
+	// back: the next attempt has the same number. A job keeps the log of
+	// only the latest snooze of each attempt number.
+	Snoozed bool `json:"snoozed,omitempty"`
+	// Log is the attempt's lines, each ending in a newline.
+	Log string `json:"log"`
 }
 
 // JobRetryParams selects the job to retry.
@@ -743,6 +757,9 @@ type JobFinalizeParams struct {
 	// as a worker's CompleteTx that has not ended, instead of waiting for
 	// it. A skipped job is not among the applied.
 	SkipLocked bool
+	// KeepLogs is the most attempt logs a job keeps, the latest; a job given
+	// another drops its oldest. Zero keeps them all.
+	KeepLogs int
 }
 
 // WorkflowPromoteParams selects the jobs WorkflowPromoteReady considers.
@@ -788,6 +805,10 @@ type JobFinalize struct {
 	Error *AttemptError
 	// Output is stored with the finalized job.
 	Output json.RawMessage
+	// Log is appended to the job's logs, if not nil, with Snoozed set from
+	// Snooze. A completed job that is not archived has no logs to keep, and
+	// its Log is not sent.
+	Log *AttemptLog
 	// Archive controls whether a terminal job is written to history. Canceled
 	// and discarded jobs are always archived; completed jobs may skip it.
 	Archive bool

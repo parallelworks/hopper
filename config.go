@@ -29,6 +29,9 @@ type Config struct {
 	Middleware []Middleware
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
+	// JobLogs bounds the log lines kept with each job, from its worker's
+	// Logger.
+	JobLogs JobLogsConfig
 	// Codec encodes args and outputs. Defaults to JSONCodec.
 	Codec Codec
 	// JobTimeout is how long a job may run before its context is canceled,
@@ -199,6 +202,10 @@ func (cfg *Config) withDefaults() (Config, error) {
 
 	if out.MaxAttempts < 0 {
 		return out, errors.New("hopper: Config.MaxAttempts must be positive")
+	}
+	var err error
+	if out.JobLogs, err = withJobLogDefaults(out.JobLogs); err != nil {
+		return out, err
 	}
 	if out.JobTimeout < 0 || out.StopTimeout < 0 || out.PollInterval < 0 || out.RescueStuckAfter < 0 {
 		return out, errors.New("hopper: Config durations must be positive")

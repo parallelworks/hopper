@@ -178,7 +178,8 @@ var workSeq atomic.Int64
 // carries one, from hopper.ContextWithClient. hopper.SetOutput and
 // hopper.CompleteTx return hopper.ErrNotInJob, since there is no stored job,
 // while hopper.RecordStep and hopper.RecordCursor keep progress in memory,
-// so that hopper.RunSteps runs every step.
+// so that hopper.RunSteps runs every step. hopper.Logger returns
+// slog.Default().
 func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.Workers, args T, opts *WorkOpts) error {
 	tb.Helper()
 	encoded, err := json.Marshal(args)

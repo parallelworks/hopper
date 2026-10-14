@@ -84,6 +84,7 @@ func New[TTx any](client *hopper.Client[TTx], cfg *Config) http.Handler {
 		"dur":    func(d time.Duration) string { return d.Round(time.Second).String() },
 		"now":    time.Now,
 		"short":  shorten,
+		"last":   func(i int, logs []hopper.AttemptLog) bool { return i == len(logs)-1 },
 	}).ParseFS(templateFS, "templates/ui.html"))
 
 	mux := http.NewServeMux()
@@ -327,6 +328,7 @@ type jobData struct {
 	Job    *hopper.JobRow
 	Live   bool
 	Errors []hopper.AttemptError
+	Logs   []hopper.AttemptLog
 }
 
 func (u *ui[TTx]) job(w http.ResponseWriter, r *http.Request) {
@@ -340,7 +342,12 @@ func (u *ui[TTx]) job(w http.ResponseWriter, r *http.Request) {
 		u.fail(w, err)
 		return
 	}
-	u.render(w, r, "job", jobData{Job: job, Live: !job.State.Terminal(), Errors: job.Errors})
+	logs, err := u.client.JobLogs(r.Context(), id)
+	if err != nil && !errors.Is(err, hopper.ErrNotFound) {
+		u.fail(w, err)
+		return
+	}
+	u.render(w, r, "job", jobData{Job: job, Live: !job.State.Terminal(), Errors: job.Errors, Logs: logs})
 }
 
 func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {

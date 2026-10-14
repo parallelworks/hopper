@@ -27,7 +27,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 15
+	const latest = 16
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}

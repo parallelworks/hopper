@@ -36,16 +36,16 @@ import (
 
 // finishedColumns lists the columns a finishing CTE returns from a
 // hopper_jobs row aliased j: the row, with the given expressions for its
-// errors, output, whether to archive it and its final state (text), and
+// errors, logs, output, whether to archive it and its final state (text), and
 // the done-channel notification for an awaited job. The notification sits
 // in RETURNING because a data-modifying CTE always runs, while a plain
 // SELECT CTE that nothing references does not.
-func finishedColumns(errorsExpr, outputExpr, archiveExpr, stateExpr, doneChannelParam string) string {
+func finishedColumns(errorsExpr, logsExpr, outputExpr, archiveExpr, stateExpr, doneChannelParam string) string {
 	return fmt.Sprintf(`j.id, j.seq, j.kind, j.queue, j.priority, j.attempt, j.max_attempts, j.scheduled_at, j.attempted_at,
     j.attempted_by, j.args, j.metadata, %s AS errors, j.unique_key, j.ordering_key, j.partition_key, j.batch_id,
-    j.expires_at, j.cancel_requested_at, j.await, j.created_at, j.progress, %s AS output, %s AS archive, %s AS final_state,
-    CASE WHEN j.await THEN pg_notify(%s, j.id::text) END AS notified`,
-		errorsExpr, outputExpr, archiveExpr, stateExpr, doneChannelParam)
+    j.expires_at, j.cancel_requested_at, j.await, j.created_at, j.progress, %s AS logs, %s AS output, %s AS archive,
+    %s AS final_state, CASE WHEN j.await THEN pg_notify(%s, j.id::text) END AS notified`,
+		errorsExpr, logsExpr, outputExpr, archiveExpr, stateExpr, doneChannelParam)
 }
 
 // appendErrorSQL is an errors expression that records a failure hopper
@@ -92,10 +92,10 @@ const archivedSQL = `archived AS (
   INSERT INTO {{schema}}.hopper_job_history (
     id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
     attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, progress, finalized_at, output)
+    expires_at, cancel_requested_at, await, created_at, progress, logs, finalized_at, output)
   SELECT id, seq, kind, queue, final_state::{{schema}}.hopper_job_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
     attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, progress, now(), output
+    expires_at, cancel_requested_at, await, created_at, progress, logs, now(), output
   FROM done WHERE archive
   RETURNING id
 )`
@@ -122,7 +122,7 @@ func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 cascaded AS (
   DELETE FROM {{schema}}.hopper_jobs j USING (SELECT DISTINCT job_id FROM cascade) c
   WHERE j.id = c.job_id AND j.state = 'pending'
-  RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "NULL::jsonb", "true", "'canceled'::text", doneChannelParam) + `
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "j.logs", "NULL::jsonb", "true", "'canceled'::text", doneChannelParam) + `
 ),
 done AS (SELECT * FROM finished UNION ALL SELECT * FROM cascaded),
 ` + archivedSQL + `,
