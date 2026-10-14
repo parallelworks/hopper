@@ -223,6 +223,10 @@ for job, err := range client.Jobs(ctx, hopper.JobFilter{
     Queue: "email", States: []hopper.JobState{hopper.JobStateDiscarded},
 }) { ... }                           // iter.Seq2, pages transparently
 
+for job, err := range client.Jobs(ctx, hopper.JobFilter{
+    Queue: "billing", OrderingKey: "customer:42", NewestFirst: true,
+}) { ... }                           // one key's lane, latest first
+
 client.Queues().Pause(ctx, "email")
 client.Queues().Add(ctx, "tenant_42", hopper.QueueConfig{MaxWorkers: 5}) // runtime, multi-tenant
 
@@ -441,6 +445,18 @@ CREATE TABLE hopper_job_history_failed PARTITION OF hopper_job_history
 -- (M2) manages time partitions. The leader creates future time partitions only,
 -- because attaching a partition scans the DEFAULT partition for overlapping rows.
 
+-- A key's lane in history, for JobList with an ordering key (schema v12). Declared
+-- ON ONLY each outcome table; the leader builds each existing partition's index
+-- CONCURRENTLY and attaches it, and a partition created later gets its index when
+-- it is attached, while still empty. hopper_job_history itself has none: the attach
+-- that completed an outcome table's index would also mark that one valid, under an
+-- ACCESS EXCLUSIVE lock taken while holding the partition's index, which deadlocks
+-- with readers of hopper_job_history.
+CREATE INDEX hopper_job_history_completed_ordering ON ONLY hopper_job_history_completed (ordering_key, id)
+  WHERE ordering_key IS NOT NULL;
+CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id)
+  WHERE ordering_key IS NOT NULL;
+
 -- Liveness: one lease row per running client process.
 CREATE TABLE hopper_clients (
   id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -493,7 +509,13 @@ name and edges of a batch, and a `batch_id` index on history (§11). Schema v5 (
 the stream log `hopper_stream_events` (partitioned by day) and `hopper_stream_consumers`
 (§10). Schema v11 adds `hopper_batch_progress (id, batch_id, done, failed)`, where
 finalizing statements record batch progress (§11), with `vacuum_truncate = false`
-like `hopper_jobs`, since every finalize of a batch's jobs writes to it.
+like `hopper_jobs`, since every finalize of a batch's jobs writes to it. Schema v12 adds
+the history index on `(ordering_key, id)` for listing one key's lane (§4.4), declared
+`ON ONLY` the completed and failed outcome tables and built per partition by the
+leader. On the live table, a key's lane is found through the claim's two ordering-key
+indexes, for its waiting jobs and its running one, and its pending jobs through their
+dependency edges, which only live workflow jobs have, so a key listing reads neither
+the whole queue nor a new index on the hot table.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -856,9 +878,37 @@ and it doesn't pin a connection. Leader-only duties are idempotent, because two 
 can briefly overlap during a partition.
 
 Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
-partitions ahead of time and dropping expired ones, removing stale `hopper_clients`
-rows, sweeping the batch progress that clients did not settle, and promoting
-workflow jobs whose last dependencies finished in concurrent transactions (§11).
+partitions ahead of time and dropping expired ones, building the ordering-key index
+of any history partition that lacks one (after the v12 upgrade), removing stale
+`hopper_clients` rows, sweeping the batch progress that clients did not settle, and
+promoting workflow jobs whose last dependencies finished in concurrent transactions
+(§11).
+
+The index build (`HistoryIndex`) runs in its own loop of the leader's term, once the
+term's first history maintenance has created the partitions ahead and then every
+maintenance interval, not in the leader loop. A `CREATE INDEX CONCURRENTLY` takes as
+long as the partition is large, and waits for every transaction in the database with
+an older snapshot, so in the leader loop it would stop the lease renewal, and
+leadership, and what runs once per term such as `RunOnStart`, would move between
+clients until it finished. Each partition is built under an advisory lock
+(`HistoryIndexLockKey`), so overlapping leaders don't build on one table at once, which
+deadlocks. The build cannot run in a transaction, so the lock is held by a read
+committed transaction of its own that stays open, idle, on another connection; a
+session lock would not survive a transaction pooler. A build on an outcome table's
+`DEFAULT` partition also holds the lock keyed to that table, which partition creation
+under it tries without waiting, deferring the partition (§7.10) while the build
+runs: attaching a partition scans the `DEFAULT` partition under a lock that the build
+holds, while the build waits for the attach's transaction. A drop of an expired
+partition that a build holds is deferred by its `lock_timeout` in the same way. A build cut short by the end of
+a term leaves an invalid index, which the next build drops and builds again. Should
+retention drop the last partition without an index before it is built, the outcome
+table's index is revalidated by attaching one of its partitions' indexes again. A
+build that runs past the session's `statement_timeout` is cancelled by it: its
+leftover is dropped, the pass goes on to the other partitions, and the leader retries
+that partition at doubling intervals, up to 64 maintenance intervals, warning each
+time that the timeout should be raised for hopper's role. The build cannot lift the
+timeout itself, because behind a transaction pooler a `SET` would land on whichever
+server connection it ran on, and stay there for other clients.
 
 A client with `Config.NeverLead` never attempts the lease. It claims and works jobs
 like any other, so an install can include processes that should do work but not run
@@ -1297,8 +1347,11 @@ observability without new machinery.
   to the latest while jobs wait in every state, inserts keep arriving and claims keep
   polling, then works them all with a client (`TestUpgradeUnderTraffic`). Migrations that touch `hopper_jobs` must not take locks that
   block claims for longer than one statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
-  constraints, and so on). A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10), because a lock
+  constraints, and so on). A migration runs in a transaction, where `CONCURRENTLY` is
+  not allowed and a partitioned table cannot take it at all, so an index on history
+  is declared `ON ONLY` and built per partition by the leader (schema v12). A change that needs `ACCESS EXCLUSIVE`, such as adding a
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v12 for the
+  `SHARE` lock that declaring the history index takes, which finalizes wait for), because a lock
   request queued behind an open transaction on the table would hold up every claim
   behind it; claims wait at most one try at a time. Between tries it sleeps a jittered,
   growing interval capped at a second, raises a `NOTICE` every 10 seconds while it

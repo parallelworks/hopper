@@ -1,7 +1,7 @@
 // Command hopper administers a hopper installation from the shell.
 //
 //	hopper migrate up|down|version [-target N]
-//	hopper jobs list [-queue Q] [-kind K] [-state S] [-limit N]
+//	hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
 //	hopper jobs get|retry|cancel <id>
 //	hopper queues list|pause|resume [name]
 //	hopper queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]
@@ -53,7 +53,7 @@ const usage = `usage: hopper [-database-url URL] [-schema NAME] [-json] <command
 
 commands:
   migrate up|down|version [-target N]
-  jobs list [-queue Q] [-kind K] [-state S] [-limit N]
+  jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
   jobs get|retry|cancel <id>
   queues list
   queues pause|resume <name>
@@ -184,11 +184,13 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		queue := fs.String("queue", "", "queue")
 		kind := fs.String("kind", "", "kind")
 		state := fs.String("state", "", "state (available, running, completed, ...)")
+		orderingKey := fs.String("ordering-key", "", "ordering key (with -queue)")
+		newest := fs.Bool("newest", false, "newest first")
 		limit := fs.Int("limit", 50, "maximum jobs to print")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		filter := hopper.JobFilter{Queue: *queue}
+		filter := hopper.JobFilter{Queue: *queue, OrderingKey: *orderingKey, NewestFirst: *newest}
 		if *kind != "" {
 			filter.Kinds = []string{*kind}
 		}

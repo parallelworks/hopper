@@ -1,6 +1,7 @@
 package drivertest
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -775,12 +776,84 @@ func testTTL[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+// testListOrderingKeyLane lists a key's jobs in every live state, each found
+// through a different index, and from history.
+func testListOrderingKeyLane[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	exec := f.NewDriver(t).Executor()
+	clientID := register(ctx, t, exec)
+	keyed := func(n int) []driver.JobInsertParams {
+		p := params("a", n)
+		for i := range p {
+			p[i].OrderingKey = "k"
+		}
+		return p
+	}
+	archived := insert(ctx, t, exec, keyed(1))[0].Job.ID
+	claim(ctx, t, exec, clientID, 1)
+	finalize(ctx, t, exec, driver.JobFinalize{ID: archived, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+
+	other := params("a", 2)
+	other[1].OrderingKey = "other"
+	insert(ctx, t, exec, other)
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Name: "w", Jobs: keyed(2), Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, pending := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID
+	if jobs := claim(ctx, t, exec, clientID, 10); len(jobs) != 3 {
+		t.Fatalf("claimed %d, want the key's first job and the two others", len(jobs))
+	}
+	later := keyed(2)
+	later[1].ScheduledAt = time.Now().Add(time.Hour)
+	waiting := insert(ctx, t, exec, later)
+	available, scheduled := waiting[0].Job.ID, waiting[1].Job.ID
+
+	list := func(states ...driver.JobState) []driver.JobID {
+		t.Helper()
+		jobs, err := exec.JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "k", States: states, Limit: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]driver.JobID, len(jobs))
+		for i, j := range jobs {
+			ids[i] = j.ID
+		}
+		slices.SortFunc(ids, func(a, b driver.JobID) int { return bytes.Compare(a[:], b[:]) })
+		return ids
+	}
+	sorted := func(ids ...driver.JobID) []driver.JobID {
+		slices.SortFunc(ids, func(a, b driver.JobID) int { return bytes.Compare(a[:], b[:]) })
+		return ids
+	}
+	if got, want := list(), sorted(archived, running, pending, available, scheduled); !slices.Equal(got, want) {
+		t.Errorf("key k = %v, want %v", got, want)
+	}
+	for _, c := range []struct {
+		state driver.JobState
+		want  driver.JobID
+	}{
+		{driver.JobStatePending, pending},
+		{driver.JobStateRunning, running},
+		{driver.JobStateAvailable, available},
+		{driver.JobStateScheduled, scheduled},
+		{driver.JobStateCompleted, archived},
+	} {
+		if got := list(c.state); !slices.Equal(got, []driver.JobID{c.want}) {
+			t.Errorf("key k, %s = %v, want %v", c.state, got, c.want)
+		}
+	}
+}
+
 func testList[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	exec := f.NewDriver(t).Executor()
 	p := params("a", 5)
 	p[1].Kind, p[3].Kind = "b", "b"
 	p[4].Queue = "other"
+	p[0].OrderingKey, p[2].OrderingKey = "k", "k"
 	inserted := insert(ctx, t, exec, p)
 	clientID := register(ctx, t, exec)
 	claimed := claim(ctx, t, exec, clientID, 1)
@@ -798,8 +871,11 @@ func testList[TTx any](t *testing.T, f Fixture[TTx]) {
 		ids := make([]driver.JobID, len(jobs))
 		for i, j := range jobs {
 			ids[i] = j.ID
-			if i > 0 && jobs[i-1].ID.String() >= j.ID.String() {
-				t.Error("not in ID order")
+			if i == 0 {
+				continue
+			}
+			if c := bytes.Compare(jobs[i-1].ID[:], j.ID[:]); c == 0 || (c > 0) != q.NewestFirst {
+				t.Errorf("not in ID order (newest first: %v)", q.NewestFirst)
 			}
 		}
 		return ids
@@ -819,5 +895,42 @@ func testList[TTx any](t *testing.T, f Fixture[TTx]) {
 	first := list(driver.JobListParams{Limit: 2})
 	if rest := list(driver.JobListParams{After: first[1]}); len(rest) != 3 || rest[0].String() <= first[1].String() {
 		t.Errorf("after cursor = %v", rest)
+	}
+
+	// IDs inserted in one batch need not be in input order, so expectations
+	// sort them.
+	byID := func(ids ...driver.JobID) []driver.JobID {
+		slices.SortFunc(ids, func(a, b driver.JobID) int { return bytes.Compare(a[:], b[:]) })
+		return ids
+	}
+	all := make([]driver.JobID, len(inserted))
+	for i, r := range inserted {
+		all[i] = r.Job.ID
+	}
+	all = byID(all...)
+
+	if _, err := exec.JobList(ctx, driver.JobListParams{OrderingKey: "k", Limit: 10}); err == nil {
+		t.Error("an ordering key without a queue was listed")
+	}
+
+	// An ordering key's jobs in its queue, live and from history.
+	if got, want := list(driver.JobListParams{Queue: "default", OrderingKey: "k"}), byID(inserted[0].Job.ID, inserted[2].Job.ID); !slices.Equal(got, want) {
+		t.Errorf("ordering key k = %v, want %v", got, want)
+	}
+
+	// Newest first, paged with the same cursor, live and from history.
+	newest := list(driver.JobListParams{NewestFirst: true, Limit: 2})
+	if want := []driver.JobID{all[4], all[3]}; !slices.Equal(newest, want) {
+		t.Fatalf("newest first = %v, want %v", newest, want)
+	}
+	if got, want := list(driver.JobListParams{NewestFirst: true, After: newest[1]}), []driver.JobID{all[2], all[1], all[0]}; !slices.Equal(got, want) {
+		t.Errorf("newest first after cursor = %v, want %v", got, want)
+	}
+	waitingK := inserted[2].Job.ID
+	if claimed[0].ID == waitingK {
+		waitingK = inserted[0].Job.ID
+	}
+	if got := list(driver.JobListParams{NewestFirst: true, Queue: "default", OrderingKey: "k", States: []driver.JobState{driver.JobStateAvailable}}); !slices.Equal(got, []driver.JobID{waitingK}) {
+		t.Errorf("newest first, key k, available = %v", got)
 	}
 }

@@ -94,6 +94,12 @@ type JobFilter struct {
 	Queue  string
 	Kinds  []string
 	States []JobState
+	// OrderingKey lists one ordering key's jobs, its lane. Keys are scoped
+	// to a queue, so it needs Queue; the listing fails without one.
+	OrderingKey string
+	// NewestFirst lists in descending ID order: the latest inserted jobs
+	// first, though IDs from the same millisecond can sort either way.
+	NewestFirst bool
 	// After starts the listing after the given job, for paging: pass the
 	// last ID of one page to get the next.
 	After JobID
@@ -103,8 +109,8 @@ type JobFilter struct {
 const jobsPageSize = 100
 
 // Jobs lists jobs matching the filter, live and from history, in ID order
-// (which is insertion order). It pages transparently; stop iterating to
-// stop fetching.
+// (which is insertion order), or newest first with NewestFirst. It pages
+// transparently; stop iterating to stop fetching.
 func (c *Client[TTx]) Jobs(ctx context.Context, filter JobFilter) iter.Seq2[*JobRow, error] {
 	return c.jobs(ctx, c.exec, filter)
 }
@@ -120,7 +126,8 @@ func (c *Client[TTx]) jobs(ctx context.Context, exec driver.Executor, filter Job
 		after := filter.After
 		for {
 			page, err := exec.JobList(ctx, driver.JobListParams{
-				Queue: filter.Queue, Kinds: filter.Kinds, States: filter.States, After: after, Limit: jobsPageSize,
+				Queue: filter.Queue, Kinds: filter.Kinds, States: filter.States, OrderingKey: filter.OrderingKey,
+				NewestFirst: filter.NewestFirst, After: after, Limit: jobsPageSize,
 			})
 			if err != nil {
 				yield(nil, err)

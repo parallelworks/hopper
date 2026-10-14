@@ -130,7 +130,8 @@ type Executor interface {
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
 	// JobGet returns a job by ID, live or from history.
 	JobGet(ctx context.Context, id JobID) (*JobRow, error)
-	// JobList returns jobs matching the filter in ID order, after the cursor.
+	// JobList returns jobs matching the filter in ID order (descending with
+	// NewestFirst), after the cursor.
 	JobList(ctx context.Context, params JobListParams) ([]*JobRow, error)
 	// JobCancel cancels a job. A waiting job moves to history as cancelled.
 	// A running job gets a cancel request that its client picks up through
@@ -274,6 +275,13 @@ type Executor interface {
 	// time partitions on Postgres). It is idempotent and may run on two
 	// leaders at once.
 	HistoryMaintain(ctx context.Context, params HistoryMaintainParams) (HistoryMaintainResult, error)
+	// HistoryIndex builds the indexes a schema upgrade declared on history
+	// for the partitions that existed before it, without blocking the
+	// finalizes that write there. Building takes as long as the partitions
+	// are large and can wait for long transactions anywhere in the database,
+	// so it runs apart from the leader's other duties. It is idempotent, and
+	// finds nothing to do once every partition has its indexes.
+	HistoryIndex(ctx context.Context, params HistoryIndexParams) (HistoryIndexResult, error)
 	// JobsMaintain keeps the live table fit between the engine's own
 	// maintenance passes: it reclaims the space and index entries of jobs
 	// that have run and left once enough have accumulated (a hundred
@@ -463,7 +471,12 @@ type JobListParams struct {
 	Queue  string
 	Kinds  []string
 	States []JobState
-	// After is the cursor: only jobs with a greater ID are returned.
+	// OrderingKey needs Queue: a key is a lane only within its queue.
+	OrderingKey string
+	// NewestFirst lists in descending ID order.
+	NewestFirst bool
+	// After is the cursor: only jobs after it in the listing's order (a
+	// greater ID, or a smaller one when NewestFirst) are returned.
 	After JobID
 	Limit int
 }
@@ -752,6 +765,21 @@ type HistoryMaintainResult struct {
 	Deferred []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64
+}
+
+// HistoryIndexParams leaves storage units out of an index pass.
+type HistoryIndexParams struct {
+	// Skip names storage units (partitions on Postgres) to leave for a later
+	// pass.
+	Skip []string
+}
+
+// HistoryIndexResult reports what an index pass could not finish.
+type HistoryIndexResult struct {
+	// TimedOut names storage units whose build ran past the session's
+	// statement timeout. What the build left is removed, and the pass goes
+	// on to the rest.
+	TimedOut []string
 }
 
 // SubscriptionRow is a topic subscription: messages published to a topic

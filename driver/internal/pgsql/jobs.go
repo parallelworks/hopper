@@ -532,11 +532,27 @@ var (
 	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM {{schema}}.hopper_jobs`, JobColumns(""))
 	jobListHistorySQL = fmt.Sprintf(`SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history`, historyColumns())
 	jobListFilterSQL  = ` WHERE ($1 = '' OR queue = $1) AND (cardinality($2::text[]) = 0 OR kind = ANY($2::text[]))
-  AND (cardinality($3::text[]) = 0 OR state::text = ANY($3::text[])) AND id > $4::uuid`
+  AND (cardinality($3::text[]) = 0 OR state::text = ANY($3::text[]))`
+	// A key's live jobs are found through the claim's ordering-key indexes,
+	// one for waiting jobs and one for the running job, and its pending jobs
+	// through their dependency edges, which only live workflow jobs have.
+	jobListKeyedSQL   = ` AND (state IN ('available', 'scheduled', 'retryable') OR state = 'running')`
+	jobListPendingSQL = ` AND state = 'pending' AND id IN (SELECT job_id FROM {{schema}}.hopper_job_deps)`
 )
 
-// JobList implements driver.Executor.
+// maxJobID starts a newest-first listing that has no cursor.
+var maxJobID = driver.JobID{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+
+// errOrderingKeyNeedsQueue refuses a key listing across queues: a key is a
+// lane only within its queue.
+var errOrderingKeyNeedsQueue = errors.New("hopper: list jobs: an ordering key is listed within a queue; set the queue")
+
+// JobList implements driver.Executor. The ordering key is matched only when
+// set, as a plain equality, so the ordering-key indexes serve it.
 func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]*driver.JobRow, error) {
+	if params.OrderingKey != "" && params.Queue == "" {
+		return nil, errOrderingKeyNeedsQueue
+	}
 	live, history := false, false
 	for _, s := range params.States {
 		if s.Terminal() {
@@ -548,21 +564,40 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	if len(params.States) == 0 {
 		live, history = true, true
 	}
-	var query string
-	switch {
-	case live && history:
-		query = "(" + jobListLiveSQL + jobListFilterSQL + ") UNION ALL (" + jobListHistorySQL + jobListFilterSQL + ")"
-	case live:
-		query = jobListLiveSQL + jobListFilterSQL
-	default:
-		query = jobListHistorySQL + jobListFilterSQL
-	}
-	query += " ORDER BY id LIMIT $5"
 	states := make([]string, len(params.States))
 	for i, s := range params.States {
 		states[i] = string(s)
 	}
-	jobs, err := historyJobs(e.Conn.Query(ctx, query, params.Queue, textArray(params.Kinds), textArray(states), uuidParam(params.After), max(params.Limit, 1)))
+	after := params.After
+	if params.NewestFirst && after.IsZero() {
+		after = maxJobID
+	}
+	args := []any{params.Queue, textArray(params.Kinds), textArray(states), uuidParam(after), max(params.Limit, 1)}
+	filter, order := jobListFilterSQL+" AND id > $4::uuid", " ORDER BY id LIMIT $5"
+	if params.NewestFirst {
+		filter, order = jobListFilterSQL+" AND id < $4::uuid", " ORDER BY id DESC LIMIT $5"
+	}
+	if params.OrderingKey != "" {
+		filter += " AND ordering_key = $6"
+		args = append(args, params.OrderingKey)
+	}
+	var arms []string
+	if live {
+		if params.OrderingKey == "" {
+			arms = append(arms, jobListLiveSQL+filter)
+		} else {
+			arms = append(arms, jobListLiveSQL+filter+jobListKeyedSQL, jobListLiveSQL+filter+jobListPendingSQL)
+		}
+	}
+	if history {
+		arms = append(arms, jobListHistorySQL+filter)
+	}
+	query := arms[0]
+	if len(arms) > 1 {
+		query = "(" + strings.Join(arms, order+") UNION ALL (") + order + ")"
+	}
+	query += order
+	jobs, err := historyJobs(e.Conn.Query(ctx, query, args...))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: list jobs: %w", err)
 	}

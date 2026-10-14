@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -368,6 +369,125 @@ func indexOf(s, sub string) int {
 	return -1
 }
 
+// testHistoryOrderingIndex checks that maintenance builds and attaches the
+// ordering-key index of every history partition (schema v12), including
+// one a cancelled build left invalid, while leaders overlap and history is
+// read throughout: no attach may deadlock with a reader.
+func testHistoryOrderingIndex[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	p := params("k", 2)
+	p[0].OrderingKey = "lane"
+	insert(ctx, t, exec, p)
+	clientID := register(ctx, t, exec)
+	for _, j := range claim(ctx, t, exec, clientID, 2) {
+		finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	}
+	unattached := func() string {
+		t.Helper()
+		return f.QueryText(ctx, t, d, `
+			SELECT count(*)::text FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+			WHERE i.inhparent IN ('hopper_job_history_completed'::regclass, 'hopper_job_history_failed'::regclass)
+			  AND NOT EXISTS (
+			    SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
+			    WHERE x.indrelid = c.oid
+			      AND xi.inhparent IN ('hopper_job_history_completed_ordering'::regclass, 'hopper_job_history_failed_ordering'::regclass))`)
+	}
+	if n := unattached(); n == "0" {
+		t.Fatal("no partition is missing its index before maintenance")
+	}
+	skipped := driver.HistoryIndexParams{Skip: []string{"hopper_job_history_completed_default", "hopper_job_history_failed_default"}}
+	if _, err := exec.HistoryIndex(ctx, skipped); err != nil {
+		t.Fatal(err)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT (to_regclass('hopper_job_history_completed_default_ordering') IS NULL AND to_regclass('hopper_job_history_failed_default_ordering') IS NULL)::text"); v != "true" {
+		t.Error("a skipped partition was indexed")
+	}
+
+	// What a cancelled CREATE INDEX CONCURRENTLY leaves: an invalid index
+	// under the name maintenance uses.
+	f.Exec(ctx, t, d, "CREATE INDEX hopper_job_history_completed_default_ordering ON hopper_job_history_completed_default (kind)")
+	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_completed_default_ordering'::regclass")
+
+	maintainWhileReading(ctx, t, exec)
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := unattached(); n != "0" {
+		t.Errorf("%s partitions without an attached index", n)
+	}
+	for _, parent := range []string{"hopper_job_history_completed_ordering", "hopper_job_history_failed_ordering"} {
+		if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = $1::regclass", parent); v != "true" {
+			t.Errorf("%s valid = %s", parent, v)
+		}
+	}
+	if def := f.QueryText(ctx, t, d, "SELECT pg_get_indexdef('hopper_job_history_completed_default_ordering'::regclass)"); !strings.Contains(def, "(ordering_key, id) WHERE (ordering_key IS NOT NULL)") {
+		t.Errorf("rebuilt index = %s", def)
+	}
+	jobs, err := exec.JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10})
+	if err != nil || len(jobs) != 1 || jobs[0].OrderingKey != "lane" {
+		t.Errorf("history by key = %+v, %v", jobs, err)
+	}
+
+	// What retention dropping the last partition without an index leaves:
+	// every partition's index attached, and the outcome table's not valid.
+	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass"); v != "true" {
+		t.Errorf("hopper_job_history_failed_ordering valid after revalidation = %s", v)
+	}
+}
+
+// maintainWhileReading runs the history maintenance and indexing of three
+// overlapping leaders while eight readers list a key's jobs from history, and
+// fails the test on any error either side returns: no attach may deadlock
+// with a reader.
+func maintainWhileReading(ctx context.Context, t *testing.T, exec driver.Executor) {
+	t.Helper()
+	var (
+		readers  sync.WaitGroup
+		stop     = make(chan struct{})
+		readErrs = make(chan error, 8)
+	)
+	for range 8 {
+		readers.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := exec.JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10}); err != nil {
+					readErrs <- err
+					return
+				}
+			}
+		})
+	}
+	errs := make(chan error, 6)
+	for range 3 {
+		go func() {
+			_, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: time.Hour})
+			errs <- err
+		}()
+		go func() { _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); errs <- err }()
+	}
+	for range 6 {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent maintenance: %v", err)
+		}
+	}
+	close(stop)
+	readers.Wait()
+	close(readErrs)
+	for err := range readErrs {
+		t.Errorf("read during maintenance: %v", err)
+	}
+}
+
 func testHistoryMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -389,18 +509,7 @@ func testHistoryMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("recent history row lost: %v", err)
 	}
 	// Concurrent leaders do not trip over each other.
-	errs := make(chan error, 3)
-	for range 3 {
-		go func() {
-			_, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: time.Hour})
-			errs <- err
-		}()
-	}
-	for range 3 {
-		if err := <-errs; err != nil {
-			t.Errorf("concurrent maintenance: %v", err)
-		}
-	}
+	maintainWhileReading(ctx, t, exec)
 }
 
 func testNow[TTx any](t *testing.T, f Fixture[TTx]) {

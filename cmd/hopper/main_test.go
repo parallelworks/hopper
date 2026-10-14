@@ -72,6 +72,23 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "list", "-queue", "other"); strings.Contains(got, id) {
 		t.Errorf("filtered jobs list = %q", got)
 	}
+	keyed, err := client.Insert(ctx, ping{}, &hopper.InsertOpts{Queue: "q1", OrderingKey: "lane"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hopperCmd("jobs", "list", "-queue", "q1", "-ordering-key", "lane"); !strings.Contains(got, keyed.Job.ID.String()) || strings.Contains(got, id) {
+		t.Errorf("jobs list by ordering key = %q", got)
+	}
+	newer, older := keyed.Job.ID.String(), id
+	if newer < older {
+		newer, older = older, newer
+	}
+	if got := hopperCmd("jobs", "list", "-newest", "-limit", "1"); !strings.Contains(got, newer) || strings.Contains(got, older) {
+		t.Errorf("newest jobs list = %q", got)
+	}
+	if _, err := client.JobCancel(ctx, keyed.Job.ID); err != nil {
+		t.Fatal(err)
+	}
 	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "state:         available") {
 		t.Errorf("jobs get = %q", got)
 	}
