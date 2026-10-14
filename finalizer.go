@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +21,11 @@ import (
 // results fills the buffer and stops the claims. A flush that times out is
 // retried in halves, so one statement the database cannot finish in time
 // degrades into smaller ones instead of being sent again as it was.
+//
+// Results also carry their attempts' logs, which count against two bounds
+// of their own: a flush starts once its results hold finalizeLogBytes of
+// logs, and job goroutines block on submit while the buffered results hold
+// bufferedLogBytes.
 type finalizer struct {
 	exec     finalizeExecutor
 	logger   *slog.Logger
@@ -27,6 +33,11 @@ type finalizer struct {
 	maxBatch int
 	// keepLogs is how many attempt logs a job keeps.
 	keepLogs int
+	// flushLogBytes is finalizeLogBytes, and logs counts the bytes of logs
+	// that submitted results hold until they are flushed, up to
+	// bufferedLogBytes.
+	flushLogBytes int
+	logs          logBudget
 	// wake is called with the queue of a result that made a job claimable
 	// again right away, so the local producer need not wait for its poll.
 	wake func(queue string)
@@ -67,23 +78,31 @@ type pending struct {
 	waits int
 }
 
-func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, wake func(string), applied func(*driver.JobRow, driver.JobFinalize)) *finalizer {
+func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs int, wake func(string), applied func(*driver.JobRow, driver.JobFinalize)) *finalizer {
 	return &finalizer{
-		exec:     exec,
-		logger:   logger,
-		interval: t.finalizeInterval,
-		maxBatch: t.finalizeBatch,
-		wake:     wake,
-		applied:  applied,
-		in:       make(chan pending, max(t.finalizeBuffer, 2*t.finalizeBatch)),
-		done:     make(chan struct{}),
+		exec:          exec,
+		logger:        logger,
+		interval:      t.finalizeInterval,
+		maxBatch:      t.finalizeBatch,
+		keepLogs:      keepLogs,
+		flushLogBytes: finalizeLogBytes,
+		logs:          logBudget{max: bufferedLogBytes, freed: make(chan struct{})},
+		wake:          wake,
+		applied:       applied,
+		in:            make(chan pending, max(t.finalizeBuffer, 2*t.finalizeBatch)),
+		done:          make(chan struct{}),
 	}
 }
 
-// submit queues a result. It blocks while the buffer is full. A result
+// submit queues a result. It blocks while the buffer is full, or while
+// the buffered results' logs fill their budget. A result
 // submitted after the finalizer has stopped is dropped: the job stays
 // running in the database and is rescued once this client's lease expires.
 func (f *finalizer) submit(p pending) {
+	if n := p.logBytes(); n > 0 && !f.logs.acquire(n, f.done) {
+		f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", p.result.ID)
+		return
+	}
 	select {
 	case f.in <- p:
 	case <-f.done:
@@ -96,22 +115,24 @@ func (f *finalizer) submit(p pending) {
 func (f *finalizer) run(ctx context.Context) {
 	defer close(f.done)
 	var (
-		batch []pending
-		timer <-chan time.Time
+		batch    []pending
+		logBytes int
+		timer    <-chan time.Time
 	)
 	for {
 		select {
 		case p := <-f.in:
 			batch = append(batch, p)
-			if len(batch) >= f.maxBatch {
+			logBytes += p.logBytes()
+			if len(batch) >= f.maxBatch || logBytes >= f.flushLogBytes {
 				f.flush(ctx, batch)
-				batch, timer = nil, nil
+				batch, logBytes, timer = nil, 0, nil
 			} else if timer == nil {
 				timer = time.After(f.interval)
 			}
 		case <-timer:
 			f.flush(ctx, batch)
-			batch, timer = nil, nil
+			batch, logBytes, timer = nil, 0, nil
 		case <-ctx.Done():
 			if f.crashed.Load() {
 				return
@@ -128,13 +149,74 @@ func (f *finalizer) run(ctx context.Context) {
 				break
 			}
 			for len(batch) > 0 {
-				n := min(len(batch), f.maxBatch)
+				n, size := 0, 0
+				for n < len(batch) && n < f.maxBatch && size < f.flushLogBytes {
+					size += batch[n].logBytes()
+					n++
+				}
 				f.flush(ctx, batch[:n])
 				batch = batch[n:]
 			}
 			return
 		}
 	}
+}
+
+// finalizeLogBytes is the size of the logs from which a batch of results is
+// flushed without waiting for more, which keeps a finalize statement's
+// parameters small. bufferedLogBytes bounds the logs that submitted results
+// hold in memory.
+const (
+	finalizeLogBytes = 8 << 20
+	bufferedLogBytes = 64 << 20
+)
+
+// logBytes is the size of the result's log.
+func (p pending) logBytes() int {
+	if p.result.Log == nil {
+		return 0
+	}
+	return len(p.result.Log.Log)
+}
+
+// logBudget is a count of bytes that waits for room. A single acquire larger
+// than max is let through when nothing else holds the budget.
+type logBudget struct {
+	mu    sync.Mutex
+	used  int
+	max   int
+	freed chan struct{} // closed and replaced on each release
+}
+
+// acquire waits until n bytes fit, or done is closed, and reports whether
+// they were acquired.
+func (b *logBudget) acquire(n int, done <-chan struct{}) bool {
+	for {
+		b.mu.Lock()
+		if b.used == 0 || b.used+n <= b.max {
+			b.used += n
+			b.mu.Unlock()
+			return true
+		}
+		freed := b.freed
+		b.mu.Unlock()
+		select {
+		case <-freed:
+		case <-done:
+			return false
+		}
+	}
+}
+
+func (b *logBudget) release(n int) {
+	if n == 0 {
+		return
+	}
+	b.mu.Lock()
+	b.used -= n
+	close(b.freed)
+	b.freed = make(chan struct{})
+	b.mu.Unlock()
 }
 
 // flushTimeout bounds one finalize statement.
@@ -154,6 +236,13 @@ const heldWait = 2 * time.Second
 // before) in another that skips held rows. Completions the client saw
 // commit are reported without a write.
 func (f *finalizer) flush(ctx context.Context, batch []pending) {
+	defer func() {
+		n := 0
+		for _, p := range batch {
+			n += p.logBytes()
+		}
+		f.logs.release(n)
+	}()
 	var plain, tx, committed []pending
 	for _, p := range batch {
 		switch {

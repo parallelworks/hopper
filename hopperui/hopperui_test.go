@@ -141,11 +141,11 @@ func TestUI(t *testing.T) {
 	if strings.Contains(body, "<h2>Logs</h2>") {
 		t.Error("a job that logged nothing shows logs")
 	}
-	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET logs = '[{"attempt": 1, "log": "msg=one\n"}, {"attempt": 2, "log": "msg=<two>\n"}]' WHERE id = $1`, [16]byte(snoozed.Job.ID)); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET logs = '[{"attempt": 1, "snoozed": true, "log": "msg=one\n"}, {"attempt": 2, "log": "msg=<two>\n"}]' WHERE id = $1`, [16]byte(snoozed.Job.ID)); err != nil {
 		t.Fatal(err)
 	}
 	code, body = get(readOnly, "/jobs/"+snoozed.Job.ID.String())
-	want(200, body, code, `<details class="log"><summary>attempt 1</summary><pre>msg=one
+	want(200, body, code, `<details class="log"><summary>attempt 1 (snoozed)</summary><pre>msg=one
 </pre></details>`, `<details class="log" open><summary>attempt 2</summary><pre>msg=&lt;two&gt;
 </pre></details>`)
 	code, body = get(readOnly, "/jobs/not-an-id")

@@ -2,7 +2,6 @@ package hopper
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -17,14 +16,25 @@ type AttemptLog = driver.AttemptLog
 type JobLogsConfig struct {
 	// MaxBytes is how much of an attempt's log is kept. Once a line would
 	// pass it, that line and the rest are dropped, and the log ends with a
-	// line that counts them. Defaults to 32 KiB; negative keeps no lines.
+	// line that counts them. Defaults to 32 KiB, and is at most 1 MiB;
+	// negative keeps no lines. A finished attempt's lines wait in memory
+	// with its result until it is written, so a client holds at most
+	// 64 MiB of them; past that, finished jobs wait to hand in their
+	// results, as they do when the finalizer's buffer is full.
 	MaxBytes int
-	// MaxAttempts is how many attempts' logs a job keeps, the latest.
-	// Defaults to 10.
+	// MaxAttempts is how many attempts' logs a job keeps, the latest. Each
+	// snooze keeps its own until the next snooze of the same attempt
+	// number. Defaults to 10, and is at most 100.
 	MaxAttempts int
 	// Level is the lowest level kept. Defaults to slog.LevelInfo. Lines
 	// go to Config.Logger at whatever level its handler takes.
 	Level slog.Leveler
+	// ReplaceAttr, if set, rewrites or drops each attribute of a kept line,
+	// as slog.HandlerOptions.ReplaceAttr does. The options of
+	// Config.Logger's handler do not apply to the kept lines, so whatever
+	// that handler redacts is redacted here too, or it is stored with the
+	// job and shown by hopper jobs get and hopperui.
+	ReplaceAttr func(groups []string, a slog.Attr) slog.Attr
 }
 
 // Defaults for JobLogsConfig fields.
@@ -33,10 +43,17 @@ const (
 	DefaultJobLogAttempts = 10
 )
 
+// Limits of JobLogsConfig fields, which keep a job's logs and a finalize
+// statement's well within what Postgres takes.
+const (
+	MaxJobLogBytes    = 1 << 20
+	MaxJobLogAttempts = 100
+)
+
 // Logger returns the logger of the job whose context ctx is. Its lines go
 // to Config.Logger, with the job's ID, kind and attempt, and are kept with
-// the job, in text form, as the logs of the attempt: JobGet returns them in
-// JobRow.Logs, and hopper jobs get and hopperui show them. They are written
+// the job, in text form, as the logs of the attempt: Client.JobLogs returns
+// them, and hopper jobs get and hopperui show them. They are written
 // with the attempt's result, so they cost no writes of their own; a job
 // keeps those of its latest attempts, bounded by Config.JobLogs, through
 // retries and into history, and they leave with the job.
@@ -47,17 +64,27 @@ const (
 //		...
 //	}
 //
-// The lines of an attempt whose client crashes are lost with it; its error
-// says the client was lost. A job completed with CompleteTx keeps the lines
-// logged before that call. Outside a job, Logger returns slog.Default().
+// The lines of an attempt whose result is not written are lost with it: one
+// whose client crashes or loses its lease, or that is rescued for running
+// past Config.RescueStuckAfter. The rescue's error says which. A job
+// completed with CompleteTx keeps the lines logged before that call. A
+// worker run with Workers.Work logs as the attempt that ran it, if any.
+// Outside a job, Logger returns slog.Default().
 func Logger(ctx context.Context) *slog.Logger {
 	a, _ := ctx.Value(attemptKey{}).(*attempt)
 	if a == nil {
+		if l, ok := ctx.Value(inlineLoggerKey{}).(*slog.Logger); ok {
+			return l
+		}
 		return slog.Default()
 	}
 	a.loggerOnce.Do(a.newLogger)
 	return a.logger
 }
+
+// inlineLoggerKey carries the logger of the attempt that runs a worker
+// with Workers.Work.
+type inlineLoggerKey struct{}
 
 // newLogger builds the attempt's logger: lines go to the client's logger and,
 // unless the client keeps none, to the attempt's log.
@@ -71,7 +98,7 @@ func (a *attempt) newLogger() {
 	a.mu.Lock()
 	a.kept = kept
 	a.mu.Unlock()
-	text := slog.NewTextHandler(kept, &slog.HandlerOptions{Level: a.logs.Level})
+	text := slog.NewTextHandler(kept, &slog.HandlerOptions{Level: a.logs.Level, ReplaceAttr: a.logs.ReplaceAttr})
 	a.logger = slog.New(slog.NewMultiHandler(base.Handler(), text))
 }
 
@@ -128,8 +155,11 @@ func withJobLogDefaults(cfg JobLogsConfig) (JobLogsConfig, error) {
 	if cfg.MaxAttempts == 0 {
 		cfg.MaxAttempts = DefaultJobLogAttempts
 	}
-	if cfg.MaxAttempts < 0 {
-		return cfg, errors.New("hopper: Config.JobLogs.MaxAttempts must be positive")
+	if cfg.MaxAttempts < 0 || cfg.MaxAttempts > MaxJobLogAttempts {
+		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxAttempts must be between 1 and %d", MaxJobLogAttempts)
+	}
+	if cfg.MaxBytes > MaxJobLogBytes {
+		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxBytes must be at most %d", MaxJobLogBytes)
 	}
 	if cfg.Level == nil {
 		cfg.Level = slog.LevelInfo

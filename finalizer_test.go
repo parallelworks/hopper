@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,7 +70,7 @@ func (e *stubExec) batches() []int {
 }
 
 func newTestFinalizer(exec finalizeExecutor, t tuning, applied func()) (*finalizer, func()) {
-	f := newFinalizer(exec, slog.New(slog.DiscardHandler), t, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), t, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {
 		if applied != nil {
 			applied()
 		}
@@ -258,5 +259,80 @@ func TestFinalizerSkipsRowsHeldByTx(t *testing.T) {
 	exec.mu.Unlock()
 	if len(sizes) != 2 || sizes[0] != 1 || sizes[1] != 1 || skipped[0] || !skipped[1] {
 		t.Errorf("statements of sizes %v skipping held rows %v, want a plain one and one that skips", sizes, skipped)
+	}
+}
+
+// loggedResult is a result whose attempt kept n bytes of logs.
+func loggedResult(i, n int) pending {
+	return pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{
+		ID: driver.JobID{byte(i), byte(i >> 8)}, State: driver.JobStateCompleted,
+		Log: &driver.AttemptLog{Attempt: 1, Log: strings.Repeat("x", n)},
+	}}
+}
+
+// A batch is flushed once its results hold flushLogBytes of logs, without
+// waiting for the interval or a full batch, so that one statement's
+// parameters stay small.
+func TestFinalizerFlushesAtLogBytes(t *testing.T) {
+	exec := &stubExec{started: make(chan int, 64)}
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeInterval: time.Hour, finalizeBatch: 500, finalizeBuffer: 100}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	f.flushLogBytes = 1000
+	ctx, cancel := context.WithCancel(context.Background())
+	go f.run(ctx)
+	f.submit(loggedResult(0, 10))
+	f.submit(loggedResult(1, 600))
+	f.submit(loggedResult(2, 400))
+	select {
+	case n := <-exec.started:
+		if n != 3 {
+			t.Errorf("flush took %d results, want 3", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no flush at flushLogBytes")
+	}
+	f.submit(loggedResult(3, 10))
+	cancel()
+	<-f.done
+	if got := exec.batches(); !slices.Equal(got, []int{3, 1}) {
+		t.Errorf("batches %v, want [3 1]", got)
+	}
+}
+
+// Results holding the whole log budget make submit block until a flush
+// frees it, as a full buffer does; a result over the budget alone goes
+// through when nothing else holds it.
+func TestFinalizerBoundsBufferedLogs(t *testing.T) {
+	exec := &stubExec{release: make(chan struct{}), started: make(chan int, 64)}
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeInterval: time.Millisecond, finalizeBatch: 500, finalizeBuffer: 100}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	f.flushLogBytes = 100
+	f.logs.max = 300
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); <-f.done }()
+
+	f.submit(loggedResult(0, 1000))
+	go f.run(ctx)
+	<-exec.started
+	submitted := make(chan int, 4)
+	go func() {
+		for i := 1; i <= 4; i++ {
+			f.submit(loggedResult(i, 100))
+			submitted <- i
+		}
+	}()
+	select {
+	case i := <-submitted:
+		t.Fatalf("result %d submitted while a flush held the budget", i)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(exec.release)
+	for want := 1; want <= 4; want++ {
+		select {
+		case i := <-submitted:
+			if i != want {
+				t.Fatalf("submitted %d, want %d", i, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("result %d still blocked after the flush", want)
+		}
 	}
 }

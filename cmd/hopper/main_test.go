@@ -98,10 +98,11 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, `progress:      step "fetch", cursor 3 (`) {
 		t.Errorf("jobs get with progress = %q", got)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET logs = '[{"attempt": 1, "log": "level=INFO msg=one\nlevel=WARN msg=two\n"}]' WHERE id = $1::uuid`, id); err != nil {
+	// A log written by hand may not end in a newline.
+	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET logs = '[{"attempt": 1, "log": "level=INFO msg=one\nlevel=WARN msg=two\n"}, {"attempt": 2, "log": "no newline"}]' WHERE id = $1::uuid`, id); err != nil {
 		t.Fatal(err)
 	}
-	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "log #1:\n  level=INFO msg=one\n  level=WARN msg=two\n") {
+	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "log #1:\n  level=INFO msg=one\n  level=WARN msg=two\nlog #2:\n  no newline\n") {
 		t.Errorf("jobs get with logs = %q", got)
 	}
 	if got := hopperCmd("jobs", "retry", id); !strings.Contains(got, "progress:") {

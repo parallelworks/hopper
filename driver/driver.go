@@ -143,6 +143,9 @@ type Executor interface {
 	JobRecordProgress(ctx context.Context, params JobRecordProgressParams) (*Progress, error)
 	// JobGet returns a job by ID, live or from history.
 	JobGet(ctx context.Context, id JobID) (*JobRow, error)
+	// JobLogs returns the logs of a job's latest attempts, oldest first,
+	// live or from history.
+	JobLogs(ctx context.Context, id JobID) ([]AttemptLog, error)
 	// JobList returns jobs matching the filter in ID order (descending with
 	// NewestFirst), after the cursor.
 	JobList(ctx context.Context, params JobListParams) ([]*JobRow, error)
@@ -410,9 +413,6 @@ type JobRow struct {
 	// Progress is the last step the job's worker recorded, or nil. It
 	// survives retries, snoozes and a JobRetry from history.
 	Progress *Progress
-	// Logs are the log lines of the job's latest attempts, oldest first.
-	// Only JobGet reads them.
-	Logs []AttemptLog
 	// FinalizedAt is set for jobs in history.
 	FinalizedAt time.Time
 	// Output is the value recorded by the worker, for jobs in history.
@@ -434,6 +434,10 @@ type Progress struct {
 // AttemptLog is the log output of one attempt of a job.
 type AttemptLog struct {
 	Attempt int `json:"attempt"`
+	// Snoozed reports that the attempt snoozed, which gives the attempt
+	// back: the next attempt has the same number. A job keeps the log of
+	// only the latest snooze of each attempt number.
+	Snoozed bool `json:"snoozed,omitempty"`
 	// Log is the attempt's lines, each ending in a newline.
 	Log string `json:"log"`
 }
@@ -801,7 +805,9 @@ type JobFinalize struct {
 	Error *AttemptError
 	// Output is stored with the finalized job.
 	Output json.RawMessage
-	// Log is appended to the job's logs, if not nil.
+	// Log is appended to the job's logs, if not nil, with Snoozed set from
+	// Snooze. A completed job that is not archived has no logs to keep, and
+	// its Log is not sent.
 	Log *AttemptLog
 	// Archive controls whether a terminal job is written to history. Canceled
 	// and discarded jobs are always archived; completed jobs may skip it.

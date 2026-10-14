@@ -609,9 +609,15 @@ var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
 SELECT id FROM retry UNION ALL SELECT id FROM finished`
 
 // appendLogSQL appends an attempt's log, if it has one, to its job's logs,
-// keeping the latest $13.
+// keeping the latest $13. A snooze gives its attempt back, so a job that
+// snoozes again and again would fill its logs with them: a snooze's log
+// replaces the one of the previous snooze of the same attempt number.
 const appendLogSQL = `CASE WHEN r.log IS NULL THEN j.logs
-         ELSE jsonb_path_query_array(coalesce(j.logs, '[]') || jsonb_build_array(r.log),
+         ELSE jsonb_path_query_array(
+           CASE WHEN r.snooze
+                THEN jsonb_path_query_array(coalesce(j.logs, '[]'), '$[*] ? (!exists(@.snoozed) || @.attempt != $a)',
+                       jsonb_build_object('a', r.log->'attempt'))
+                ELSE coalesce(j.logs, '[]') END || jsonb_build_array(r.log),
            '$[last - $keep + 1 to last]', jsonb_build_object('keep', $13::int)) END`
 
 // jobFinalizePlainSQL is jobFinalizeSQL for results whose jobs belong to
@@ -671,16 +677,18 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 			errs[i] = b
 		}
 		outputs[i] = f.Output
-		if f.Log != nil {
-			b, err := json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Log: storableText(f.Log.Log)})
+		// Only completed jobs may skip history; the failed partitions are the
+		// dead-letter queue.
+		archives[i] = f.Archive || f.State != driver.JobStateCompleted
+		// A finished job that skips history takes its logs with it, so its
+		// log is not sent.
+		if f.Log != nil && (archives[i] || !f.State.Terminal()) {
+			b, err := json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Log: storableText(f.Log.Log)})
 			if err != nil {
 				return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 			}
 			logs[i] = b
 		}
-		// Only completed jobs may skip history; the failed partitions are the
-		// dead-letter queue.
-		archives[i] = f.Archive || f.State != driver.JobStateCompleted
 	}
 	args := []any{
 		uuidArray(ids), int64Array(attemptedBy), textArray(states), floatArray(delays), boolArray(snoozes),
@@ -723,9 +731,9 @@ func marshalAttemptError(e *driver.AttemptError) ([]byte, error) {
 }
 
 var jobGetQuery = fmt.Sprintf(`
-SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output, logs FROM {{schema}}.hopper_jobs WHERE id = $1
+SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE id = $1
 UNION ALL
-SELECT %s, finalized_at, output, logs FROM {{schema}}.hopper_job_history WHERE id = $1
+SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history WHERE id = $1
 LIMIT 1`, JobColumns(""), historyColumns(""))
 
 // jobRecordProgressSQL stores a running job's progress, fenced to the
@@ -808,23 +816,41 @@ func decodeProgress(stored string) *driver.Progress {
 
 // JobGet implements driver.Executor.
 func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
-	var logs jsonText
-	job, err := scanJob(e.Conn.QueryRow(ctx, jobGetQuery, uuidParam(id)), true, &logs)
+	job, err := scanJob(e.Conn.QueryRow(ctx, jobGetQuery, uuidParam(id)), true)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("hopper: get job: %w", err)
 	}
-	job.Logs = decodeLogs(string(logs))
 	return job, nil
+}
+
+const jobLogsQuery = `
+SELECT logs FROM {{schema}}.hopper_jobs WHERE id = $1
+UNION ALL
+SELECT logs FROM {{schema}}.hopper_job_history WHERE id = $1
+LIMIT 1`
+
+// JobLogs implements driver.Executor.
+func (e *Executor) JobLogs(ctx context.Context, id driver.JobID) ([]driver.AttemptLog, error) {
+	var logs jsonText
+	err := e.Conn.QueryRow(ctx, jobLogsQuery, uuidParam(id)).Scan(&logs)
+	if errors.Is(err, ErrNoRows) {
+		return nil, driver.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("hopper: get job logs: %w", err)
+	}
+	return decodeLogs(string(logs)), nil
 }
 
 // decodeLogs reads a job's logs, skipping entries that are not in the form
 // the finalize writes, such as ones written by hand.
 func decodeLogs(stored string) []driver.AttemptLog {
+	// Anything but an array (or null) fails to decode into entries.
 	var entries []json.RawMessage
-	if !strings.HasPrefix(strings.TrimSpace(stored), "[") || json.Unmarshal([]byte(stored), &entries) != nil {
+	if json.Unmarshal([]byte(stored), &entries) != nil {
 		return nil
 	}
 	var logs []driver.AttemptLog

@@ -2,6 +2,7 @@ package drivertest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -13,7 +14,7 @@ import (
 
 // testJobLogs appends attempt logs with retries, snoozes and finalizes,
 // keeping the latest KeepLogs, and checks that they go to history with the
-// job, come back with a JobRetry from history, and are read by JobGet only.
+// job, come back with a JobRetry from history, and are read by JobLogs.
 func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -32,9 +33,6 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		if !slices.ContainsFunc(jobs, func(j *driver.JobRow) bool { return j.ID == id }) {
 			t.Fatalf("claim of %s = %d jobs", id, len(jobs))
 		}
-		if len(jobs[0].Logs) > 0 {
-			t.Errorf("the claim read logs: %+v", jobs[0].Logs)
-		}
 		var results []driver.JobFinalize
 		for _, j := range jobs {
 			r := driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateRetryable}
@@ -51,11 +49,11 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 	logs := func(id driver.JobID) []driver.AttemptLog {
 		t.Helper()
-		j, err := exec.JobGet(ctx, id)
+		l, err := exec.JobLogs(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return j.Logs
+		return l
 	}
 	check := func(what string, got []driver.AttemptLog, want ...driver.AttemptLog) {
 		t.Helper()
@@ -65,6 +63,7 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 	a1 := driver.AttemptLog{Attempt: 1, Log: "level=INFO msg=one\n"}
 	a2 := driver.AttemptLog{Attempt: 2, Log: "level=INFO msg=two\nlevel=WARN msg=more\n"}
+	a2again := driver.AttemptLog{Attempt: 2, Log: "level=INFO msg=again\n"}
 	a3 := driver.AttemptLog{Attempt: 3, Log: "nul \x00 replaced\n"}
 	a4 := driver.AttemptLog{Attempt: 4, Log: "four\n"}
 
@@ -72,30 +71,28 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	run(id, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "x"}, Log: &a1}, 2, false)
 	check("after a retry", logs(id), a1)
 	check("a job that logged nothing", logs(other))
+	// A snooze gives the attempt back, and the next snooze of the same
+	// attempt number replaces its log.
 	run(id, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &a2}, 2, true)
-	check("after a snooze", logs(id), a1, a2)
+	s2 := a2
+	s2.Snoozed = true
+	check("after a snooze", logs(id), a1, s2)
+	run(id, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &a2again}, 2, false)
+	s2.Log = a2again.Log
+	check("after another snooze", logs(id), a1, s2)
 	run(id, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 2, Error: "x"}}, 2, false)
-	check("after an attempt that logged nothing", logs(id), a1, a2)
+	check("after an attempt that logged nothing", logs(id), a1, s2)
 	run(id, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 3, Error: "x"}, Log: &a3}, 2, false)
 	stored := driver.AttemptLog{Attempt: 3, Log: "nul � replaced\n"}
-	check("past KeepLogs", logs(id), a2, stored)
+	check("past KeepLogs", logs(id), s2, stored)
 
 	// Into history and back, with KeepLogs zero keeping them all.
 	run(id, driver.JobFinalize{State: driver.JobStateCompleted, Archive: true, Log: &a4}, 0, false)
-	check("in history", logs(id), a2, stored, a4)
+	check("in history", logs(id), s2, stored, a4)
 	if _, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: id}); err != nil {
 		t.Fatal(err)
 	}
-	check("after a JobRetry from history", logs(id), a2, stored, a4)
-	list, err := exec.JobList(ctx, driver.JobListParams{Limit: 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, j := range list {
-		if len(j.Logs) > 0 {
-			t.Errorf("JobList read the logs of %s", j.ID)
-		}
-	}
+	check("after a JobRetry from history", logs(id), s2, stored, a4)
 
 	// A canceled job takes them to history too.
 	if _, err := exec.JobCancel(ctx, id); err != nil {
@@ -104,7 +101,19 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	if j, err := exec.JobGet(ctx, id); err != nil || j.State != driver.JobStateCanceled {
 		t.Fatalf("canceled job = %+v, %v", j, err)
 	}
-	check("canceled", logs(id), a2, stored, a4)
+	check("canceled", logs(id), s2, stored, a4)
+
+	// So does one that expires.
+	run(other, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "x"}, Log: &a1}, 2, false)
+	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = now() - interval '1s' WHERE id = $1::uuid", other.String())
+	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 1 || expired[0].ID != other {
+		t.Fatalf("expired = %v, %v", expired, err)
+	}
+	check("expired", logs(other), a1)
+
+	if _, err := exec.JobLogs(ctx, driver.JobID{9}); !errors.Is(err, driver.ErrNotFound) {
+		t.Errorf("JobLogs of an unknown job = %v", err)
+	}
 }
 
 // testJobLogsFenced finalizes a job from its attempt and, concurrently,
@@ -150,13 +159,13 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 		if applied[0] != 1 || slices.Max(applied[1:]) != 0 {
 			t.Fatalf("round %d: applied %v, want only the owner's", round, applied)
 		}
-		j, err := exec.JobGet(ctx, id)
+		got, err := exec.JobLogs(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}
 		want := []driver.AttemptLog{{Attempt: 1, Log: fmt.Sprintf("client %d\n", owner)}}
-		if !slices.Equal(j.Logs, want) {
-			t.Fatalf("round %d: logs %+v, want %+v", round, j.Logs, want)
+		if !slices.Equal(got, want) {
+			t.Fatalf("round %d: logs %+v, want %+v", round, got, want)
 		}
 	}
 }

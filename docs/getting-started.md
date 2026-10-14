@@ -360,7 +360,7 @@ The lines go to `Config.Logger`, with the job's ID, kind and attempt, as
 they happen. Each attempt's lines are also stored with the job when the
 attempt finishes, up to 32 KiB per attempt for the latest 10 attempts
 (`Config.JobLogs`), and kept for as long as the job is: `hopper jobs get`
-and the web UI show them, and `client.JobGet` returns them in `job.Logs`.
+and the web UI show them, and `client.JobLogs(ctx, id)` returns them.
 
 ## Operate
 
