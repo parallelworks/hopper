@@ -52,6 +52,12 @@
   session connection: point the listener at a direct address with
   `hopperpgx.Config.ListenConnConfig`, or accept polling (the client logs
   once and polls every `PollInterval`, one second by default).
+- **`statement_timeout`.** After the v12 upgrade the leader builds an index
+  on each existing history partition with `CREATE INDEX CONCURRENTLY`, which
+  runs under the pool's `statement_timeout` and waits for every older
+  transaction in the database. A build that runs past the timeout is retried
+  at doubling intervals with a warning; raise the timeout for hopper's role
+  until the warnings stop.
 - **Streams.** The stream log is partitioned by day and dropped after
   `StreamRetention`, like history. Consumers are delivered by the leader,
   in transaction-commit order per batch, and a transaction that commits
@@ -149,7 +155,7 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
 
 ```sh
 hopper [-schema NAME] migrate up|down|version
-hopper jobs list [-queue Q] [-kind K] [-state S] [-limit N]
+hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
 hopper jobs get|retry|cancel <id>
 hopper queues list|pause|resume [name]
 hopper clients list

@@ -50,6 +50,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			c.pruneClients(ctx)
 			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval && c.maintainHistory(ctx) {
 				lastMaintenance = time.Now()
+				term.maintainedOnce()
 			}
 		default:
 			if c.isLeader.Swap(false) {
@@ -73,11 +74,17 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 type leaderTerm struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	// maintained is closed once the term's first history maintenance has
+	// run, which the index loop waits for (see indexLoop).
+	maintained chan struct{}
+	once       sync.Once
 }
+
+func (t *leaderTerm) maintainedOnce() { t.once.Do(func() { close(t.maintained) }) }
 
 func (c *Client[TTx]) startTerm(ctx context.Context) *leaderTerm {
 	termCtx, cancel := context.WithCancel(ctx)
-	t := &leaderTerm{cancel: cancel, done: make(chan struct{})}
+	t := &leaderTerm{cancel: cancel, done: make(chan struct{}), maintained: make(chan struct{})}
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		if len(c.cfg.Periodic) > 0 {
@@ -86,6 +93,7 @@ func (c *Client[TTx]) startTerm(ctx context.Context) *leaderTerm {
 	})
 	wg.Go(func() { c.streamLoop(termCtx) })
 	wg.Go(func() { c.liveLoop(termCtx) })
+	wg.Go(func() { c.indexLoop(termCtx, t.maintained) })
 	go func() {
 		defer close(t.done)
 		wg.Wait()
@@ -338,6 +346,62 @@ func (c *Client[TTx]) pruneClients(ctx context.Context) {
 	}
 	if n > 0 {
 		c.logger.InfoContext(ctx, "hopper: pruned expired clients", "count", n)
+	}
+}
+
+// maxIndexBackoffShift caps the retry interval of a timed-out index build
+// at 64 maintenance intervals.
+const maxIndexBackoffShift = 6
+
+// indexLoop builds history indexes an upgrade declared (HistoryIndex) once
+// the term's first history maintenance has run, and then every maintenance
+// interval. It runs beside the leader loop, not in it: a concurrent index
+// build can take minutes, and the leader loop must keep renewing the lease
+// meanwhile. It waits for that first maintenance because partition creation
+// skips a partition while a build runs on its table's DEFAULT partition
+// (HistoryIndexLockKey), and the term starts by creating the partitions
+// ahead. A build cut short by the end of the term is redone by the next
+// leader. A partition whose build outlasts the session's statement_timeout
+// is retried at doubling intervals, so that it neither holds up the others
+// nor costs a futile build every interval.
+func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{}) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-maintained:
+	}
+	ticker := time.NewTicker(c.tuning.maintenanceInterval)
+	defer ticker.Stop()
+	type backoff struct {
+		failures int
+		next     time.Time
+	}
+	timedOut := map[string]backoff{}
+	for {
+		var skip []string
+		for name, b := range timedOut {
+			if time.Now().Before(b.next) {
+				skip = append(skip, name)
+			}
+		}
+		res, err := c.exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: skip})
+		if err != nil && ctx.Err() == nil {
+			c.logger.WarnContext(ctx, "hopper: index history", "error", err)
+		}
+		for _, name := range res.TimedOut {
+			b := timedOut[name]
+			b.failures++
+			wait := c.tuning.maintenanceInterval << min(b.failures, maxIndexBackoffShift)
+			b.next = time.Now().Add(wait)
+			timedOut[name] = b
+			c.logger.WarnContext(ctx, "hopper: a history partition's index build ran past statement_timeout; raise it for this role to let the build finish",
+				"partition", name, "retry_in", wait)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 

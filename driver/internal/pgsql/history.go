@@ -3,6 +3,7 @@ package pgsql
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"slices"
@@ -189,6 +190,212 @@ func (e *Executor) dropPartition(ctx context.Context, name, lockTimeout string) 
 	return true, nil
 }
 
+// orderingIndexes pairs each history outcome table with its ON ONLY
+// ordering-key index (schema v12).
+var orderingIndexes = map[string]string{
+	"hopper_job_history_completed": "hopper_job_history_completed_ordering",
+	"hopper_job_history_failed":    "hopper_job_history_failed_ordering",
+}
+
+// HistoryIndexLockKey is the pg_advisory_xact_lock key held while a history
+// partition is indexed, combined with the schema like HistoryLockKey. Two
+// concurrent CREATE INDEX CONCURRENTLY on one table can deadlock, so
+// overlapping leaders index one at a time; the one that does not get the
+// lock leaves the work to the other.
+//
+// A build on an outcome table's DEFAULT partition also holds the key combined
+// with the schema and that table. Partition creation under the table tries it
+// without waiting, and leaves the partition to its next pass while the build
+// runs: its attach scans the DEFAULT partition, which the build holds, while
+// the build waits for the attach's transaction to end. A build elsewhere does
+// not conflict with the attach.
+//
+// The CREATE INDEX CONCURRENTLY cannot run in a transaction, so the locks are
+// held by a transaction of their own, which stays open and idle on another
+// connection for the build. A session-level lock would not do: behind a
+// transaction pooler, the lock, the build and the unlock can each run on a
+// different server connection, and the lock would outlive the build.
+const HistoryIndexLockKey int32 = 0x686f7069 // "hopi"
+
+// tryHistoryIndexLock tries HistoryIndexLockKey combined with name, for the
+// rest of tx.
+func tryHistoryIndexLock(ctx context.Context, tx Conn, name string) (bool, error) {
+	var locked bool
+	err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock(hashtext($1), $2)", name, HistoryIndexLockKey).Scan(&locked)
+	return locked, err
+}
+
+// HistoryIndex implements driver.Executor. It builds the ordering-key index
+// of every history partition that has none attached yet, concurrently so
+// that finalizes keep moving rows into history, and attaches it. Partitions
+// created since v12 get theirs when they are attached, so this finds work
+// only after the upgrade, once per partition. An index a cancelled build
+// left invalid is dropped and built again. A build cancelled by the
+// session's statement timeout is reported, and the pass goes on to the next
+// partition.
+func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexParams) (driver.HistoryIndexResult, error) {
+	var res driver.HistoryIndexResult
+	if e.InTx {
+		return res, errors.New("hopper: history indexing must run on the pool, not in a transaction")
+	}
+	for parent, parentIndex := range orderingIndexes {
+		leaves, err := scanStrings(e.Conn.Query(ctx, `
+			SELECT c.relname FROM pg_inherits i
+			JOIN pg_class c ON c.oid = i.inhrelid
+			WHERE i.inhparent = to_regclass($1) AND to_regclass($2) IS NOT NULL
+			  AND NOT EXISTS (
+			    SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
+			    WHERE x.indrelid = c.oid AND xi.inhparent = to_regclass($2))`,
+			e.Schema.Table(parent), e.Schema.Table(parentIndex)))
+		if err != nil {
+			return res, fmt.Errorf("hopper: list unindexed partitions of %s: %w", parent, err)
+		}
+		for _, leaf := range leaves {
+			if slices.Contains(params.Skip, leaf) {
+				continue
+			}
+			done, err := e.indexHistoryPartitionLocked(ctx, parent, leaf, parentIndex)
+			if errors.Is(err, errStatementTimeout) {
+				res.TimedOut = append(res.TimedOut, leaf)
+				continue
+			}
+			if err != nil || !done {
+				return res, err
+			}
+		}
+		if err := e.revalidateOrderingIndex(ctx, parentIndex); err != nil {
+			return res, err
+		}
+	}
+	return res, nil
+}
+
+// errStatementTimeout marks a build the session's statement_timeout
+// cancelled.
+var errStatementTimeout = errors.New("hopper: index build exceeded statement_timeout")
+
+// indexHistoryPartitionLocked indexes one partition under
+// HistoryIndexLockKey, and reports false, having done nothing, if another
+// session holds it: another leader indexing, or, for a DEFAULT partition,
+// partition creation. The lock is held per partition, so that creation waits
+// out at most one partition's build.
+func (e *Executor) indexHistoryPartitionLocked(ctx context.Context, parent, leaf, parentIndex string) (bool, error) {
+	lock, err := e.Conn.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
+	}
+	// Ending the transaction releases the locks.
+	defer func() { _ = lock.Rollback(context.WithoutCancel(ctx)) }()
+	// The transaction must hold no snapshot while it waits idle for the
+	// build, which would otherwise wait for it in turn: read committed keeps
+	// none between statements.
+	if _, err := lock.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
+	}
+	locked, err := tryHistoryIndexLock(ctx, lock, e.Schema.Name)
+	if err == nil && locked && leaf == parent+"_default" {
+		locked, err = tryHistoryIndexLock(ctx, lock, e.Schema.Name+"."+parent)
+	}
+	if err != nil {
+		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
+	}
+	if !locked {
+		return false, nil
+	}
+	// A statement of its own lets go of the portal the lock's query left
+	// open, whose snapshot the build would wait for, and it keeps the server
+	// from ending the idle transaction, and the locks, during a long build.
+	if _, err := lock.Exec(ctx, "SET LOCAL idle_in_transaction_session_timeout = 0"); err != nil {
+		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
+	}
+	return true, e.indexHistoryPartition(ctx, leaf, parentIndex)
+}
+
+// indexHistoryPartition builds one partition's ordering-key index and
+// attaches it to its outcome table's index. A partition dropped by retention
+// since it was listed is skipped.
+func (e *Executor) indexHistoryPartition(ctx context.Context, leaf, parentIndex string) error {
+	index := leaf + "_ordering"
+	var (
+		exists bool
+		valid  sql.NullBool
+	)
+	if err := e.Conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL, (SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($2))",
+		e.Schema.Table(leaf), e.Schema.Table(index)).Scan(&exists, &valid); err != nil {
+		return fmt.Errorf("hopper: index partition %s: %w", leaf, err)
+	}
+	if !exists {
+		return nil
+	}
+	if valid.Valid && !valid.Bool {
+		if _, err := e.Conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+e.Schema.Table(index)); err != nil {
+			return fmt.Errorf("hopper: drop invalid index %s: %w", index, err)
+		}
+	}
+	if !valid.Valid || !valid.Bool {
+		if _, err := e.Conn.Exec(ctx, "CREATE INDEX CONCURRENTLY IF NOT EXISTS "+quoteIdent(index)+" ON "+e.Schema.Table(leaf)+
+			" (ordering_key, id) WHERE ordering_key IS NOT NULL"); err != nil {
+			var coded interface{ SQLState() string }
+			if ctx.Err() == nil && errors.As(err, &coded) && coded.SQLState() == "57014" {
+				// The build left an invalid index behind, which would cost
+				// every write to the partition until the next attempt.
+				if _, derr := e.Conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+e.Schema.Table(index)); derr != nil {
+					return fmt.Errorf("hopper: drop invalid index %s: %w", index, derr)
+				}
+				return fmt.Errorf("%w: %s: %w", errStatementTimeout, leaf, err)
+			}
+			return fmt.Errorf("hopper: index partition %s: %w", leaf, err)
+		}
+	}
+	return e.attachIndex(ctx, parentIndex, index)
+}
+
+// attachIndex attaches a partition's index under the history maintenance
+// lock, which partition creation (whose attach indexes the new partition)
+// also takes. Postgres marks a partitioned index valid in the attach that
+// completes it, counting the attached indexes it can see; two attaches
+// committing side by side would each miss the other's and leave the parent
+// invalid for good.
+func (e *Executor) attachIndex(ctx context.Context, parentIndex, index string) (err error) {
+	tx, err := e.Conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+		}
+	}()
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", e.Schema.Name, HistoryLockKey); err != nil {
+		return fmt.Errorf("hopper: lock history maintenance: %w", err)
+	}
+	if _, err = tx.Exec(ctx, "ALTER INDEX "+e.Schema.Table(parentIndex)+" ATTACH PARTITION "+e.Schema.Table(index)); err != nil {
+		return fmt.Errorf("hopper: attach index %s: %w", index, err)
+	}
+	return tx.Commit(ctx)
+}
+
+// revalidateOrderingIndex marks an outcome table's index valid when no
+// partition lacks its index any more but the attach that would have
+// completed it never ran, because retention dropped the last partition
+// without one before it was built. Attaching a partition's index again makes
+// Postgres count the attached indexes again; a new partition's attach does
+// not.
+func (e *Executor) revalidateOrderingIndex(ctx context.Context, parentIndex string) error {
+	var child sql.NullString
+	err := e.Conn.QueryRow(ctx, `
+		SELECT (SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		        WHERE i.inhparent = x.indexrelid LIMIT 1)
+		FROM pg_index x WHERE x.indexrelid = to_regclass($1) AND NOT x.indisvalid`, e.Schema.Table(parentIndex)).Scan(&child)
+	if errors.Is(err, ErrNoRows) || (err == nil && !child.Valid) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("hopper: check index %s: %w", parentIndex, err)
+	}
+	return e.attachIndex(ctx, parentIndex, child.String)
+}
+
 // partitionsOf lists the partitions attached to parent.
 func (e *Executor) partitionsOf(ctx context.Context, parent string) (map[string]struct{}, error) {
 	names, err := scanStrings(e.Conn.Query(ctx, `
@@ -227,6 +434,19 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// already created the partition.
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", e.Schema.Name, HistoryLockKey); err != nil {
 		return false, false, fmt.Errorf("hopper: lock history maintenance: %w", err)
+	}
+	// An index being built concurrently on this table's DEFAULT partition
+	// (HistoryIndex) holds HistoryIndexLockKey combined with the table, and
+	// the attach below would deadlock with it. Partitions are created periods
+	// ahead, so this one is deferred to the next pass instead.
+	if _, indexed := orderingIndexes[g.parent]; indexed {
+		var free bool
+		if free, err = tryHistoryIndexLock(ctx, tx, e.Schema.Name+"."+g.parent); err != nil {
+			return false, false, fmt.Errorf("hopper: lock history indexing: %w", err)
+		}
+		if !free {
+			return false, true, nil
+		}
 	}
 	var exists bool
 	if err = tx.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", e.Schema.Table(name)).Scan(&exists); err != nil {

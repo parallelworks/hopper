@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/parallelworks/hopper"
+	"github.com/parallelworks/hopper/internal/testdb"
 )
 
 // blocker is a worker that reports when it starts and then waits until it is
@@ -610,4 +614,175 @@ func TestInsertOnlyClientNotifiesWorkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = fmt.Sprint()
+}
+
+// TestLeaderKeepsLeaseWhileIndexingHistory has the leader build the history
+// indexes an upgrade declares (the DEFAULT partitions of a fresh schema
+// have none) while a transaction elsewhere in the database holds an old
+// snapshot, which a concurrent index build waits for. The leader keeps
+// renewing its lease meanwhile: no other client takes over, so leadership,
+// and what fires once per term, does not repeat.
+func TestLeaderKeepsLeaseWhileIndexingHistory(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	held, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(ctx) }()
+	if _, err := held.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.Exec(ctx, "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	var elected atomic.Int64
+	ectx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cfg := func() *hopper.Config {
+		return &hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()}
+	}
+	clients := []*hopper.Client[pgxTx]{h.client(cfg()), h.client(cfg())}
+	for _, c := range clients {
+		go func() {
+			for range c.Events(ectx, hopper.EventLeaderElected) {
+				elected.Add(1)
+			}
+		}()
+	}
+	for _, c := range clients {
+		if err := c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The build is under way, waiting for the old snapshot, before the
+	// lease is watched through it.
+	waitFor(t, func() bool {
+		return h.count(`SELECT count(*) FROM pg_stat_progress_create_index
+			WHERE relid IN (to_regclass('hopper_job_history_completed_default'), to_regclass('hopper_job_history_failed_default'))`) > 0
+	})
+	time.Sleep(3 * fastTuning.LeaderTTL)
+	if n := elected.Load(); n != 1 {
+		t.Errorf("%d elections while the leader indexed history, want 1", n)
+	}
+	if err := held.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const unindexed = `SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent IN ('hopper_job_history_completed'::regclass, 'hopper_job_history_failed'::regclass)
+		  AND NOT EXISTS (SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
+		    WHERE x.indrelid = c.oid
+		      AND xi.inhparent IN ('hopper_job_history_completed_ordering'::regclass, 'hopper_job_history_failed_ordering'::regclass))`
+	// A concurrent build also waits for every older snapshot elsewhere in
+	// the database, such as other packages' tests queued for the migration
+	// lock, so it can take longer than waitFor allows.
+	for deadline := time.Now().Add(2 * time.Minute); h.count(unindexed) != 0; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("history partitions still without an attached index")
+		}
+	}
+}
+
+// TestLeaderBacksOffTimedOutIndexBuilds runs the index loop on sessions
+// whose statement_timeout cuts every build short, the builds waiting for a
+// held snapshot. Each partition's build times out on its own, the pass going
+// on to the next, and is retried at doubling intervals.
+func TestLeaderBacksOffTimedOutIndexBuilds(t *testing.T) {
+	t.Parallel()
+	defaults := []string{"hopper_job_history_completed_default", "hopper_job_history_failed_default"}
+	t.Run("pass", func(t *testing.T) {
+		t.Parallel()
+		// One pass only: the next is a minute away.
+		logs := timedOutBuilds(t, time.Minute)
+		waitFor(t, func() bool { return logs.count(defaults[0]) > 0 && logs.count(defaults[1]) > 0 })
+	})
+	t.Run("backoff", func(t *testing.T) {
+		t.Parallel()
+		logs := timedOutBuilds(t, 250*time.Millisecond)
+		waitFor(t, func() bool { return logs.count(defaults[0]) > 0 && logs.count(defaults[1]) > 0 })
+		// Without backoff each partition would time out on every pass, about
+		// eight times in three seconds; with it, after waits of 0.5, 1 and 2
+		// seconds.
+		time.Sleep(3 * time.Second)
+		for _, p := range defaults {
+			if n := logs.count(p); n < 2 || n > 4 {
+				t.Errorf("%s timed out %d times in three seconds, want 2 to 4", p, n)
+			}
+		}
+	})
+}
+
+// timedOutBuilds starts a leader whose sessions have a statement_timeout
+// that every index build overruns, waiting for a snapshot held open, and
+// counts the timed-out builds it logs.
+func timedOutBuilds(t *testing.T, maintenance time.Duration) *timeoutLog {
+	t.Helper()
+	h := newHarness(t)
+	ctx := context.Background()
+	held, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Rollback(ctx) })
+	if _, err := held.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.Exec(ctx, "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	pcfg := h.pool.Config()
+	pcfg.ConnConfig.RuntimeParams["statement_timeout"] = "200ms"
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	logs := &timeoutLog{counts: map[string]int{}}
+	c, err := hopper.NewClient(testdb.Driver(pool), &hopper.Config{
+		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
+		Logger: slog.New(logs),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := fastTuning
+	tun.Maintenance = maintenance
+	c.SetTuning(tun)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Stop(context.Background()) })
+	return logs
+}
+
+// timeoutLog counts the index loop's timed-out builds per partition.
+type timeoutLog struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (l *timeoutLog) Enabled(context.Context, slog.Level) bool { return true }
+func (l *timeoutLog) WithAttrs([]slog.Attr) slog.Handler       { return l }
+func (l *timeoutLog) WithGroup(string) slog.Handler            { return l }
+
+func (l *timeoutLog) Handle(_ context.Context, r slog.Record) error {
+	if !strings.Contains(r.Message, "statement_timeout") {
+		return nil
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "partition" {
+			l.mu.Lock()
+			l.counts[a.Value.String()]++
+			l.mu.Unlock()
+		}
+		return true
+	})
+	return nil
+}
+
+func (l *timeoutLog) count(partition string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.counts[partition]
 }

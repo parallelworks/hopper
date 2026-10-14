@@ -465,6 +465,20 @@ func TestJobsIteratorPages(t *testing.T) {
 	if n != 125 {
 		t.Errorf("iterated %d jobs, want 125", n)
 	}
+	n, last = 0, ""
+	for job, err := range c.Jobs(ctx, hopper.JobFilter{Queue: "even", NewestFirst: true}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.Queue != "even" || (last != "" && job.ID.String() >= last) {
+			t.Fatalf("unexpected job %+v after %s, newest first", job, last)
+		}
+		last = job.ID.String()
+		n++
+	}
+	if n != 125 {
+		t.Errorf("iterated %d jobs newest first, want 125", n)
+	}
 	// Breaking out early stops fetching.
 	n = 0
 	for _, err := range c.Jobs(ctx, hopper.JobFilter{}) {
