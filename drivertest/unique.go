@@ -41,6 +41,8 @@ func testInsertUniqueFinished[TTx any](t *testing.T, f Fixture[TTx]) {
 	completed := runTo(ctx, t, exec, clientID, "completed", driver.JobStateCompleted)
 	runTo(ctx, t, exec, clientID, "discarded", driver.JobStateDiscarded)
 	canceled := runTo(ctx, t, exec, clientID, "canceled", driver.JobStateCanceled)
+	runTo(ctx, t, exec, clientID, "batch-ok", driver.JobStateCompleted)
+	runTo(ctx, t, exec, clientID, "batch-bad", driver.JobStateDiscarded)
 
 	res := insert(ctx, t, exec, []driver.JobInsertParams{
 		uniqueFinished("fresh", 1, driver.JobStateCompleted),
@@ -105,6 +107,30 @@ func testInsertUniqueFinished[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.JobGet(ctx, inTx[1].Job.ID); err != nil {
 		t.Errorf("job inserted in tx: %v", err)
 	}
+
+	// Jobs of a batch found finished count toward the batch as their
+	// outcomes.
+	batch, err := exec.BatchInsert(ctx, driver.BatchInsertParams{Total: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inBatch := []driver.JobInsertParams{
+		uniqueFinished("batch-ok", 11, driver.JobStateCompleted, driver.JobStateDiscarded),
+		uniqueFinished("batch-bad", 12, driver.JobStateCompleted, driver.JobStateDiscarded),
+	}
+	for i := range inBatch {
+		inBatch[i].BatchID = batch
+	}
+	if res := insert(ctx, t, exec, inBatch); !res[0].Duplicate || !res[1].Duplicate {
+		t.Fatalf("batch jobs = %+v, %+v, want finished duplicates", res[0], res[1])
+	}
+	if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{batch}}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := exec.BatchGet(ctx, batch); err != nil || b.CompletedAt.IsZero() || b.Pending != 0 || b.Failed != 1 {
+		t.Errorf("batch of finished duplicates = %+v, %v, want completed with 1 failed", b, err)
+	}
+
 	if n := f.CountLive(ctx, t, d); n != 4 {
 		t.Errorf("%d live jobs, want 4 (fresh, discarded, canceled, tx)", n)
 	}
@@ -130,14 +156,16 @@ func testInsertUniqueFinishedRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]
 		defer rollback() //nolint:errcheck // already ended on the happy path
 		finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 
+		// The insert's transaction begins here, since Begin may call
+		// t.Fatal, which only the test's goroutine may.
+		ins, insCommit, insRollback := exec, func() error { return nil }, func() error { return nil }
+		if inTx {
+			var itx TTx
+			itx, insCommit, insRollback = f.Begin(ctx, t, d)
+			ins = d.UnwrapTx(itx)
+		}
 		done := make(chan driver.JobInsertResult, 1)
 		go func() {
-			ins, insCommit, insRollback := exec, func() error { return nil }, func() error { return nil }
-			if inTx {
-				var itx TTx
-				itx, insCommit, insRollback = f.Begin(ctx, t, d)
-				ins = d.UnwrapTx(itx)
-			}
 			defer insRollback() //nolint:errcheck // already ended on the happy path
 			res, err := ins.JobInsertMany(ctx, []driver.JobInsertParams{uniqueFinished(key, 1, driver.JobStateCompleted)}, driver.JobInsertOpts{})
 			if err == nil {

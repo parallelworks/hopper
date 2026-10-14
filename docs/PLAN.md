@@ -463,12 +463,14 @@ CREATE TABLE hopper_job_history_failed PARTITION OF hopper_job_history
 -- with readers of hopper_job_history.
 CREATE INDEX hopper_job_history_completed_ordering ON ONLY hopper_job_history_completed (ordering_key, id)
   WHERE ordering_key IS NOT NULL;
+CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id)
+  WHERE ordering_key IS NOT NULL;
 -- A unique key's finished jobs, for UniqueOpts.Finished (schema v14). Declared and
 -- built like the ordering-key index.
 CREATE INDEX hopper_job_history_completed_unique ON ONLY hopper_job_history_completed (kind, unique_key, finalized_at)
   WHERE unique_key IS NOT NULL;
-CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id)
-  WHERE ordering_key IS NOT NULL;
+CREATE INDEX hopper_job_history_failed_unique ON ONLY hopper_job_history_failed (kind, unique_key, finalized_at)
+  WHERE unique_key IS NOT NULL;
 
 -- Liveness: one lease row per running client process.
 CREATE TABLE hopper_clients (
@@ -601,18 +603,28 @@ skew between pods cannot cause early or duplicate execution.
   canceled, discarded) whose jobs in history also count as duplicates, for as long as
   retention keeps them; with `ByPeriod` that is the rest of the period, which is part
   of the key. The plain insert statement is unchanged, so jobs without `Finished` pay
-  nothing. A batch with such jobs first looks each one up in history through the v14
-  index, skipping those with a live duplicate, which the insert reports or replaces as
-  before; a finished duplicate is reported and never replaced. The rest are inserted
-  as usual, and a second statement in the same transaction looks again for the jobs
-  just inserted, deleting any whose duplicate it now finds. That second look covers a
-  duplicate finalized while the insert ran: its finalize deletes the live row and
-  writes the history row in one transaction, so the insert's snapshot sees neither,
-  but the insert's conflict check waits for that transaction on the live row, and the
-  next statement's snapshot at read committed includes it. A pool insert runs the
-  insert and the second look in a transaction of its own, so no worker claims a job
-  about to be deleted. A caller's transaction at repeatable read or serializable
-  keeps its snapshot, and misses a duplicate finalized after it.
+  nothing. A batch with such jobs is inserted as usual, which reports or replaces a
+  live duplicate as before, and a second statement in the same transaction then looks
+  up each job it inserted in history through the v14 index, deleting the job and
+  reporting the finished one (never replaced) where it finds a duplicate. Looking
+  after the insert rather than before also covers a duplicate finalized while the
+  insert ran: its finalize deletes the live row and writes the history row in one
+  transaction, so the insert's snapshot sees neither, but the insert's conflict check
+  waits for that transaction on the live row, and the next statement's snapshot at
+  read committed includes it. A duplicate already in history costs a row inserted and
+  deleted, less than a second lookup. The lookup reads only the outcome table holding
+  the counted states, and descends one index per partition of it, so it costs more as
+  retention keeps more partitions: on Postgres 17, a batch of 100 jobs counting
+  completed duplicates took about 9 ms with a day of hourly partitions (4.5 ms
+  without `Finished`), and about 30 ms with seven days. A pool insert runs the insert
+  and the lookup in a read committed transaction of its own, whatever the server's
+  default isolation, so no worker claims a job about to be deleted. A caller's
+  transaction at repeatable read or serializable keeps its snapshot, and misses a
+  duplicate finalized after it. A job of a batch found finished counts toward the
+  batch as that job's outcome (done, and failed unless it completed), recorded with
+  the insert, so the batch still completes. Within a batch, a later input with the same
+  key that counts different finished states is inserted in a statement after the
+  earlier one's, as if inserted on its own.
 - **Wake-up:** an insert inside a caller's transaction sends
   `pg_notify('hopper_insert', queue)` in the same pipelined batch as the insert, once
   per queue. Postgres delivers notifications only on commit and collapses identical

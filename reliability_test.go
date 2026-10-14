@@ -210,13 +210,20 @@ func TestUniqueFinished(t *testing.T) {
 		t.Errorf("insert in tx after completion = %+v", inTx.Job)
 	}
 
-	// A job without Finished ignores history.
-	plain, err := c.Insert(ctx, noop{N: 1}, &hopper.InsertOpts{Unique: &hopper.UniqueOpts{ByArgs: true}})
+	// A job without Finished ignores history, also after one with the same
+	// key in its batch that counts it.
+	mixed, err := c.InsertMany(ctx, []hopper.InsertParams{
+		once(1),
+		{Args: noop{N: 1}, Opts: &hopper.InsertOpts{Unique: &hopper.UniqueOpts{ByArgs: true}}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plain.Duplicate {
-		t.Errorf("history counted without Finished: %+v", plain.Job)
+	if !mixed[0].Duplicate || mixed[0].Job.ID != first.Job.ID {
+		t.Errorf("batch input counting history = %+v", mixed[0].Job)
+	}
+	if mixed[1].Duplicate {
+		t.Errorf("history counted without Finished: %+v", mixed[1].Job)
 	}
 	if _, err := c.Insert(ctx, noop{N: 3}, &hopper.InsertOpts{Unique: &hopper.UniqueOpts{Finished: []hopper.JobState{hopper.JobStateRunning}}}); err == nil {
 		t.Error("Finished accepted a state that is not finished")

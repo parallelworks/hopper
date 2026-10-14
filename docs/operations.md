@@ -59,6 +59,11 @@
   at doubling intervals with a warning; raise the timeout for hopper's role
   until the warnings stop. Until a partition has its unique-key index, an insert
   with `UniqueOpts.Finished` reads that partition in full.
+- **`UniqueOpts.Finished`.** Each such job is looked up in every history
+  partition of the outcomes it counts, one index lookup each, so the cost
+  grows with retention. With the default 24 hours of completed history, a
+  batch of 100 jobs counting completed duplicates took about twice as long
+  as one without; with seven days, about seven times as long.
 - **Streams.** The stream log is partitioned by day and dropped after
   `StreamRetention`, like history. Consumers are delivered by the leader,
   in transaction-commit order per batch, and a transaction that commits

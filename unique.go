@@ -46,11 +46,13 @@ type UniqueOpts struct {
 	// (Config.CompletedRetention, Config.FailedRetention). With ByPeriod a
 	// finished job counts only for the rest of its period, which is part of
 	// the key. A finished duplicate is reported like a live one, and is
-	// never replaced.
+	// never replaced. Looking in history costs an index lookup per history
+	// partition, so it grows with retention (docs/operations.md).
 	//
-	// A duplicate that finalizes while the insert runs is still found at
-	// read committed isolation, the default. A transaction at a stricter
-	// level does not see a duplicate finalized after its snapshot.
+	// A duplicate that finalizes while the insert runs is still found,
+	// except in a caller's transaction (InsertTx, InsertManyTx) at
+	// repeatable read or serializable, which does not see a duplicate
+	// finalized after its snapshot.
 	Finished []JobState
 }
 

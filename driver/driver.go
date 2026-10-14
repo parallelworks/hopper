@@ -105,8 +105,12 @@ type Executor interface {
 	SchemaVersion(ctx context.Context) (int, error)
 
 	// JobInsertMany inserts jobs in one statement and returns one result per
-	// input, in input order. An input whose unique key matches a live job is
-	// not inserted; its result carries the existing job and Duplicate = true.
+	// input, in input order. An input whose unique key matches a live job, or
+	// with UniqueFinished a job in history in one of those states, is not
+	// inserted; its result carries the existing job and Duplicate = true. A
+	// batch with UniqueFinished inputs takes more than one statement, and
+	// counts each input of a batch found in history toward the batch's
+	// progress.
 	// With ConflictReplace, the existing job's args, metadata, priority,
 	// max attempts and schedule are replaced unless it is running. Inputs are
 	// already deduplicated by unique key within the batch.
@@ -423,7 +427,8 @@ type JobInsertParams struct {
 	UniqueKey string
 	// UniqueFinished lists finished states in which a job in history with
 	// the same kind and UniqueKey is a duplicate too. The insert must find
-	// one that finalizes while it runs, at read committed isolation.
+	// one that finalizes while it runs: always on the pool, and in a
+	// caller's transaction at read committed isolation.
 	UniqueFinished []JobState
 	// OrderingKey, if set, serializes the job with others of the same key
 	// in its queue: at most one runs at a time, oldest first.

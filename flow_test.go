@@ -443,3 +443,77 @@ func TestBatchesCompleteOnceAcrossClients(t *testing.T) {
 		}
 	}
 }
+
+// A batch job answered by a finished duplicate (UniqueOpts.Finished) counts
+// as that job's outcome, so the batch still completes.
+func TestBatchCountsFinishedDuplicates(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[shard]) error {
+		if job.Args.N == 2 {
+			return hopper.Cancel(errors.New("shard 2 is bad"))
+		}
+		return nil
+	})
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[reportDone]) error { return nil })
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[alertOps]) error { return nil })
+	c := h.started(workers, 4)
+	once := &hopper.InsertOpts{Await: true, Unique: &hopper.UniqueOpts{
+		ByArgs: true, Finished: []hopper.JobState{hopper.JobStateCompleted, hopper.JobStateDiscarded},
+	}}
+	for _, n := range []int{1, 2} {
+		res, err := c.Insert(ctx, shard{N: n}, once)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := hopper.Await[struct{}](ctx, c, res.Job.ID); err != nil && n == 1 {
+			t.Fatal(err)
+		}
+	}
+
+	// Every job finished already: the batch completes as it is inserted.
+	b := c.NewBatch(hopper.BatchOpts{OnSuccess: reportDone{RunID: 1}, OnFailure: alertOps{RunID: 1}})
+	b.Add(shard{N: 1}, once)
+	b.Add(shard{N: 2}, once)
+	res, err := b.Insert(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Jobs[0].Duplicate || !res.Jobs[1].Duplicate {
+		t.Fatalf("batch jobs = %+v, %+v, want finished duplicates", res.Jobs[0], res.Jobs[1])
+	}
+	got, err := c.BatchGet(ctx, res.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CompletedAt.IsZero() || got.Pending != 0 || got.Failed != 1 || got.Total != 2 {
+		t.Errorf("batch of finished duplicates = %+v, want completed with 1 failed", got)
+	}
+
+	// In a transaction, with a new job beside a finished one: the batch
+	// completes when the new job does.
+	b = c.NewBatch(hopper.BatchOpts{OnSuccess: reportDone{RunID: 2}})
+	b.Add(shard{N: 1}, once)
+	b.Add(shard{N: 3}, once)
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // committed on the happy path
+	res, err = b.InsertTx(ctx, tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !res.Jobs[0].Duplicate || res.Jobs[1].Duplicate {
+		t.Fatalf("batch jobs = %+v, %+v", res.Jobs[0], res.Jobs[1])
+	}
+	waitFor(t, func() bool {
+		got, err := c.BatchGet(ctx, res.ID)
+		return err == nil && !got.CompletedAt.IsZero() && got.Failed == 0
+	})
+}
