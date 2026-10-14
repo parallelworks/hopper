@@ -2,8 +2,11 @@ package hoppermigrate_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,30 +39,58 @@ func (upgradeJob) Kind() string { return "upgrade" }
 // producer contract and by statements every schema version accepts
 // (docs/PLAN.md §12).
 //
-// It starts from the previous schema version, and from the schema of the
-// latest release, the upgrade users run, which can apply several migrations
-// in one Up.
+// It starts from the previous schema version and from every schema version
+// a release shipped, the upgrades users run, which can apply several
+// migrations in one Up.
 func TestUpgradeUnderTraffic(t *testing.T) {
 	t.Parallel()
 	if hoppermigrate.Latest() < 2 {
 		t.Skip("only one schema version")
 	}
-	from := map[string]int{"previous": hoppermigrate.Latest() - 1}
-	if releasedSchema < hoppermigrate.Latest()-1 {
-		from["released"] = releasedSchema
+	from := map[int]bool{hoppermigrate.Latest() - 1: true}
+	for _, v := range releasedSchemas {
+		if v < 1 || v > hoppermigrate.Latest() {
+			t.Fatalf("a release's schema is %d, not a schema version (1 to %d)", v, hoppermigrate.Latest())
+		}
+		if v < hoppermigrate.Latest() {
+			from[v] = true
+		}
 	}
-	for name, version := range from {
-		t.Run(name, func(t *testing.T) {
+	for v := range from {
+		t.Run(fmt.Sprintf("from_v%d", v), func(t *testing.T) {
 			t.Parallel()
-			upgradeUnderTraffic(t, version)
+			upgradeUnderTraffic(t, v)
 		})
 	}
 }
 
-// releasedSchema is the schema version of the latest release (v0.7.0). A
-// release that ships a new schema version updates it in its release PR
-// (docs/releasing.md).
-const releasedSchema = 13
+// releasedSchemas is the schema version each release shipped: the latest
+// migration at its tag. Each release adds its own in its release PR
+// (docs/releasing.md); TestReleasedSchemas fails the release PR until it
+// does.
+var releasedSchemas = map[string]int{
+	"0.1.0": 6, "0.1.1": 7, "0.1.2": 7, "0.2.0": 7, "0.3.0": 8, "0.3.1": 8,
+	"0.4.0": 8, "0.5.0": 8, "0.6.0": 9, "0.7.0": 13,
+}
+
+// TestReleasedSchemas checks that releasedSchemas has the version the
+// release manifest names, which the release PR moves to the version it
+// releases.
+func TestReleasedSchemas(t *testing.T) {
+	t.Parallel()
+	data, err := os.ReadFile("../.release-please-manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest map[string]string
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	version := manifest["."]
+	if _, ok := releasedSchemas[version]; !ok {
+		t.Errorf("releasedSchemas has no entry for %s: add %q: %d, the schema version it ships", version, version, hoppermigrate.Latest())
+	}
+}
 
 func upgradeUnderTraffic(t *testing.T, from int) {
 	ctx := context.Background()

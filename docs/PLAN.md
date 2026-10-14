@@ -1345,7 +1345,7 @@ observability without new machinery.
   binds SQL producer functions to that namespace. Down to zero leaves the
   namespace intact. Raw SQL users must set the target path themselves.
 - Every schema change ships with an upgrade test that migrates to the latest version
-  from the previous one, and from the latest release's, while jobs wait in every state,
+  from the previous one, and from every schema a release shipped, while jobs wait in every state,
   inserts keep arriving, claims keep polling, finalizes keep moving jobs into history
   and a transaction that wrote both stays open, then works them all with a client
   (`TestUpgradeUnderTraffic`). Migration versions are numbers only, so the latest is
