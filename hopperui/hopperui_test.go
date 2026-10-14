@@ -130,9 +130,14 @@ func TestUI(t *testing.T) {
 	code, body = get(readOnly, "/jobs?queue=naps")
 	want(200, body, code, `title="snoozed: mail server &lt;busy&gt;"`)
 	_, body = get(readOnly, "/jobs/"+job.Job.ID.String())
-	if strings.Contains(body, "snooze reason") {
-		t.Error("job that never snoozed shows a snooze reason")
+	if strings.Contains(body, "snooze reason") || strings.Contains(body, "<dt>progress</dt>") {
+		t.Error("job that never snoozed or recorded progress shows a snooze reason or progress")
 	}
+	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET progress = '{"step": "fetch <1>", "cursor": {"page": 2}, "at": "2026-01-02T03:04:05Z"}' WHERE id = $1`, [16]byte(snoozed.Job.ID)); err != nil {
+		t.Fatal(err)
+	}
+	code, body = get(readOnly, "/jobs/"+snoozed.Job.ID.String())
+	want(200, body, code, `<dt>progress</dt><dd>finished <code>fetch &lt;1&gt;</code>, cursor <code>{&#34;page&#34;: 2}</code>`)
 	code, body = get(readOnly, "/jobs/not-an-id")
 	want(400, body, code)
 	code, body = get(readOnly, "/jobs/"+hopper.JobID{1}.String())

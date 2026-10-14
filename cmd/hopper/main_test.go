@@ -92,6 +92,12 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "state:         available") {
 		t.Errorf("jobs get = %q", got)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET progress = '{"step": "fetch", "cursor": 3, "at": "2026-01-02T03:04:05Z"}' WHERE id = $1::uuid`, id); err != nil {
+		t.Fatal(err)
+	}
+	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, `progress:      step "fetch", cursor 3 (`) {
+		t.Errorf("jobs get with progress = %q", got)
+	}
 	if got := hopperCmd("jobs", "cancel", id); !strings.Contains(got, "state:         canceled") {
 		t.Errorf("jobs cancel = %q", got)
 	}

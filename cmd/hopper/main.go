@@ -263,6 +263,13 @@ func printJob(w io.Writer, j *hopper.JobRow) {
 	if j.UniqueKey != "" {
 		fmt.Fprintf(w, "unique_key:    %q\n", j.UniqueKey)
 	}
+	if p := j.Progress; p != nil {
+		fmt.Fprintf(w, "progress:      step %q", p.Step)
+		if len(p.Cursor) > 0 {
+			fmt.Fprintf(w, ", cursor %s", p.Cursor)
+		}
+		fmt.Fprintf(w, " (%s)\n", p.RecordedAt.Local().Format(time.RFC3339))
+	}
 	fmt.Fprintf(w, "args:          %s\nmetadata:      %s\n", j.Args, j.Metadata)
 	if len(j.Output) > 0 {
 		fmt.Fprintf(w, "output:        %s\n", j.Output)

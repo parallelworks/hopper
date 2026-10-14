@@ -17,6 +17,10 @@ type attemptKey struct{}
 // SetOutput, and the completion CompleteTx wrote, if it did.
 type attempt struct {
 	codec Codec
+	// exec is the client's pool, and attempt the job's attempt number, for
+	// recording progress.
+	exec    driver.Executor
+	attempt int
 	// completion is the attempt's result if it succeeds, without output.
 	completion driver.JobFinalize
 

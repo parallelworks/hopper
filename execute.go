@@ -27,7 +27,7 @@ import (
 func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) pending {
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	a := &attempt{codec: c.cfg.Codec, completion: completedResult(row, qcfg)}
+	a := &attempt{codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt}
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	c.trackRunning(row.ID, cancel)

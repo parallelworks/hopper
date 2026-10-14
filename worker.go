@@ -105,7 +105,8 @@ func (w *Workers) add(info *workerInfo) {
 // Work runs the registered worker for job.Kind inline, decoding job.Args
 // with codec and honoring the worker's Timeout. It exists for tests (see the
 // hoppertest package): nothing is claimed or finalized, and middleware does
-// not run. It returns an UnknownKindError for an unregistered kind.
+// not run. RecordStep and RecordCursor update job.Progress without storing
+// it. It returns an UnknownKindError for an unregistered kind.
 func (w *Workers) Work(ctx context.Context, job *JobRow, codec Codec) error {
 	info, ok := w.lookup(job.Kind)
 	if !ok {
@@ -118,6 +119,7 @@ func (w *Workers) Work(ctx context.Context, job *JobRow, codec Codec) error {
 	if err != nil {
 		return fmt.Errorf("hopper: decode args for %q: %w", job.Kind, err)
 	}
+	ctx = context.WithValue(ctx, inlineKey{}, true)
 	if timeout := unit.Timeout(); timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeoutCause(ctx, timeout, ErrJobTimeout)

@@ -161,6 +161,9 @@ type WorkOpts struct {
 	Attempt  int // defaults to 1
 	Priority hopper.Priority
 	Metadata json.RawMessage
+	// Progress is the job's progress from an earlier attempt, to test
+	// resuming. RecordStep and RecordCursor update it in memory.
+	Progress *hopper.Progress
 }
 
 var workSeq atomic.Int64
@@ -172,7 +175,9 @@ var workSeq atomic.Int64
 // hopper.Snooze and hopper.Cancel results with errors.As.
 // A worker that uses hopper.ClientFromContext gets a client only if ctx
 // carries one, from hopper.ContextWithClient. hopper.SetOutput and
-// hopper.CompleteTx return hopper.ErrNotInJob, since there is no stored job.
+// hopper.CompleteTx return hopper.ErrNotInJob, since there is no stored job,
+// while hopper.RecordStep and hopper.RecordCursor keep progress in memory,
+// so that hopper.RunSteps runs every step.
 func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.Workers, args T, opts *WorkOpts) error {
 	tb.Helper()
 	encoded, err := json.Marshal(args)
@@ -209,6 +214,10 @@ func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.
 	}
 	if len(opts.Metadata) > 0 {
 		row.Metadata = opts.Metadata
+	}
+	if opts.Progress != nil {
+		p := *opts.Progress
+		row.Progress = &p
 	}
 	return workers.Work(ctx, row, hopper.JSONCodec{})
 }

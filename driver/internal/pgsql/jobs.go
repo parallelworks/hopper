@@ -17,7 +17,7 @@ var jobColumns = []string{
 	"id", "kind", "queue", "state", "priority", "attempt", "max_attempts",
 	"scheduled_at", "attempted_at", "attempted_by", "args", "metadata", "errors",
 	"unique_key", "ordering_key", "partition_key", "batch_id", "expires_at", "cancel_requested_at", "await", "created_at",
-	"snooze_reason",
+	"snooze_reason", "progress",
 }
 
 // JobColumns lists hopper_jobs columns in scan order. prefix qualifies them
@@ -48,7 +48,7 @@ func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 		attemptedBy                      sql.NullInt64
 		uniqueKey, orderingKey, partKey  sql.NullString
 		snoozeReason                     sql.NullString
-		args, metadata, output           jsonText
+		args, metadata, output, progress jsonText
 		errs                             attemptErrors
 		batchID                          nullUUID
 	)
@@ -56,7 +56,7 @@ func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 		&j.ID, &j.Kind, &j.Queue, &state, &priority, &attempt, &maxAttempts,
 		&j.ScheduledAt, &attemptedAt, &attemptedBy, &args, &metadata, &errs,
 		&uniqueKey, &orderingKey, &partKey, &batchID, &expiresAt, &cancelAt, &j.Await, &j.CreatedAt,
-		&snoozeReason,
+		&snoozeReason, &progress,
 	}
 	if history {
 		dest = append(dest, &finalizedAt, &output)
@@ -79,6 +79,12 @@ func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 	}
 	if batchID.Valid {
 		j.BatchID = batchID.ID
+	}
+	if progress != "" {
+		j.Progress = new(driver.Progress)
+		if err := json.Unmarshal([]byte(progress), j.Progress); err != nil {
+			return nil, fmt.Errorf("pgsql: job %s progress: %w", j.ID, err)
+		}
 	}
 	return &j, nil
 }
@@ -698,6 +704,42 @@ UNION ALL
 SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history WHERE id = $1
 LIMIT 1`, JobColumns(""), historyColumns(""))
 
+// jobRecordProgressSQL stores a running job's progress, fenced to the
+// attempt. A cursor of NULL leaves the key out, rather than storing a JSON
+// null. The time is the statement's, which in a caller's transaction is not
+// the transaction's start.
+const jobRecordProgressSQL = `
+UPDATE {{schema}}.hopper_jobs
+SET progress = jsonb_build_object(
+      'step', CASE WHEN $5 THEN coalesce(progress->>'step', '') ELSE $4::text END,
+      'at', statement_timestamp())
+    || CASE WHEN $6::jsonb IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('cursor', $6::jsonb) END
+WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND attempt = $3
+RETURNING progress::text`
+
+// JobRecordProgress implements driver.Executor.
+func (e *Executor) JobRecordProgress(ctx context.Context, params driver.JobRecordProgressParams) (*driver.Progress, error) {
+	var cursor *string
+	if len(params.Cursor) > 0 {
+		c := string(params.Cursor)
+		cursor = &c
+	}
+	var stored string
+	err := e.Conn.QueryRow(ctx, jobRecordProgressSQL, uuidParam(params.ID), params.AttemptedBy, params.Attempt,
+		params.Step, params.KeepStep, cursor).Scan(&stored)
+	if errors.Is(err, ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("hopper: record job progress: %w", err)
+	}
+	var p driver.Progress
+	if err := json.Unmarshal([]byte(stored), &p); err != nil {
+		return nil, fmt.Errorf("hopper: record job progress: %w", err)
+	}
+	return &p, nil
+}
+
 // JobGet implements driver.Executor.
 func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
 	job, err := scanJob(e.Conn.QueryRow(ctx, jobGetQuery, uuidParam(id)), true)
@@ -913,10 +955,10 @@ RETURNING %s`, JobColumns(""))
 	jobRetryHistorySQL = fmt.Sprintf(`
 WITH h AS (DELETE FROM {{schema}}.hopper_job_history WHERE id = $1 RETURNING *)
 INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata,
-  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at)
+  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, progress)
 SELECT id, kind, queue, 'available', priority, attempt,
   CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END, statement_timestamp(), args, metadata,
-  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at
+  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, progress
 FROM h
 RETURNING %s`, JobColumns(""))
 )

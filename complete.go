@@ -8,9 +8,9 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
-// ErrJobFenced is returned by CompleteTx when the attempt no longer owns its
-// job: the job was rescued after this client lost its lease, or it was
-// already finalized.
+// ErrJobFenced is returned by CompleteTx, RecordStep and RecordCursor when
+// the attempt no longer owns its job: the job was rescued after this client
+// lost its lease, or it was already finalized.
 var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt")
 
 // CompleteTx completes the running job inside tx, so that the worker's own

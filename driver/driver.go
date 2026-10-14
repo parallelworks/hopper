@@ -132,6 +132,11 @@ type Executor interface {
 	// produced it; the IDs that were applied are returned, and the caller
 	// treats the rest as fenced.
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
+	// JobRecordProgress stores a running job's progress, fenced like a
+	// finalize: only while the job is running in the given attempt of the
+	// given client. It returns the progress as stored, or nil if the attempt
+	// no longer owns the job.
+	JobRecordProgress(ctx context.Context, params JobRecordProgressParams) (*Progress, error)
 	// JobGet returns a job by ID, live or from history.
 	JobGet(ctx context.Context, id JobID) (*JobRow, error)
 	// JobList returns jobs matching the filter in ID order (descending with
@@ -397,10 +402,40 @@ type JobRow struct {
 	// scheduled: the claim, any other finalize, a retry and a replacing
 	// insert clear it, and a row in another state never reports one.
 	SnoozeReason string
+	// Progress is the last step the job's worker recorded, or nil. It
+	// survives retries, snoozes and a JobRetry from history.
+	Progress *Progress
 	// FinalizedAt is set for jobs in history.
 	FinalizedAt time.Time
 	// Output is the value recorded by the worker, for jobs in history.
 	Output json.RawMessage
+}
+
+// Progress is how far a job's worker got: the last step it finished, and a
+// cursor within the work that follows.
+type Progress struct {
+	// Step is the last step finished, or empty before the first.
+	Step string `json:"step"`
+	// Cursor is a JSON value marking a position within the work after Step,
+	// or nil.
+	Cursor json.RawMessage `json:"cursor,omitempty"`
+	// RecordedAt is the database time at which it was recorded.
+	RecordedAt time.Time `json:"at"`
+}
+
+// JobRecordProgressParams is a running job's new progress.
+type JobRecordProgressParams struct {
+	ID JobID
+	// AttemptedBy and Attempt identify the attempt, which must still own
+	// the job.
+	AttemptedBy int64
+	Attempt     int
+	// Step is the last step finished. With KeepStep the stored step is
+	// kept and Step is ignored.
+	Step     string
+	KeepStep bool
+	// Cursor is a JSON value, or nil for none.
+	Cursor json.RawMessage
 }
 
 // AttemptError records one failed attempt.
