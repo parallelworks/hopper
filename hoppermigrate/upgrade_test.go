@@ -315,10 +315,13 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 		t.Fatal(err)
 	}
 
-	// Left waiting: the failing jobs and the ones scheduled for later.
+	// Left waiting: the failing jobs and the ones scheduled for later. The
+	// jobs inserted during the migration grow with the migrations it
+	// applies, and the subtests share the host, so the deadline only
+	// catches jobs that never finish.
 	const unfinished = `SELECT count(*) FROM hopper_jobs
 	                    WHERE (args->>'n')::int % 10 <> 1 AND scheduled_at < now() + interval '30 minutes'`
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(time.Minute)
 	for count(unfinished) > 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -331,7 +334,7 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 	}
 	// The previous release's batch completed once this release had
 	// finalized the rest of its jobs, and ran its callback once.
-	deadline = time.Now().Add(15 * time.Second)
+	deadline = time.Now().Add(time.Minute)
 	for count(`SELECT count(*) FROM hopper_job_history WHERE (args->>'n')::int = 300000`) == 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
