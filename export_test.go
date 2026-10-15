@@ -41,6 +41,7 @@ func (c *Client[TTx]) SetTuning(t Tuning) {
 		rescueBatch:         t.RescueBatch,
 		streamBatch:         defaultTuning.streamBatch,
 		logCloseTimeout:     cmp.Or(t.LogStoreClose, defaultTuning.logCloseTimeout),
+		finalizeDrain:       defaultTuning.finalizeDrain,
 	}
 	c.notifier.interval = c.tuning.notifyInterval
 }

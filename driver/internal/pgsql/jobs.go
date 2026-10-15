@@ -610,15 +610,22 @@ SELECT id FROM retry UNION ALL SELECT id FROM finished`
 
 // appendLogSQL appends an attempt's log, if it has one, to its job's logs,
 // keeping the latest $13. A snooze gives its attempt back, so a job that
-// snoozes again and again would fill its logs with them: a snooze's log
-// replaces the one of the previous snooze of the same attempt number.
-const appendLogSQL = `CASE WHEN r.log IS NULL THEN j.logs
-         ELSE jsonb_path_query_array(
+// snoozes again and again would fill its logs with them: a snooze's log,
+// or its lack of one, replaces the log of the previous snooze of the same
+// attempt number. The SET reads j.attempt before the snooze gives it back.
+// A job whose logs do not change keeps its stored value, which is not
+// rewritten: one with no logs keeps NULL (jsonb_path_exists of NULL is
+// NULL, which would otherwise take the ELSE branch), and one whose last
+// entry is removed goes back to NULL.
+const appendLogSQL = `CASE
+         WHEN r.log IS NULL AND NOT (r.snooze AND coalesce(jsonb_path_exists(j.logs, '$[*] ? (exists(@.snoozed) && @.attempt == $a)',
+           jsonb_build_object('a', j.attempt)), false)) THEN j.logs
+         ELSE nullif(jsonb_path_query_array(
            CASE WHEN r.snooze
                 THEN jsonb_path_query_array(coalesce(j.logs, '[]'), '$[*] ? (!exists(@.snoozed) || @.attempt != $a)',
-                       jsonb_build_object('a', r.log->'attempt'))
-                ELSE coalesce(j.logs, '[]') END || jsonb_build_array(r.log),
-           '$[last - $keep + 1 to last]', jsonb_build_object('keep', $13::int)) END`
+                       jsonb_build_object('a', j.attempt))
+                ELSE coalesce(j.logs, '[]') END || CASE WHEN r.log IS NULL THEN '[]' ELSE jsonb_build_array(r.log) END,
+           '$[last - $keep + 1 to last]', jsonb_build_object('keep', $13::int)), '[]') END`
 
 // jobFinalizePlainSQL is jobFinalizeSQL for results whose jobs belong to
 // no batch or workflow (driver.JobFinalizeParams.NoBatches): without the
@@ -679,10 +686,8 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		outputs[i] = f.Output
 		// Only completed jobs may skip history; the failed partitions are the
 		// dead-letter queue.
-		archives[i] = f.Archive || f.State != driver.JobStateCompleted
-		// A finished job that skips history takes its logs with it, so its
-		// log is not sent.
-		if f.Log != nil && (archives[i] || !f.State.Terminal()) {
+		archives[i] = f.Archived()
+		if f.Log != nil && f.KeepsLog() {
 			b, err := json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Log: storableText(f.Log.Log)})
 			if err != nil {
 				return nil, fmt.Errorf("hopper: finalize jobs: %w", err)

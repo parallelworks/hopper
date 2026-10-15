@@ -283,6 +283,10 @@ type tuning struct {
 	// logCloseTimeout is how long a finished attempt waits for its log in
 	// the LogStore to close before its result goes ahead.
 	logCloseTimeout time.Duration
+	// finalizeDrain bounds how long a stop's final drain, once it has
+	// written what was buffered at the stop, takes results from jobs that
+	// are still finishing. What was handed in by then is written.
+	finalizeDrain time.Duration
 }
 
 // withLease returns t with the client lease lasting ttl.
@@ -312,4 +316,5 @@ var defaultTuning = tuning{
 	rescueBatch:         1000,
 	streamBatch:         500,
 	logCloseTimeout:     5 * time.Second,
+	finalizeDrain:       5 * time.Second,
 }

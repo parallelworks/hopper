@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -72,15 +73,19 @@ type JobLogsConfig struct {
 	Store LogStore
 	// MaxBytes is how much of an attempt's log is kept. Once a line would
 	// pass it, that line and the rest are dropped, and the log ends with a
-	// line that counts them. Defaults to 32 KiB, and is at most 1 MiB;
-	// negative keeps no lines. A finished attempt's lines wait in memory
-	// with its result until it is written, so a client holds at most
-	// 64 MiB of them; past that, finished jobs wait to hand in their
-	// results, as they do when the finalizer's buffer is full.
+	// line that counts them. Defaults to 32 KiB, and is at most 1 MiB,
+	// and MaxBytes times MaxAttempts at most 4 MiB; negative keeps no
+	// lines. For larger logs, use a Store. A finished attempt's lines
+	// wait in memory with its result until it is written, so a client
+	// holds at most 64 MiB of them; past that, finished jobs wait to hand
+	// in their results, as they do when the finalizer's buffer is full.
 	MaxBytes int
 	// MaxAttempts is how many attempts' logs a job keeps, the latest. Each
 	// snooze keeps its own until the next snooze of the same attempt
-	// number. Defaults to 10, and is at most 100.
+	// number, which replaces it, or removes it if that snooze logged
+	// nothing. A store keeps what it is given: a snooze that logs nothing
+	// writes nothing to it, so it removes only a snooze's log that the
+	// job's row holds. Defaults to 10, and is at most 100.
 	MaxAttempts int
 	// Level is the lowest level kept. Defaults to slog.LevelInfo. Lines
 	// go to Config.Logger at whatever level its handler takes.
@@ -99,11 +104,14 @@ const (
 	DefaultJobLogAttempts = 10
 )
 
-// Limits of JobLogsConfig fields, which keep a job's logs and a finalize
-// statement's well within what Postgres takes.
+// Limits of JobLogsConfig fields. A finalize that writes a log rewrites
+// all of the job's, so MaxJobLogTotalBytes bounds MaxBytes times
+// MaxAttempts, and with it what one write costs: about that much, as each
+// entry may pass MaxBytes by its dropped-lines line and JSON escaping.
 const (
-	MaxJobLogBytes    = 1 << 20
-	MaxJobLogAttempts = 100
+	MaxJobLogBytes      = 1 << 20
+	MaxJobLogAttempts   = 100
+	MaxJobLogTotalBytes = 4 << 20
 )
 
 // Logger returns the logger of the job whose context ctx is. Its lines go
@@ -132,18 +140,18 @@ const (
 func Logger(ctx context.Context) *slog.Logger {
 	a, _ := ctx.Value(attemptKey{}).(*attempt)
 	if a == nil {
-		if l, ok := ctx.Value(inlineLoggerKey{}).(*slog.Logger); ok {
-			return l
-		}
+		a, _ = ctx.Value(inlineAttemptKey{}).(*attempt)
+	}
+	if a == nil {
 		return slog.Default()
 	}
 	a.loggerOnce.Do(func() { a.newLogger(ctx) })
 	return a.logger
 }
 
-// inlineLoggerKey carries the logger of the attempt that runs a worker
-// with Workers.Work.
-type inlineLoggerKey struct{}
+// inlineAttemptKey carries the attempt that runs a worker with
+// Workers.Work, whose logger the worker logs with.
+type inlineAttemptKey struct{}
 
 // newLogger builds the attempt's logger: lines go to the client's logger and
 // to the attempt's log, in the store or, unless the client keeps none, in
@@ -151,12 +159,18 @@ type inlineLoggerKey struct{}
 func (a *attempt) newLogger(ctx context.Context) {
 	base := a.baseLogger.With("job_id", a.completion.ID, "kind", a.row.Kind, "attempt", a.attempt)
 	a.logger = base
-	var out io.Writer
+	var (
+		out  io.Writer
+		kept *logBuffer
+	)
 	switch {
 	case a.logs.Store != nil:
 		// The store's context does not carry the attempt: a store that logs
 		// with Logger would otherwise re-enter the attempt's logger.
-		sw := newStoreWriter(a.logs.Store, context.WithValue(context.WithoutCancel(ctx), attemptKey{}, (*attempt)(nil)), a.row, base)
+		storeCtx := context.WithValue(context.WithoutCancel(ctx), attemptKey{}, (*attempt)(nil))
+		storeCtx = context.WithValue(storeCtx, inlineAttemptKey{}, (*attempt)(nil))
+		storeCtx = context.WithValue(storeCtx, inlineKey{}, nil)
+		sw := newStoreWriter(a.logs.Store, storeCtx, a.row, base)
 		a.mu.Lock()
 		ended := a.logEnded
 		if !ended {
@@ -169,7 +183,7 @@ func (a *attempt) newLogger(ctx context.Context) {
 		}
 		out = sw
 	case a.logs.MaxBytes > 0:
-		kept := &logBuffer{max: a.logs.MaxBytes}
+		kept = &logBuffer{max: a.logs.MaxBytes}
 		a.mu.Lock()
 		a.kept = kept
 		a.mu.Unlock()
@@ -178,7 +192,47 @@ func (a *attempt) newLogger(ctx context.Context) {
 		return
 	}
 	text := slog.NewTextHandler(out, &slog.HandlerOptions{Level: a.logs.Level, ReplaceAttr: a.logs.ReplaceAttr})
-	a.logger = slog.New(slog.NewMultiHandler(base.Handler(), text))
+	a.logger = slog.New(attemptHandler{base: base.Handler(), text: text, kept: kept})
+}
+
+// attemptHandler sends an attempt's lines to Config.Logger's handler and
+// formats them into its log. Once its buffer (kept, nil with a store) has
+// dropped a line it only counts the rest, so a worker that logs past
+// MaxBytes does not pay to format lines that are dropped. A record is not
+// cloned: the text handler keeps nothing of it, and a handler that does
+// clones it itself.
+type attemptHandler struct {
+	base, text slog.Handler
+	kept       *logBuffer
+}
+
+func (h attemptHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.base.Enabled(ctx, level) || h.text.Enabled(ctx, level)
+}
+
+func (h attemptHandler) Handle(ctx context.Context, r slog.Record) error {
+	var baseErr, textErr error
+	if h.base.Enabled(ctx, r.Level) {
+		baseErr = h.base.Handle(ctx, r)
+	}
+	if h.text.Enabled(ctx, r.Level) && (h.kept == nil || !h.kept.dropIfFull()) {
+		textErr = h.text.Handle(ctx, r)
+	}
+	return errors.Join(baseErr, textErr)
+}
+
+func (h attemptHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	text := h.text
+	// A full log formats no more lines, so it need not format their
+	// attributes either.
+	if h.kept == nil || h.kept.dropped.Load() == 0 {
+		text = text.WithAttrs(attrs)
+	}
+	return attemptHandler{base: h.base.WithAttrs(attrs), text: text, kept: h.kept}
+}
+
+func (h attemptHandler) WithGroup(name string) slog.Handler {
+	return attemptHandler{base: h.base.WithGroup(name), text: h.text.WithGroup(name), kept: h.kept}
 }
 
 // closeLog ends the attempt's log in the store, if it has one, and keeps
@@ -383,32 +437,45 @@ func (a *attempt) keptLog() *driver.AttemptLog {
 // logBuffer holds an attempt's lines up to max bytes. The text handler
 // writes each line in one call.
 type logBuffer struct {
-	mu      sync.Mutex
-	max     int
-	buf     []byte
-	dropped int
+	mu  sync.Mutex
+	max int
+	buf []byte
+	// dropped counts the lines dropped once one did not fit, after which
+	// every line is.
+	dropped atomic.Int64
 }
 
 func (b *logBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.dropped > 0 || len(b.buf)+len(p) > b.max {
-		b.dropped++
+	if b.dropped.Load() > 0 || len(b.buf)+len(p) > b.max {
+		b.dropped.Add(1)
 	} else {
 		b.buf = append(b.buf, p...)
 	}
 	return len(p), nil
 }
 
+// dropIfFull counts a line as dropped, and reports so, once the buffer has
+// dropped one: every later line is dropped too.
+func (b *logBuffer) dropIfFull() bool {
+	if b.dropped.Load() == 0 {
+		return false
+	}
+	b.dropped.Add(1)
+	return true
+}
+
 func (b *logBuffer) log(attempt int) *driver.AttemptLog {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.buf) == 0 && b.dropped == 0 {
+	dropped := b.dropped.Load()
+	if len(b.buf) == 0 && dropped == 0 {
 		return nil
 	}
 	l := &driver.AttemptLog{Attempt: attempt, Log: string(b.buf)}
-	if b.dropped > 0 {
-		l.Log += fmt.Sprintf("hopper: %d more lines dropped: the attempt's log is limited to %d bytes\n", b.dropped, b.max)
+	if dropped > 0 {
+		l.Log += fmt.Sprintf("hopper: %d more lines dropped: the attempt's log is limited to %d bytes\n", dropped, b.max)
 	}
 	return l
 }
@@ -429,6 +496,9 @@ func withJobLogDefaults(cfg JobLogsConfig) (JobLogsConfig, error) {
 	}
 	if cfg.Store == nil && cfg.MaxBytes > MaxJobLogBytes {
 		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxBytes must be at most %d", MaxJobLogBytes)
+	}
+	if cfg.Store == nil && cfg.MaxBytes > 0 && cfg.MaxBytes*cfg.MaxAttempts > MaxJobLogTotalBytes {
+		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxBytes times MaxAttempts must be at most %d", MaxJobLogTotalBytes)
 	}
 	return cfg, nil
 }

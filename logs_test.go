@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -169,6 +170,37 @@ func TestLoggerBoundsJobLogs(t *testing.T) {
 	}
 }
 
+// Once an attempt's log has dropped a line, its later lines are counted
+// without being formatted.
+func TestLoggerSkipsFormattingDroppedLines(t *testing.T) {
+	t.Parallel()
+	var formatted atomic.Int32
+	cfg := &hopper.Config{JobLogs: hopper.JobLogsConfig{MaxBytes: 200, ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+		if a.Key == "i" {
+			formatted.Add(1)
+		}
+		return a
+	}}}
+	const lines = 50
+	_, logs := runLogged(t, cfg, 1, func(ctx context.Context, job *hopper.Job[logged]) error {
+		for i := range lines {
+			hopper.Logger(ctx).Info("line", "i", i)
+		}
+		return nil
+	})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %+v, want one attempt", logs)
+	}
+	kept := strings.Count(logs[0].Log, "msg=line")
+	if want := fmt.Sprintf("hopper: %d more lines dropped", lines-kept); !strings.Contains(logs[0].Log, want) {
+		t.Errorf("log %q does not count the dropped lines (%q)", logs[0].Log, want)
+	}
+	// The kept lines, and the one that did not fit.
+	if got := formatted.Load(); got != int32(kept+1) {
+		t.Errorf("formatted %d lines, want %d", got, kept+1)
+	}
+}
+
 // JobLogs.ReplaceAttr redacts the kept lines, which Config.Logger's
 // handler options do not reach.
 func TestLoggerRedactsKeptLines(t *testing.T) {
@@ -262,13 +294,24 @@ func TestJobLogsConfigValidated(t *testing.T) {
 		{hopper.JobLogsConfig{MaxAttempts: -1}, "JobLogs.MaxAttempts"},
 		{hopper.JobLogsConfig{MaxAttempts: hopper.MaxJobLogAttempts + 1}, "JobLogs.MaxAttempts"},
 		{hopper.JobLogsConfig{MaxBytes: hopper.MaxJobLogBytes + 1}, "JobLogs.MaxBytes"},
+		{hopper.JobLogsConfig{MaxBytes: hopper.MaxJobLogBytes}, "JobLogs.MaxBytes times MaxAttempts"},
+		{hopper.JobLogsConfig{MaxBytes: hopper.MaxJobLogTotalBytes/hopper.MaxJobLogAttempts + 1, MaxAttempts: hopper.MaxJobLogAttempts}, "JobLogs.MaxBytes times MaxAttempts"},
 	} {
 		if _, err := hopper.NewClient(h.d, &hopper.Config{JobLogs: tc.cfg}); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("NewClient with %+v = %v", tc.cfg, err)
 		}
 	}
-	if _, err := hopper.NewClient(h.d, &hopper.Config{JobLogs: hopper.JobLogsConfig{MaxBytes: hopper.MaxJobLogBytes, MaxAttempts: hopper.MaxJobLogAttempts}}); err != nil {
-		t.Errorf("NewClient at the limits = %v", err)
+	for _, cfg := range []hopper.JobLogsConfig{
+		{MaxBytes: hopper.MaxJobLogBytes, MaxAttempts: hopper.MaxJobLogTotalBytes / hopper.MaxJobLogBytes},
+		{MaxBytes: hopper.MaxJobLogTotalBytes / hopper.MaxJobLogAttempts, MaxAttempts: hopper.MaxJobLogAttempts},
+		{MaxBytes: hopper.MaxJobLogBytes, MaxAttempts: hopper.MaxJobLogAttempts, Store: &memStore{}},
+		// Negative keeps no lines, however large: its product with
+		// MaxAttempts, which overflows, is not checked.
+		{MaxBytes: math.MinInt / 2, MaxAttempts: 3},
+	} {
+		if _, err := hopper.NewClient(h.d, &hopper.Config{JobLogs: cfg}); err != nil {
+			t.Errorf("NewClient at the limits with %+v = %v", cfg, err)
+		}
 	}
 }
 
@@ -310,6 +353,35 @@ func TestLoggerInlineWorker(t *testing.T) {
 	})
 	if len(logs) != 1 || !strings.Contains(logs[0].Log, "msg=inner\n") {
 		t.Errorf("logs = %+v, want the inline worker's line", logs)
+	}
+}
+
+// A worker run with Workers.Work logs to the attempt's store, and the
+// store's context leads back to neither the attempt nor the inline worker.
+func TestLogStoreInlineWorker(t *testing.T) {
+	t.Parallel()
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[inner]) error {
+		hopper.Logger(ctx).Info("inner")
+		return nil
+	})
+	store := &memStore{}
+	_, logs := runLogged(t, &hopper.Config{JobLogs: hopper.JobLogsConfig{Store: store}}, 1,
+		func(ctx context.Context, job *hopper.Job[logged]) error {
+			return workers.Work(ctx, &hopper.JobRow{Kind: "inner", Args: []byte("{}")}, nil)
+		})
+	if len(logs) != 1 || !strings.Contains(logs[0].Log, "msg=inner\n") {
+		t.Errorf("logs = %+v, want the inline worker's line", logs)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, ctx := range store.ctxs {
+		if hopper.Logger(ctx) != slog.Default() {
+			t.Error("the store's context leads back to the attempt's logger")
+		}
+	}
+	if len(store.ctxs) != 1 {
+		t.Errorf("store opened %d writers, want 1", len(store.ctxs))
 	}
 }
 
@@ -741,7 +813,9 @@ func TestLogStoreDropsWhenBehind(t *testing.T) {
 	}
 	lines := strings.Split(strings.TrimSuffix(texts[0], "\n"), "\n")
 	last := lines[len(lines)-1]
-	if !strings.HasPrefix(last, "hopper: ") || !strings.HasSuffix(last, " lines dropped: the store fell behind") || len(lines) > 300 {
+	// The store holds at most the batch it took before its first write
+	// blocked and a full queue behind it, 256 KiB each.
+	if !strings.HasPrefix(last, "hopper: ") || !strings.HasSuffix(last, " lines dropped: the store fell behind") || len(lines) > 2*(256<<10)/len(line)+1 {
 		t.Errorf("%d lines, ending %q", len(lines), last)
 	}
 	for i, l := range lines[:len(lines)-1] {

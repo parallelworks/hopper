@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -80,6 +81,11 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	run(id, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &a2again}, 2, false)
 	s2.Log = a2again.Log
 	check("after another snooze", logs(id), a1, s2)
+	// A snooze that logs nothing replaces it too.
+	run(id, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
+	check("after a snooze that logged nothing", logs(id), a1)
+	run(id, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &a2again}, 2, false)
+	check("after a snooze that logged again", logs(id), a1, s2)
 	run(id, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 2, Error: "x"}}, 2, false)
 	check("after an attempt that logged nothing", logs(id), a1, s2)
 	run(id, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 3, Error: "x"}, Log: &a3}, 2, false)
@@ -103,7 +109,25 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 	check("canceled", logs(id), s2, stored, a4)
 
-	// So does one that expires.
+	// A snooze that logs nothing leaves a job without logs as it is, and
+	// takes one whose only log is a snooze's back to none.
+	noLogs := func(what string) {
+		t.Helper()
+		if got := f.QueryText(ctx, t, d, "SELECT coalesce(logs::text, 'NULL') FROM hopper_jobs WHERE id = $1::uuid", other.String()); got != "NULL" {
+			t.Errorf("logs %s = %s, want NULL", what, got)
+		}
+	}
+	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
+	noLogs("after a snooze that logged nothing")
+	attempt, err := strconv.Atoi(f.QueryText(ctx, t, d, "SELECT attempt::text FROM hopper_jobs WHERE id = $1::uuid", other.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &driver.AttemptLog{Attempt: attempt + 1, Log: "x\n"}}, 2, false)
+	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
+	noLogs("after a snooze that logged nothing removed the only log")
+
+	// An expired job takes its logs to history too.
 	run(other, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "x"}, Log: &a1}, 2, false)
 	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = now() - interval '1s' WHERE id = $1::uuid", other.String())
 	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 1 || expired[0].ID != other {
@@ -118,20 +142,31 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 
 // testJobLogsFenced finalizes a job from its attempt and, concurrently,
 // from clients that do not own it, such as one whose lease lapsed: only the
-// owner's log is appended, once.
+// owner's log is appended, once, and only the owner's snooze that logged
+// nothing removes the log of the snooze before it.
 func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
-	for round := range 20 {
+	for round := range 30 {
 		id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 		owner := register(ctx, t, exec)
 		if jobs := claim(ctx, t, exec, owner, 1); len(jobs) != 1 || jobs[0].ID != id {
 			t.Fatal("claim")
 		}
-		state := driver.JobStateRetryable
-		if round%2 == 1 {
-			state = driver.JobStateCompleted
+		state := []driver.JobState{driver.JobStateRetryable, driver.JobStateCompleted, driver.JobStateScheduled}[round%3]
+		snooze := state == driver.JobStateScheduled
+		if snooze {
+			log := driver.AttemptLog{Attempt: 1, Log: "first snooze\n"}
+			if ids, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{
+				ID: id, AttemptedBy: owner, State: state, Snooze: true, Log: &log,
+			}}}); err != nil || len(ids) != 1 {
+				t.Fatalf("round %d: first snooze = %v, %v", round, ids, err)
+			}
+			f.MakeClaimable(ctx, t, d, id)
+			if jobs := claim(ctx, t, exec, owner, 1); len(jobs) != 1 || jobs[0].ID != id {
+				t.Fatal("claim after the snooze")
+			}
 		}
 		const stale = 4
 		var wg sync.WaitGroup
@@ -142,13 +177,12 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 				by = owner + int64(i)*1000
 			}
 			wg.Go(func() {
-				log := driver.AttemptLog{Attempt: 1, Log: fmt.Sprintf("client %d\n", by)}
-				ids, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{
-					Jobs: []driver.JobFinalize{{
-						ID: id, AttemptedBy: by, State: state, Delay: time.Hour, Archive: true, Log: &log,
-						Error: &driver.AttemptError{Attempt: 1, Error: "x"},
-					}},
-				})
+				r := driver.JobFinalize{ID: id, AttemptedBy: by, State: state, Delay: time.Hour, Snooze: snooze}
+				if !snooze {
+					r.Archive, r.Error = true, &driver.AttemptError{Attempt: 1, Error: "x"}
+					r.Log = &driver.AttemptLog{Attempt: 1, Log: fmt.Sprintf("client %d\n", by)}
+				}
+				ids, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{r}})
 				if err != nil {
 					t.Error(err)
 				}
@@ -164,6 +198,9 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 			t.Fatal(err)
 		}
 		want := []driver.AttemptLog{{Attempt: 1, Log: fmt.Sprintf("client %d\n", owner)}}
+		if snooze {
+			want = nil
+		}
 		if !slices.Equal(got, want) {
 			t.Fatalf("round %d: logs %+v, want %+v", round, got, want)
 		}

@@ -240,13 +240,20 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 			return err
 		}
 		var (
-			job  *hopper.JobRow
-			logs []hopper.AttemptLog
+			job     *hopper.JobRow
+			logs    []hopper.AttemptLog
+			logsErr error
 		)
 		switch args[0] {
 		case "get":
+			// The job is shown even if its logs cannot be read, as the web
+			// UI shows it, and the command then fails: a job deleted since
+			// JobGet, as a completed job on a DeleteCompleted queue is, has
+			// none, and a database before schema v16 has no logs column.
 			if job, err = c.client.JobGet(ctx, id); err == nil {
-				logs, err = c.client.JobLogs(ctx, id)
+				if logs, logsErr = c.client.JobLogs(ctx, id); errors.Is(logsErr, hopper.ErrNotFound) {
+					logsErr = nil
+				}
 			}
 		case "retry":
 			job, err = c.client.JobRetry(ctx, id, opts...)
@@ -260,15 +267,25 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		}
 		out := struct {
 			*hopper.JobRow
-			Logs []hopper.AttemptLog `json:",omitempty"`
-		}{job, logs}
-		return c.print(out, func(w io.Writer) { printJob(w, job, logs) })
+			Logs      []hopper.AttemptLog `json:",omitempty"`
+			LogsError string              `json:",omitempty"`
+		}{JobRow: job, Logs: logs}
+		if logsErr != nil {
+			out.LogsError = logsErr.Error()
+		}
+		if err := c.print(out, func(w io.Writer) { printJob(w, job, logs, out.LogsError) }); err != nil {
+			return err
+		}
+		if logsErr != nil {
+			return fmt.Errorf("jobs get: read the job's logs: %w", logsErr)
+		}
+		return nil
 	default:
 		return fmt.Errorf("jobs: unknown subcommand %q", args[0])
 	}
 }
 
-func printJob(w io.Writer, j *hopper.JobRow, logs []hopper.AttemptLog) {
+func printJob(w io.Writer, j *hopper.JobRow, logs []hopper.AttemptLog, logsErr string) {
 	fmt.Fprintf(w, "id:            %s\nkind:          %s\nqueue:         %s\nstate:         %s\npriority:      %d\nattempt:       %d/%d\n",
 		j.ID, j.Kind, j.Queue, j.State, j.Priority, j.Attempt, j.MaxAttempts)
 	fmt.Fprintf(w, "scheduled_at:  %s\ncreated_at:    %s\n", j.ScheduledAt.Local().Format(time.RFC3339), j.CreatedAt.Local().Format(time.RFC3339))
@@ -300,6 +317,9 @@ func printJob(w io.Writer, j *hopper.JobRow, logs []hopper.AttemptLog) {
 	}
 	for _, e := range j.Errors {
 		fmt.Fprintf(w, "error #%d:      %s (%s)\n", e.Attempt, e.Error, e.At.Local().Format(time.RFC3339))
+	}
+	if logsErr != "" {
+		fmt.Fprintf(w, "logs:          unavailable: %s\n", logsErr)
 	}
 	for _, l := range logs {
 		snoozed := ""
