@@ -174,7 +174,8 @@ A worker logs through `hopper.Logger(ctx)`, a `*slog.Logger` whose lines go to
 `Config.Logger` with the job's ID, kind and attempt, and are also kept with the job:
 each attempt's lines, in text form, are written with its result, bounded per attempt,
 and a job keeps those of its latest attempts (§7.5). `client.JobLogs(ctx, id)` returns
-them, and `hopper jobs get` and the web UI show them.
+them, and `hopper jobs get` and the web UI show them; both still show a job whose logs
+cannot be read, and say why.
 
 ```go
 func (w *Importer) Work(ctx context.Context, job *hopper.Job[ImportArgs]) error {
@@ -944,13 +945,19 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   of their own, and a job that logged nothing writes `NULL` and keeps what it has. A
   completed job that skips history (`DeleteCompleted`) sends no log. A snooze gives
   its attempt back, so the next attempt has the same number: its log is marked
-  `snoozed`, and replaces the log of the previous snooze of that number, so a job
-  that polls by snoozing keeps one, not `MaxAttempts` of them. `MaxBytes` is at most
-  1 MiB and `MaxAttempts` at most 100, which keeps a job's logs well under jsonb's
-  limit. A finished attempt's lines wait in memory with its result: a flush starts
+  `snoozed`, and replaces the log of the previous snooze of that number, as a snooze
+  that logged nothing removes it, so a job that polls by snoozing keeps at most one,
+  not `MaxAttempts` of them. `MaxBytes` is at most
+  1 MiB, `MaxAttempts` at most 100, and their product at most 4 MiB: each finalize
+  that writes a log rewrites the job's whole `logs` value, so the product bounds a
+  write's cost, and with it how much a job that retries many times writes over its
+  life. Larger logs go to a log store, which the database never holds. A finished attempt's lines wait in memory with its result: a flush starts
   once its results hold 8 MiB of logs, which keeps a statement's parameters small,
   and job goroutines block on submit while the buffered results hold 64 MiB, as they
-  do when the buffer is full, so a slow database cannot make logs exhaust memory.
+  do when the buffer is full, so a slow database cannot make logs exhaust memory. A
+  stop's final flush lets those submits through and takes their results, as it takes
+  those waiting on a full buffer. Completed jobs that skip history hold no log, and
+  once an attempt's log is full its later lines are counted without being formatted.
   `CompleteTx` writes the lines logged before it. The lines are not streamed to the
   database while the attempt runs: each write would rewrite the whole value on the
   hottest table, so a steadily logging job would write the square of its log's size,

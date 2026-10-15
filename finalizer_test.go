@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,6 +279,7 @@ func TestFinalizerFlushesAtLogBytes(t *testing.T) {
 	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeInterval: time.Hour, finalizeBatch: 500, finalizeBuffer: 100}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
 	f.flushLogBytes = 1000
 	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); <-f.done }()
 	go f.run(ctx)
 	f.submit(loggedResult(0, 10))
 	f.submit(loggedResult(1, 600))
@@ -336,3 +338,80 @@ func TestFinalizerBoundsBufferedLogs(t *testing.T) {
 		}
 	}
 }
+
+// A stop drains the results whose submits wait on the log budget, as it
+// drains those that wait on a full buffer, instead of leaving their jobs to
+// be rescued and run again.
+func TestFinalizerDrainTakesResultsWaitingOnLogs(t *testing.T) {
+	exec := &stubExec{release: make(chan struct{}), started: make(chan int, 64)}
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeInterval: time.Hour, finalizeBatch: 500, finalizeBuffer: 100}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	f.logs.max = 300
+	ctx, cancel := context.WithCancel(context.Background())
+	go f.run(ctx)
+	f.submit(loggedResult(0, 200))
+	submitted := make(chan struct{})
+	go func() {
+		f.submit(loggedResult(1, 200))
+		close(submitted)
+	}()
+	cancel()
+	<-exec.started
+	select {
+	case <-submitted:
+	case <-time.After(5 * time.Second):
+		close(exec.release)
+		<-f.done
+		t.Fatal("the drain left a result waiting on the log budget")
+	}
+	close(exec.release)
+	<-f.done
+	total := 0
+	for _, n := range exec.batches() {
+		total += n
+	}
+	if total != 2 {
+		t.Errorf("drain wrote %d results in batches %v, want 2", total, exec.batches())
+	}
+}
+
+// However a submit races with the stop, its result is either written by the
+// final drain or dropped with a warning.
+func TestFinalizerDrainRacingSubmits(t *testing.T) {
+	for round := range 50 {
+		exec := &stubExec{}
+		var dropped atomic.Int64
+		f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+		f.logs.max = 300
+		ctx, cancel := context.WithCancel(context.Background())
+		go f.run(ctx)
+		const n = 40
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() { f.submit(loggedResult(i, 100)) })
+		}
+		cancel()
+		wg.Wait()
+		<-f.done
+		written := 0
+		for _, b := range exec.batches() {
+			written += b
+		}
+		if written+int(dropped.Load()) != n {
+			t.Fatalf("round %d: %d written and %d dropped of %d", round, written, dropped.Load(), n)
+		}
+	}
+}
+
+// dropCounter counts the finalizer's warnings of dropped results.
+type dropCounter struct{ n *atomic.Int64 }
+
+func (h dropCounter) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h dropCounter) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, "result dropped") {
+		h.n.Add(1)
+	}
+	return nil
+}
+func (h dropCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h dropCounter) WithGroup(string) slog.Handler      { return h }

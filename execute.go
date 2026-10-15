@@ -62,11 +62,20 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	if f.State.Terminal() {
 		f.Output = a.get()
 	}
-	f.Log = a.keptLog()
+	if keepsLog(f) {
+		f.Log = a.keptLog()
+	}
 	if known {
 		c.logOutcome(ctx, row, f, err)
 	}
 	return pending{job: row, result: f, completedTx: completed, heldByTx: a.txHeld()}
+}
+
+// keepsLog reports whether the job keeps the log of the attempt that ends
+// with f: a completed job that skips history (DeleteCompleted) is deleted
+// with its logs, so its log would only hold the finalizer's log budget.
+func keepsLog(f driver.JobFinalize) bool {
+	return f.Archive || f.State != driver.JobStateCompleted
 }
 
 // errNotCommitted fails an attempt whose worker completed it with

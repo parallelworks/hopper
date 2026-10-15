@@ -123,7 +123,7 @@ func (w *Workers) Work(ctx context.Context, job *JobRow, codec Codec) error {
 	// attempt: SetOutput and CompleteTx refuse, and progress stays in job.
 	// It logs as that attempt does.
 	if a, _ := ctx.Value(attemptKey{}).(*attempt); a != nil {
-		ctx = context.WithValue(ctx, inlineLoggerKey{}, Logger(ctx))
+		ctx = context.WithValue(ctx, inlineAttemptKey{}, a)
 	}
 	ctx = context.WithValue(context.WithValue(ctx, attemptKey{}, (*attempt)(nil)), inlineKey{}, true)
 	if timeout := unit.Timeout(); timeout > 0 {

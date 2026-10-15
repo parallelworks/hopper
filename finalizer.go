@@ -38,6 +38,13 @@ type finalizer struct {
 	// bufferedLogBytes.
 	flushLogBytes int
 	logs          logBudget
+	// draining is closed when run starts its final drain, which lets
+	// submits waiting on the log budget through. The drain ends once no
+	// submit is in flight, and a submit after it is dropped.
+	draining   chan struct{}
+	submitMu   sync.Mutex
+	submitting int
+	stopped    bool
 	// wake is called with the queue of a result that made a job claimable
 	// again right away, so the local producer need not wait for its poll.
 	wake func(queue string)
@@ -87,6 +94,7 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs
 		keepLogs:      keepLogs,
 		flushLogBytes: finalizeLogBytes,
 		logs:          logBudget{max: bufferedLogBytes, freed: make(chan struct{})},
+		draining:      make(chan struct{}),
 		wake:          wake,
 		applied:       applied,
 		in:            make(chan pending, max(t.finalizeBuffer, 2*t.finalizeBatch)),
@@ -99,15 +107,43 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs
 // submitted after the finalizer has stopped is dropped: the job stays
 // running in the database and is rescued once this client's lease expires.
 func (f *finalizer) submit(p pending) {
-	if n := p.logBytes(); n > 0 && !f.logs.acquire(n, f.done) {
-		f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", p.result.ID)
+	f.submitMu.Lock()
+	stopped := f.stopped
+	if !stopped {
+		f.submitting++
+	}
+	f.submitMu.Unlock()
+	if stopped {
+		f.drop(p)
+		return
+	}
+	defer func() {
+		f.submitMu.Lock()
+		f.submitting--
+		f.submitMu.Unlock()
+	}()
+	if n := p.logBytes(); n > 0 && !f.logs.acquire(n, f.draining, f.done) {
+		f.drop(p)
 		return
 	}
 	select {
 	case f.in <- p:
 	case <-f.done:
-		f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", p.result.ID)
+		f.drop(p)
 	}
+}
+
+func (f *finalizer) drop(p pending) {
+	f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", p.result.ID)
+}
+
+// idle reports whether no submit is in flight or buffered and, if so,
+// stops the finalizer taking more.
+func (f *finalizer) idle() bool {
+	f.submitMu.Lock()
+	defer f.submitMu.Unlock()
+	f.stopped = f.submitting == 0 && len(f.in) == 0
+	return f.stopped
 }
 
 // run flushes until ctx is done, then flushes what is buffered with a bounded
@@ -137,8 +173,11 @@ func (f *finalizer) run(ctx context.Context) {
 			if f.crashed.Load() {
 				return
 			}
-			// Drain what job goroutines have already submitted, then write
-			// it with one attempt per batch.
+			// Drain what job goroutines have submitted, and are submitting,
+			// and write it with one attempt per batch. Submits waiting on
+			// the log budget are let through, as those waiting on a full
+			// buffer are taken by the drain.
+			close(f.draining)
 			for {
 				select {
 				case p := <-f.in:
@@ -146,18 +185,24 @@ func (f *finalizer) run(ctx context.Context) {
 					continue
 				default:
 				}
-				break
-			}
-			for len(batch) > 0 {
-				n, size := 0, 0
-				for n < len(batch) && n < f.maxBatch && size < f.flushLogBytes {
-					size += batch[n].logBytes()
-					n++
+				for len(batch) > 0 {
+					n, size := 0, 0
+					for n < len(batch) && n < f.maxBatch && size < f.flushLogBytes {
+						size += batch[n].logBytes()
+						n++
+					}
+					f.flush(ctx, batch[:n])
+					batch = batch[n:]
 				}
-				f.flush(ctx, batch[:n])
-				batch = batch[n:]
+				if f.idle() {
+					return
+				}
+				select {
+				case p := <-f.in:
+					batch = append(batch, p)
+				case <-time.After(time.Millisecond):
+				}
 			}
-			return
 		}
 	}
 }
@@ -188,12 +233,21 @@ type logBudget struct {
 	freed chan struct{} // closed and replaced on each release
 }
 
-// acquire waits until n bytes fit, or done is closed, and reports whether
-// they were acquired.
-func (b *logBudget) acquire(n int, done <-chan struct{}) bool {
+// acquire waits until n bytes fit and reports whether it took them. Once
+// over is closed it takes them without waiting; once done is closed it
+// gives up.
+func (b *logBudget) acquire(n int, over, done <-chan struct{}) bool {
 	for {
 		b.mu.Lock()
-		if b.used == 0 || b.used+n <= b.max {
+		fits := b.used == 0 || b.used+n <= b.max
+		if !fits {
+			select {
+			case <-over:
+				fits = true
+			default:
+			}
+		}
+		if fits {
 			b.used += n
 			b.mu.Unlock()
 			return true
@@ -202,6 +256,7 @@ func (b *logBudget) acquire(n int, done <-chan struct{}) bool {
 		b.mu.Unlock()
 		select {
 		case <-freed:
+		case <-over:
 		case <-done:
 			return false
 		}

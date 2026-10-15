@@ -80,6 +80,11 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	run(id, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &a2again}, 2, false)
 	s2.Log = a2again.Log
 	check("after another snooze", logs(id), a1, s2)
+	// A snooze that logs nothing replaces it too.
+	run(id, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
+	check("after a snooze that logged nothing", logs(id), a1)
+	run(id, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &a2again}, 2, false)
+	check("after a snooze that logged again", logs(id), a1, s2)
 	run(id, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 2, Error: "x"}}, 2, false)
 	check("after an attempt that logged nothing", logs(id), a1, s2)
 	run(id, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 3, Error: "x"}, Log: &a3}, 2, false)

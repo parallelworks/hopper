@@ -105,6 +105,13 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "log #1:\n  level=INFO msg=one\n  level=WARN msg=two\nlog #2:\n  no newline\n") {
 		t.Errorf("jobs get with logs = %q", got)
 	}
+	// A job whose logs cannot be read, here from a schema before v16, is
+	// still shown, with why its logs are missing.
+	hopperCmd("migrate", "down", "-target", "15")
+	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "state:         available") || !strings.Contains(got, "logs:          unavailable: ") {
+		t.Errorf("jobs get without a logs column = %q", got)
+	}
+	hopperCmd("migrate", "up")
 	if got := hopperCmd("jobs", "retry", id); !strings.Contains(got, "progress:") {
 		t.Errorf("jobs retry dropped the progress: %q", got)
 	}
