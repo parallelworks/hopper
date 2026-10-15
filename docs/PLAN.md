@@ -965,20 +965,32 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   A worker run inline with `Workers.Work` inside an attempt logs as that attempt.
   A value not in the form hopper writes reads as the entries that are.
 - **Log store.** With `Config.JobLogs.Store`, a `LogStore`, the attempt's logger
-  writes its text lines to the store instead of the buffer: `Writer(ctx, job)`,
-  opened on the first `Logger` call with the job's context minus its cancellation,
-  gets one line per `Write` as it is logged, and is closed once the worker returns,
-  before the result is submitted. Nothing goes to the `logs` column (the result
-  carries no `Log`), so the store costs the database nothing and keeps a crashed
-  client's lines up to the crash. Logs are keyed by job ID and attempt, which a
-  process that runs the work outside the client (a remote executor) knows from the
-  claim, so it writes to the store directly. `Client.JobLogs` reads `Logs(ctx, id)`,
-  and hopperui with it; the CLI, which has no store, shows only the column.
-  `MaxBytes` and `MaxAttempts` do not apply, and retention is the store's: hopper
-  does not remove a job's logs from it. A failed `Writer`, `Write` or `Close` is
-  logged to `Config.Logger` and drops the rest of that attempt's lines; it never
-  changes the job's outcome. The interface stays small on purpose: a live tail is
-  the store's to offer, from what it has been written.
+  writes its text lines to the store instead of the buffer. `Writer(ctx, job)` is
+  called with the attempt's first line, so an attempt that logs nothing opens none,
+  and gets one line per `Write`. Its context has the job's values but not its
+  cancellation, deadline or attempt (a store that logs with `hopper.Logger` must not
+  re-enter the attempt's logger), and is canceled once the writer is closed. The
+  writer is closed once the worker returns, and the attempt's result waits for
+  `Close` for up to 5 seconds, so a store that saves on `Close` has the log when the
+  job is finished; past that the result goes ahead and the close finishes on its own.
+  A line logged after the close, by a goroutine the worker left, goes to
+  `Config.Logger` only. Nothing goes to the `logs` column (the result carries no
+  `Log`), so the store costs the database nothing and keeps a crashed client's lines
+  up to the crash. Logs are keyed by job ID and attempt, which a process that runs
+  the work outside the client (a remote executor) knows from the claim, so it writes
+  to the store directly. A snooze gives the attempt back, so the run after it opens a
+  writer under the same ID and attempt; the store keeps both in order, and
+  `Client.JobLogs` marks a store log followed by another of the same attempt number
+  as snoozed. `Client.JobLogs` returns the logs the job's row holds (from before the
+  store, or from clients without it during a rolling deploy), then the store's, in
+  attempt order; if the store fails it returns the row's with the error, and
+  hopperui shows the job with a note where the logs would be. The CLI, which has no
+  store, shows only the column. `MaxBytes` and `MaxAttempts` neither apply nor are
+  checked, and retention is the store's: hopper does not remove a job's logs from it.
+  A failed or panicking `Writer`, `Write` or `Close`, or a nil writer, is logged to
+  `Config.Logger` and drops the rest of that attempt's lines; it never changes the
+  job's outcome. The interface stays small on purpose: a live tail is the store's
+  to offer, from what it has been written.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure

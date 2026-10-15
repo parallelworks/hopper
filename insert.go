@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -262,12 +263,29 @@ func (c *Client[TTx]) JobGet(ctx context.Context, id JobID) (*JobRow, error) {
 }
 
 // JobLogs returns the logs a job's worker kept with Logger, of its latest
-// attempts, oldest first, live or from history: from Config.JobLogs.Store
-// if it is set, and otherwise from the job's row, when it returns
-// ErrNotFound if the job does not exist or its history has been dropped.
+// attempts, oldest first, live or from history. It returns ErrNotFound if
+// the job does not exist or its history has been dropped. With
+// Config.JobLogs.Store, the store's logs follow those the job's row holds,
+// from before the store or from clients without it, in attempt order, and
+// a log the store has for an attempt number again after it reads as a
+// snooze. If the store fails, the row's logs are returned with the error.
 func (c *Client[TTx]) JobLogs(ctx context.Context, id JobID) ([]AttemptLog, error) {
-	if s := c.cfg.JobLogs.Store; s != nil {
-		return s.Logs(ctx, id)
+	logs, err := c.exec.JobLogs(ctx, id)
+	s := c.cfg.JobLogs.Store
+	if s == nil || (err != nil && !errors.Is(err, ErrNotFound)) {
+		return logs, err
 	}
-	return c.exec.JobLogs(ctx, id)
+	stored, serr := s.Logs(ctx, id)
+	if serr != nil {
+		return logs, fmt.Errorf("hopper: read the logs of job %s from the store: %w", id, serr)
+	}
+	if err != nil && len(stored) == 0 {
+		return nil, err
+	}
+	for i := range stored {
+		stored[i].Snoozed = stored[i].Snoozed || (i+1 < len(stored) && stored[i+1].Attempt == stored[i].Attempt)
+	}
+	logs = append(logs, stored...)
+	slices.SortStableFunc(logs, func(a, b AttemptLog) int { return cmp.Compare(a.Attempt, b.Attempt) })
+	return logs, nil
 }

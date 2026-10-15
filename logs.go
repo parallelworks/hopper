@@ -2,10 +2,12 @@ package hopper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/parallelworks/hopper/driver"
 )
@@ -25,15 +27,26 @@ type AttemptLog = driver.AttemptLog
 type LogStore interface {
 	// Writer returns where the lines of the attempt of job that is running
 	// go, as Logger logs them: one line per Write, in slog's text format.
-	// It is called when the worker first calls Logger, with the job's
-	// context without its cancellation, which ends with the attempt.
-	// Hopper closes the writer once the worker returns, before the
-	// attempt's result is written, so Close should be prompt. A failed
-	// Write or Close is logged to Config.Logger and drops the attempt's
-	// remaining lines; the job's outcome does not depend on it.
+	// It is called with the attempt's first line, so an attempt that logs
+	// nothing opens no writer. Its context carries the job's values but not
+	// its cancellation, deadline or attempt (Logger called with it logs as
+	// outside a job), and is canceled once the writer is closed.
+	//
+	// Hopper closes the writer once the worker returns and waits for Close
+	// for up to 5 seconds before it hands in the attempt's result, so a
+	// store that saves on Close has the log by the time the job is finished.
+	// A job completed with CompleteTx is finished when the worker's
+	// transaction commits, which may be before. Lines logged after the
+	// close go to Config.Logger only.
+	//
+	// A snooze gives the attempt back, so the run after it calls Writer
+	// again with the same job ID and attempt: keep both, in order. A failed
+	// or panicking Writer, Write or Close, or a nil writer, is logged to
+	// Config.Logger and drops the attempt's remaining lines; the job's
+	// outcome does not depend on it.
 	Writer(ctx context.Context, job *JobRow) (io.WriteCloser, error)
 	// Logs returns the logs of a job's attempts, oldest first, for
-	// Client.JobLogs and hopperui.
+	// Client.JobLogs and hopperui, with no entry for a job it has none of.
 	Logs(ctx context.Context, id JobID) ([]AttemptLog, error)
 }
 
@@ -42,8 +55,9 @@ type LogStore interface {
 type JobLogsConfig struct {
 	// Store, if set, receives each attempt's lines as they are logged
 	// instead of the job's row in the database, and Client.JobLogs reads
-	// them from it. MaxBytes and MaxAttempts then do not apply: what the
-	// store keeps is its own choice.
+	// them from it, after any the job's row holds. MaxBytes and
+	// MaxAttempts then do not apply, nor are they checked: what the store
+	// keeps is its own choice.
 	Store LogStore
 	// MaxBytes is how much of an attempt's log is kept. Once a line would
 	// pass it, that line and the rest are dropped, and the log ends with a
@@ -124,20 +138,25 @@ type inlineLoggerKey struct{}
 // to the attempt's log, in the store or, unless the client keeps none, in
 // the attempt's buffer.
 func (a *attempt) newLogger(ctx context.Context) {
-	base := a.baseLogger.With("job_id", a.completion.ID, "kind", a.kind, "attempt", a.attempt)
+	base := a.baseLogger.With("job_id", a.completion.ID, "kind", a.row.Kind, "attempt", a.attempt)
+	a.logger = base
 	var out io.Writer
 	switch {
 	case a.logs.Store != nil:
-		w, err := a.logs.Store.Writer(context.WithoutCancel(ctx), a.row)
-		if err != nil {
-			base.WarnContext(ctx, "hopper: open the job's log in the store; the attempt's lines go to Config.Logger only", "error", err)
-			a.logger = base
+		// The store's context does not carry the attempt: a store that logs
+		// with Logger would otherwise re-enter the attempt's logger.
+		sctx, cancel := context.WithCancel(context.WithValue(context.WithoutCancel(ctx), attemptKey{}, (*attempt)(nil)))
+		sw := &storeWriter{store: a.logs.Store, ctx: sctx, cancel: cancel, row: a.row, logger: base}
+		a.mu.Lock()
+		ended := a.logEnded
+		if !ended {
+			a.stored = sw
+		}
+		a.mu.Unlock()
+		if ended {
+			cancel()
 			return
 		}
-		sw := &storeWriter{w: w, logger: base}
-		a.mu.Lock()
-		a.stored = sw
-		a.mu.Unlock()
 		out = sw
 	case a.logs.MaxBytes > 0:
 		kept := &logBuffer{max: a.logs.MaxBytes}
@@ -146,31 +165,43 @@ func (a *attempt) newLogger(ctx context.Context) {
 		a.mu.Unlock()
 		out = kept
 	default:
-		a.logger = base
 		return
 	}
 	text := slog.NewTextHandler(out, &slog.HandlerOptions{Level: a.logs.Level, ReplaceAttr: a.logs.ReplaceAttr})
 	a.logger = slog.New(slog.NewMultiHandler(base.Handler(), text))
 }
 
-// closeLog closes the attempt's writer in the store, if it has one. Lines
-// logged after it are dropped.
-func (a *attempt) closeLog() {
+// closeLog ends the attempt's log in the store, if it has one, and keeps
+// one from starting later: lines logged after it go to Config.Logger only.
+// It waits for the store's Close for at most timeout.
+func (a *attempt) closeLog(timeout time.Duration) {
+	if a.logs.Store == nil {
+		return
+	}
 	a.mu.Lock()
+	a.logEnded = true
 	sw := a.stored
 	a.mu.Unlock()
 	if sw != nil {
-		sw.close()
+		sw.close(timeout)
 	}
 }
 
-// storeWriter is an attempt's writer in a LogStore, which it stops using
-// once a write fails or the attempt ends.
+// storeWriter is an attempt's log in a LogStore. It opens the store's writer
+// with the first line, so an attempt that writes none opens none, and stops
+// using it once the attempt ends or the store fails. Store calls run outside
+// the worker's panic guard once the worker has returned, so a panic in one
+// is logged as a failure.
 type storeWriter struct {
-	mu     sync.Mutex
-	w      io.WriteCloser
+	store  LogStore
+	ctx    context.Context
+	cancel context.CancelFunc
+	row    *driver.JobRow
 	logger *slog.Logger
-	done   bool
+
+	mu   sync.Mutex
+	w    io.WriteCloser
+	done bool
 }
 
 func (s *storeWriter) Write(p []byte) (int, error) {
@@ -179,26 +210,77 @@ func (s *storeWriter) Write(p []byte) (int, error) {
 	if s.done {
 		return len(p), nil
 	}
-	if _, err := s.w.Write(p); err != nil {
-		s.done = true
-		s.logger.Warn("hopper: write the job's log to the store; the attempt's later lines go to Config.Logger only", "error", err)
-		if err := s.w.Close(); err != nil {
-			s.logger.Warn("hopper: close the job's log in the store", "error", err)
+	if s.w == nil {
+		w, err := s.open()
+		if err != nil {
+			s.logger.Warn("hopper: open the job's log in the store; the attempt's lines go to Config.Logger only", "error", err)
+			s.done = true
+			s.cancel()
+			return len(p), nil
 		}
+		s.w = w
+	}
+	if err := storeCall(func() error { _, err := s.w.Write(p); return err }); err != nil {
+		s.logger.Warn("hopper: write the job's log to the store; the attempt's later lines go to Config.Logger only", "error", err)
+		s.closeLocked()
 	}
 	return len(p), nil
 }
 
-func (s *storeWriter) close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.done {
+func (s *storeWriter) open() (w io.WriteCloser, err error) {
+	err = storeCall(func() error {
+		w, err = s.store.Writer(s.ctx, s.row)
+		return err
+	})
+	if err == nil && w == nil {
+		err = errors.New("the store returned no writer")
+	}
+	return w, err
+}
+
+// close closes the store's writer, waiting at most timeout for it, and for
+// a write or an open under way: past it, the attempt's result goes ahead
+// while the close finishes on its own.
+func (s *storeWriter) close(timeout time.Duration) {
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if !s.done {
+			s.closeLocked()
+		}
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-closed:
+	case <-t.C:
+		s.logger.Warn("hopper: the store has not closed the job's log; the attempt's result goes ahead without it", "waited", timeout)
+	}
+}
+
+// closeLocked closes the store's writer, if it opened one, and cancels the
+// writer's context.
+func (s *storeWriter) closeLocked() {
+	s.done = true
+	defer s.cancel()
+	if s.w == nil {
 		return
 	}
-	s.done = true
-	if err := s.w.Close(); err != nil {
+	if err := storeCall(s.w.Close); err != nil {
 		s.logger.Warn("hopper: close the job's log in the store", "error", err)
 	}
+}
+
+// storeCall calls a LogStore method, turning a panic into an error.
+func storeCall(f func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return f()
 }
 
 // keptLog returns the attempt's log, or nil if it logged nothing that is
@@ -253,6 +335,12 @@ func withJobLogDefaults(cfg JobLogsConfig) (JobLogsConfig, error) {
 	}
 	if cfg.MaxAttempts == 0 {
 		cfg.MaxAttempts = DefaultJobLogAttempts
+	}
+	if cfg.Store != nil {
+		if cfg.Level == nil {
+			cfg.Level = slog.LevelInfo
+		}
+		return cfg, nil
 	}
 	if cfg.MaxAttempts < 0 || cfg.MaxAttempts > MaxJobLogAttempts {
 		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxAttempts must be between 1 and %d", MaxJobLogAttempts)

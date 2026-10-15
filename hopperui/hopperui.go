@@ -329,6 +329,9 @@ type jobData struct {
 	Live   bool
 	Errors []hopper.AttemptError
 	Logs   []hopper.AttemptLog
+	// LogsErr is why the logs could not all be read, as from a LogStore
+	// that is down; the page shows the job and the logs it has.
+	LogsErr string
 }
 
 func (u *ui[TTx]) job(w http.ResponseWriter, r *http.Request) {
@@ -342,12 +345,12 @@ func (u *ui[TTx]) job(w http.ResponseWriter, r *http.Request) {
 		u.fail(w, err)
 		return
 	}
-	logs, err := u.client.JobLogs(r.Context(), id)
+	data := jobData{Job: job, Live: !job.State.Terminal(), Errors: job.Errors}
+	data.Logs, err = u.client.JobLogs(r.Context(), id)
 	if err != nil && !errors.Is(err, hopper.ErrNotFound) {
-		u.fail(w, err)
-		return
+		data.LogsErr = err.Error()
 	}
-	u.render(w, r, "job", jobData{Job: job, Live: !job.State.Terminal(), Errors: job.Errors, Logs: logs})
+	u.render(w, r, "job", data)
 }
 
 func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
