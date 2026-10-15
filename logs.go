@@ -106,7 +106,8 @@ const (
 
 // Limits of JobLogsConfig fields. A finalize that writes a log rewrites
 // all of the job's, so MaxJobLogTotalBytes bounds MaxBytes times
-// MaxAttempts: what one write costs.
+// MaxAttempts, and with it what one write costs: about that much, as each
+// entry may pass MaxBytes by its dropped-lines line and JSON escaping.
 const (
 	MaxJobLogBytes      = 1 << 20
 	MaxJobLogAttempts   = 100
@@ -221,7 +222,13 @@ func (h attemptHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 func (h attemptHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return attemptHandler{base: h.base.WithAttrs(attrs), text: h.text.WithAttrs(attrs), kept: h.kept}
+	text := h.text
+	// A full log formats no more lines, so it need not format their
+	// attributes either.
+	if h.kept == nil || h.kept.dropped.Load() == 0 {
+		text = text.WithAttrs(attrs)
+	}
+	return attemptHandler{base: h.base.WithAttrs(attrs), text: text, kept: h.kept}
 }
 
 func (h attemptHandler) WithGroup(name string) slog.Handler {
@@ -490,7 +497,7 @@ func withJobLogDefaults(cfg JobLogsConfig) (JobLogsConfig, error) {
 	if cfg.Store == nil && cfg.MaxBytes > MaxJobLogBytes {
 		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxBytes must be at most %d", MaxJobLogBytes)
 	}
-	if cfg.Store == nil && cfg.MaxBytes*cfg.MaxAttempts > MaxJobLogTotalBytes {
+	if cfg.Store == nil && cfg.MaxBytes > 0 && cfg.MaxBytes*cfg.MaxAttempts > MaxJobLogTotalBytes {
 		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxBytes times MaxAttempts must be at most %d", MaxJobLogTotalBytes)
 	}
 	return cfg, nil

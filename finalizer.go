@@ -42,10 +42,10 @@ type finalizer struct {
 	// draining is closed when run starts its final drain, which lets
 	// submits waiting on the log budget through. The drain takes results
 	// for at most drainTimeout once its first round is written, and ends
-	// once no submit is in flight; a
-	// submit after it is dropped. submits counts the submits that started,
-	// times two, plus one once the drain has ended, and submitted those
-	// that are done.
+	// once no submit is in flight, counting a held result's retry that
+	// notWritten scheduled; a submit after it is dropped. submits counts
+	// the submits that started, times two, plus one once the drain has
+	// ended, and submitted those that are done.
 	draining     chan struct{}
 	drainTimeout time.Duration
 	submits      paddedInt64
@@ -90,6 +90,9 @@ type pending struct {
 	// waits counts the flushes that found the worker's transaction still
 	// open.
 	waits int
+	// handedIn is when a submit during the stop's final drain handed the
+	// result in: one handed in past the drain's deadline is dropped.
+	handedIn time.Time
 }
 
 func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs int, wake func(string), applied func(*driver.JobRow, driver.JobFinalize)) *finalizer {
@@ -116,14 +119,31 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs
 // submitted after the finalizer has stopped is dropped: the job stays
 // running in the database and is rescued once this client's lease expires.
 func (f *finalizer) submit(p pending) {
-	defer f.submitDone()
-	if f.submits.Add(2)&1 == 1 {
+	if !f.startSubmit() {
+		defer f.submitDone()
 		f.drop(p)
 		return
 	}
+	f.deliver(p)
+}
+
+// startSubmit counts a submit in flight, unless the final drain has ended,
+// and reports which.
+func (f *finalizer) startSubmit() bool {
+	return f.submits.Add(2)&1 == 0
+}
+
+// deliver hands in the result of a submit that startSubmit counted.
+func (f *finalizer) deliver(p pending) {
+	defer f.submitDone()
 	if n := p.logBytes(); n > 0 && !f.logs.acquire(n, f.draining, f.done) {
 		f.drop(p)
 		return
+	}
+	select {
+	case <-f.draining:
+		p.handedIn = time.Now()
+	default:
 	}
 	select {
 	case f.in <- p:
@@ -133,11 +153,10 @@ func (f *finalizer) submit(p pending) {
 }
 
 // drop gives up a result once the finalizer has stopped taking them. A
-// result whose CompleteTx the client saw commit needs no write, and is
-// applied.
+// result whose CompleteTx the client saw commit loses nothing but its
+// event: its job is finished, and the leader settles its batch.
 func (f *finalizer) drop(p pending) {
 	if p.committed {
-		f.applied(p.job, *p.completedTx)
 		return
 	}
 	f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", p.result.ID)
@@ -212,8 +231,10 @@ func (f *finalizer) run(ctx context.Context) {
 			// buffer are taken by the drain. drainTimeout starts once the
 			// first round is written, so that a slow write of what was
 			// buffered at the stop does not use it up before the submits
-			// it let through arrive; past it, results from jobs still
-			// finishing are dropped.
+			// it let through arrive; past it, results handed in later, from
+			// jobs still finishing, are dropped, and those handed in before
+			// it are written, however long the writes before them took. A
+			// committed CompleteTx result needs no write, and is applied.
 			close(f.draining)
 			var (
 				deadline time.Time
@@ -227,13 +248,20 @@ func (f *finalizer) run(ctx context.Context) {
 				default:
 				}
 				late := !deadline.IsZero() && time.Now().After(deadline)
-				for len(batch) > 0 {
-					if late {
-						f.drop(batch[0])
-						f.logs.release(batch[0].logBytes())
-						batch = batch[1:]
-						continue
+				if late {
+					kept, dropped := batch[:0], 0
+					for _, p := range batch {
+						if p.handedIn.After(deadline) && !p.committed {
+							f.drop(p)
+							dropped += p.logBytes()
+						} else {
+							kept = append(kept, p)
+						}
 					}
+					batch = kept
+					f.logs.release(dropped)
+				}
+				for len(batch) > 0 {
 					n, size := 0, 0
 					for n < len(batch) && n < f.maxBatch && size < f.flushLogBytes {
 						size += batch[n].logBytes()
@@ -527,6 +555,13 @@ func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
 			f.logger.WarnContext(ctx, "hopper: another transaction holds a finished job's row, such as one that called JobCancelTx and has not committed; the job's result waits for it", "job_id", p.result.ID)
 		}
 	}
-	time.AfterFunc(heldRetry, func() { f.submit(p) })
+	// The retry counts as a submit in flight from now, so that a stop's
+	// final drain waits for it rather than ending before it is handed in.
+	if !f.startSubmit() {
+		f.drop(p)
+		f.submitDone()
+		return p, false
+	}
+	time.AfterFunc(heldRetry, func() { f.deliver(p) })
 	return p, false
 }

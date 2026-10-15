@@ -21,7 +21,6 @@ type Tuning struct {
 	Maintenance      time.Duration
 	RescueBatch      int
 	LogStoreClose    time.Duration // 0: the default
-	FinalizeDrain    time.Duration // 0: the default
 }
 
 // SetTuning overrides the client's internal timings. Call it before Start.
@@ -42,7 +41,7 @@ func (c *Client[TTx]) SetTuning(t Tuning) {
 		rescueBatch:         t.RescueBatch,
 		streamBatch:         defaultTuning.streamBatch,
 		logCloseTimeout:     cmp.Or(t.LogStoreClose, defaultTuning.logCloseTimeout),
-		finalizeDrain:       cmp.Or(t.FinalizeDrain, defaultTuning.finalizeDrain),
+		finalizeDrain:       defaultTuning.finalizeDrain,
 	}
 	c.notifier.interval = c.tuning.notifyInterval
 }

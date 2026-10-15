@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -108,11 +109,23 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 	check("canceled", logs(id), s2, stored, a4)
 
-	// A snooze that logs nothing leaves a job without logs as it is.
-	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
-	if got := f.QueryText(ctx, t, d, "SELECT coalesce(logs::text, 'NULL') FROM hopper_jobs WHERE id = $1::uuid", other.String()); got != "NULL" {
-		t.Errorf("logs after a snooze that logged nothing = %s, want NULL", got)
+	// A snooze that logs nothing leaves a job without logs as it is, and
+	// takes one whose only log is a snooze's back to none.
+	noLogs := func(what string) {
+		t.Helper()
+		if got := f.QueryText(ctx, t, d, "SELECT coalesce(logs::text, 'NULL') FROM hopper_jobs WHERE id = $1::uuid", other.String()); got != "NULL" {
+			t.Errorf("logs %s = %s, want NULL", what, got)
+		}
 	}
+	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
+	noLogs("after a snooze that logged nothing")
+	attempt, err := strconv.Atoi(f.QueryText(ctx, t, d, "SELECT attempt::text FROM hopper_jobs WHERE id = $1::uuid", other.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &driver.AttemptLog{Attempt: attempt + 1, Log: "x\n"}}, 2, false)
+	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
+	noLogs("after a snooze that logged nothing removed the only log")
 
 	// An expired job takes its logs to history too.
 	run(other, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "x"}, Log: &a1}, 2, false)

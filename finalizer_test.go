@@ -404,11 +404,13 @@ func TestFinalizerDrainRacingSubmits(t *testing.T) {
 
 // A stop's final drain takes results for at most drainTimeout: a job that
 // finishes later has its result dropped with a warning instead of holding
-// the stop.
+// the stop, unless its CompleteTx committed, which is applied. Once the
+// drain has ended, a committed result is dropped without a warning.
 func TestFinalizerDrainTimeout(t *testing.T) {
 	exec := &stubExec{}
-	var dropped atomic.Int64
-	f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	var dropped, applied atomic.Int64
+	f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {},
+		func(*driver.JobRow, driver.JobFinalize) { applied.Add(1) })
 	f.drainTimeout = 50 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	go f.run(ctx)
@@ -431,7 +433,11 @@ func TestFinalizerDrainTimeout(t *testing.T) {
 		t.Fatal("the drain ended with a submit in flight")
 	case <-time.After(20 * time.Millisecond):
 	}
-	f.in <- loggedResult(1, 10)
+	late := loggedResult(1, 10)
+	late.handedIn = time.Now() // as deliver stamps it during the drain
+	f.in <- late
+	done := driver.JobFinalize{ID: driver.JobID{3}, State: driver.JobStateCompleted}
+	f.in <- pending{job: &driver.JobRow{Queue: "default"}, result: done, completedTx: &done, committed: true, handedIn: time.Now()}
 	f.submitDone()
 	select {
 	case <-f.done:
@@ -441,6 +447,80 @@ func TestFinalizerDrainTimeout(t *testing.T) {
 	f.submit(loggedResult(2, 10))
 	if got := exec.batches(); !slices.Equal(got, []int{1}) || dropped.Load() != 2 {
 		t.Errorf("batches %v, %d dropped; want the first result written and the later two dropped", got, dropped.Load())
+	}
+	if applied.Load() != 2 {
+		t.Errorf("applied %d results, want the first and the late committed one", applied.Load())
+	}
+	f.submit(pending{job: &driver.JobRow{Queue: "default"}, result: done, completedTx: &done, committed: true})
+	if applied.Load() != 2 || dropped.Load() != 2 {
+		t.Errorf("a committed CompleteTx result after the drain: applied %d, %d dropped; want neither", applied.Load()-2, dropped.Load()-2)
+	}
+}
+
+// A result handed in before drainTimeout passed is written, even when the
+// write before it ran past drainTimeout.
+func TestFinalizerDrainWritesResultsHandedInBeforeDeadline(t *testing.T) {
+	exec := &stubExec{release: make(chan struct{}), started: make(chan int, 8)}
+	var dropped atomic.Int64
+	f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	f.drainTimeout = 200 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	f.submits.Add(2) // a job still finishing keeps the drain open
+	go f.run(ctx)
+	cancel()
+	<-f.draining
+	time.Sleep(10 * time.Millisecond) // past the first round, which starts drainTimeout
+	f.submit(loggedResult(0, 10))
+	<-exec.started // its write is held past drainTimeout
+	f.submit(loggedResult(1, 10))
+	time.Sleep(2 * f.drainTimeout)
+	close(exec.release)
+	f.submitDone()
+	select {
+	case <-f.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain did not end")
+	}
+	if got := exec.batches(); !slices.Equal(got, []int{1, 1}) || dropped.Load() != 0 {
+		t.Errorf("batches %v, %d dropped; want both results written", got, dropped.Load())
+	}
+}
+
+// heldOnceExec finds every job's row held by a transaction the first time
+// it is finalized, and the job still running in its attempt.
+type heldOnceExec struct {
+	stubExec
+	held atomic.Bool
+}
+
+func (e *heldOnceExec) JobGet(_ context.Context, id driver.JobID) (*driver.JobRow, error) {
+	return &driver.JobRow{ID: id, State: driver.JobStateRunning}, nil
+}
+
+func (e *heldOnceExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+	if e.held.CompareAndSwap(false, true) {
+		return nil, nil
+	}
+	return e.stubExec.JobFinalizeMany(ctx, params)
+}
+
+// A stop's final drain waits for the retry of a result whose row a
+// transaction held, rather than dropping it.
+func TestFinalizerDrainWaitsForHeldRetry(t *testing.T) {
+	exec := &heldOnceExec{}
+	var dropped atomic.Int64
+	f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	ctx, cancel := context.WithCancel(context.Background())
+	go f.run(ctx)
+	f.submit(pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{ID: driver.JobID{1}, State: driver.JobStateCompleted}, heldByTx: true})
+	cancel()
+	select {
+	case <-f.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain did not end")
+	}
+	if got := exec.batches(); !slices.Equal(got, []int{1}) || dropped.Load() != 0 {
+		t.Errorf("batches %v after the held write, %d dropped; want the retry written", got, dropped.Load())
 	}
 }
 

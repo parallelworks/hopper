@@ -285,7 +285,7 @@ type tuning struct {
 	logCloseTimeout time.Duration
 	// finalizeDrain bounds how long a stop's final drain, once it has
 	// written what was buffered at the stop, takes results from jobs that
-	// are still finishing. What it has taken by then is written.
+	// are still finishing. What was handed in by then is written.
 	finalizeDrain time.Duration
 }
 

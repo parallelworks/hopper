@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -304,6 +305,9 @@ func TestJobLogsConfigValidated(t *testing.T) {
 		{MaxBytes: hopper.MaxJobLogBytes, MaxAttempts: hopper.MaxJobLogTotalBytes / hopper.MaxJobLogBytes},
 		{MaxBytes: hopper.MaxJobLogTotalBytes / hopper.MaxJobLogAttempts, MaxAttempts: hopper.MaxJobLogAttempts},
 		{MaxBytes: hopper.MaxJobLogBytes, MaxAttempts: hopper.MaxJobLogAttempts, Store: &memStore{}},
+		// Negative keeps no lines, however large: its product with
+		// MaxAttempts, which overflows, is not checked.
+		{MaxBytes: math.MinInt / 2, MaxAttempts: 3},
 	} {
 		if _, err := hopper.NewClient(h.d, &hopper.Config{JobLogs: cfg}); err != nil {
 			t.Errorf("NewClient at the limits with %+v = %v", cfg, err)

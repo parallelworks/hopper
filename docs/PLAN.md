@@ -950,16 +950,19 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   not `MaxAttempts` of them. `MaxBytes` is at most
   1 MiB, `MaxAttempts` at most 100, and their product at most 4 MiB: each finalize
   that writes a log rewrites the job's whole `logs` value, so the product bounds a
-  write's cost, and with it how much a job that retries many times writes over its
-  life. Larger logs go to a log store, which the database never holds. A finished attempt's lines wait in memory with its result: a flush starts
-  once its results hold 8 MiB of logs, which keeps a statement's parameters small,
+  write's cost (to within each entry's dropped-lines line and JSON escaping), and with
+  it how much a job that retries many times writes over its life. Larger logs go to a
+  log store, which the database never holds. A finished attempt's lines wait in memory
+  with its result: a flush starts once its results hold 8 MiB of logs, which keeps a statement's parameters small,
   and job goroutines block on submit while the buffered results hold 64 MiB, as they
   do when the buffer is full, so a slow database cannot make logs exhaust memory. A
   stop's final flush lets those submits through and takes their results, as it takes
-  those waiting on a full buffer, and ends once no submit is in flight. Once what was
-  buffered at the stop is written, it takes results for at most 5 s more; past that,
-  those of jobs still finishing are dropped with a warning, and their jobs rescued,
+  those waiting on a full buffer, and ends once no submit is in flight, counting the
+  retry of a result whose row a transaction held. Once what was buffered at the stop
+  is written, it takes results for at most 5 s more; past that, those handed in later,
+  from jobs still finishing, are dropped with a warning, and their jobs rescued,
   rather than holding the stop (a result whose `CompleteTx` committed is applied).
+  Results handed in before then are written, however long the writes before them took.
   Completed jobs that skip history hold no log, nor does a `CompleteTx` result, and
   once an attempt's log is full its later lines are counted without being formatted.
   `CompleteTx` writes the lines logged before it. The lines are not streamed to the

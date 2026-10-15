@@ -615,16 +615,17 @@ SELECT id FROM retry UNION ALL SELECT id FROM finished`
 // attempt number. The SET reads j.attempt before the snooze gives it back.
 // A job whose logs do not change keeps its stored value, which is not
 // rewritten: one with no logs keeps NULL (jsonb_path_exists of NULL is
-// NULL, which would otherwise take the ELSE branch and store '[]').
+// NULL, which would otherwise take the ELSE branch), and one whose last
+// entry is removed goes back to NULL.
 const appendLogSQL = `CASE
          WHEN r.log IS NULL AND NOT (r.snooze AND coalesce(jsonb_path_exists(j.logs, '$[*] ? (exists(@.snoozed) && @.attempt == $a)',
            jsonb_build_object('a', j.attempt)), false)) THEN j.logs
-         ELSE jsonb_path_query_array(
+         ELSE nullif(jsonb_path_query_array(
            CASE WHEN r.snooze
                 THEN jsonb_path_query_array(coalesce(j.logs, '[]'), '$[*] ? (!exists(@.snoozed) || @.attempt != $a)',
                        jsonb_build_object('a', j.attempt))
                 ELSE coalesce(j.logs, '[]') END || CASE WHEN r.log IS NULL THEN '[]' ELSE jsonb_build_array(r.log) END,
-           '$[last - $keep + 1 to last]', jsonb_build_object('keep', $13::int)) END`
+           '$[last - $keep + 1 to last]', jsonb_build_object('keep', $13::int)), '[]') END`
 
 // jobFinalizePlainSQL is jobFinalizeSQL for results whose jobs belong to
 // no batch or workflow (driver.JobFinalizeParams.NoBatches): without the
