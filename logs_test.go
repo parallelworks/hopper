@@ -322,9 +322,10 @@ type memStore struct {
 	// reenter logs with Logger from Writer; nilWriter opens no writer;
 	// closePanic panics in Close.
 	reenter, nilWriter, closePanic bool
-	// closeBlock, if set, holds Close until it is closed. logsErr fails
-	// Logs.
+	// closeBlock and writeBlock, if set, hold Close and Write until they
+	// are closed. logsErr fails Logs.
 	closeBlock chan struct{}
+	writeBlock chan struct{}
 	logsErr    error
 	// ctxs are the contexts writers were opened with.
 	ctxs []context.Context
@@ -386,6 +387,9 @@ func (s *memStore) get(id hopper.JobID) (texts []string, closes []int) {
 }
 
 func (l *memLog) Write(p []byte) (int, error) {
+	if l.store.writeBlock != nil {
+		<-l.store.writeBlock
+	}
 	l.store.mu.Lock()
 	defer l.store.mu.Unlock()
 	if l.store.writeErr != nil {
@@ -447,9 +451,10 @@ func TestLogStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := <-started
-	if texts, closes := store.get(id); len(texts) != 1 || !strings.Contains(texts[0], "msg=attempt n=1\n") || closes[0] != 0 {
-		t.Errorf("while the attempt runs: store has %q, closed %v", texts, closes)
-	}
+	waitFor(t, func() bool {
+		texts, closes := store.get(id)
+		return len(texts) == 1 && strings.Contains(texts[0], "msg=attempt n=1\n") && closes[0] == 0
+	})
 	close(release)
 	if _, err := hopper.Await[struct{}](ctx, c, res.Job.ID); err != nil {
 		t.Fatal(err)
@@ -620,5 +625,162 @@ func TestJobLogsWithStore(t *testing.T) {
 	logs, err = c.JobLogs(ctx, res.Job.ID)
 	if err == nil || !strings.Contains(err.Error(), "store down") || len(logs) != 1 {
 		t.Errorf("JobLogs with the store down = %+v, %v", logs, err)
+	}
+	if _, err := c.JobLogs(ctx, hopper.JobID{9}); !errors.Is(err, hopper.ErrNotFound) || !strings.Contains(err.Error(), "store down") {
+		t.Errorf("JobLogs of an unknown job with the store down = %v", err)
+	}
+	// A store that answers ErrNotFound for a job it has no logs of.
+	store.logsErr = fmt.Errorf("no such object: %w", hopper.ErrNotFound)
+	if logs, err = c.JobLogs(ctx, res.Job.ID); err != nil || len(logs) != 1 {
+		t.Errorf("JobLogs with a store that has none = %+v, %v", logs, err)
+	}
+}
+
+// A client that stops hard waits for a store's Close for only part of its
+// stop grace, so the result of the job it canceled is still written.
+func TestLogStoreHardStop(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	store := &memStore{closeBlock: make(chan struct{})}
+	defer close(store.closeBlock)
+	started := make(chan struct{}, 1)
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, _ *hopper.Job[logged]) error {
+		hopper.Logger(ctx).Info("running")
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	c := h.client(&hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers: workers,
+		JobLogs: hopper.JobLogsConfig{Store: store},
+	})
+	tun := stepTuning
+	tun.LogStoreClose = time.Minute
+	c.SetTuning(tun)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, logged{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	stopCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop = %v, want DeadlineExceeded", err)
+	}
+	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State != hopper.JobStateRetryable {
+		t.Errorf("job after a hard stop with the store's Close blocked = %+v, %v", job, err)
+	}
+}
+
+// add stores a log of id's attempt directly, as another process would.
+func (s *memStore) add(id hopper.JobID, attempt int, text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.logs == nil {
+		s.logs = map[hopper.JobID][]*memLog{}
+	}
+	l := &memLog{store: s, attempt: attempt, closes: 1}
+	l.buf.WriteString(text)
+	s.logs[id] = append(s.logs[id], l)
+}
+
+// A store whose Write blocks holds up neither the worker nor, past the close
+// timeout, the attempt's result, and its writer's context is canceled.
+func TestLogStoreDoesNotBlockWorker(t *testing.T) {
+	t.Parallel()
+	store := &memStore{writeBlock: make(chan struct{})}
+	defer close(store.writeBlock)
+	var out syncBuffer
+	tun := stepTuning
+	tun.LogStoreClose = 50 * time.Millisecond
+	cfg := &hopper.Config{Logger: slog.New(slog.NewTextHandler(&out, nil)), JobLogs: hopper.JobLogsConfig{Store: store}}
+	var took time.Duration
+	job, _ := runLoggedTuned(t, cfg, tun, 1, func(ctx context.Context, job *hopper.Job[logged]) error {
+		start := time.Now()
+		for i := range 100 {
+			hopper.Logger(ctx).Info("line", "i", i)
+		}
+		took = time.Since(start)
+		return nil
+	})
+	if job.State != hopper.JobStateCompleted || took > time.Second {
+		t.Errorf("job %s; logging took %s", job.State, took)
+	}
+	if !strings.Contains(out.String(), "the store has not closed the job's log") {
+		t.Errorf("Config.Logger got %q", out.String())
+	}
+	waitFor(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return len(store.ctxs) == 1 && store.ctxs[0].Err() != nil
+	})
+}
+
+// Lines past what may wait for a store that falls behind are dropped and
+// counted, and the rest reach it in order.
+func TestLogStoreDropsWhenBehind(t *testing.T) {
+	t.Parallel()
+	store := &memStore{writeBlock: make(chan struct{})}
+	line := strings.Repeat("x", 1000)
+	job, _ := runLogged(t, &hopper.Config{JobLogs: hopper.JobLogsConfig{Store: store}}, 1, func(ctx context.Context, job *hopper.Job[logged]) error {
+		for i := range 1000 {
+			hopper.Logger(ctx).Info(line, "i", i)
+		}
+		close(store.writeBlock)
+		return nil
+	})
+	texts, closes := store.get(job.ID)
+	if len(texts) != 1 || !slices.Equal(closes, []int{1}) {
+		t.Fatalf("store has %d logs, closed %v", len(texts), closes)
+	}
+	lines := strings.Split(strings.TrimSuffix(texts[0], "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.HasPrefix(last, "hopper: ") || !strings.HasSuffix(last, " lines dropped: the store fell behind") || len(lines) > 300 {
+		t.Errorf("%d lines, ending %q", len(lines), last)
+	}
+	for i, l := range lines[:len(lines)-1] {
+		if !strings.HasSuffix(l, fmt.Sprintf(" i=%d", i)) {
+			t.Fatalf("line %d = %q", i, l)
+		}
+	}
+}
+
+// JobLogs marks a store's snoozed runs, the latest one by the job's attempt
+// number, and keeps the latest snooze of each number and the latest
+// MaxAttempts logs.
+func TestJobLogsBoundsStore(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	store := &memStore{}
+	c := h.client(&hopper.Config{JobLogs: hopper.JobLogsConfig{Store: store, MaxAttempts: 3}})
+
+	// A job that is gone: its runs read by number alone.
+	gone := hopper.JobID{7}
+	for i, attempt := range []int{1, 1, 1, 2, 2, 3} {
+		store.add(gone, attempt, fmt.Sprintf("run %d\n", i))
+	}
+	logs, err := c.JobLogs(ctx, gone)
+	want := []hopper.AttemptLog{{Attempt: 2, Snoozed: true, Log: "run 3\n"}, {Attempt: 2, Log: "run 4\n"}, {Attempt: 3, Log: "run 5\n"}}
+	if err != nil || !slices.Equal(logs, want) {
+		t.Errorf("JobLogs = %+v, %v; want %+v", logs, err, want)
+	}
+
+	// A job waiting out a snooze has given its attempt back: the store's
+	// run past its attempt number was the snooze.
+	res, err := c.Insert(ctx, logged{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.add(res.Job.ID, 1, "snoozed run\n")
+	logs, err = c.JobLogs(ctx, res.Job.ID)
+	if err != nil || len(logs) != 1 || !logs[0].Snoozed {
+		t.Errorf("JobLogs of a snoozed job = %+v, %v", logs, err)
 	}
 }

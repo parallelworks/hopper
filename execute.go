@@ -32,7 +32,13 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 		codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt,
 		row: row, baseLogger: c.logger, logs: c.cfg.JobLogs,
 	}
-	defer a.closeLog(c.tuning.logCloseTimeout)
+	if c.cfg.JobLogs.Store != nil {
+		// The store's Writer gets the row as claimed: the worker changes its
+		// own, as RecordStep does Progress, which a Writer reading it races.
+		claimed := *row
+		a.row = &claimed
+	}
+	defer func() { a.closeLog(c.logCloseTimeout(ctx)) }()
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	c.trackRunning(row.ID, cancel)

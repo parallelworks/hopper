@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -26,23 +27,33 @@ type AttemptLog = driver.AttemptLog
 // Its methods are called from many goroutines at once.
 type LogStore interface {
 	// Writer returns where the lines of the attempt of job that is running
-	// go, as Logger logs them: one line per Write, in slog's text format.
-	// It is called with the attempt's first line, so an attempt that logs
-	// nothing opens no writer. Its context carries the job's values but not
-	// its cancellation, deadline or attempt (Logger called with it logs as
-	// outside a job), and is canceled once the writer is closed.
+	// go, as Logger logs them: one line per Write, in slog's text format,
+	// in the order they were logged. job is the row as it was claimed.
 	//
-	// Hopper closes the writer once the worker returns and waits for Close
-	// for up to 5 seconds before it hands in the attempt's result, so a
-	// store that saves on Close has the log by the time the job is finished.
-	// A job completed with CompleteTx is finished when the worker's
+	// Logging never waits for the store: lines are queued, and one
+	// goroutine per attempt opens the writer with the first line and hands
+	// the lines to it. Up to 256 KiB of lines wait for a store that falls
+	// behind; lines past that are dropped, and a line counting them follows.
+	// Writer's context carries the values of the context the worker first
+	// called Logger with, such as a trace span its middleware started, but
+	// not its cancellation, deadline or attempt (Logger called with it logs
+	// as outside a job). It is canceled once the writer is closed, or once
+	// hopper stops waiting for it.
+	//
+	// Hopper closes the writer once the worker returns and waits for the
+	// queued lines and Close for up to 5 seconds before it hands in the
+	// attempt's result, so a store that saves on Close has the log by the
+	// time the job is finished; past that, the context is canceled and the
+	// result goes ahead. A client that stops hard waits for at most half its
+	// stop grace, so the result of the job it canceled is still written. A
+	// job completed with CompleteTx is finished when the worker's
 	// transaction commits, which may be before. Lines logged after the
 	// close go to Config.Logger only.
 	//
 	// A snooze gives the attempt back, so the run after it calls Writer
 	// again with the same job ID and attempt: keep both, in order. A failed
 	// or panicking Writer, Write or Close, or a nil writer, is logged to
-	// Config.Logger and drops the attempt's remaining lines; the job's
+	// Config.Logger once and drops the attempt's remaining lines; the job's
 	// outcome does not depend on it.
 	Writer(ctx context.Context, job *JobRow) (io.WriteCloser, error)
 	// Logs returns the logs of a job's attempts, oldest first, for
@@ -55,9 +66,9 @@ type LogStore interface {
 type JobLogsConfig struct {
 	// Store, if set, receives each attempt's lines as they are logged
 	// instead of the job's row in the database, and Client.JobLogs reads
-	// them from it, after any the job's row holds. MaxBytes and
-	// MaxAttempts then do not apply, nor are they checked: what the store
-	// keeps is its own choice.
+	// them from it, after any the job's row holds. MaxBytes then neither
+	// applies nor is checked, and MaxAttempts bounds what Client.JobLogs
+	// returns: what the store keeps is its own choice.
 	Store LogStore
 	// MaxBytes is how much of an attempt's log is kept. Once a line would
 	// pass it, that line and the rest are dropped, and the log ends with a
@@ -145,8 +156,7 @@ func (a *attempt) newLogger(ctx context.Context) {
 	case a.logs.Store != nil:
 		// The store's context does not carry the attempt: a store that logs
 		// with Logger would otherwise re-enter the attempt's logger.
-		sctx, cancel := context.WithCancel(context.WithValue(context.WithoutCancel(ctx), attemptKey{}, (*attempt)(nil)))
-		sw := &storeWriter{store: a.logs.Store, ctx: sctx, cancel: cancel, row: a.row, logger: base}
+		sw := newStoreWriter(a.logs.Store, context.WithValue(context.WithoutCancel(ctx), attemptKey{}, (*attempt)(nil)), a.row, base)
 		a.mu.Lock()
 		ended := a.logEnded
 		if !ended {
@@ -154,7 +164,7 @@ func (a *attempt) newLogger(ctx context.Context) {
 		}
 		a.mu.Unlock()
 		if ended {
-			cancel()
+			sw.cancel()
 			return
 		}
 		out = sw
@@ -187,11 +197,29 @@ func (a *attempt) closeLog(timeout time.Duration) {
 	}
 }
 
-// storeWriter is an attempt's log in a LogStore. It opens the store's writer
-// with the first line, so an attempt that writes none opens none, and stops
-// using it once the attempt ends or the store fails. Store calls run outside
-// the worker's panic guard once the worker has returned, so a panic in one
-// is logged as a failure.
+// logCloseTimeout is how long an attempt that ran with ctx waits for its log
+// in the LogStore to close. A hard stop, which cancels ctx, waits for the
+// canceled jobs only for the stop's grace, so their attempts wait for at
+// most half of it and their results still reach the finalizer; so does a
+// fenced attempt's, which is ctx's other cancellation.
+func (c *Client[TTx]) logCloseTimeout(ctx context.Context) time.Duration {
+	if ctx.Err() != nil {
+		return min(c.tuning.logCloseTimeout, c.tuning.stopGrace/2)
+	}
+	return c.tuning.logCloseTimeout
+}
+
+// storePending bounds the bytes of an attempt's lines that wait for the
+// store: a store that falls behind costs the attempt the lines past it, not
+// its worker's time.
+const storePending = 256 << 10
+
+// storeWriter is an attempt's log in a LogStore. Lines are queued, and one
+// goroutine, started with the first line, opens the store's writer and
+// hands them to it in order, so logging never waits for the store and an
+// attempt that logs nothing opens no writer. Lines that arrive while the
+// queue is full are dropped and counted. After a failure, the store gets
+// no more of the attempt's lines.
 type storeWriter struct {
 	store  LogStore
 	ctx    context.Context
@@ -199,32 +227,101 @@ type storeWriter struct {
 	row    *driver.JobRow
 	logger *slog.Logger
 
-	mu   sync.Mutex
-	w    io.WriteCloser
-	done bool
+	mu      sync.Mutex
+	queue   [][]byte
+	queued  int
+	dropped int
+	ended   bool
+	started bool
+	wake    chan struct{} // signals the goroutine; buffered by one
+	done    chan struct{} // closed when the goroutine returns
+}
+
+func newStoreWriter(store LogStore, ctx context.Context, row *driver.JobRow, logger *slog.Logger) *storeWriter {
+	ctx, cancel := context.WithCancel(ctx)
+	return &storeWriter{
+		store: store, ctx: ctx, cancel: cancel, row: row, logger: logger,
+		wake: make(chan struct{}, 1), done: make(chan struct{}),
+	}
 }
 
 func (s *storeWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.done {
-		return len(p), nil
+	switch {
+	case s.ended:
+	case s.queued+len(p) > storePending:
+		s.dropped++
+	default:
+		s.queue = append(s.queue, slices.Clone(p))
+		s.queued += len(p)
 	}
-	if s.w == nil {
-		w, err := s.open()
-		if err != nil {
-			s.logger.Warn("hopper: open the job's log in the store; the attempt's lines go to Config.Logger only", "error", err)
-			s.done = true
-			s.cancel()
-			return len(p), nil
-		}
-		s.w = w
+	start := !s.ended && !s.started
+	s.started = s.started || start
+	s.mu.Unlock()
+	if start {
+		go s.run()
 	}
-	if err := storeCall(func() error { _, err := s.w.Write(p); return err }); err != nil {
-		s.logger.Warn("hopper: write the job's log to the store; the attempt's later lines go to Config.Logger only", "error", err)
-		s.closeLocked()
-	}
+	s.signal()
 	return len(p), nil
+}
+
+func (s *storeWriter) signal() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// run hands the queued lines to the store until the attempt ends.
+func (s *storeWriter) run() {
+	defer close(s.done)
+	defer s.cancel()
+	var (
+		w      io.WriteCloser
+		failed bool
+	)
+	fail := func(what string, err error) {
+		failed = true
+		s.logger.Warn("hopper: "+what+"; the attempt's later lines go to Config.Logger only", "error", err)
+	}
+	for {
+		s.mu.Lock()
+		lines, dropped, ended := s.queue, s.dropped, s.ended
+		s.queue, s.queued, s.dropped = nil, 0, 0
+		s.mu.Unlock()
+		if dropped > 0 {
+			lines = append(lines, fmt.Appendf(nil, "hopper: %d lines dropped: the store fell behind\n", dropped))
+		}
+		for _, line := range lines {
+			if failed {
+				break
+			}
+			if w == nil {
+				var err error
+				if w, err = s.open(); err != nil {
+					fail("open the job's log in the store", err)
+					break
+				}
+			}
+			if err := storeCall(func() error { _, err := w.Write(line); return err }); err != nil {
+				fail("write the job's log to the store", err)
+				_ = storeCall(w.Close) // the failure is logged once
+			}
+		}
+		if ended {
+			if w != nil && !failed {
+				if err := storeCall(w.Close); err != nil {
+					s.logger.Warn("hopper: close the job's log in the store", "error", err)
+				}
+			}
+			return
+		}
+		select {
+		case <-s.wake:
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }
 
 func (s *storeWriter) open() (w io.WriteCloser, err error) {
@@ -238,38 +335,26 @@ func (s *storeWriter) open() (w io.WriteCloser, err error) {
 	return w, err
 }
 
-// close closes the store's writer, waiting at most timeout for it, and for
-// a write or an open under way: past it, the attempt's result goes ahead
-// while the close finishes on its own.
+// close ends the attempt's log and waits at most timeout for the store to
+// take its last lines and close: past it, the writer's context is canceled
+// and the attempt's result goes ahead without it.
 func (s *storeWriter) close(timeout time.Duration) {
-	closed := make(chan struct{})
-	go func() {
-		defer close(closed)
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if !s.done {
-			s.closeLocked()
-		}
-	}()
+	s.mu.Lock()
+	s.ended = true
+	started := s.started
+	s.mu.Unlock()
+	if !started {
+		s.cancel()
+		return
+	}
+	s.signal()
 	t := time.NewTimer(timeout)
 	defer t.Stop()
 	select {
-	case <-closed:
+	case <-s.done:
 	case <-t.C:
-		s.logger.Warn("hopper: the store has not closed the job's log; the attempt's result goes ahead without it", "waited", timeout)
-	}
-}
-
-// closeLocked closes the store's writer, if it opened one, and cancels the
-// writer's context.
-func (s *storeWriter) closeLocked() {
-	s.done = true
-	defer s.cancel()
-	if s.w == nil {
-		return
-	}
-	if err := storeCall(s.w.Close); err != nil {
-		s.logger.Warn("hopper: close the job's log in the store", "error", err)
+		s.logger.Warn("hopper: the store has not closed the job's log; its context is canceled, and the attempt's result goes ahead without it", "waited", timeout)
+		s.cancel()
 	}
 }
 
@@ -336,20 +421,14 @@ func withJobLogDefaults(cfg JobLogsConfig) (JobLogsConfig, error) {
 	if cfg.MaxAttempts == 0 {
 		cfg.MaxAttempts = DefaultJobLogAttempts
 	}
-	if cfg.Store != nil {
-		if cfg.Level == nil {
-			cfg.Level = slog.LevelInfo
-		}
-		return cfg, nil
+	if cfg.Level == nil {
+		cfg.Level = slog.LevelInfo
 	}
 	if cfg.MaxAttempts < 0 || cfg.MaxAttempts > MaxJobLogAttempts {
 		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxAttempts must be between 1 and %d", MaxJobLogAttempts)
 	}
-	if cfg.MaxBytes > MaxJobLogBytes {
+	if cfg.Store == nil && cfg.MaxBytes > MaxJobLogBytes {
 		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxBytes must be at most %d", MaxJobLogBytes)
-	}
-	if cfg.Level == nil {
-		cfg.Level = slog.LevelInfo
 	}
 	return cfg, nil
 }
