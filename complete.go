@@ -66,7 +66,7 @@ func CompleteTx[TTx any, T JobArgs](ctx context.Context, tx TTx, job *Job[T]) er
 	// from another goroutine must not block on the database.
 	result := a.completion
 	result.Output = a.get()
-	if keepsLog(result) {
+	if result.KeepsLog() {
 		result.Log = a.keptLog()
 	}
 	applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{

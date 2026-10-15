@@ -247,8 +247,9 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		switch args[0] {
 		case "get":
 			// The job is shown even if its logs cannot be read, as the web
-			// UI shows it: a job that finished or was deleted since JobGet
-			// has none, and a database before schema v16 has no logs column.
+			// UI shows it: a job deleted since JobGet, as a completed job on
+			// a DeleteCompleted queue is, has none, and a database before
+			// schema v16 has no logs column.
 			if job, err = c.client.JobGet(ctx, id); err == nil {
 				if logs, logsErr = c.client.JobLogs(ctx, id); errors.Is(logsErr, hopper.ErrNotFound) {
 					logsErr = nil

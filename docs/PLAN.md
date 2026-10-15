@@ -956,7 +956,9 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   and job goroutines block on submit while the buffered results hold 64 MiB, as they
   do when the buffer is full, so a slow database cannot make logs exhaust memory. A
   stop's final flush lets those submits through and takes their results, as it takes
-  those waiting on a full buffer. Completed jobs that skip history hold no log, and
+  those waiting on a full buffer, and ends once no submit is in flight; it takes
+  results for at most 5 s, after which those of jobs still finishing are dropped
+  with a warning, and their jobs rescued, rather than holding the stop. Completed jobs that skip history hold no log, and
   once an attempt's log is full its later lines are counted without being formatted.
   `CompleteTx` writes the lines logged before it. The lines are not streamed to the
   database while the attempt runs: each write would rewrite the whole value on the

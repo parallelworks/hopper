@@ -39,12 +39,15 @@ type finalizer struct {
 	flushLogBytes int
 	logs          logBudget
 	// draining is closed when run starts its final drain, which lets
-	// submits waiting on the log budget through. The drain ends once no
-	// submit is in flight, and a submit after it is dropped.
-	draining   chan struct{}
-	submitMu   sync.Mutex
-	submitting int
-	stopped    bool
+	// submits waiting on the log budget through. The drain takes results
+	// for at most drainTimeout and ends once no submit is in flight; a
+	// submit after it is dropped. submits counts the submits that started,
+	// times two, plus one once the drain has ended, and submitted those
+	// that are done.
+	draining     chan struct{}
+	drainTimeout time.Duration
+	submits      atomic.Int64
+	submitted    atomic.Int64
 	// wake is called with the queue of a result that made a job claimable
 	// again right away, so the local producer need not wait for its poll.
 	wake func(queue string)
@@ -95,6 +98,7 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs
 		flushLogBytes: finalizeLogBytes,
 		logs:          logBudget{max: bufferedLogBytes, freed: make(chan struct{})},
 		draining:      make(chan struct{}),
+		drainTimeout:  drainTimeout,
 		wake:          wake,
 		applied:       applied,
 		in:            make(chan pending, max(t.finalizeBuffer, 2*t.finalizeBatch)),
@@ -107,21 +111,17 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs
 // submitted after the finalizer has stopped is dropped: the job stays
 // running in the database and is rescued once this client's lease expires.
 func (f *finalizer) submit(p pending) {
-	f.submitMu.Lock()
-	stopped := f.stopped
-	if !stopped {
-		f.submitting++
+	for {
+		n := f.submits.Load()
+		if n&1 == 1 {
+			f.drop(p)
+			return
+		}
+		if f.submits.CompareAndSwap(n, n+2) {
+			break
+		}
 	}
-	f.submitMu.Unlock()
-	if stopped {
-		f.drop(p)
-		return
-	}
-	defer func() {
-		f.submitMu.Lock()
-		f.submitting--
-		f.submitMu.Unlock()
-	}()
+	defer f.submitted.Add(1)
 	if n := p.logBytes(); n > 0 && !f.logs.acquire(n, f.draining, f.done) {
 		f.drop(p)
 		return
@@ -137,13 +137,20 @@ func (f *finalizer) drop(p pending) {
 	f.logger.Warn("hopper: result dropped after finalizer stopped; job will be rescued", "job_id", p.result.ID)
 }
 
-// idle reports whether no submit is in flight or buffered and, if so,
-// stops the finalizer taking more.
-func (f *finalizer) idle() bool {
-	f.submitMu.Lock()
-	defer f.submitMu.Unlock()
-	f.stopped = f.submitting == 0 && len(f.in) == 0
-	return f.stopped
+// stopIfIdle reports whether no submit is in flight or buffered and, if
+// so, stops the finalizer taking more. Once force is set it stops taking
+// more either way, and reports whether the submits in flight are done.
+func (f *finalizer) stopIfIdle(force bool) bool {
+	for {
+		n := f.submits.Load()
+		idle := f.submitted.Load() == n>>1 && len(f.in) == 0
+		if n&1 == 1 || (!idle && !force) {
+			return idle
+		}
+		if f.submits.CompareAndSwap(n, n|1) {
+			return idle
+		}
+	}
 }
 
 // run flushes until ctx is done, then flushes what is buffered with a bounded
@@ -176,8 +183,10 @@ func (f *finalizer) run(ctx context.Context) {
 			// Drain what job goroutines have submitted, and are submitting,
 			// and write it with one attempt per batch. Submits waiting on
 			// the log budget are let through, as those waiting on a full
-			// buffer are taken by the drain.
+			// buffer are taken by the drain. Past drainTimeout, results from
+			// jobs still finishing are dropped.
 			close(f.draining)
+			deadline := time.Now().Add(f.drainTimeout)
 			for {
 				select {
 				case p := <-f.in:
@@ -185,7 +194,13 @@ func (f *finalizer) run(ctx context.Context) {
 					continue
 				default:
 				}
+				late := time.Now().After(deadline)
 				for len(batch) > 0 {
+					if late {
+						f.drop(batch[0])
+						batch = batch[1:]
+						continue
+					}
 					n, size := 0, 0
 					for n < len(batch) && n < f.maxBatch && size < f.flushLogBytes {
 						size += batch[n].logBytes()
@@ -194,7 +209,7 @@ func (f *finalizer) run(ctx context.Context) {
 					f.flush(ctx, batch[:n])
 					batch = batch[n:]
 				}
-				if f.idle() {
+				if f.stopIfIdle(late) {
 					return
 				}
 				select {
@@ -206,6 +221,10 @@ func (f *finalizer) run(ctx context.Context) {
 		}
 	}
 }
+
+// drainTimeout bounds how long a stop's final drain takes results from jobs
+// that are still finishing. What it has taken by then is written.
+const drainTimeout = 5 * time.Second
 
 // finalizeLogBytes is the size of the logs from which a batch of results is
 // flushed without waiting for more, which keeps a finalize statement's

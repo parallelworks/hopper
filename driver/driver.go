@@ -805,13 +805,18 @@ type JobFinalize struct {
 	Error *AttemptError
 	// Output is stored with the finalized job.
 	Output json.RawMessage
-	// Log is appended to the job's logs, if not nil, with Snoozed set from
-	// Snooze. A completed job that is not archived has no logs to keep, and
-	// its Log is not sent.
+	// Log is appended to the job's logs, if not nil and KeepsLog, with
+	// Snoozed set from Snooze.
 	Log *AttemptLog
 	// Archive controls whether a terminal job is written to history. Canceled
 	// and discarded jobs are always archived; completed jobs may skip it.
 	Archive bool
+}
+
+// KeepsLog reports whether the job keeps the log of the attempt that ends
+// with f: a completed job that is not archived is deleted with its logs.
+func (f JobFinalize) KeepsLog() bool {
+	return f.Archive || f.State != JobStateCompleted
 }
 
 // JobRescueParams selects jobs to rescue.

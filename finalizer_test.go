@@ -402,6 +402,37 @@ func TestFinalizerDrainRacingSubmits(t *testing.T) {
 	}
 }
 
+// A stop's final drain takes results for at most drainTimeout: a job that
+// finishes later has its result dropped with a warning instead of holding
+// the stop.
+func TestFinalizerDrainTimeout(t *testing.T) {
+	exec := &stubExec{}
+	var dropped atomic.Int64
+	f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	f.drainTimeout = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	go f.run(ctx)
+	f.submit(loggedResult(0, 10))
+	f.submits.Add(2) // a submit in flight that has not reached the buffer
+	cancel()
+	select {
+	case <-f.done:
+		t.Fatal("the drain ended with a submit in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	f.in <- loggedResult(1, 10)
+	f.submitted.Add(1)
+	select {
+	case <-f.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the drain did not end past drainTimeout")
+	}
+	f.submit(loggedResult(2, 10))
+	if got := exec.batches(); !slices.Equal(got, []int{1}) || dropped.Load() != 2 {
+		t.Errorf("batches %v, %d dropped; want the first result written and the later two dropped", got, dropped.Load())
+	}
+}
+
 // dropCounter counts the finalizer's warnings of dropped results.
 type dropCounter struct{ n *atomic.Int64 }
 

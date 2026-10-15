@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -81,8 +82,9 @@ type JobLogsConfig struct {
 	MaxBytes int
 	// MaxAttempts is how many attempts' logs a job keeps, the latest. Each
 	// snooze keeps its own until the next snooze of the same attempt
-	// number, which replaces it, or removes it if that snooze logged
-	// nothing. Defaults to 10, and is at most 100.
+	// number, which replaces it, or, without a Store, removes it if that
+	// snooze logged nothing (a store has no entry for such a snooze).
+	// Defaults to 10, and is at most 100.
 	MaxAttempts int
 	// Level is the lowest level kept. Defaults to slog.LevelInfo. Lines
 	// go to Config.Logger at whatever level its handler takes.
@@ -165,6 +167,7 @@ func (a *attempt) newLogger(ctx context.Context) {
 		// with Logger would otherwise re-enter the attempt's logger.
 		storeCtx := context.WithValue(context.WithoutCancel(ctx), attemptKey{}, (*attempt)(nil))
 		storeCtx = context.WithValue(storeCtx, inlineAttemptKey{}, (*attempt)(nil))
+		storeCtx = context.WithValue(storeCtx, inlineKey{}, nil)
 		sw := newStoreWriter(a.logs.Store, storeCtx, a.row, base)
 		a.mu.Lock()
 		ended := a.logEnded
@@ -418,17 +421,19 @@ func (a *attempt) keptLog() *driver.AttemptLog {
 // logBuffer holds an attempt's lines up to max bytes. The text handler
 // writes each line in one call.
 type logBuffer struct {
-	mu      sync.Mutex
-	max     int
-	buf     []byte
-	dropped int
+	mu  sync.Mutex
+	max int
+	buf []byte
+	// dropped counts the lines dropped once one did not fit, after which
+	// every line is.
+	dropped atomic.Int64
 }
 
 func (b *logBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.dropped > 0 || len(b.buf)+len(p) > b.max {
-		b.dropped++
+	if b.dropped.Load() > 0 || len(b.buf)+len(p) > b.max {
+		b.dropped.Add(1)
 	} else {
 		b.buf = append(b.buf, p...)
 	}
@@ -438,24 +443,23 @@ func (b *logBuffer) Write(p []byte) (int, error) {
 // dropIfFull counts a line as dropped, and reports so, once the buffer has
 // dropped one: every later line is dropped too.
 func (b *logBuffer) dropIfFull() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.dropped == 0 {
+	if b.dropped.Load() == 0 {
 		return false
 	}
-	b.dropped++
+	b.dropped.Add(1)
 	return true
 }
 
 func (b *logBuffer) log(attempt int) *driver.AttemptLog {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.buf) == 0 && b.dropped == 0 {
+	dropped := b.dropped.Load()
+	if len(b.buf) == 0 && dropped == 0 {
 		return nil
 	}
 	l := &driver.AttemptLog{Attempt: attempt, Log: string(b.buf)}
-	if b.dropped > 0 {
-		l.Log += fmt.Sprintf("hopper: %d more lines dropped: the attempt's log is limited to %d bytes\n", b.dropped, b.max)
+	if dropped > 0 {
+		l.Log += fmt.Sprintf("hopper: %d more lines dropped: the attempt's log is limited to %d bytes\n", dropped, b.max)
 	}
 	return l
 }
