@@ -12,7 +12,8 @@ import (
 
 // execute runs one claimed job and turns its outcome into a finalize result.
 // It never panics and never blocks past the job's timeout, other than for
-// one bounded read of a job the worker completed with CompleteTx.
+// one bounded read of a job the worker completed with CompleteTx and the
+// bounded close of the attempt's log in Config.JobLogs.Store.
 //
 // A job the worker completed with CompleteTx is finished once the worker's
 // transaction commits, which the client cannot see, so it reads the job. If
@@ -29,8 +30,15 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	defer cancel(nil)
 	a := &attempt{
 		codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt,
-		kind: row.Kind, baseLogger: c.logger, logs: c.cfg.JobLogs,
+		row: row, baseLogger: c.logger, logs: c.cfg.JobLogs,
 	}
+	if c.cfg.JobLogs.Store != nil {
+		// The store's Writer gets the row as claimed: the worker changes its
+		// own, as RecordStep does Progress, which a Writer reading it races.
+		claimed := *row
+		a.row = &claimed
+	}
+	defer func() { a.closeLog(c.logCloseTimeout(ctx)) }()
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	c.trackRunning(row.ID, cancel)

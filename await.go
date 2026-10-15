@@ -26,9 +26,9 @@ type attempt struct {
 	progressMu sync.Mutex
 	// completion is the attempt's result if it succeeds, without output.
 	completion driver.JobFinalize
-	// kind, baseLogger and logs make the attempt's logger, which Logger
+	// row, baseLogger and logs make the attempt's logger, which Logger
 	// builds on first use.
-	kind       string
+	row        *driver.JobRow
 	baseLogger *slog.Logger
 	logs       JobLogsConfig
 	loggerOnce sync.Once
@@ -41,8 +41,12 @@ type attempt struct {
 	// row (CompleteTx, RecordStepTx, RecordCursorTx), which it may still
 	// hold.
 	heldByTx bool
-	// kept is the attempt's log, once Logger has built its logger.
-	kept *logBuffer
+	// kept is the attempt's log, or stored its writer in the client's
+	// LogStore, once Logger has built its logger. logEnded reports that
+	// closeLog ran, after which no log starts.
+	kept     *logBuffer
+	stored   *storeWriter
+	logEnded bool
 }
 
 func (a *attempt) markHeldByTx() {

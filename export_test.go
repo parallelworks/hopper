@@ -20,6 +20,7 @@ type Tuning struct {
 	LeaderInterval   time.Duration
 	Maintenance      time.Duration
 	RescueBatch      int
+	LogStoreClose    time.Duration // 0: the default
 }
 
 // SetTuning overrides the client's internal timings. Call it before Start.
@@ -39,6 +40,7 @@ func (c *Client[TTx]) SetTuning(t Tuning) {
 		maintenanceInterval: t.Maintenance,
 		rescueBatch:         t.RescueBatch,
 		streamBatch:         defaultTuning.streamBatch,
+		logCloseTimeout:     cmp.Or(t.LogStoreClose, defaultTuning.logCloseTimeout),
 	}
 	c.notifier.interval = c.tuning.notifyInterval
 }

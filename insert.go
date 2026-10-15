@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -264,6 +265,72 @@ func (c *Client[TTx]) JobGet(ctx context.Context, id JobID) (*JobRow, error) {
 // JobLogs returns the logs a job's worker kept with Logger, of its latest
 // attempts, oldest first, live or from history. It returns ErrNotFound if
 // the job does not exist or its history has been dropped.
+//
+// With Config.JobLogs.Store, the logs the job's row holds, from before the
+// store or from clients without it, come first, then the store's, in
+// attempt order. A store log that a later one of the same attempt number
+// follows, or whose number is past the job's, was a snooze, which gave its
+// attempt back; as in the row, only the latest snooze of each attempt
+// number is returned, and only the latest JobLogs.MaxAttempts logs. A job
+// that is gone yields the store's logs of it, if it has any. If the store
+// fails, the row's logs are returned with the error.
 func (c *Client[TTx]) JobLogs(ctx context.Context, id JobID) ([]AttemptLog, error) {
-	return c.exec.JobLogs(ctx, id)
+	s := c.cfg.JobLogs.Store
+	if s == nil {
+		return c.exec.JobLogs(ctx, id)
+	}
+	var (
+		stored []AttemptLog
+		serr   error
+		read   = make(chan struct{})
+	)
+	go func() {
+		defer close(read)
+		stored, serr = s.Logs(ctx, id)
+	}()
+	job, err := c.exec.JobGet(ctx, id)
+	var logs []AttemptLog
+	if err == nil {
+		logs, err = c.exec.JobLogs(ctx, id)
+	}
+	<-read
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return logs, err
+	}
+	switch {
+	case errors.Is(serr, ErrNotFound):
+		// A store that says so for a job it has no logs of.
+		stored = nil
+	case serr != nil:
+		// A job that is gone stays ErrNotFound.
+		return logs, errors.Join(err, fmt.Errorf("hopper: read the logs of job %s from the store: %w", id, serr))
+	}
+	if err != nil && len(stored) == 0 {
+		return nil, err
+	}
+	// The entries are copied: the store's slice is its own.
+	n := len(logs)
+	logs = append(logs, stored...)
+	for i := n; i < len(logs); i++ {
+		next := i+1 < len(logs) && logs[i+1].Attempt == logs[i].Attempt
+		logs[i].Snoozed = logs[i].Snoozed || next || (job != nil && logs[i].Attempt > job.Attempt)
+	}
+	slices.SortStableFunc(logs, func(a, b AttemptLog) int { return cmp.Compare(a.Attempt, b.Attempt) })
+	return latestLogs(logs, c.cfg.JobLogs.MaxAttempts), nil
+}
+
+// latestLogs keeps, of logs in attempt order, the latest snooze of each
+// attempt number and the latest keep.
+func latestLogs(logs []AttemptLog, keep int) []AttemptLog {
+	out := logs[:0]
+	for i, l := range logs {
+		if l.Snoozed && slices.ContainsFunc(logs[i+1:], func(o AttemptLog) bool { return o.Snoozed && o.Attempt == l.Attempt }) {
+			continue
+		}
+		out = append(out, l)
+	}
+	if keep > 0 && len(out) > keep {
+		out = out[len(out)-keep:]
+	}
+	return out
 }

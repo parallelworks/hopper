@@ -145,7 +145,8 @@
 
 {{.Trace}}{{end}}</pre></td></tr>{{end}}
 </tbody></table>{{end}}
-{{with $.Data.Logs}}{{$logs := .}}<h2>Logs</h2>
+{{with $.Data.LogsErr}}<h2>Logs</h2><p class="err">logs unavailable: {{.}}</p>{{end}}
+{{with $.Data.Logs}}{{$logs := .}}{{if not $.Data.LogsErr}}<h2>Logs</h2>{{end}}
 {{range $i, $l := .}}<details class="log"{{if last $i $logs}} open{{end}}><summary>attempt {{$l.Attempt}}{{if $l.Snoozed}} (snoozed){{end}}</summary><pre>{{$l.Log}}</pre></details>
 {{end}}{{end}}
 {{end}}

@@ -251,3 +251,40 @@ func TestUI(t *testing.T) {
 	code, body = post(admin, "/jobs/"+job.Job.ID.String()+"/explode", nil, true)
 	want(404, body, code)
 }
+
+// downStore is a LogStore that cannot be read.
+type downStore struct{}
+
+func (downStore) Writer(context.Context, *hopper.JobRow) (io.WriteCloser, error) {
+	return nil, errors.New("store down")
+}
+
+func (downStore) Logs(context.Context, hopper.JobID) ([]hopper.AttemptLog, error) {
+	return nil, errors.New("store down")
+}
+
+// A job's page renders while its client's LogStore is down, saying so where
+// the logs would be.
+func TestUIJobLogsStoreDown(t *testing.T) {
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	client, err := hopper.NewClient(testdb.Driver(pool), &hopper.Config{JobLogs: hopper.JobLogsConfig{Store: downStore{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := client.Insert(ctx, ping{N: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(hopperui.New(client, nil))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/jobs/" + job.Job.ID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `<p class="err">logs unavailable: hopper: read the logs of job `) || !strings.Contains(string(body), "store down") {
+		t.Errorf("job page = %d %s", resp.StatusCode, body)
+	}
+}
