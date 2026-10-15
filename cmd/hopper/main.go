@@ -247,9 +247,9 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		switch args[0] {
 		case "get":
 			// The job is shown even if its logs cannot be read, as the web
-			// UI shows it: a job deleted since JobGet, as a completed job on
-			// a DeleteCompleted queue is, has none, and a database before
-			// schema v16 has no logs column.
+			// UI shows it, and the command then fails: a job deleted since
+			// JobGet, as a completed job on a DeleteCompleted queue is, has
+			// none, and a database before schema v16 has no logs column.
 			if job, err = c.client.JobGet(ctx, id); err == nil {
 				if logs, logsErr = c.client.JobLogs(ctx, id); errors.Is(logsErr, hopper.ErrNotFound) {
 					logsErr = nil
@@ -273,7 +273,13 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		if logsErr != nil {
 			out.LogsError = logsErr.Error()
 		}
-		return c.print(out, func(w io.Writer) { printJob(w, job, logs, out.LogsError) })
+		if err := c.print(out, func(w io.Writer) { printJob(w, job, logs, out.LogsError) }); err != nil {
+			return err
+		}
+		if logsErr != nil {
+			return fmt.Errorf("jobs get: read the job's logs: %w", logsErr)
+		}
+		return nil
 	default:
 		return fmt.Errorf("jobs: unknown subcommand %q", args[0])
 	}

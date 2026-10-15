@@ -108,7 +108,13 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 	check("canceled", logs(id), s2, stored, a4)
 
-	// So does one that expires.
+	// A snooze that logs nothing leaves a job without logs as it is.
+	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
+	if got := f.QueryText(ctx, t, d, "SELECT coalesce(logs::text, 'NULL') FROM hopper_jobs WHERE id = $1::uuid", other.String()); got != "NULL" {
+		t.Errorf("logs after a snooze that logged nothing = %s, want NULL", got)
+	}
+
+	// An expired job takes its logs to history too.
 	run(other, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "x"}, Log: &a1}, 2, false)
 	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = now() - interval '1s' WHERE id = $1::uuid", other.String())
 	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 1 || expired[0].ID != other {

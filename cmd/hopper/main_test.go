@@ -106,10 +106,12 @@ func TestCLI(t *testing.T) {
 		t.Errorf("jobs get with logs = %q", got)
 	}
 	// A job whose logs cannot be read, here from a schema before v16, is
-	// still shown, with why its logs are missing.
+	// still shown, with why its logs are missing, and the command fails.
 	hopperCmd("migrate", "down", "-target", "15")
-	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "state:         available") || !strings.Contains(got, "logs:          unavailable: ") {
-		t.Errorf("jobs get without a logs column = %q", got)
+	var getOut bytes.Buffer
+	err = run(ctx, []string{"-schema", schema, "jobs", "get", id}, &getOut)
+	if got := getOut.String(); err == nil || !strings.Contains(got, "state:         available") || !strings.Contains(got, "logs:          unavailable: ") {
+		t.Errorf("jobs get without a logs column = %v, %q", err, got)
 	}
 	hopperCmd("migrate", "up")
 	if got := hopperCmd("jobs", "retry", id); !strings.Contains(got, "progress:") {

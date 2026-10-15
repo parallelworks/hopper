@@ -614,10 +614,11 @@ SELECT id FROM retry UNION ALL SELECT id FROM finished`
 // or its lack of one, replaces the log of the previous snooze of the same
 // attempt number. The SET reads j.attempt before the snooze gives it back.
 // A job whose logs do not change keeps its stored value, which is not
-// rewritten.
+// rewritten: one with no logs keeps NULL (jsonb_path_exists of NULL is
+// NULL, which would otherwise take the ELSE branch and store '[]').
 const appendLogSQL = `CASE
-         WHEN r.log IS NULL AND NOT (r.snooze AND jsonb_path_exists(j.logs, '$[*] ? (exists(@.snoozed) && @.attempt == $a)',
-           jsonb_build_object('a', j.attempt))) THEN j.logs
+         WHEN r.log IS NULL AND NOT (r.snooze AND coalesce(jsonb_path_exists(j.logs, '$[*] ? (exists(@.snoozed) && @.attempt == $a)',
+           jsonb_build_object('a', j.attempt)), false)) THEN j.logs
          ELSE jsonb_path_query_array(
            CASE WHEN r.snooze
                 THEN jsonb_path_query_array(coalesce(j.logs, '[]'), '$[*] ? (!exists(@.snoozed) || @.attempt != $a)',
@@ -684,7 +685,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		outputs[i] = f.Output
 		// Only completed jobs may skip history; the failed partitions are the
 		// dead-letter queue.
-		archives[i] = f.Archive || f.State != driver.JobStateCompleted
+		archives[i] = f.Archived()
 		if f.Log != nil && f.KeepsLog() {
 			b, err := json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Log: storableText(f.Log.Log)})
 			if err != nil {

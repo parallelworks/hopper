@@ -48,12 +48,13 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	completed := a.completedTx()
 	state := txUnknown
 	if completed != nil {
+		// CompleteTx wrote the log, or its transaction will, so the
+		// completion does not hold it while it waits in the finalizer.
+		done := *completed
+		done.Log = nil
+		completed = &done
 		if state = readTx(ctx, c.exec, row); state == txCommitted {
-			// CompleteTx wrote the log, so the result does not hold it in
-			// the finalizer's log budget.
-			done := *completed
-			done.Log = nil
-			return pending{job: row, result: done, completedTx: &done, committed: true}
+			return pending{job: row, result: done, completedTx: completed, committed: true}
 		}
 		if err == nil {
 			err = errNotCommitted

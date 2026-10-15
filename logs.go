@@ -75,16 +75,17 @@ type JobLogsConfig struct {
 	// pass it, that line and the rest are dropped, and the log ends with a
 	// line that counts them. Defaults to 32 KiB, and is at most 1 MiB,
 	// and MaxBytes times MaxAttempts at most 4 MiB; negative keeps no
-	// lines. For larger logs, use a Store. A finished attempt's lines wait in memory
-	// with its result until it is written, so a client holds at most
-	// 64 MiB of them; past that, finished jobs wait to hand in their
-	// results, as they do when the finalizer's buffer is full.
+	// lines. For larger logs, use a Store. A finished attempt's lines
+	// wait in memory with its result until it is written, so a client
+	// holds at most 64 MiB of them; past that, finished jobs wait to hand
+	// in their results, as they do when the finalizer's buffer is full.
 	MaxBytes int
 	// MaxAttempts is how many attempts' logs a job keeps, the latest. Each
 	// snooze keeps its own until the next snooze of the same attempt
-	// number, which replaces it, or, without a Store, removes it if that
-	// snooze logged nothing (a store has no entry for such a snooze).
-	// Defaults to 10, and is at most 100.
+	// number, which replaces it, or removes it if that snooze logged
+	// nothing. A store keeps what it is given: a snooze that logs nothing
+	// writes nothing to it, so it removes only a snooze's log that the
+	// job's row holds. Defaults to 10, and is at most 100.
 	MaxAttempts int
 	// Level is the lowest level kept. Defaults to slog.LevelInfo. Lines
 	// go to Config.Logger at whatever level its handler takes.
@@ -189,34 +190,42 @@ func (a *attempt) newLogger(ctx context.Context) {
 	default:
 		return
 	}
-	var text slog.Handler = slog.NewTextHandler(out, &slog.HandlerOptions{Level: a.logs.Level, ReplaceAttr: a.logs.ReplaceAttr})
-	if kept != nil {
-		text = keptHandler{Handler: text, buf: kept}
+	text := slog.NewTextHandler(out, &slog.HandlerOptions{Level: a.logs.Level, ReplaceAttr: a.logs.ReplaceAttr})
+	a.logger = slog.New(attemptHandler{base: base.Handler(), text: text, kept: kept})
+}
+
+// attemptHandler sends an attempt's lines to Config.Logger's handler and
+// formats them into its log. Once its buffer (kept, nil with a store) has
+// dropped a line it only counts the rest, so a worker that logs past
+// MaxBytes does not pay to format lines that are dropped. A record is not
+// cloned: the text handler keeps nothing of it, and a handler that does
+// clones it itself.
+type attemptHandler struct {
+	base, text slog.Handler
+	kept       *logBuffer
+}
+
+func (h attemptHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.base.Enabled(ctx, level) || h.text.Enabled(ctx, level)
+}
+
+func (h attemptHandler) Handle(ctx context.Context, r slog.Record) error {
+	var baseErr, textErr error
+	if h.base.Enabled(ctx, r.Level) {
+		baseErr = h.base.Handle(ctx, r)
 	}
-	a.logger = slog.New(slog.NewMultiHandler(base.Handler(), text))
-}
-
-// keptHandler formats an attempt's lines into its buffer and, once the
-// buffer has dropped a line, only counts the rest: a worker that logs past
-// MaxBytes does not pay to format lines that are dropped.
-type keptHandler struct {
-	slog.Handler
-	buf *logBuffer
-}
-
-func (h keptHandler) Handle(ctx context.Context, r slog.Record) error {
-	if h.buf.dropIfFull() {
-		return nil
+	if h.text.Enabled(ctx, r.Level) && (h.kept == nil || !h.kept.dropIfFull()) {
+		textErr = h.text.Handle(ctx, r)
 	}
-	return h.Handler.Handle(ctx, r)
+	return errors.Join(baseErr, textErr)
 }
 
-func (h keptHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return keptHandler{Handler: h.Handler.WithAttrs(attrs), buf: h.buf}
+func (h attemptHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return attemptHandler{base: h.base.WithAttrs(attrs), text: h.text.WithAttrs(attrs), kept: h.kept}
 }
 
-func (h keptHandler) WithGroup(name string) slog.Handler {
-	return keptHandler{Handler: h.Handler.WithGroup(name), buf: h.buf}
+func (h attemptHandler) WithGroup(name string) slog.Handler {
+	return attemptHandler{base: h.base.WithGroup(name), text: h.text.WithGroup(name), kept: h.kept}
 }
 
 // closeLog ends the attempt's log in the store, if it has one, and keeps

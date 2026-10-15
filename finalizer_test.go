@@ -415,13 +415,24 @@ func TestFinalizerDrainTimeout(t *testing.T) {
 	f.submit(loggedResult(0, 10))
 	f.submits.Add(2) // a submit in flight that has not reached the buffer
 	cancel()
+	// Past drainTimeout the drain stops taking submits (the low bit of
+	// submits) but waits for the one in flight.
+	for stopped := time.After(5 * time.Second); f.submits.Load()&1 == 0; {
+		select {
+		case <-f.done:
+			t.Fatal("the drain ended with a submit in flight")
+		case <-stopped:
+			t.Fatal("the drain did not stop taking submits past drainTimeout")
+		case <-time.After(time.Millisecond):
+		}
+	}
 	select {
 	case <-f.done:
 		t.Fatal("the drain ended with a submit in flight")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(20 * time.Millisecond):
 	}
 	f.in <- loggedResult(1, 10)
-	f.submitted.Add(1)
+	f.submitDone()
 	select {
 	case <-f.done:
 	case <-time.After(5 * time.Second):
