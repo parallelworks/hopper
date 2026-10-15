@@ -58,7 +58,12 @@
   transaction in the database. A build that runs past the timeout is retried
   at doubling intervals with a warning; raise the timeout for hopper's role
   until the warnings stop. Until a partition has its unique-key index, an insert
-  with `UniqueOpts.Finished` reads that partition in full.
+  with `UniqueOpts.Finished` reads that partition in full. Releases up to 0.7.0
+  could leave an outcome table's index invalid, unused by the planner, when
+  retention dropped the last partition without one; the leader repairs it on
+  Postgres releases from May 2026 (17.10) on, so update Postgres's minor
+  version if `indisvalid` stays false for `hopper_job_history_*_ordering` or
+  `_unique`.
 - **`UniqueOpts.Finished`.** Each such job is looked up in every history
   partition of the outcomes it counts, one index lookup each, so the cost
   grows with retention. With the default 24 hours of completed history, a

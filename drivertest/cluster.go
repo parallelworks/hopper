@@ -439,8 +439,13 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("history by unique key = %+v", res[0].Job)
 	}
 
-	// What retention dropping the last partition without an index leaves:
-	// every partition's index attached, and the outcome table's not valid.
+	// What retention dropping the last partition without an index left
+	// before indexBeforeDrop: every partition's index attached, and the
+	// outcome table's not valid. Only releases whose attach counts again
+	// can repair it.
+	if !reattachRevalidates(ctx, t, f, d) {
+		return
+	}
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
 	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
 		t.Fatal(err)
@@ -469,6 +474,110 @@ var onceAgain = driver.JobInsertParams{
 // overlapping leaders while eight readers list a key's jobs from history and
 // look for a unique key's duplicates there, and fails the test on any error
 // either side returns: no attach may deadlock with a reader.
+// reattachRevalidates reports whether attaching a partition's index again
+// marks its parent valid, as Postgres does from the May 2026 releases (17.10)
+// on.
+func reattachRevalidates[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx]) bool {
+	t.Helper()
+	f.Exec(ctx, t, d, "CREATE TABLE revalidate_probe (k int) PARTITION BY LIST (k)")
+	f.Exec(ctx, t, d, "CREATE TABLE revalidate_probe_1 PARTITION OF revalidate_probe FOR VALUES IN (1)")
+	f.Exec(ctx, t, d, "CREATE INDEX revalidate_probe_k ON revalidate_probe (k)")
+	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'revalidate_probe_k'::regclass")
+	f.Exec(ctx, t, d, "ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k_idx")
+	valid := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'revalidate_probe_k'::regclass") == "true"
+	f.Exec(ctx, t, d, "DROP TABLE revalidate_probe")
+	return valid
+}
+
+// testHistoryRetentionCompletesIndex covers retention dropping the last
+// partitions an outcome table's index lacks, after a schema upgrade
+// declared it: the index must end valid, which nothing can do afterwards on
+// releases before May 2026.
+func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	keep := driver.HistoryMaintainParams{FailedRetention: 48 * time.Hour}
+	if _, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err != nil {
+		t.Fatal(err)
+	}
+	// Past partitions attached before the ordering-key index was declared,
+	// as on an installation upgraded to schema v13.
+	redeclare := func(days ...string) []string {
+		t.Helper()
+		f.Exec(ctx, t, d, "DROP INDEX hopper_job_history_failed_ordering")
+		var names []string
+		for _, day := range days {
+			from, err := time.Parse("20060102", day)
+			if err != nil {
+				t.Fatal(err)
+			}
+			name := "hopper_job_history_failed_" + day
+			f.Exec(ctx, t, d, "CREATE TABLE "+name+" (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)")
+			f.Exec(ctx, t, d, "ALTER TABLE hopper_job_history_failed ATTACH PARTITION "+name+" FOR VALUES FROM ('"+
+				from.Format(time.RFC3339)+"') TO ('"+from.AddDate(0, 0, 1).Format(time.RFC3339)+"')")
+			names = append(names, name)
+		}
+		f.Exec(ctx, t, d, "CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id) WHERE ordering_key IS NOT NULL")
+		return names
+	}
+	valid := func() string {
+		t.Helper()
+		return f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
+	}
+
+	old := redeclare("20000101")
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: old}); err != nil {
+		t.Fatal(err)
+	}
+	if v := valid(); v != "false" {
+		t.Fatalf("valid with a partition unindexed = %s", v)
+	}
+	res, err := exec.HistoryMaintain(ctx, keep)
+	if err != nil || !slices.Contains(res.Dropped, old[0]) {
+		t.Fatalf("maintain = %+v, %v", res, err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after retention dropped the last unindexed partition = %s", v)
+	}
+
+	// Retention dropping partitions while the leader builds the others'.
+	for round := range 4 {
+		old := redeclare("20000102", "20000103", "20000104", "20000105")
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Go(func() {
+			if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+				errs <- err
+			}
+		})
+		wg.Go(func() {
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				res, err := exec.HistoryMaintain(ctx, keep)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if len(res.Deferred) == 0 || time.Now().After(deadline) {
+					return
+				}
+			}
+		})
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatal(err)
+		}
+		if v := f.QueryText(ctx, t, d, "SELECT count(to_regclass(n))::text FROM unnest($1::text[]) n", old); v != "0" {
+			t.Fatalf("round %d: %s partitions past retention left", round, v)
+		}
+		if v := valid(); v != "true" {
+			t.Fatalf("round %d: valid after retention and indexing = %s", round, v)
+		}
+	}
+}
+
 func maintainWhileReading(ctx context.Context, t *testing.T, exec driver.Executor) {
 	t.Helper()
 	var (

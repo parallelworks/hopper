@@ -1150,11 +1150,18 @@ session lock would not survive a transaction pooler. A build on an outcome table
 under it tries without waiting, deferring the partition (§7.10) while the build
 runs: attaching a partition scans the `DEFAULT` partition under a lock that the build
 holds, while the build waits for the attach's transaction. A drop of an expired
-partition that a build holds is deferred by its `lock_timeout` in the same way. A build cut short by the end of
-a term leaves an invalid index, which the next build drops and builds again. Should
-retention drop the last partition without an index before it is built, the outcome
-table's index is revalidated by attaching one of its partitions' indexes again. A
-build that runs past the session's `statement_timeout` is canceled by it: its
+partition that a build holds is deferred by its `lock_timeout` in the same way, and a
+partition dropped during its build is skipped. A build cut short by the end of
+a term leaves an invalid index, which the next build drops and builds again.
+Postgres marks an outcome table's index valid only in the attach that completes it,
+so retention must not drop the last partition without an index before it is built:
+before Postgres's May 2026 releases (17.10), nothing short of a catalog update could
+mark the index valid after that. So a drop first checks, under the history
+maintenance lock that attaches take too, whether the partition is the last one an
+outcome table's index lacks; if it is, the drop empties it, builds and attaches its
+index (instant on an empty table), and drops it. An index left invalid by an older
+release is revalidated by attaching one of its partitions' indexes again, which
+releases from May 2026 on count anew. A build that runs past the session's `statement_timeout` is canceled by it: its
 leftover is dropped, the pass goes on to the other partitions, and the leader retries
 that partition at doubling intervals, up to 64 maintenance intervals, warning each
 time that the timeout should be raised for hopper's role. The build cannot lift the
