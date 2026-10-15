@@ -362,6 +362,29 @@ attempt finishes, up to 32 KiB per attempt for the latest 10 attempts
 (`Config.JobLogs`), and kept for as long as the job is: `hopper jobs get`
 and the web UI show them, and `client.JobLogs(ctx, id)` returns them.
 
+To keep logs elsewhere, such as in object storage, or to read them while
+the job runs, give the client a `hopper.LogStore`:
+
+```go
+type LogStore interface {
+    Writer(ctx context.Context, job *hopper.JobRow) (io.WriteCloser, error)
+    Logs(ctx context.Context, id hopper.JobID) ([]hopper.AttemptLog, error)
+}
+
+client, err := hopper.NewClient(driver, &hopper.Config{
+    JobLogs: hopper.JobLogsConfig{Store: blobLogs},
+    ...
+})
+```
+
+Each attempt's lines are written to its `Writer` as they are logged, and
+the writer is closed when the worker returns. Nothing is written to the
+database, so the store also keeps the lines of a client that crashed, and
+a process that runs the work elsewhere can write to the same store under
+the job's ID and attempt. `client.JobLogs` and the web UI read the store.
+`hopper jobs get` shows only logs kept in the database. The store decides
+how long to keep logs.
+
 ## Operate
 
 ```go

@@ -262,8 +262,12 @@ func (c *Client[TTx]) JobGet(ctx context.Context, id JobID) (*JobRow, error) {
 }
 
 // JobLogs returns the logs a job's worker kept with Logger, of its latest
-// attempts, oldest first, live or from history. It returns ErrNotFound if
-// the job does not exist or its history has been dropped.
+// attempts, oldest first, live or from history: from Config.JobLogs.Store
+// if it is set, and otherwise from the job's row, when it returns
+// ErrNotFound if the job does not exist or its history has been dropped.
 func (c *Client[TTx]) JobLogs(ctx context.Context, id JobID) ([]AttemptLog, error) {
+	if s := c.cfg.JobLogs.Store; s != nil {
+		return s.Logs(ctx, id)
+	}
 	return c.exec.JobLogs(ctx, id)
 }

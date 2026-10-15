@@ -29,6 +29,7 @@ type attempt struct {
 	// kind, baseLogger and logs make the attempt's logger, which Logger
 	// builds on first use.
 	kind       string
+	row        *driver.JobRow
 	baseLogger *slog.Logger
 	logs       JobLogsConfig
 	loggerOnce sync.Once
@@ -41,8 +42,10 @@ type attempt struct {
 	// row (CompleteTx, RecordStepTx, RecordCursorTx), which it may still
 	// hold.
 	heldByTx bool
-	// kept is the attempt's log, once Logger has built its logger.
-	kept *logBuffer
+	// kept is the attempt's log, or stored its writer in the client's
+	// LogStore, once Logger has built its logger.
+	kept   *logBuffer
+	stored *storeWriter
 }
 
 func (a *attempt) markHeldByTx() {

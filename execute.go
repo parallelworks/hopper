@@ -29,8 +29,9 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	defer cancel(nil)
 	a := &attempt{
 		codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt,
-		kind: row.Kind, baseLogger: c.logger, logs: c.cfg.JobLogs,
+		kind: row.Kind, row: row, baseLogger: c.logger, logs: c.cfg.JobLogs,
 	}
+	defer a.closeLog()
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	c.trackRunning(row.ID, cancel)

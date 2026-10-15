@@ -3,8 +3,11 @@ package hopper_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -301,5 +304,170 @@ func TestLoggerInlineWorker(t *testing.T) {
 	})
 	if len(logs) != 1 || !strings.Contains(logs[0].Log, "msg=inner\n") {
 		t.Errorf("logs = %+v, want the inline worker's line", logs)
+	}
+}
+
+// memStore is a LogStore in memory.
+type memStore struct {
+	mu       sync.Mutex
+	logs     map[hopper.JobID][]*memLog
+	openErr  error
+	writeErr error
+}
+
+type memLog struct {
+	store   *memStore
+	attempt int
+	buf     strings.Builder
+	closes  int
+}
+
+func (s *memStore) Writer(ctx context.Context, job *hopper.JobRow) (io.WriteCloser, error) {
+	if s.openErr != nil {
+		return nil, s.openErr
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.logs == nil {
+		s.logs = map[hopper.JobID][]*memLog{}
+	}
+	l := &memLog{store: s, attempt: job.Attempt}
+	s.logs[job.ID] = append(s.logs[job.ID], l)
+	return l, nil
+}
+
+func (s *memStore) Logs(_ context.Context, id hopper.JobID) ([]hopper.AttemptLog, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []hopper.AttemptLog
+	for _, l := range s.logs[id] {
+		out = append(out, hopper.AttemptLog{Attempt: l.attempt, Log: l.buf.String()})
+	}
+	return out, nil
+}
+
+// get returns the text and the number of closes of each of a job's logs.
+func (s *memStore) get(id hopper.JobID) (texts []string, closes []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, l := range s.logs[id] {
+		texts = append(texts, l.buf.String())
+		closes = append(closes, l.closes)
+	}
+	return texts, closes
+}
+
+func (l *memLog) Write(p []byte) (int, error) {
+	l.store.mu.Lock()
+	defer l.store.mu.Unlock()
+	if l.store.writeErr != nil {
+		return 0, l.store.writeErr
+	}
+	if l.closes > 0 {
+		return 0, errors.New("write after close")
+	}
+	return l.buf.Write(p)
+}
+
+func (l *memLog) Close() error {
+	l.store.mu.Lock()
+	defer l.store.mu.Unlock()
+	l.closes++
+	return nil
+}
+
+// With a LogStore, an attempt's lines reach the store as they are logged,
+// each attempt's writer is closed when its worker returns, Client.JobLogs
+// reads the store, and nothing is written to the job's row.
+func TestLogStore(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	store := &memStore{}
+	started, release := make(chan hopper.JobID), make(chan struct{})
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[logged]) error {
+		hopper.Logger(ctx).Info("attempt", "n", job.Attempt)
+		if job.Attempt == 1 {
+			started <- job.ID
+			<-release
+			return errors.New("first attempt fails")
+		}
+		return nil
+	})
+	var out syncBuffer
+	c := h.client(&hopper.Config{
+		Queues:      map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers:     workers,
+		Logger:      slog.New(slog.NewTextHandler(&out, nil)),
+		RetryPolicy: &hopper.ExponentialRetry{Base: time.Millisecond, Max: time.Millisecond},
+		JobLogs:     hopper.JobLogsConfig{Store: store},
+	})
+	c.SetTuning(stepTuning)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, logged{}, &hopper.InsertOpts{Await: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := <-started
+	if texts, closes := store.get(id); len(texts) != 1 || !strings.Contains(texts[0], "msg=attempt n=1\n") || closes[0] != 0 {
+		t.Errorf("while the attempt runs: store has %q, closed %v", texts, closes)
+	}
+	close(release)
+	if _, err := hopper.Await[struct{}](ctx, c, res.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	texts, closes := store.get(id)
+	if len(texts) != 2 || !strings.Contains(texts[1], "msg=attempt n=2\n") || !slices.Equal(closes, []int{1, 1}) {
+		t.Errorf("store has %q, closed %v", texts, closes)
+	}
+	logs, err := c.JobLogs(ctx, id)
+	if err != nil || len(logs) != 2 || logs[0].Attempt != 1 || logs[1].Attempt != 2 {
+		t.Errorf("JobLogs = %+v, %v", logs, err)
+	}
+	if n := h.count("SELECT count(*) FROM hopper_job_history WHERE id = $1 AND logs IS NULL", [16]byte(id)); n != 1 {
+		t.Errorf("the job's row has logs")
+	}
+	if !strings.Contains(out.String(), "msg=attempt job_id=") {
+		t.Errorf("Config.Logger got %q", out.String())
+	}
+}
+
+// A store that fails to open an attempt's writer, or to write to it, costs
+// that attempt its lines in the store, and nothing else.
+func TestLogStoreFailures(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		store *memStore
+		warn  string
+	}{
+		{"open", &memStore{openErr: errors.New("store down")}, "open the job's log in the store"},
+		{"write", &memStore{writeErr: errors.New("disk full")}, "write the job's log to the store"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var out syncBuffer
+			cfg := &hopper.Config{Logger: slog.New(slog.NewTextHandler(&out, nil)), JobLogs: hopper.JobLogsConfig{Store: tc.store}}
+			job, _ := runLogged(t, cfg, 1, func(ctx context.Context, job *hopper.Job[logged]) error {
+				hopper.Logger(ctx).Info("one")
+				hopper.Logger(ctx).Info("two")
+				return nil
+			})
+			if job.State != hopper.JobStateCompleted {
+				t.Errorf("job %s", job.State)
+			}
+			if got := out.String(); strings.Count(got, tc.warn) != 1 || !strings.Contains(got, "msg=two job_id=") {
+				t.Errorf("Config.Logger got %q, want one warning %q and both lines", got, tc.warn)
+			}
+			if _, closes := tc.store.get(job.ID); tc.name == "write" && !slices.Equal(closes, []int{1}) {
+				t.Errorf("writer closed %v times, want once", closes)
+			}
+		})
 	}
 }

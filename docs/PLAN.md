@@ -217,7 +217,7 @@ client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{
         return hopper.ErrorOutcome{} // keep the outcome
     },
     // Logger defaults to slog.Default(); every other field has a production default.
-    JobLogs: hopper.JobLogsConfig{MaxBytes: 64 << 10}, // per attempt; defaults 32 KiB, latest 10 attempts
+    JobLogs: hopper.JobLogsConfig{MaxBytes: 64 << 10}, // per attempt; defaults 32 KiB, latest 10 attempts; or Store: a LogStore
 })
 // client is a *hopper.Client[pgx.Tx]. The driver fixes the transaction type,
 // so InsertTx only accepts a transaction from the right engine.
@@ -963,8 +963,22 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   `JobLogs` (`Executor.JobLogs`) reads them: `JobRow` has no logs, so `JobGet`,
   `Await`, the read after a `CompleteTx`, the claim and listings never carry them.
   A worker run inline with `Workers.Work` inside an attempt logs as that attempt.
-  A value not in the form hopper writes
-  reads as the entries that are.
+  A value not in the form hopper writes reads as the entries that are.
+- **Log store.** With `Config.JobLogs.Store`, a `LogStore`, the attempt's logger
+  writes its text lines to the store instead of the buffer: `Writer(ctx, job)`,
+  opened on the first `Logger` call with the job's context minus its cancellation,
+  gets one line per `Write` as it is logged, and is closed once the worker returns,
+  before the result is submitted. Nothing goes to the `logs` column (the result
+  carries no `Log`), so the store costs the database nothing and keeps a crashed
+  client's lines up to the crash. Logs are keyed by job ID and attempt, which a
+  process that runs the work outside the client (a remote executor) knows from the
+  claim, so it writes to the store directly. `Client.JobLogs` reads `Logs(ctx, id)`,
+  and hopperui with it; the CLI, which has no store, shows only the column.
+  `MaxBytes` and `MaxAttempts` do not apply, and retention is the store's: hopper
+  does not remove a job's logs from it. A failed `Writer`, `Write` or `Close` is
+  logged to `Config.Logger` and drops the rest of that attempt's lines; it never
+  changes the job's outcome. The interface stays small on purpose: a live tail is
+  the store's to offer, from what it has been written.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure

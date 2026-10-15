@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 
@@ -12,8 +13,38 @@ import (
 // AttemptLog is the log output of one attempt of a job. See Logger.
 type AttemptLog = driver.AttemptLog
 
-// JobLogsConfig bounds the log lines Logger keeps with each job.
+// LogStore keeps jobs' log lines outside hopper's tables, for logs that are
+// large, must be read while the attempt runs, or are written by a process
+// that runs a job's work elsewhere. Logs are keyed by job ID and attempt:
+// hopper writes nothing of them to the database, so they survive the
+// client's crash, and a remote process writes an attempt's lines under the
+// ID and attempt its job was claimed with. The store keeps them for as long
+// as it chooses; hopper does not remove them with the job.
+//
+// Its methods are called from many goroutines at once.
+type LogStore interface {
+	// Writer returns where the lines of the attempt of job that is running
+	// go, as Logger logs them: one line per Write, in slog's text format.
+	// It is called when the worker first calls Logger, with the job's
+	// context without its cancellation, which ends with the attempt.
+	// Hopper closes the writer once the worker returns, before the
+	// attempt's result is written, so Close should be prompt. A failed
+	// Write or Close is logged to Config.Logger and drops the attempt's
+	// remaining lines; the job's outcome does not depend on it.
+	Writer(ctx context.Context, job *JobRow) (io.WriteCloser, error)
+	// Logs returns the logs of a job's attempts, oldest first, for
+	// Client.JobLogs and hopperui.
+	Logs(ctx context.Context, id JobID) ([]AttemptLog, error)
+}
+
+// JobLogsConfig bounds the log lines Logger keeps with each job, or sends
+// them to a LogStore.
 type JobLogsConfig struct {
+	// Store, if set, receives each attempt's lines as they are logged
+	// instead of the job's row in the database, and Client.JobLogs reads
+	// them from it. MaxBytes and MaxAttempts then do not apply: what the
+	// store keeps is its own choice.
+	Store LogStore
 	// MaxBytes is how much of an attempt's log is kept. Once a line would
 	// pass it, that line and the rest are dropped, and the log ends with a
 	// line that counts them. Defaults to 32 KiB, and is at most 1 MiB;
@@ -56,7 +87,9 @@ const (
 // them, and hopper jobs get and hopperui show them. They are written
 // with the attempt's result, so they cost no writes of their own; a job
 // keeps those of its latest attempts, bounded by Config.JobLogs, through
-// retries and into history, and they leave with the job.
+// retries and into history, and they leave with the job. With
+// Config.JobLogs.Store, the lines go to the store as they are logged
+// instead, and nothing of them is written to the database.
 //
 //	func (w *Importer) Work(ctx context.Context, job *hopper.Job[ImportArgs]) error {
 //		log := hopper.Logger(ctx)
@@ -64,10 +97,11 @@ const (
 //		...
 //	}
 //
-// The lines of an attempt whose result is not written are lost with it: one
-// whose client crashes or loses its lease, or that is rescued for running
-// past Config.RescueStuckAfter. The rescue's error says which. A job
-// completed with CompleteTx keeps the lines logged before that call. A
+// Without a store, the lines of an attempt whose result is not written are
+// lost with it: one whose client crashes or loses its lease, or that is
+// rescued for running past Config.RescueStuckAfter. The rescue's error says
+// which. A job completed with CompleteTx keeps the lines logged before that
+// call. A
 // worker run with Workers.Work logs as the attempt that ran it, if any.
 // Outside a job, Logger returns slog.Default().
 func Logger(ctx context.Context) *slog.Logger {
@@ -78,7 +112,7 @@ func Logger(ctx context.Context) *slog.Logger {
 		}
 		return slog.Default()
 	}
-	a.loggerOnce.Do(a.newLogger)
+	a.loggerOnce.Do(func() { a.newLogger(ctx) })
 	return a.logger
 }
 
@@ -86,20 +120,85 @@ func Logger(ctx context.Context) *slog.Logger {
 // with Workers.Work.
 type inlineLoggerKey struct{}
 
-// newLogger builds the attempt's logger: lines go to the client's logger and,
-// unless the client keeps none, to the attempt's log.
-func (a *attempt) newLogger() {
+// newLogger builds the attempt's logger: lines go to the client's logger and
+// to the attempt's log, in the store or, unless the client keeps none, in
+// the attempt's buffer.
+func (a *attempt) newLogger(ctx context.Context) {
 	base := a.baseLogger.With("job_id", a.completion.ID, "kind", a.kind, "attempt", a.attempt)
-	if a.logs.MaxBytes <= 0 {
+	var out io.Writer
+	switch {
+	case a.logs.Store != nil:
+		w, err := a.logs.Store.Writer(context.WithoutCancel(ctx), a.row)
+		if err != nil {
+			base.WarnContext(ctx, "hopper: open the job's log in the store; the attempt's lines go to Config.Logger only", "error", err)
+			a.logger = base
+			return
+		}
+		sw := &storeWriter{w: w, logger: base}
+		a.mu.Lock()
+		a.stored = sw
+		a.mu.Unlock()
+		out = sw
+	case a.logs.MaxBytes > 0:
+		kept := &logBuffer{max: a.logs.MaxBytes}
+		a.mu.Lock()
+		a.kept = kept
+		a.mu.Unlock()
+		out = kept
+	default:
 		a.logger = base
 		return
 	}
-	kept := &logBuffer{max: a.logs.MaxBytes}
-	a.mu.Lock()
-	a.kept = kept
-	a.mu.Unlock()
-	text := slog.NewTextHandler(kept, &slog.HandlerOptions{Level: a.logs.Level, ReplaceAttr: a.logs.ReplaceAttr})
+	text := slog.NewTextHandler(out, &slog.HandlerOptions{Level: a.logs.Level, ReplaceAttr: a.logs.ReplaceAttr})
 	a.logger = slog.New(slog.NewMultiHandler(base.Handler(), text))
+}
+
+// closeLog closes the attempt's writer in the store, if it has one. Lines
+// logged after it are dropped.
+func (a *attempt) closeLog() {
+	a.mu.Lock()
+	sw := a.stored
+	a.mu.Unlock()
+	if sw != nil {
+		sw.close()
+	}
+}
+
+// storeWriter is an attempt's writer in a LogStore, which it stops using
+// once a write fails or the attempt ends.
+type storeWriter struct {
+	mu     sync.Mutex
+	w      io.WriteCloser
+	logger *slog.Logger
+	done   bool
+}
+
+func (s *storeWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done {
+		return len(p), nil
+	}
+	if _, err := s.w.Write(p); err != nil {
+		s.done = true
+		s.logger.Warn("hopper: write the job's log to the store; the attempt's later lines go to Config.Logger only", "error", err)
+		if err := s.w.Close(); err != nil {
+			s.logger.Warn("hopper: close the job's log in the store", "error", err)
+		}
+	}
+	return len(p), nil
+}
+
+func (s *storeWriter) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done {
+		return
+	}
+	s.done = true
+	if err := s.w.Close(); err != nil {
+		s.logger.Warn("hopper: close the job's log in the store", "error", err)
+	}
 }
 
 // keptLog returns the attempt's log, or nil if it logged nothing that is
