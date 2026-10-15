@@ -809,7 +809,9 @@ func TestLogStoreDropsWhenBehind(t *testing.T) {
 	}
 	lines := strings.Split(strings.TrimSuffix(texts[0], "\n"), "\n")
 	last := lines[len(lines)-1]
-	if !strings.HasPrefix(last, "hopper: ") || !strings.HasSuffix(last, " lines dropped: the store fell behind") || len(lines) > 300 {
+	// The store holds at most the batch it took before its first write
+	// blocked and a full queue behind it, 256 KiB each.
+	if !strings.HasPrefix(last, "hopper: ") || !strings.HasSuffix(last, " lines dropped: the store fell behind") || len(lines) > 2*(256<<10)/len(line)+1 {
 		t.Errorf("%d lines, ending %q", len(lines), last)
 	}
 	for i, l := range lines[:len(lines)-1] {
