@@ -871,9 +871,6 @@ type HistoryMaintainResult struct {
 	// one its outcome table's index lacks, which dropping first would leave
 	// that index unable to complete. A later pass drops them.
 	Kept []string
-	// Building names those of Kept whose build is under way; the others
-	// wait for a build that has not started or keeps failing.
-	Building []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64
 }
@@ -886,7 +883,9 @@ type HistoryIndexParams struct {
 	// LockTimeout bounds how long attaching a built index, or repairing an
 	// index, waits for its lock, during which the queries of the storage
 	// unit it locks queue behind it, as HistoryMaintainParams.LockTimeout
-	// does. Zero means the engine's default.
+	// does, and how long a build waits for its storage unit's maintenance
+	// lock, held by retention or partition creation. Zero means the
+	// engine's default.
 	LockTimeout time.Duration
 }
 

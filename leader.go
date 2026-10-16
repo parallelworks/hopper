@@ -419,7 +419,7 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 			deferrals = 0
 		} else {
 			deferrals++
-			c.logger.Log(ctx, repeatLevel(deferrals, slog.LevelDebug), "hopper: history index work deferred: a transaction that used the partition, or one left open with its maintenance lock, held its lock",
+			c.logger.Log(ctx, repeatLevel(deferrals), "hopper: history index work deferred: a transaction that used the partition, or one left open with its maintenance lock, held its lock",
 				"indexes", res.Deferred, "lock_timeout", timeout, "passes", deferrals)
 		}
 		select {
@@ -460,9 +460,6 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 // is missing when its period starts sends that period's history to the
 // DEFAULT partition.
 func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
-	// A pass after one that deferred work retries it on the next leader
-	// pass, ahead of the maintenance interval.
-	retry := c.ddlDeferrals > 0
 	timeout := ddlLockTimeout(c.ddlDeferrals)
 	res, err := c.exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{
 		CompletedRetention: c.cfg.CompletedRetention,
@@ -480,29 +477,32 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
 	}
 	// A kept partition waits for its build, whose failures the index loop
-	// warns about, so it is only logged, once per maintenance interval.
-	if len(res.Kept) > 0 && !retry {
+	// warns about, so it is only logged, once per maintenance interval: the
+	// passes that retry deferred work in between, on every leader pass, are
+	// left out, without silencing a run of them that outlasts the interval.
+	if len(res.Kept) > 0 && time.Since(c.keptLogged) >= c.tuning.maintenanceInterval {
+		c.keptLogged = time.Now()
 		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built",
-			"kept", res.Kept, "building", res.Building)
+			"kept", res.Kept)
 	}
 	if len(res.Deferred) == 0 {
 		c.ddlDeferrals = 0
 		return true
 	}
 	c.ddlDeferrals++
-	c.logger.Log(ctx, repeatLevel(c.ddlDeferrals, slog.LevelDebug), "hopper: history partitions deferred: a transaction that wrote history held their lock",
+	c.logger.Log(ctx, repeatLevel(c.ddlDeferrals), "hopper: history partitions deferred: a transaction that wrote history, or other history maintenance, held their lock",
 		"deferred", res.Deferred, "lock_timeout", timeout, "passes", c.ddlDeferrals)
 	return false
 }
 
 // repeatLevel is the level of a record about something that has lasted
-// passes passes in a row: level, and a warning from the ddlDeferralsWarn-th
+// passes passes in a row: debug, and a warning from the ddlDeferralsWarn-th
 // on.
-func repeatLevel(passes int, level slog.Level) slog.Level {
+func repeatLevel(passes int) slog.Level {
 	if passes >= ddlDeferralsWarn {
 		return slog.LevelWarn
 	}
-	return level
+	return slog.LevelDebug
 }
 
 // Deferred partition work is retried on every leader pass, each time
