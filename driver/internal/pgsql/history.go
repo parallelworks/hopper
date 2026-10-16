@@ -31,8 +31,8 @@ type historyGroup struct {
 
 // HistoryLockKey is the pg_advisory_xact_lock key that serializes changes to
 // the history partitions and their indexes: partition creation between
-// overlapping leaders, index attaches, and a retention drop that may complete
-// an outcome table's index. It is combined with the schema, so installations
+// overlapping leaders, index attaches, and a retention drop's check that it
+// is not dropping the last partition an outcome table's index lacks. It is combined with the schema, so installations
 // sharing a database do not queue behind each other.
 const HistoryLockKey int32 = 0x686f7068 // "hoph"
 
@@ -141,13 +141,15 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 					res.Deferred = append(res.Deferred, name)
 					continue
 				}
-				dropped, err := e.dropPartition(ctx, g, name, lockTimeout)
-				if err != nil {
+				dropped, kept, err := e.dropPartition(ctx, g, name, lockTimeout)
+				switch {
+				case err != nil:
 					return res, err
-				}
-				if dropped {
+				case dropped:
 					res.Dropped = append(res.Dropped, name)
-				} else {
+				case kept:
+					res.Kept = append(res.Kept, name)
+				default:
 					blocked = true
 					res.Deferred = append(res.Deferred, name)
 				}
@@ -181,45 +183,60 @@ func lockNotAvailable(err error) bool {
 // dropPartition drops a partition past retention. DROP takes a brief
 // ACCESS EXCLUSIVE lock on the parent for the catalog change, once per
 // period. (DETACH CONCURRENTLY would avoid it, but Postgres refuses it while
-// a DEFAULT partition exists.) In the window after an upgrade declared a
-// history index, the drop may first complete that index (indexBeforeDrop).
-// Each lock wait is bounded by lockTimeout: a drop that cannot get a lock in
-// time returns false.
-func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lockTimeout string) (bool, error) {
-	err := e.withTx(ctx, func(tx Tx) error {
+// a DEFAULT partition exists.) The wait is bounded by lockTimeout: a drop
+// that cannot get the lock in time, or that the deadlock detector picks over
+// a concurrent index build waiting for it, returns false. A partition that
+// must wait for its index (keepForIndex) is kept, having done nothing.
+func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lockTimeout string) (dropped, kept bool, err error) {
+	err = e.withTx(ctx, func(tx Tx) error {
 		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+lockTimeout+"'"); err != nil {
 			return err
 		}
-		if err := e.indexBeforeDrop(ctx, tx, g.parent, name); err != nil {
+		if kept, err = e.keepForIndex(ctx, tx, g.parent, name); err != nil || kept {
 			return err
 		}
 		_, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name))
 		return err
 	})
-	if lockNotAvailable(err) {
-		return false, nil
+	if lockNotAvailable(err) || deadlocked(err) {
+		return false, false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
+		return false, false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
 	}
-	return true, nil
+	return !kept, kept, nil
 }
 
-// indexBeforeDrop gives a partition about to be dropped each history index
-// that, of its outcome table's partitions, only it lacks. Postgres marks an
-// outcome table's index valid only in the attach that completes it, so
-// dropping the last partition without one would leave the index invalid for
-// good on releases before May 2026 (17.10), where attaching an index again
-// does not revalidate it. The partition is emptied first, since its rows go
-// with it, so the build is instant. It runs under HistoryLockKey, which
-// attachIndex takes too, so that an attach elsewhere does not count this
-// partition as unindexed and commit beside the drop. The outcome table is
-// locked before the partition, the order in which queries and DROP lock
-// them: a reader holding the table while it waits for the partition would
-// otherwise deadlock with the drop.
-func (e *Executor) indexBeforeDrop(ctx context.Context, tx Tx, parent, name string) error {
+// deadlocked reports whether err is a deadlock the server broke.
+func deadlocked(err error) bool {
+	var coded interface{ SQLState() string }
+	return errors.As(err, &coded) && coded.SQLState() == "40P01"
+}
+
+// keepForIndex reports whether a partition past retention must stay until
+// HistoryIndex has attached its index: while its index is being built, or
+// when it is the last partition an outcome table's index lacks. Postgres
+// marks an outcome table's index valid only in the attach that completes it,
+// so dropping that partition first would leave the index invalid for good on
+// releases before May 2026 (18.4, 17.10, 16.14, 15.18, 14.23), where
+// attaching an index again does not revalidate it. Retention of that one
+// partition waits for its build, once, after an upgrade declared an index.
+// The check runs under HistoryLockKey, which attachIndex takes too, so that an
+// attach elsewhere does not count this partition as unindexed and commit
+// beside the drop.
+func (e *Executor) keepForIndex(ctx context.Context, tx Tx, parent, name string) (bool, error) {
 	if !hasHistoryIndexes(parent) {
-		return nil
+		return false, nil
+	}
+	// A build waits for the transactions older than it, this one among
+	// them, so a drop waiting on the build's lock would deadlock with it.
+	var building bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_progress_create_index WHERE relid = to_regclass($1))",
+		e.Schema.Table(name)).Scan(&building); err != nil {
+		return false, fmt.Errorf("hopper: check index builds on %s: %w", name, err)
+	}
+	if building {
+		return true, nil
 	}
 	// An outcome table's index, once valid, stays valid, so outside the
 	// window after an upgrade declared one, a drop stops here, unlocked.
@@ -227,47 +244,27 @@ func (e *Executor) indexBeforeDrop(ctx context.Context, tx Tx, parent, name stri
 		SELECT c.relname FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
 		WHERE x.indrelid = to_regclass($1) AND NOT x.indisvalid`, e.Schema.Table(parent)))
 	if err != nil {
-		return fmt.Errorf("hopper: check indexes of %s: %w", parent, err)
+		return false, fmt.Errorf("hopper: check indexes of %s: %w", parent, err)
 	}
 	if len(invalid) == 0 {
-		return nil
+		return false, nil
 	}
 	if err := lockHistoryMaintenance(ctx, tx, e.Schema.Name); err != nil {
-		return err
+		return false, err
 	}
-	emptied := false
 	for _, x := range historyIndexes {
 		if x.parent != parent || !slices.Contains(invalid, x.name()) {
 			continue
 		}
 		unindexed, err := scanStrings(tx.Query(ctx, unindexedPartitions, e.Schema.Table(parent), e.Schema.Table(x.name())))
 		if err != nil {
-			return fmt.Errorf("hopper: check index %s: %w", x.name(), err)
+			return false, fmt.Errorf("hopper: check index %s: %w", x.name(), err)
 		}
-		if len(unindexed) != 1 || unindexed[0] != name {
-			continue
-		}
-		if !emptied {
-			if _, err := tx.Exec(ctx, "LOCK TABLE ONLY "+e.Schema.Table(parent)+", "+e.Schema.Table(name)+" IN ACCESS EXCLUSIVE MODE"); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, "TRUNCATE "+e.Schema.Table(name)); err != nil {
-				return err
-			}
-			emptied = true
-		}
-		index := name + x.suffix
-		if _, err := tx.Exec(ctx, "DROP INDEX IF EXISTS "+e.Schema.Table(index)); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "CREATE INDEX "+quoteIdent(index)+" ON "+e.Schema.Table(name)+" "+x.definition); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, "ALTER INDEX "+e.Schema.Table(x.name())+" ATTACH PARTITION "+e.Schema.Table(index)); err != nil {
-			return err
+		if len(unindexed) == 1 && unindexed[0] == name {
+			return true, nil
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // historyIndex is an index declared ON ONLY a history outcome table by a
@@ -371,11 +368,15 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 				return res, err
 			}
 		}
-		if !complete {
+		if !complete || slices.Contains(skip, parentIndex) {
 			continue
 		}
-		if err := e.revalidateIndex(ctx, parentIndex); err != nil {
+		invalid, err := e.revalidateIndex(ctx, parentIndex)
+		if err != nil {
 			return res, err
+		}
+		if invalid {
+			res.Invalid = append(res.Invalid, parentIndex)
 		}
 	}
 	return res, nil
@@ -470,7 +471,7 @@ func (e *Executor) buildHistoryIndex(ctx context.Context, x historyIndex, leaf s
 			return fmt.Errorf("hopper: index partition %s: %w", leaf, err)
 		}
 	}
-	return e.attachIndex(ctx, x.name(), index)
+	return e.attachIndex(ctx, x.name(), index, "")
 }
 
 // attachIndex attaches a partition's index under the history maintenance
@@ -479,7 +480,7 @@ func (e *Executor) buildHistoryIndex(ctx context.Context, x historyIndex, leaf s
 // completes it, counting the attached indexes it can see; two attaches
 // committing side by side would each miss the other's and leave the parent
 // invalid for good.
-func (e *Executor) attachIndex(ctx context.Context, parentIndex, index string) (err error) {
+func (e *Executor) attachIndex(ctx context.Context, parentIndex, index, lockTimeout string) (err error) {
 	tx, err := e.Conn.Begin(ctx)
 	if err != nil {
 		return err
@@ -489,6 +490,11 @@ func (e *Executor) attachIndex(ctx context.Context, parentIndex, index string) (
 			_ = tx.Rollback(context.WithoutCancel(ctx))
 		}
 	}()
+	if lockTimeout != "" {
+		if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout = '"+lockTimeout+"'"); err != nil {
+			return err
+		}
+	}
 	if err = lockHistoryMaintenance(ctx, tx, e.Schema.Name); err != nil {
 		return err
 	}
@@ -498,26 +504,40 @@ func (e *Executor) attachIndex(ctx context.Context, parentIndex, index string) (
 	return tx.Commit(ctx)
 }
 
-// revalidateIndex marks an outcome table's index valid when no
-// partition lacks its index any more but the attach that would have
-// completed it never ran, because retention dropped the last partition
-// without one before indexBeforeDrop did its build. Attaching a partition's
-// index again makes Postgres count the attached indexes again, from the May
-// 2026 releases (17.10) on; earlier ones, and a new partition's attach, do
-// not.
-func (e *Executor) revalidateIndex(ctx context.Context, parentIndex string) error {
+// revalidateIndex marks an outcome table's index valid when no partition
+// lacks its index any more but the attach that would have completed it never
+// ran, because an earlier release's retention dropped the last partition
+// without one first (keepForIndex). Attaching a partition's index again makes
+// Postgres count the attached indexes again from its May 2026 releases on;
+// earlier ones do not, and it reports true when the index stays invalid. The
+// attach waits for its locks no longer than a partition's creation or drop
+// does, since every query of that partition queues behind it; a pass that
+// cannot get them leaves the index to the next.
+func (e *Executor) revalidateIndex(ctx context.Context, parentIndex string) (invalid bool, err error) {
 	var child sql.NullString
-	err := e.Conn.QueryRow(ctx, `
+	err = e.Conn.QueryRow(ctx, `
 		SELECT (SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
 		        WHERE i.inhparent = x.indexrelid LIMIT 1)
 		FROM pg_index x WHERE x.indexrelid = to_regclass($1) AND NOT x.indisvalid`, e.Schema.Table(parentIndex)).Scan(&child)
 	if errors.Is(err, ErrNoRows) || (err == nil && !child.Valid) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("hopper: check index %s: %w", parentIndex, err)
+		return false, fmt.Errorf("hopper: check index %s: %w", parentIndex, err)
 	}
-	return e.attachIndex(ctx, parentIndex, child.String)
+	timeout := fmt.Sprintf("%dms", defaultDDLLockTimeout.Milliseconds())
+	if err := e.attachIndex(ctx, parentIndex, child.String, timeout); err != nil {
+		if lockNotAvailable(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	var valid bool
+	if err := e.Conn.QueryRow(ctx, "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+		e.Schema.Table(parentIndex)).Scan(&valid); err != nil {
+		return false, fmt.Errorf("hopper: check index %s: %w", parentIndex, err)
+	}
+	return !valid, nil
 }
 
 // partitionsOf lists the partitions attached to parent.

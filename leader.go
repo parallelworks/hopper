@@ -363,7 +363,8 @@ const maxIndexBackoffShift = 6
 // ahead. A build cut short by the end of the term is redone by the next
 // leader. A partition whose build outlasts the session's statement_timeout
 // is retried at doubling intervals, so that it neither holds up the others
-// nor costs a futile build every interval.
+// nor costs a futile build every interval, and so is an index the server
+// cannot repair, with a warning each time.
 func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{}) {
 	select {
 	case <-ctx.Done():
@@ -388,14 +389,22 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		if err != nil && ctx.Err() == nil {
 			c.logger.WarnContext(ctx, "hopper: index history", "error", err)
 		}
-		for _, name := range res.TimedOut {
+		retryIn := func(name string) time.Duration {
 			b := timedOut[name]
 			b.failures++
 			wait := c.tuning.maintenanceInterval << min(b.failures, maxIndexBackoffShift)
 			b.next = time.Now().Add(wait)
 			timedOut[name] = b
+			return wait
+		}
+		for _, name := range res.TimedOut {
 			c.logger.WarnContext(ctx, "hopper: a history partition's index build ran past statement_timeout; raise it for this role to let the build finish",
-				"partition", name, "retry_in", wait)
+				"partition", name, "retry_in", retryIn(name))
+		}
+		for _, name := range res.Invalid {
+			c.logger.WarnContext(ctx, "hopper: a history index stays invalid, so queries that need it read every partition; "+
+				"Postgres repairs it from its May 2026 minor releases (18.4, 17.10, 16.14, 15.18, 14.23) on",
+				"index", name, "retry_in", retryIn(name))
 		}
 		select {
 		case <-ctx.Done():
@@ -450,6 +459,9 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	}
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
+	}
+	if len(res.Kept) > 0 {
+		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built", "kept", res.Kept)
 	}
 	if len(res.Deferred) == 0 {
 		c.ddlDeferrals = 0

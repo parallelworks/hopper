@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/hopper"
+	"github.com/parallelworks/hopper/driver"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
 
@@ -786,6 +787,63 @@ func TestLeaderBacksOffTimedOutIndexBuilds(t *testing.T) {
 	})
 }
 
+// TestLeaderReportsInvalidHistoryIndex leaves an outcome table's index
+// invalid with every partition indexed, as an earlier release's retention
+// could. The leader repairs it where Postgres's re-attach counts the attached
+// indexes again, and otherwise warns, at doubling intervals.
+func TestLeaderReportsInvalidHistoryIndex(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	exec := func(query string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	exec("CREATE TABLE revalidate_probe (k int) PARTITION BY LIST (k)")
+	exec("CREATE TABLE revalidate_probe_1 PARTITION OF revalidate_probe FOR VALUES IN (1)")
+	exec("CREATE INDEX revalidate_probe_k ON revalidate_probe (k)")
+	exec("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'revalidate_probe_k'::regclass")
+	exec("ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k_idx")
+	repairs := h.count("SELECT indisvalid::int FROM pg_index WHERE indexrelid = 'revalidate_probe_k'::regclass") == 1
+	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	const index = "hopper_job_history_failed_ordering"
+	exec("UPDATE pg_index SET indisvalid = false WHERE indexrelid = '" + index + "'::regclass")
+	logs := &timeoutLog{counts: map[string]int{}, message: "stays invalid", key: "index"}
+	c, err := hopper.NewClient(h.d, &hopper.Config{
+		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
+		Logger: slog.New(logs),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := fastTuning
+	tun.Maintenance = 250 * time.Millisecond
+	c.SetTuning(tun)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Stop(context.Background()) })
+	if repairs {
+		waitFor(t, func() bool {
+			return h.count("SELECT indisvalid::int FROM pg_index WHERE indexrelid = '"+index+"'::regclass") == 1
+		})
+		if n := logs.count(index); n != 0 {
+			t.Errorf("repaired index reported %d times", n)
+		}
+		return
+	}
+	waitFor(t, func() bool { return logs.count(index) > 0 })
+	// As with timed-out builds: after waits of 0.5, 1 and 2 seconds.
+	time.Sleep(3 * time.Second)
+	if n := logs.count(index); n < 2 || n > 4 {
+		t.Errorf("%s reported %d times in three seconds, want 2 to 4", index, n)
+	}
+}
+
 // timedOutBuilds starts a leader whose sessions have a statement_timeout
 // that every index build overruns, waiting for a snapshot held open, and
 // counts the timed-out builds it logs.
@@ -811,7 +869,7 @@ func timedOutBuilds(t *testing.T, maintenance time.Duration) *timeoutLog {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	logs := &timeoutLog{counts: map[string]int{}}
+	logs := &timeoutLog{counts: map[string]int{}, message: "statement_timeout", key: "partition"}
 	c, err := hopper.NewClient(testdb.Driver(pool), &hopper.Config{
 		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
 		Logger: slog.New(logs),
@@ -829,10 +887,13 @@ func timedOutBuilds(t *testing.T, maintenance time.Duration) *timeoutLog {
 	return logs
 }
 
-// timeoutLog counts the index loop's timed-out builds per partition.
+// timeoutLog counts the index loop's records whose message contains
+// message, by their key attribute: timed-out builds per partition, or
+// unrepairable indexes.
 type timeoutLog struct {
-	mu     sync.Mutex
-	counts map[string]int
+	mu           sync.Mutex
+	counts       map[string]int
+	message, key string
 }
 
 func (l *timeoutLog) Enabled(context.Context, slog.Level) bool { return true }
@@ -840,11 +901,11 @@ func (l *timeoutLog) WithAttrs([]slog.Attr) slog.Handler       { return l }
 func (l *timeoutLog) WithGroup(string) slog.Handler            { return l }
 
 func (l *timeoutLog) Handle(_ context.Context, r slog.Record) error {
-	if !strings.Contains(r.Message, "statement_timeout") {
+	if !strings.Contains(r.Message, l.message) {
 		return nil
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "partition" {
+		if a.Key == l.key {
 			l.mu.Lock()
 			l.counts[a.Value.String()]++
 			l.mu.Unlock()
@@ -854,8 +915,8 @@ func (l *timeoutLog) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-func (l *timeoutLog) count(partition string) int {
+func (l *timeoutLog) count(name string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.counts[partition]
+	return l.counts[name]
 }

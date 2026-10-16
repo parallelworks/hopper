@@ -865,6 +865,10 @@ type HistoryMaintainResult struct {
 	// transaction that has not ended, such as one that wrote history; a
 	// later pass retries them.
 	Deferred []string
+	// Kept names storage units past retention that wait for HistoryIndex to
+	// build their index, which dropping them first would leave their outcome
+	// table's index unable to complete; a later pass drops them.
+	Kept []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64
 }
@@ -872,7 +876,7 @@ type HistoryMaintainResult struct {
 // HistoryIndexParams leaves storage units out of an index pass.
 type HistoryIndexParams struct {
 	// Skip names storage units (partitions on Postgres) to leave for a later
-	// pass.
+	// pass, and indexes not to try to repair (HistoryIndexResult.Invalid).
 	Skip []string
 }
 
@@ -882,6 +886,12 @@ type HistoryIndexResult struct {
 	// statement timeout. What the build left is removed, and the pass goes
 	// on to the rest.
 	TimedOut []string
+	// Invalid names indexes that stay invalid although every storage unit
+	// under them is indexed, which the server cannot repair: on Postgres, an
+	// outcome table's index left invalid by an earlier release, before
+	// Postgres's May 2026 minor releases. Queries that need it read every
+	// partition instead.
+	Invalid []string
 }
 
 // SubscriptionRow is a topic subscription: messages published to a topic

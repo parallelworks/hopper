@@ -439,20 +439,31 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("history by unique key = %+v", res[0].Job)
 	}
 
-	// What retention dropping the last partition without an index left
-	// before indexBeforeDrop: every partition's index attached, and the
-	// outcome table's not valid. Only releases whose attach counts again
-	// can repair it.
-	if !reattachRevalidates(ctx, t, f, d) {
-		t.Log("this server's re-attach does not revalidate an index; not checking revalidation")
-		return
-	}
+	// What an earlier release's retention could leave by dropping the last
+	// partition without an index: every partition's index attached, and
+	// the outcome table's not valid. Only releases whose attach counts again
+	// can repair it; on others, HistoryIndex reports it, and leaves it alone
+	// when told to skip it.
+	repairs := reattachRevalidates(ctx, t, f, d)
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
-	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+	res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass"); v != "true" {
-		t.Errorf("hopper_job_history_failed_ordering valid after revalidation = %s", v)
+	want := "true"
+	if !repairs {
+		want = "false"
+		if !slices.Equal(res.Invalid, []string{"hopper_job_history_failed_ordering"}) {
+			t.Errorf("unrepairable indexes = %q", res.Invalid)
+		}
+		if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: res.Invalid}); err != nil || len(res.Invalid) != 0 {
+			t.Errorf("skipped unrepairable index reported = %+v, %v", res, err)
+		}
+	} else if len(res.Invalid) != 0 {
+		t.Errorf("repaired index reported unrepairable: %q", res.Invalid)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass"); v != want {
+		t.Errorf("hopper_job_history_failed_ordering valid after revalidation = %s, want %s", v, want)
 	}
 }
 
@@ -530,36 +541,25 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	if v := valid(); v != "false" {
 		t.Fatalf("valid with a partition unindexed = %s", v)
 	}
-	// A reader holds the outcome table and then reads the partition while
-	// retention drops it, with the lock_timeout the leader reaches after a
-	// few deferrals, longer than deadlock_timeout: the drop must lock the
-	// table before the partition, as the reader does, or the two deadlock.
-	var reader sync.WaitGroup
-	reader.Go(func() {
-		f.Exec(ctx, t, d, `DO $$
-			BEGIN
-			  LOCK TABLE ONLY hopper_job_history_failed IN ACCESS SHARE MODE;
-			  PERFORM pg_sleep(0.5);
-			  PERFORM count(*) FROM `+old[0]+`;
-			END
-			$$`)
-	})
-	for deadline := time.Now().Add(5 * time.Second); f.QueryText(ctx, t, d, `SELECT count(*)::text FROM pg_locks
-		WHERE relation = 'hopper_job_history_failed'::regclass AND mode = 'AccessShareLock' AND granted AND pid <> pg_backend_pid()`) == "0"; {
-		if time.Now().After(deadline) {
-			t.Fatal("the reader did not lock the outcome table")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// Retention keeps the partition until it is indexed.
+	res, err := exec.HistoryMaintain(ctx, keep)
+	if err != nil || !slices.Contains(res.Kept, old[0]) || slices.Contains(res.Dropped, old[0]) {
+		t.Fatalf("maintain with the last unindexed partition past retention = %+v, %v", res, err)
 	}
-	slow := keep
-	slow.LockTimeout = 2 * time.Second
-	res, err := exec.HistoryMaintain(ctx, slow)
-	reader.Wait()
-	if err != nil || !slices.Contains(res.Dropped, old[0]) {
-		t.Fatalf("maintain = %+v, %v", res, err)
+	if v := f.QueryText(ctx, t, d, "SELECT (to_regclass($1) IS NOT NULL)::text", old[0]); v != "true" {
+		t.Fatalf("kept partition exists = %s", v)
+	}
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
 	}
 	if v := valid(); v != "true" {
-		t.Errorf("valid after retention dropped the last unindexed partition = %s", v)
+		t.Errorf("valid once the kept partition is indexed = %s", v)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Contains(res.Dropped, old[0]) || len(res.Kept) != 0 {
+		t.Errorf("maintain after indexing = %+v, %v", res, err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after retention dropped the indexed partition = %s", v)
 	}
 
 	// Retention dropping partitions while the leader builds the others'.
@@ -580,9 +580,10 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 					errs <- err
 					return
 				}
-				if len(res.Deferred) == 0 || time.Now().After(deadline) {
+				if len(res.Deferred)+len(res.Kept) == 0 || time.Now().After(deadline) {
 					return
 				}
+				time.Sleep(10 * time.Millisecond)
 			}
 		})
 		wg.Wait()
