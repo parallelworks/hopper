@@ -61,7 +61,8 @@
   with `UniqueOpts.Finished` reads that partition in full. Retention keeps the
   last partition without an index past its retention until it has one, and a
   warning that partitions have been kept for five passes means their builds keep
-  failing: look for the `statement_timeout` warning. Releases
+  failing or their attaches keep being deferred: look for the
+  `statement_timeout` warning and the attach-deferred warning below. Releases
   up to 0.7.0 could instead drop it first and leave the outcome table's index
   invalid, unused by the planner. The leader repairs that on Postgres's May 2026
   minor releases (18.4, 17.10, 16.14, 15.18, 14.23) and later; on earlier ones
@@ -69,7 +70,9 @@
   lets it finish, within 8 maintenance intervals. Attaching a built index, and
   the repair, wait for transactions that read the partition they lock; a
   warning that an attach has been deferred for five passes means such
-  transactions keep overlapping. A warning that partitions have been kept
+  transactions keep overlapping, or that a transaction left open holds a
+  partition's maintenance lock, which a build waits for under the same
+  timeout. A warning that partitions have been kept
   for five passes is not raised while their build is still running.
 - **`UniqueOpts.Finished`.** Each such job is looked up in every history
   partition of the outcomes it counts, one index lookup each, so the cost

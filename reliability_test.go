@@ -798,20 +798,13 @@ func TestLeaderReportsInvalidHistoryIndex(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	ctx := context.Background()
+	repairs := reattachRevalidates(t, h)
 	exec := func(query string) {
 		t.Helper()
 		if _, err := h.pool.Exec(ctx, query); err != nil {
 			t.Fatalf("%s: %v", query, err)
 		}
 	}
-	repairs := drivertest.ReattachRevalidates(exec, func(query string) string {
-		t.Helper()
-		var v string
-		if err := h.pool.QueryRow(ctx, query).Scan(&v); err != nil {
-			t.Fatalf("%s: %v", query, err)
-		}
-		return v
-	})
 	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
 		t.Fatal(err)
 	}
@@ -859,6 +852,9 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	ctx := context.Background()
+	if !reattachRevalidates(t, h) {
+		t.Skip("this Postgres release cannot repair the index, which is reported invalid without an attach (TestLeaderReportsInvalidHistoryIndex)")
+	}
 	// The partitions ahead exist before the reader holds their attaches
 	// off, so that the leader's first maintenance, which the index loop
 	// waits for, completes.
@@ -880,7 +876,7 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	if _, err := reader.Exec(ctx, "SELECT count(*) FROM hopper_job_history WHERE ordering_key = 'lane'"); err != nil {
 		t.Fatal(err)
 	}
-	logs := &timeoutLog{counts: map[string]int{}, message: "attach deferred", key: "passes", level: slog.LevelWarn}
+	logs := &timeoutLog{counts: map[string]int{}, message: "index work deferred", key: "passes", level: slog.LevelWarn}
 	c, err := hopper.NewClient(h.d, &hopper.Config{
 		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
 		Logger: slog.New(logs),
@@ -904,42 +900,32 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	}
 }
 
-// TestLeaderWarnsAboutKeptPartition makes the last partition an outcome
-// table's index lacks pass retention while its build keeps running past the
-// session's statement_timeout. Retention keeps the partition on every pass,
-// and the leader warns from the fifth pass in a row on.
-func TestLeaderWarnsAboutKeptPartition(t *testing.T) {
-	t.Parallel()
-	logs := &timeoutLog{counts: map[string]int{}, message: "kept until their index is built", key: "passes", level: slog.LevelWarn}
-	timedOutBuildsLogging(t, 100*time.Millisecond, logs, func(h *harness) {
-		const old = "hopper_job_history_failed_20000101"
-		for _, query := range []string{
-			"DROP INDEX hopper_job_history_failed_ordering",
-			"CREATE TABLE " + old + " (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)",
-			"ALTER TABLE hopper_job_history_failed ATTACH PARTITION " + old + " FOR VALUES FROM ('2000-01-01Z') TO ('2000-01-02Z')",
-			"CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id) WHERE ordering_key IS NOT NULL",
-		} {
-			if _, err := h.pool.Exec(context.Background(), query); err != nil {
-				t.Fatalf("%s: %v", query, err)
-			}
+// reattachRevalidates runs drivertest.ReattachRevalidates on the harness's
+// database.
+func reattachRevalidates(t *testing.T, h *harness) bool {
+	t.Helper()
+	ctx := context.Background()
+	return drivertest.ReattachRevalidates(func(query string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
 		}
-		if _, err := h.d.Executor().HistoryIndex(context.Background(), driver.HistoryIndexParams{Skip: []string{old}}); err != nil {
-			t.Fatal(err)
+	}, func(query string) string {
+		t.Helper()
+		var v string
+		if err := h.pool.QueryRow(ctx, query).Scan(&v); err != nil {
+			t.Fatalf("%s: %v", query, err)
 		}
-	}, func(cfg *hopper.Config) { cfg.FailedRetention = 48 * time.Hour })
-	waitFor(t, func() bool { return logs.count("5") > 0 })
-	if n := logs.count("4"); n != 0 {
-		t.Errorf("warned after 4 passes")
-	}
+		return v
+	})
 }
 
-// TestLeaderDoesNotWarnAboutPartitionKeptForBuild keeps the last partition
-// an outcome table's index lacks past retention while a build holds it, for
-// more passes than the warning waits for: a long build is reported at Info,
-// and does not count towards the warning.
-func TestLeaderDoesNotWarnAboutPartitionKeptForBuild(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t)
+// lastUnindexedPartition attaches a partition from 2000 to the failed outcome
+// table before its ordering-key index is declared, as on an installation
+// upgraded to schema v13, and indexes every other partition, leaving that one
+// the last the index lacks. It returns the partition's name.
+func lastUnindexedPartition(t *testing.T, h *harness) string {
+	t.Helper()
 	ctx := context.Background()
 	const old = "hopper_job_history_failed_20000101"
 	for _, query := range []string{
@@ -955,6 +941,34 @@ func TestLeaderDoesNotWarnAboutPartitionKeptForBuild(t *testing.T) {
 	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{Skip: []string{old}}); err != nil {
 		t.Fatal(err)
 	}
+	return old
+}
+
+// TestLeaderWarnsAboutKeptPartition makes the last partition an outcome
+// table's index lacks pass retention while its build keeps running past the
+// session's statement_timeout. Retention keeps the partition on every pass,
+// and the leader warns from the fifth pass in a row on.
+func TestLeaderWarnsAboutKeptPartition(t *testing.T) {
+	t.Parallel()
+	logs := &timeoutLog{counts: map[string]int{}, message: "kept until their index is built", key: "passes", level: slog.LevelWarn}
+	timedOutBuildsLogging(t, 100*time.Millisecond, logs, func(h *harness) {
+		lastUnindexedPartition(t, h)
+	}, func(cfg *hopper.Config) { cfg.FailedRetention = 48 * time.Hour })
+	waitFor(t, func() bool { return logs.count("5") > 0 })
+	if n := logs.count("4"); n != 0 {
+		t.Errorf("warned after 4 passes")
+	}
+}
+
+// TestLeaderDoesNotWarnAboutPartitionKeptForBuild keeps the last partition
+// an outcome table's index lacks past retention while a build holds it, for
+// more passes than the warning waits for: a long build is reported at Info,
+// and does not count towards the warning.
+func TestLeaderDoesNotWarnAboutPartitionKeptForBuild(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	old := lastUnindexedPartition(t, h)
 	// The partition's build lock (HistoryIndexLockKey), held as a build
 	// holds it.
 	build, err := h.pool.Begin(ctx)

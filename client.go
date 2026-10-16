@@ -65,7 +65,7 @@ type Client[TTx any] struct {
 	// workflow sweeps resume, ddlDeferrals counts its consecutive passes
 	// with deferred partition work, and keptPasses its consecutive
 	// maintenance passes this term that kept a partition past retention for
-	// its index.
+	// an index build that is not under way.
 	settleAfter, promoteAfter driver.JobID
 	ddlDeferrals, keptPasses  int
 	streamPoke                chan struct{}

@@ -902,11 +902,11 @@ type HistoryIndexResult struct {
 	// Postgres's May 2026 minor releases. Queries that need it read every
 	// partition instead.
 	Invalid []string
-	// Deferred names indexes whose attach (a storage unit's index, once
-	// built) or repair (an outcome table's) could not get its lock within
-	// LockTimeout, held off by a transaction that read or wrote the storage
-	// unit it locks; a later pass retries them, without building a built
-	// index again.
+	// Deferred names indexes whose build (a storage unit's index), attach
+	// (the same, once built) or repair (an outcome table's) could not get its
+	// lock within LockTimeout, held off by a transaction that read or wrote
+	// the storage unit it locks, or that holds the unit's maintenance lock; a
+	// later pass retries them, without building a built index again.
 	Deferred []string
 }
 

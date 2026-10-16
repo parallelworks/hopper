@@ -1158,8 +1158,13 @@ partitions while the table's `DEFAULT` partition is being built: a drop takes `A
 EXCLUSIVE` locks on the table and then on its `DEFAULT` partition, so it would hold
 every query of the table up while it waited for the build, which waits for the drop's
 snapshot in turn. Retention holds those locks only while it drops the partition, and
-creation the table's only while it creates one, so a build waits for them and skips
-a partition dropped meanwhile. A drop the deadlock detector
+creation the table's only while it creates one, in share mode, which a build's
+exclusive hold conflicts with and an overlapping leader's retention or creation does
+not: a lock found held always means a build. A build waits for them, under the
+doubling lock timeout of deferred partition work, and skips a partition dropped
+meanwhile; one that times out, behind a transaction left open with the lock, is
+reported deferred (`HistoryIndexResult.Deferred`) rather than stall the pass, and
+every other leader's, behind the schema's build lock. A drop the deadlock detector
 picks over a build waiting for its snapshot is deferred. A build cut short by the end of a term
 leaves an invalid index, which the next build drops and builds again. Postgres marks
 an outcome table's index valid only in the attach that completes it, so retention
@@ -1173,10 +1178,16 @@ build, once, after an upgrade. Once every index is valid, no partition is being 
 and a drop skips the locks and the check. The leader logs kept partitions, and warns
 once it has kept one whose build is not under way (`HistoryMaintainResult.Building`
 lists those whose build lock is held) for five maintenance passes in a row (the retries
-of deferred work on the leader passes between them do not count), which means their
-builds keep failing; a long build is no failure, and resets the count. An index an earlier release left
+of deferred work on the leader passes between them do not count, and a pass that
+deferred a drop, which may have left the kept partition untried, neither counts nor
+resets the run), which means their builds keep failing; a long build is no failure,
+and resets the count. An index an earlier release left
 invalid is revalidated by attaching one of its partitions' indexes again, which
-releases from May 2026 on count anew. The attach waits for its locks under the same
+releases from May 2026 on count anew. The pass first asks the server whether its
+attach counts anew, on temporary tables in a transaction it rolls back, rather than by
+its version, which forks number their own way; where it does not, the index is
+reported invalid without locking the partition (a role that may not create temporary
+tables tries the attach itself). The attach waits for its locks under the same
 doubling timeout as deferred partition work (`HistoryIndexParams.LockTimeout`), since
 the partition's queries queue behind it; so does the attach that ends a build. One
 that cannot get them is reported (`HistoryIndexResult.Deferred`, naming the

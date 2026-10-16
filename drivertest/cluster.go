@@ -484,8 +484,9 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
 
 	// A transaction that read every history partition holds the re-attach
-	// off: the pass reports the index deferred, for the next to retry,
-	// without waiting for the reader or reporting the index invalid.
+	// off: where the attach repairs, the pass reports the index deferred,
+	// for the next to retry, without waiting for the reader; where it
+	// cannot, the pass reports it invalid without trying.
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
 	if _, err := d.UnwrapTx(tx).JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10}); err != nil {
@@ -493,7 +494,11 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	start = time.Now()
 	held, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{LockTimeout: 50 * time.Millisecond})
-	if err != nil || len(held.Invalid) != 0 || !slices.Equal(held.Deferred, []string{"hopper_job_history_failed_ordering"}) {
+	wantInvalid, wantDeferred := []string(nil), []string{"hopper_job_history_failed_ordering"}
+	if !repairs {
+		wantInvalid, wantDeferred = wantDeferred, nil
+	}
+	if err != nil || !slices.Equal(held.Invalid, wantInvalid) || !slices.Equal(held.Deferred, wantDeferred) {
 		t.Errorf("revalidation behind a reader = %+v, %v", held, err)
 	}
 	if took := time.Since(start); took > 5*time.Second {
@@ -637,16 +642,17 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	// the partition rather than dropping it under the build, and drops the
 	// others past retention.
 	pending := redeclare("20000106", "20000107")
-	// holdBuildLock holds HistoryIndexLockKey combined with name for two
-	// seconds, as a build does, and returns once it is held, with a channel
-	// closed once it is released.
-	holdBuildLock := func(name string) <-chan struct{} {
+	// holdIndexLock holds HistoryIndexLockKey combined with name for two
+	// seconds, through lock (exclusively, as a build does, or in share mode,
+	// as retention and partition creation do), and returns once it is held,
+	// with a channel closed once it is released.
+	holdIndexLock := func(lock, name string) <-chan struct{} {
 		t.Helper()
 		const buildLock = "hashtext(current_schema() || '.' || $1), 1752133737" // HistoryIndexLockKey
 		released := make(chan struct{})
 		go func() {
 			defer close(released)
-			f.Exec(ctx, t, d, "SELECT pg_advisory_xact_lock("+buildLock+"), pg_sleep(2)", name)
+			f.Exec(ctx, t, d, "SELECT "+lock+"("+buildLock+"), pg_sleep(2)", name)
 		}()
 		for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
 			"SELECT (NOT pg_try_advisory_xact_lock("+buildLock+"))::text", name) != "true"; time.Sleep(10 * time.Millisecond) {
@@ -656,6 +662,7 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 		}
 		return released
 	}
+	holdBuildLock := func(name string) <-chan struct{} { t.Helper(); return holdIndexLock("pg_advisory_xact_lock", name) }
 	released := holdBuildLock(pending[0])
 	res, err = exec.HistoryMaintain(ctx, keep)
 	if err != nil || !slices.Equal(res.Kept, pending[:1]) || !slices.Equal(res.Building, pending[:1]) || !slices.Equal(res.Dropped, pending[1:]) {
@@ -690,6 +697,48 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if v := valid(); v != "true" {
 		t.Errorf("valid after the DEFAULT partition's build = %s", v)
+	}
+
+	// An overlapping leader's retention or partition creation holds the
+	// partition's and the table's locks in share mode: retention drops the
+	// partition rather than keep it for a build no one runs.
+	// Partition creation likewise creates the furthest one ahead, dropped
+	// here, rather than defer it.
+	dropping := redeclare("20000109")
+	ahead := f.QueryText(ctx, t, d, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`)
+	f.Exec(ctx, t, d, "DROP TABLE "+ahead)
+	releasedPartition := holdIndexLock("pg_advisory_xact_lock_shared", dropping[0])
+	releasedTable := holdIndexLock("pg_advisory_xact_lock_shared", "hopper_job_history_failed")
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, dropping) || !slices.Equal(res.Created, []string{ahead}) ||
+		len(res.Kept)+len(res.Building)+len(res.Deferred) != 0 {
+		t.Errorf("maintain beside another leader's retention = %+v, %v", res, err)
+	}
+	<-releasedPartition
+	<-releasedTable
+
+	// A transaction left open holding a partition's lock holds its build off
+	// no longer than the lock timeout: the pass reports the build deferred
+	// rather than stall behind it.
+	stalled := redeclare("20000110")
+	// The other partitions are skipped: their builds would wait for the
+	// holder's snapshot until it lets go of the lock.
+	others := strings.Split(f.QueryText(ctx, t, d, `SELECT string_agg(c.relname, ',') FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> $1`, stalled[0]), ",")
+	released = holdIndexLock("pg_advisory_xact_lock_shared", stalled[0])
+	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: others, LockTimeout: 50 * time.Millisecond}); err != nil ||
+		!slices.Contains(res.Deferred, stalled[0]+"_ordering") {
+		t.Errorf("index behind a held partition lock = %+v, %v", res, err)
+	}
+	<-released
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, stalled) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the deferred build = %+v, %v", res, err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after the deferred build = %s", v)
 	}
 
 	// Retention dropping partitions while the leader builds the others'.

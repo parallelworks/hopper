@@ -420,7 +420,7 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 			deferrals = 0
 		} else {
 			deferrals++
-			c.logger.Log(ctx, repeatLevel(deferrals, slog.LevelDebug), "hopper: history index attach deferred: a transaction that used the partition held its lock",
+			c.logger.Log(ctx, repeatLevel(deferrals, slog.LevelDebug), "hopper: history index work deferred: a transaction that used the partition, or one left open with its maintenance lock, held its lock",
 				"indexes", res.Deferred, "lock_timeout", timeout, "passes", deferrals)
 		}
 		select {
@@ -483,8 +483,11 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	// Kept partitions wait for the index loop, which runs every maintenance
 	// interval, so only those passes count towards the warning, and only
 	// while a partition waits for a build that is not under way: a long
-	// build is no failure.
+	// build is no failure. A pass that deferred drops may have left a
+	// kept partition among them, untried behind another drop or held off
+	// from its check, so it keeps the count rather than reset it.
 	switch {
+	case len(res.Kept) == 0 && len(res.Deferred) > 0:
 	case len(res.Kept) == len(res.Building):
 		c.keptPasses = 0
 		if len(res.Kept) > 0 && !retry {
