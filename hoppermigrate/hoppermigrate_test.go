@@ -393,10 +393,11 @@ func TestTagsUpgrade(t *testing.T) {
 	partition := "hopper_job_history_completed_" + hour.Format("2006010215")
 	exec(fmt.Sprintf("CREATE TABLE %s PARTITION OF hopper_job_history_completed FOR VALUES FROM ('%s') TO ('%s')",
 		partition, hour.Add(-time.Hour).Format(time.RFC3339), hour.Add(2*time.Hour).Format(time.RFC3339)))
-	// One of a period past, which no job is finalized into any more.
-	past := "hopper_job_history_completed_" + hour.Add(-5*time.Hour).Format("2006010215")
+	// One of a day past, which no job is finalized into any more.
+	pastHour := hour.Add(-72 * time.Hour)
+	past := "hopper_job_history_completed_" + pastHour.Format("2006010215")
 	exec(fmt.Sprintf("CREATE TABLE %s PARTITION OF hopper_job_history_completed FOR VALUES FROM ('%s') TO ('%s')",
-		past, hour.Add(-5*time.Hour).Format(time.RFC3339), hour.Add(-4*time.Hour).Format(time.RFC3339)))
+		past, pastHour.Format(time.RFC3339), pastHour.Add(time.Hour).Format(time.RFC3339)))
 	exec("INSERT INTO hopper_jobs (kind) SELECT 'k' FROM generate_series(1, 100)")
 	exec(fmt.Sprintf(archive, "", "true"))
 	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
@@ -425,10 +426,10 @@ func TestTagsUpgrade(t *testing.T) {
 	if l, h := count("SELECT count(*) FROM hopper_job_tags"), count("SELECT count(*) FROM hopper_job_history_tags WHERE id = $1::uuid AND state = 'completed'", id); l != 0 || h != 2 {
 		t.Errorf("after the move to history: %d live tags rows, want 0, and %d history tags rows, want 2", l, h)
 	}
-	// The upgrade gave history's time partition its tags partition, where
-	// the job's tags rows went with it.
-	if n := count("SELECT count(*) FROM "+strings.Replace(partition, "history_", "history_tags_", 1)+" WHERE id = $1::uuid", id); n != 2 {
-		t.Errorf("%d tags rows beside the job's history partition, want 2", n)
+	// The upgrade gave the days of history's time partition their tags
+	// partitions, where the job's tags rows went with it.
+	if n := count("SELECT count(*) FROM hopper_job_history_tags_completed_"+hour.Format("20060102")+" WHERE id = $1::uuid", id); n != 2 {
+		t.Errorf("%d tags rows in the tags partition of the job's day, want 2", n)
 	}
 	// Tags compare by their bytes, whatever the database's collation.
 	if n := count(`SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
@@ -437,7 +438,7 @@ func TestTagsUpgrade(t *testing.T) {
 		t.Errorf("%d tags tables' tag columns use a collation other than C", n)
 	}
 	if n := count("SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relname = $1",
-		strings.Replace(past, "history_", "history_tags_", 1)); n != 0 {
+		"hopper_job_history_tags_completed_"+pastHour.Format("20060102")); n != 0 {
 		t.Errorf("the past period's history partition got %d tags partitions, want 0", n)
 	}
 	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
@@ -523,7 +524,7 @@ func TestTagsUpgradeLocksOnlyInItsRetryLoop(t *testing.T) {
 	}
 	var n int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relname = $1 AND relnamespace = current_schema()::regnamespace",
-		"hopper_job_history_tags_completed_"+hour.Format("2006010215")).Scan(&n); err != nil {
+		"hopper_job_history_tags_completed_"+hour.Format("20060102")).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
@@ -976,14 +977,20 @@ func TestTagsUpgradeCopiesBoundsInAnyDateStyle(t *testing.T) {
 	if _, err := hoppermigrate.Up(ctx, testdb.Driver(styled), &hoppermigrate.Options{Logger: logger}); err != nil {
 		t.Fatal(err)
 	}
-	var history, tags string
-	if err := pool.QueryRow(ctx, `SELECT pg_get_expr(h.relpartbound, h.oid), coalesce(pg_get_expr(g.relpartbound, g.oid), '')
-		FROM pg_class h LEFT JOIN pg_class g ON g.relname = $2 AND g.relnamespace = h.relnamespace
-		WHERE h.relname = $1 AND h.relnamespace = current_schema()::regnamespace`,
-		partition, strings.Replace(partition, "history_", "history_tags_", 1)).Scan(&history, &tags); err != nil {
-		t.Fatal(err)
-	}
-	if tags != history {
-		t.Errorf("tags partition bound %q, want history's %q", tags, history)
+	// Each day the history partition overlaps has its tags partition, whose
+	// bounds are that day's in UTC.
+	for day := hour.Truncate(24 * time.Hour); day.Before(hour.Add(2 * time.Hour)); day = day.Add(24 * time.Hour) {
+		var bound string
+		var exact bool
+		if err := pool.QueryRow(ctx, `SELECT coalesce(pg_get_expr(g.relpartbound, g.oid), ''),
+			  coalesce((regexp_match(pg_get_expr(g.relpartbound, g.oid), 'FROM \(''([^'']+)''\)'))[1]::timestamptz = $2
+			    AND (regexp_match(pg_get_expr(g.relpartbound, g.oid), 'TO \(''([^'']+)''\)'))[1]::timestamptz = $3, false)
+			FROM (SELECT 1) one LEFT JOIN pg_class g ON g.relname = $1 AND g.relnamespace = current_schema()::regnamespace`,
+			"hopper_job_history_tags_completed_"+day.Format("20060102"), day, day.Add(24*time.Hour)).Scan(&bound, &exact); err != nil {
+			t.Fatal(err)
+		}
+		if !exact {
+			t.Errorf("tags partition of %s has bound %q, want that day in UTC", day.Format("2006-01-02"), bound)
+		}
 	}
 }

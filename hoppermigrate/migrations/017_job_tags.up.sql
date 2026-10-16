@@ -56,10 +56,13 @@ CREATE TABLE hopper_job_history_tags_failed_default PARTITION OF hopper_job_hist
 -- Postgres requires, and still walks a tag's jobs in ID order.
 CREATE UNIQUE INDEX hopper_job_history_tags_tag ON hopper_job_history_tags (tag, id, state, finalized_at);
 
--- The time partitions history already has for the current period and those
--- ahead get their tags partitions here, so that a job's tags rows sit in the
--- partition its job does from the start; the leader creates later ones
--- beside history's. A past period's partition gets none: a job is
+-- History's tags rows are partitioned by outcome, as history is, and then by
+-- day, also for completed jobs, whose history is partitioned by the hour, so
+-- that a walk of a tag's rows plans a partition a day of retention. The days
+-- of the time partitions history already has for the current period and
+-- those ahead get their tags partitions here, so that a job's tags rows sit
+-- in a time partition from the start; the leader creates later ones beside
+-- history's. A past period's partition gets none: a job is
 -- finalized into history at now(), so only a direct SQL write could give it
 -- tags rows, which the tags' DEFAULT partition keeps instead, and a
 -- retention of months would otherwise create a table, with its index, for
@@ -76,6 +79,8 @@ CREATE UNIQUE INDEX hopper_job_history_tags_tag ON hopper_job_history_tags (tag,
 DO $$
 DECLARE
   p record;
+  day timestamptz;
+  upto timestamptz;
   prior_datestyle constant text := current_setting('datestyle');
 BEGIN
   PERFORM set_config('datestyle', 'ISO', true);
@@ -86,10 +91,17 @@ BEGIN
     WHERE i.inhparent IN ('hopper_job_history_completed'::regclass, 'hopper_job_history_failed'::regclass)
       AND c.oid <> pt.partdefid
   LOOP
-    IF (regexp_match(p.bound, 'TO \(''([^'']+)''\)'))[1]::timestamptz > now() THEN
-      EXECUTE format('CREATE TABLE %I PARTITION OF %I %s',
-        'hopper_job_history_tags_' || substr(p.name, length('hopper_job_history_') + 1),
-        'hopper_job_history_tags_' || substr(p.parent, length('hopper_job_history_') + 1), p.bound);
+    upto := (regexp_match(p.bound, 'TO \(''([^'']+)''\)'))[1]::timestamptz;
+    IF upto > now() THEN
+      -- Every day the partition's period overlaps, should it cross midnight.
+      FOR day IN SELECT generate_series(
+          date_trunc('day', (regexp_match(p.bound, 'FROM \(''([^'']+)''\)'))[1]::timestamptz AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+          upto - interval '1 microsecond', interval '1 day')
+      LOOP
+        EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF %I FOR VALUES FROM (%L) TO (%L)',
+          'hopper_job_history_tags_' || substr(p.parent, length('hopper_job_history_') + 1) || '_' || to_char(day AT TIME ZONE 'UTC', 'YYYYMMDD'),
+          'hopper_job_history_tags_' || substr(p.parent, length('hopper_job_history_') + 1), day, day + interval '1 day');
+      END LOOP;
     END IF;
   END LOOP;
   PERFORM set_config('datestyle', prior_datestyle, true);

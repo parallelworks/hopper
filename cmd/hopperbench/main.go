@@ -244,8 +244,11 @@ func (b *bench) reset(ctx context.Context) error {
 			    start := (date_trunc('hour', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - make_interval(hours => h);
 			    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF hopper_job_history_completed FOR VALUES FROM (%L) TO (%L)',
 			      'hopper_job_history_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDDHH24'), start, start + interval '1 hour');
+			  END LOOP;
+			  FOR h IN 0..1 LOOP
+			    start := (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - make_interval(days => h);
 			    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF hopper_job_history_tags_completed FOR VALUES FROM (%L) TO (%L)',
-			      'hopper_job_history_tags_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDDHH24'), start, start + interval '1 hour');
+			      'hopper_job_history_tags_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDD'), start, start + interval '1 day');
 			  END LOOP;
 			END $$`); err != nil {
 			return fmt.Errorf("preload partitions: %w", err)

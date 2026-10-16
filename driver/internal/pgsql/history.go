@@ -52,11 +52,14 @@ var historyGroups = []historyGroup{
 	{root: "hopper_job_history", parent: "hopper_job_history_completed", timeColumn: "finalized_at", period: time.Hour, ahead: 3, format: "2006010215"},
 	{root: "hopper_job_history", parent: "hopper_job_history_failed", timeColumn: "finalized_at", period: 24 * time.Hour, ahead: 2, format: "20060102"},
 	{root: "hopper_stream_events", parent: "hopper_stream_events", timeColumn: "created_at", period: 24 * time.Hour, ahead: 2, format: "20060102"},
-	// History's tags rows (schema v17), partitioned as history is, so that
-	// retention drops them with their jobs. A tags partition is dropped
-	// only once its history partition is gone, in a statement of its own:
-	// these groups come after history's, so a pass drops both.
-	{root: "hopper_job_history_tags", parent: "hopper_job_history_tags_completed", timeColumn: "finalized_at", period: time.Hour, ahead: 3, format: "2006010215", mirrors: "hopper_job_history_completed"},
+	// History's tags rows (schema v17), partitioned by outcome as history is
+	// and then by day, so that retention drops them with their jobs and a
+	// walk of a tag's rows plans a partition a day: by the hour, a month's
+	// retention of completed jobs would be 720. A day's tags partition is
+	// dropped only once every history partition of that day is gone, in a
+	// statement of its own: these groups come after history's, so a pass
+	// drops a day's last history partition and its tags partition together.
+	{root: "hopper_job_history_tags", parent: "hopper_job_history_tags_completed", timeColumn: "finalized_at", period: 24 * time.Hour, ahead: 2, format: "20060102", mirrors: "hopper_job_history_completed"},
 	{root: "hopper_job_history_tags", parent: "hopper_job_history_tags_failed", timeColumn: "finalized_at", period: 24 * time.Hour, ahead: 2, format: "20060102", mirrors: "hopper_job_history_failed"},
 }
 
@@ -963,20 +966,25 @@ func (e *Executor) partitionsOf(ctx context.Context, parent string) (map[string]
 }
 
 // mirroredPartitions reports which of g's expired partitions, names, still
-// have the partition of g.mirrors for the same period, in one statement for
-// the whole group: a tags partition goes only once its history partition is
-// gone.
+// have a partition of g.mirrors in their period, in one statement for the
+// whole group: a tags partition goes only once every history partition of
+// its day is gone.
 func (e *Executor) mirroredPartitions(ctx context.Context, g historyGroup, names []string) (map[string]bool, error) {
 	if g.mirrors == "" || len(names) == 0 {
 		return nil, nil
 	}
-	mirrors := make([]string, len(names))
-	for i, name := range names {
-		mirrors[i] = e.Schema.Table(g.mirrors + strings.TrimPrefix(name, g.parent))
+	mirror := historyGroups[slices.IndexFunc(historyGroups, func(m historyGroup) bool { return m.parent == g.mirrors })]
+	var owners, mirrors []string
+	for _, name := range names {
+		from, _ := g.parse(name)
+		for at := from; at.Before(from.Add(g.period)); at = at.Add(mirror.period) {
+			owners = append(owners, name)
+			mirrors = append(mirrors, e.Schema.Table(mirror.name(at)))
+		}
 	}
 	found, err := scanStrings(e.Conn.Query(ctx, `
-		SELECT n FROM unnest($1::text[], $2::text[]) AS m(n, mirror) WHERE to_regclass(m.mirror) IS NOT NULL`,
-		textArray(names), textArray(mirrors)))
+		SELECT DISTINCT n FROM unnest($1::text[], $2::text[]) AS m(n, mirror) WHERE to_regclass(m.mirror) IS NOT NULL`,
+		textArray(owners), textArray(mirrors)))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: check partitions of %s: %w", g.mirrors, err)
 	}

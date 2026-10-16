@@ -102,9 +102,9 @@ func TestHistoryMaintain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 3 hourly and 2 daily periods ahead of the current ones, for history and
-	// for its tags rows, and 2 daily stream partitions.
-	if len(res.Created) != 2*(3+2)+2 {
+	// 3 hourly and 2 daily periods ahead of the current ones for history, 2
+	// days ahead for each outcome's tags rows, and 2 daily stream partitions.
+	if len(res.Created) != 3+2+2*2+2 {
 		t.Errorf("created = %v", res.Created)
 	}
 	next := "hopper_job_history_completed_" + time.Now().UTC().Add(time.Hour).Format("2006010215")
@@ -188,9 +188,8 @@ func TestHistoryMaintainGoesPastGroupError(t *testing.T) {
 	if _, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err == nil {
 		t.Fatal("HistoryMaintain with a stream log partition that cannot attach = nil error")
 	}
-	hour := now.UTC().Truncate(time.Hour).Add(time.Hour)
 	var exists bool
-	if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", "hopper_job_history_tags_completed_"+hour.Format("2006010215")).Scan(&exists); err != nil || !exists {
+	if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", "hopper_job_history_tags_completed_"+day.Format("20060102")).Scan(&exists); err != nil || !exists {
 		t.Errorf("history tags partition ahead exists = %t, %v; want it created past the stream log's error", exists, err)
 	}
 }
@@ -235,11 +234,11 @@ func TestTagsPartitionKeptWhileHistoryPruneFails(t *testing.T) {
 	t.Parallel()
 	ctx, d, exec := setup(t)
 	pool := d.Pool()
-	const tagsPartition = "hopper_job_history_tags_completed_2020010100"
+	const tagsPartition = "hopper_job_history_tags_completed_20200101"
 	var id string
 	for _, q := range []string{
 		`CREATE TABLE ` + tagsPartition + ` PARTITION OF hopper_job_history_tags_completed
-		 FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`,
+		 FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-02 00:00:00+00')`,
 		`CREATE FUNCTION refuse_prune() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'prune refused'; END $$`,
 		`CREATE TRIGGER refuse_prune BEFORE DELETE ON hopper_job_history_completed_default
 		 FOR EACH ROW EXECUTE FUNCTION refuse_prune()`,
@@ -269,6 +268,46 @@ func TestTagsPartitionKeptWhileHistoryPruneFails(t *testing.T) {
 	res, err = exec.HistoryMaintain(ctx, p)
 	if err != nil || !slices.Contains(res.Dropped, tagsPartition) {
 		t.Errorf("maintenance once history's prune runs = %+v, %v; want %s dropped", res, err, tagsPartition)
+	}
+}
+
+// TestTagsDayWaitsForEveryHourOfIt checks that a day's tags partition is
+// dropped only once every hourly history partition of that day is gone: while
+// a reader holds the drop of the day's second hour off, the day's tags
+// partition, which holds that hour's jobs' tags rows too, stays.
+func TestTagsDayWaitsForEveryHourOfIt(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	const first, second, day = "hopper_job_history_completed_2020010100", "hopper_job_history_completed_2020010101", "hopper_job_history_tags_completed_20200101"
+	for _, q := range []string{
+		`CREATE TABLE ` + first + ` PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`,
+		`CREATE TABLE ` + second + ` PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2020-01-01 01:00:00+00') TO ('2020-01-01 02:00:00+00')`,
+		`CREATE TABLE ` + day + ` PARTITION OF hopper_job_history_tags_completed FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-02 00:00:00+00')`,
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Rollback(ctx) //nolint:errcheck // read only
+	if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+second); err != nil {
+		t.Fatal(err)
+	}
+	p := driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, FailedRetention: 7 * 24 * time.Hour}
+	res, err := exec.HistoryMaintain(ctx, p)
+	if err != nil || slices.Contains(res.Dropped, second) || slices.Contains(res.Dropped, day) {
+		t.Errorf("maintenance while %s is read = %+v, %v; want it and %s kept", second, res, err, day)
+	}
+	if err := reader.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err = exec.HistoryMaintain(ctx, p)
+	if err != nil || !slices.Contains(res.Dropped, day) {
+		t.Errorf("maintenance once every hour of the day can go = %+v, %v; want %s dropped", res, err, day)
 	}
 }
 
@@ -596,12 +635,16 @@ func TestRetentionChecksTagsPartitionsTogether(t *testing.T) {
 	if _, err := exec.HistoryMaintain(ctx, p); err != nil {
 		t.Fatal(err)
 	}
-	addHour := func(h int) {
+	// A day's first hour of history, and the day's tags partition.
+	addDay := func(d int) {
 		t.Helper()
-		from := time.Date(2020, 1, 1, h, 0, 0, 0, time.UTC)
-		for _, parent := range []string{"hopper_job_history_completed", "hopper_job_history_tags_completed"} {
+		from := time.Date(2020, 1, 1+d, 0, 0, 0, 0, time.UTC)
+		for _, p := range []struct {
+			parent, format string
+			period         time.Duration
+		}{{"hopper_job_history_completed", "2006010215", time.Hour}, {"hopper_job_history_tags_completed", "20060102", 24 * time.Hour}} {
 			if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s_%s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')`,
-				parent, from.Format("2006010215"), parent, from.Format(time.RFC3339), from.Add(time.Hour).Format(time.RFC3339))); err != nil {
+				p.parent, from.Format(p.format), p.parent, from.Format(time.RFC3339), from.Add(p.period).Format(time.RFC3339))); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -637,10 +680,10 @@ func TestRetentionChecksTagsPartitionsTogether(t *testing.T) {
 			}
 		}
 	}
-	addHour(0)
+	addDay(0)
 	one := pass()
-	for h := 1; h < 20; h++ {
-		addHour(h)
+	for d := 1; d < 20; d++ {
+		addDay(d)
 	}
 	if many := pass(); many != one {
 		t.Errorf("retention over 20 tags partitions waiting for history ran %d statements, over one %d; want the same", many, one)

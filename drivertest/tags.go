@@ -377,11 +377,11 @@ func testTagsPartitionWaitsForHistory[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.HistoryMaintain(ctx, p); err != nil {
 		t.Fatal(err)
 	}
-	const old, oldTags = "hopper_job_history_completed_2020010100", "hopper_job_history_tags_completed_2020010100"
-	for _, part := range [][2]string{{old, "hopper_job_history_completed"}, {oldTags, "hopper_job_history_tags_completed"}} {
-		f.Exec(ctx, t, d, `CREATE TABLE `+part[0]+` PARTITION OF `+part[1]+`
-			FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`)
-	}
+	const old, oldTags = "hopper_job_history_completed_2020010100", "hopper_job_history_tags_completed_20200101"
+	f.Exec(ctx, t, d, `CREATE TABLE `+old+` PARTITION OF hopper_job_history_completed
+		FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`)
+	f.Exec(ctx, t, d, `CREATE TABLE `+oldTags+` PARTITION OF hopper_job_history_tags_completed
+		FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-02 00:00:00+00')`)
 	insert(ctx, t, exec, params("k", 1))
 	id := f.QueryText(ctx, t, d, `INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts,
 		  scheduled_at, args, metadata, errors, await, created_at, finalized_at, tags)
