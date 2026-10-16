@@ -3,7 +3,7 @@ version: 2
 # compromised release is likely to have been pulled before it is proposed here.
 updates:
   - package-ecosystem: gomod
-    directories: ["/", "/tools", "/hopperotel", "/hopperui"]
+    directories: ["/", "/tools", "/tools/dev", "/hopperotel", "/hopperui"]
     schedule: { interval: weekly }
     cooldown: { default-days: 7 }
     commit-message: { prefix: "build(deps)" }

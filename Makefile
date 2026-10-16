@@ -5,12 +5,13 @@ SHELL := /bin/bash
 
 # Development tools are pinned in tools/go.mod and run with `go tool`.
 GOTOOL := go tool -modfile=tools/go.mod
+# dev runs what dev.json describes; see github.com/parallelworks/foundation/dev.
+# It has a module of its own, since it needs a newer Go than the rest.
+DEV := go tool -modfile=tools/dev/go.mod dev
 
-# Integration tests need a Postgres 14+ database. `make pg` starts one in Docker.
-PG_CONTAINER ?= hopper-postgres
-PG_PORT      ?= 54329
-PG_IMAGE     ?= postgres:17-alpine
-HOPPER_TEST_DATABASE_URL ?= postgres://hopper:hopper@localhost:$(PG_PORT)/hopper_test?sslmode=disable
+# Integration tests need a Postgres 14+ database. `make devstack` runs one
+# natively on the port in dev.json; set HOPPER_TEST_DATABASE_URL for another.
+HOPPER_TEST_DATABASE_URL ?= postgres://hopper:hopper@localhost:54329/hopper_test?sslmode=disable
 export HOPPER_TEST_DATABASE_URL
 
 .PHONY: help
@@ -19,16 +20,17 @@ help: ## Show this help
 
 ## Local development
 
-.PHONY: pg
-pg: ## Start a throwaway Postgres for tests (data is not persisted)
-	docker run -d --rm --name $(PG_CONTAINER) -p $(PG_PORT):5432 \
-		-e POSTGRES_USER=hopper -e POSTGRES_PASSWORD=hopper -e POSTGRES_DB=hopper_test \
-		$(PG_IMAGE) -c fsync=off -c synchronous_commit=off -c max_connections=300
-	@until docker exec $(PG_CONTAINER) pg_isready -U hopper -d hopper_test >/dev/null 2>&1; do sleep 0.5; done
+.PHONY: devstack
+devstack: ## Run Postgres natively for tests until interrupted (data in .devstack/)
+	$(DEV) stack
 
-.PHONY: pg-down
-pg-down: ## Stop the test Postgres
-	-docker stop $(PG_CONTAINER)
+.PHONY: devstack-wait
+devstack-wait: ## Wait until a `make devstack` started elsewhere accepts connections
+	$(DEV) wait
+
+.PHONY: reset
+reset: ## Delete the local Postgres data (stop `make devstack` first)
+	$(DEV) reset
 
 ## Quality
 
@@ -46,7 +48,13 @@ fmt: ## Format Go code
 	$(GOTOOL) golangci-lint fmt
 
 .PHONY: test
-test: ## Run tests (integration tests need `make pg` or HOPPER_TEST_DATABASE_URL)
+test: ## Run tests (integration tests need `make devstack` or HOPPER_TEST_DATABASE_URL)
+	@# Under a running `dev`, whose ports move when taken, its environment
+	@# gives the database; otherwise the default above does.
+	@if $(DEV) status >/dev/null 2>&1; then $(DEV) exec -- $(MAKE) test-modules; else $(MAKE) test-modules; fi
+
+.PHONY: test-modules
+test-modules:
 	go test -race -cover -timeout 10m ./...
 	cd hopperotel && go test -race -cover -timeout 10m ./...
 	cd hopperui && go test -race -cover -timeout 10m ./...

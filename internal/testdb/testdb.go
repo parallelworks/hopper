@@ -1,7 +1,7 @@
 // Package testdb gives integration tests a Postgres database of their own.
 //
 // Each test gets a fresh schema, so tests run in parallel and leave nothing
-// behind. The database comes from HOPPER_TEST_DATABASE_URL; without it,
+// behind, unless the test binary is killed. The database comes from HOPPER_TEST_DATABASE_URL; without it,
 // integration tests are skipped.
 package testdb
 
@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -22,12 +23,17 @@ import (
 
 var counter atomic.Int64
 
+// run tells this process's schemas from those of an earlier process with the
+// same PID, whose schemas a killed test left behind in a database that
+// persists between runs.
+var run = rand.Uint32()
+
 // URL returns HOPPER_TEST_DATABASE_URL or skips the test.
 func URL(t testing.TB) string {
 	t.Helper()
 	url := os.Getenv("HOPPER_TEST_DATABASE_URL")
 	if url == "" {
-		t.Skip("HOPPER_TEST_DATABASE_URL not set; run `make pg` and `make test`")
+		t.Skip("HOPPER_TEST_DATABASE_URL not set; run `make devstack` and `make test`")
 	}
 	return url
 }
@@ -50,7 +56,7 @@ func EmptyPool(t testing.TB, maxConns int32) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 	url := URL(t)
-	schema := fmt.Sprintf("hopper_test_%d_%d", os.Getpid(), counter.Add(1))
+	schema := fmt.Sprintf("hopper_test_%d_%08x_%d", os.Getpid(), run, counter.Add(1))
 
 	admin, err := pgx.Connect(ctx, url)
 	if err != nil {
