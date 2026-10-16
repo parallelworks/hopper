@@ -527,7 +527,7 @@ CREATE TABLE hopper_job_tags (tag text COLLATE "C" NOT NULL, id uuid NOT NULL, P
 CREATE TABLE hopper_job_history_tags (
   state hopper_job_state NOT NULL, finalized_at timestamptz NOT NULL, tag text COLLATE "C" NOT NULL,
   id uuid NOT NULL
-) PARTITION BY LIST (state);                    -- partitioned as hopper_job_history is
+) PARTITION BY LIST (state);                    -- then by day, for both outcomes (§7.10)
 CREATE UNIQUE INDEX hopper_job_history_tags_tag                -- a job's tags rows are unique
   ON hopper_job_history_tags (tag, id, state, finalized_at);
 
@@ -736,12 +736,35 @@ skew between pods cannot cause early or duplicate execution.
   unique, as `hopper_job_tags`' are, so reinserting such a partition's rows fails
   (23505) rather than adding a second copy of each job's tags rows, which would list
   the job twice. A tagged job pays an index insert per tag when inserted and a
-  delete and an insert per tag when finalized. History's table is partitioned as history is, and
-  the leader creates and drops its time partitions with history's (§7.10), so
-  retention stays a partition drop. A listing by tag has an arm per tag and table (live
-  and history): it walks the tag's rows in ID order from the cursor, looks each row's
-  job up by key in a `LATERAL` subquery fenced with `OFFSET 0`, and stops at the page
-  size. The lookup checks the walked tag on the job's row too (`tags ? t.tag`), so
+  delete and an insert per tag when finalized. History's table is partitioned by
+  outcome as history is and then by day, and the leader creates and drops its
+  partitions with history's (§7.10), so retention stays a partition drop. A listing by
+  tag has an arm per table (live and history): for each of its tags (`unnest`) a
+  `LATERAL` subquery walks the tag's rows in ID order from the cursor and stops at the
+  page size, and the arm keeps each job once, in ID order, up to the page. On the live
+  table the walk looks each row's job up by key in a `LATERAL` subquery fenced with
+  `OFFSET 0`. In history that lookup is a `LATERAL` reference to a partition key, which
+  no plan can prune, so a page planned every one of history's partitions, once per tag:
+  at 30 days of hourly `completed` partitions (725) a page by 8 tags took 830 ms to plan
+  and one by 64 tags 8.5 s, against 15 ms and 81 ms at the default day. So outside a
+  transaction the listing reads history in two statements: the walk returns the page's
+  keys (ID, state and `finalized_at`), and a second statement reads the jobs with those
+  values as constants (`state = ANY('{...}') AND finalized_at = ANY('{...}') AND id =
+  ANY($n)`), which the planner prunes to the partitions the page's jobs are in, or the
+  `DEFAULT` partition for a period that has none. The live arm goes in that second
+  statement, so a page is two round trips. Both run in one `READ ONLY` `REPEATABLE
+  READ` transaction: under read committed a job finalized between them is in neither
+  the live table nor the keys the walk read, and a page would skip it; under one
+  snapshot a partition dropped or a job moved after the walk changes neither
+  statement's rows. The second statement applies the listing's other filters, so it can
+  return fewer jobs than the walk found. The page's jobs are known in full up to the
+  end of each arm that came back full, the live arm's last job and the walk's last key;
+  when the walk ends them short of a page, the listing walks history on from that key
+  in the same transaction, keeping the live jobs it has. Inside a caller's transaction (`JobsTx`) the listing cannot set the
+  isolation level, so its history arm looks jobs up inline as the live one does; it is
+  correct, and plans every partition. A statement leaves out a parameter it does not
+  use, since the server cannot type one it never sees (42P18), and numbers the rest in
+  order. The lookup checks the walked tag on the job's row too (`tags ? t.tag`), so
   that a tags row the column no longer holds lists nothing, whatever left it: a
   `TRUNCATE` of a partition, or a write with the triggers disabled. The walk is narrowed by what the tags table holds beside the tag, since the
   fence keeps the job query's filter out of it: the listing's `IDs`, and in history its
@@ -754,10 +777,11 @@ skew between pods cannot cause early or duplicate execution.
   query as the lookup makes it merge history's partitions in index order even when it
   takes the tag for a rare one, as a generic plan does, where ordering the walk in a
   subquery sorted every row of the tag. A job with several of `TagsAny`'s tags comes
-  from each of their arms, and the merge keeps one (`DISTINCT ON (id)`), so each arm
+  from each of their walks, and the arm keeps one (`DISTINCT ON (id)`), so each walk
   reads at most a page however much the tags overlap; leaving an earlier tag's jobs out
-  of each later arm instead walked the whole range of a tag whose jobs mostly had an
-  earlier one (seconds a page for two tags on the same 600,000 jobs). Repeated tags are
+  of each later walk instead walked the whole range of a tag whose jobs mostly had an
+  earlier one (seconds a page for two tags on the same 600,000 jobs). With one walk per
+  tag in one arm, the plan is the same for one tag as for 64. Repeated tags are
   dropped, in `TagsAll` as in `TagsAny`, so that a filter repeating one tag costs no more
   than one naming it once. `TagsAll` walks its rarest tag and checks
   the rest on the job's row (`tags ?& $n`): the listing's statement counts each tag up
@@ -778,7 +802,15 @@ skew between pods cannot cause early or duplicate execution.
   choose parallel scans and JIT compilation. On Postgres 18 with a million live and a
   million finished jobs, under generic plans, a page of 20 took 0.3 ms for a tag on
   every job, 0.1 ms for one on 18, 0.4 ms for both with `TagsAny`, and 1.2 ms with
-  `TagsAll` for the common tag and one on 2,000 jobs.
+  `TagsAll` for the common tag and one on 2,000 jobs. With 300,000 jobs (200,000 in
+  history) tagged with one of 64 tags and 8 more, a page of 100 under generic plans,
+  both statements together, took 1.8 to 3.2 ms to plan at the default day of
+  `completed` partitions (29) for 1 to 64 tags of `TagsAny` and 2 or 8 of `TagsAll`. At
+  30 days (725) the walk of 33 daily tags partitions planned in 0.3 to 1.1 ms, and the
+  second statement in 0.5 to 0.7 ms when the page's jobs had finished in a few hours
+  of each other, as jobs listed in ID order mostly have; with `finalized_at` random
+  across the 30 days, each job of the page was in a partition of its own and it took
+  6.5 to 7.4 ms, a cost bounded by the page size.
 - **Other filters:** `JobFilter.IDs` and `Priorities` match any of the given values,
   and `Metadata`, a JSON object, matches jobs whose metadata contains it (jsonb `@>`).
   Metadata has no index, since one would cost every insert; it narrows what the other
@@ -787,7 +819,7 @@ skew between pods cannot cause early or duplicate execution.
   out-of-range priority, `Metadata` that is not a JSON object or that jsonb's input
   refuses, a queue, kind, state or tag that the database's text refuses, a tag no job could
   have, or more distinct `TagsAny` or `TagsAll` than `MaxTags`, which bounds a
-  listing's arms) fails with `ErrInvalidFilter`. What the server's input refuses is
+  listing's walks) fails with `ErrInvalidFilter`. What the server's input refuses is
   left to it: text with a NUL or a character the database's encoding lacks, and for
   jsonb also bytes that are not UTF-8, a `\u0000` escape, an unpaired surrogate, a
   number beyond numeric's range, and nesting past the server's stack. No statement
@@ -1411,11 +1443,14 @@ instead. A schedule with no recorded slot starts from its next slot.
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.
 Retention is enforced by dropping whole partitions, so there is no `DELETE`, no dead
 tuples and no vacuum work. Their tags rows (schema v17, §7.2) live in `hopper_job_history_tags`,
-partitioned the same way, whose partitions the leader creates and drops beside
-history's, each in a transaction of its own. A tags partition is dropped only once its
-history partition is gone, after it in the same pass or in a later one, so that a job
-in history always keeps its tags rows; a tags partition left without its history
-partition indexes nothing a listing returns. A period that never had a history
+partitioned by outcome and then by day for both outcomes, whose partitions the leader
+creates (two days ahead) and drops beside history's, each in a transaction of its own.
+Daily partitions keep a listing's walk, which reads every tags partition of its
+outcome, to one per day of retention rather than one per hour. A tags partition is
+dropped only once every history partition covering its day is gone, after them in the
+same pass or in a later one, so that a job in history always keeps its tags rows; a
+tags partition left without its history partitions indexes nothing a listing
+returns. A period that never had a history
 partition has its jobs in history's `DEFAULT` partition, so tags partitions are dropped
 only in a pass whose history outcome group has pruned its `DEFAULT` partition; while
 that prune fails, they wait. Neither creation nor a drop locks both
@@ -1424,8 +1459,9 @@ history, so a statement that held one parent while it waited for the other could
 deadlock with either. A history partition that has no tags partition beside it, as one
 a previous release's leader creates, sends its jobs' tags rows to the tags table's
 `DEFAULT` partition, whose prune keeps the rows of jobs still in history. v17 gives
-history's partitions for the current period and those ahead theirs, so that a job's
-tags rows are in its job's partition from the upgrade on. A past period's partition
+each day that history's partitions for the current period and those ahead cover its
+tags partition, so that a job's tags rows are in their day's partition from the upgrade
+on. A past period's partition
 gets none: jobs are finalized into history at `now()`, so only a direct SQL write
 could give one tags rows, which the `DEFAULT` partition keeps, and a long retention
 would otherwise create a table and index per period in the migration's transaction. The leader creates partitions several intervals ahead
