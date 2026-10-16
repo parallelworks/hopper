@@ -52,8 +52,14 @@ func (r probeRow) Scan(dest ...any) error { return r(dest...) }
 
 func TestReattachRevalidatesOncePerBuild(t *testing.T) {
 	ctx := context.Background()
+	versions := []string{"PostgreSQL 18.4 probe-test-a", "PostgreSQL 18.4 probe-test-a", "PostgreSQL 18.5 probe-test-a"}
+	// The answers outlive the test in the package's cache, so a run before
+	// this one in the same process (go test -count) would have kept them.
+	for _, version := range versions {
+		revalidates.Delete(version)
+	}
 	var probes int
-	for _, version := range []string{"PostgreSQL 18.4 probe-test-a", "PostgreSQL 18.4 probe-test-a", "PostgreSQL 18.5 probe-test-a"} {
+	for _, version := range versions {
 		e := &Executor{Conn: probeConn{version: version, probes: &probes}, Schema: NewSchema("")}
 		if ok, err := e.reattachRevalidates(ctx); err != nil || !ok {
 			t.Fatalf("reattachRevalidates on %s = %v, %v", version, ok, err)

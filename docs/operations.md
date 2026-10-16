@@ -57,7 +57,9 @@
   runs under the pool's `statement_timeout` and waits for every older
   transaction in the database. A build that runs past the timeout is retried
   at doubling intervals with a warning; raise the timeout for hopper's role
-  until the warnings stop. Until a partition has its unique-key index, an insert
+  until the warnings stop. A timeout that ends a partition's creation or drop, or an
+  index's attach, while it waits for its locks defers that work like a lock timeout.
+  Until a partition has its unique-key index, an insert
   with `UniqueOpts.Finished` reads that partition in full. Retention keeps the
   last partition without an index past its retention until it has one, logged
   at Info; if it stays, its build is failing, and the `statement_timeout`

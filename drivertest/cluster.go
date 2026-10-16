@@ -511,9 +511,11 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 
-	// The re-attach takes the partition furthest ahead, which nothing reads
-	// or writes yet: a statement reading every other partition, the DEFAULT
-	// one and the current period's among them, does not hold it off.
+	// The re-attach takes the partition furthest ahead, which finalizes do
+	// not write to yet: a statement reading every other partition, the
+	// DEFAULT one and the current period's among them, does not hold it off.
+	// A reader that cannot narrow by finalized_at reads that partition too,
+	// and holds the re-attach off for up to the lock timeout.
 	if repairs {
 		others := strings.Split(f.QueryText(ctx, t, d, `SELECT string_agg(format('(SELECT count(*) FROM %I)', c.relname), ',')
 			FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = 'hopper_job_history_failed'::regclass
@@ -585,14 +587,19 @@ func reattachRevalidates[TTx any](ctx context.Context, t *testing.T, f Fixture[T
 // marks its parent valid, as Postgres does from the May 2026 releases (18.4,
 // 17.10, 16.14, 15.18, 14.23) on, which decides whether HistoryIndex can
 // repair an outcome table's index or reports it in
-// HistoryIndexResult.Invalid. exec runs a statement and queryText returns the
-// single text value a query selects, both on a Postgres database a test owns.
+// HistoryIndexResult.Invalid. It runs the driver's own probe: the parent's
+// index left invalid by dropping the one partition without an index, then
+// attached again. exec runs a statement and queryText returns the single
+// text value a query selects, both on a Postgres database a test owns.
 func ReattachRevalidates(exec func(query string), queryText func(query string) string) bool {
 	exec("CREATE TABLE revalidate_probe (k int) PARTITION BY LIST (k)")
 	exec("CREATE TABLE revalidate_probe_1 PARTITION OF revalidate_probe FOR VALUES IN (1)")
-	exec("CREATE INDEX revalidate_probe_k ON revalidate_probe (k)")
-	exec("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'revalidate_probe_k'::regclass")
-	exec("ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k_idx")
+	exec("CREATE TABLE revalidate_probe_2 PARTITION OF revalidate_probe FOR VALUES IN (2)")
+	exec("CREATE INDEX revalidate_probe_k ON ONLY revalidate_probe (k)")
+	exec("CREATE INDEX revalidate_probe_1_k ON revalidate_probe_1 (k)")
+	exec("ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k")
+	exec("DROP TABLE revalidate_probe_2")
+	exec("ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k")
 	valid := queryText("SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'revalidate_probe_k'::regclass") == "true"
 	exec("DROP TABLE revalidate_probe")
 	return valid

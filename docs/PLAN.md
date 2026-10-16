@@ -1255,9 +1255,10 @@ therefore holds up a group's finalizes for at most that timeout per kind of DDL 
 pass. A creation's wait for the history maintenance lock, which an overlapping leader's
 creation, retention or attach holds, runs under the same timeout, so a leader that
 stalls holding it defers the partitions ahead rather than stall this leader's loop and
-its lease renewal. A session `statement_timeout` no longer than the lock timeout would end
-these waits first, with a cancel that reads as a failure rather than a deferral, so they
-raise it to twice the lock timeout for their transaction. Deferrals are logged at debug level, and as a warning from the fifth pass in a
+its lease renewal. A session `statement_timeout` that runs out during one
+of these statements, which it can whatever its length since `lock_timeout` bounds each of
+a statement's lock waits rather than their sum, defers the work the same way rather than
+fail the pass. Deferrals are logged at debug level, and as a warning from the fifth pass in a
 row. Retention periods are set in `Config` and enforced by the leader, so the leader's
 settings apply cluster-wide.
 

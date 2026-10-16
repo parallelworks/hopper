@@ -1109,5 +1109,135 @@ func TestHistoryLockWaitOutlastsStatementTimeout(t *testing.T) {
 	}
 }
 
+// TestHistoryDropOutlastsStatementTimeoutAcrossLocks drops a partition past
+// retention on sessions whose statement_timeout is longer than the lock
+// timeout, while its parent and then the partition are held. Each wait ends
+// within the lock timeout, but the two together outlast statement_timeout:
+// the drop is deferred, rather than fail the pass.
+func TestHistoryDropOutlastsStatementTimeoutAcrossLocks(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.d.Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err != nil {
+		t.Fatal(err)
+	}
+	const old = "hopper_job_history_failed_20000101"
+	for _, q := range []string{
+		"CREATE TABLE " + old + " (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)",
+		"ALTER TABLE hopper_job_history_failed ATTACH PARTITION " + old + " FOR VALUES FROM ('2000-01-01Z') TO ('2000-01-02Z')",
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	hold := func(query string) pgxTx {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = tx.Rollback(ctx) })
+		if _, err := tx.Exec(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+	// DROP locks the parent first, then the partition.
+	parent := hold("LOCK TABLE ONLY hopper_job_history_failed IN ACCESS SHARE MODE")
+	hold("LOCK TABLE " + old + " IN ACCESS SHARE MODE")
+	time.AfterFunc(700*time.Millisecond, func() { _ = parent.Rollback(ctx) })
+	pcfg := h.pool.Config()
+	pcfg.ConnConfig.RuntimeParams["statement_timeout"] = "1500ms"
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	res, err := testdb.Driver(pool).Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{FailedRetention: 48 * time.Hour, LockTimeout: time.Second})
+	if err != nil || !slices.Contains(res.Deferred, old) {
+		t.Errorf("drop waiting on two locks past statement_timeout = %+v, %v", res, err)
+	}
+}
+
+// TestRetentionRechecksUnderStricterIsolation runs retention on sessions
+// whose default_transaction_isolation is repeatable read. The partition past
+// retention is one of two that the failed table's ordering-key index lacks,
+// and the other's index is attached while the drop waits for the history
+// maintenance lock. The drop's check under the lock must see that attach and
+// keep the partition, now the last the index lacks, rather than read the
+// partitions from before its wait and drop it.
+func TestRetentionRechecksUnderStricterIsolation(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	exec := func(query string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	if _, err := h.d.Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err != nil {
+		t.Fatal(err)
+	}
+	var ahead string
+	if err := h.pool.QueryRow(ctx, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`).Scan(&ahead); err != nil {
+		t.Fatal(err)
+	}
+	const old = "hopper_job_history_failed_20000101"
+	exec("DROP INDEX hopper_job_history_failed_ordering")
+	exec("CREATE TABLE " + old + " (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)")
+	exec("ALTER TABLE hopper_job_history_failed ATTACH PARTITION " + old + " FOR VALUES FROM ('2000-01-01Z') TO ('2000-01-02Z')")
+	exec("CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id) WHERE ordering_key IS NOT NULL")
+	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{Skip: []string{old, ahead}}); err != nil {
+		t.Fatal(err)
+	}
+	// The partition ahead's index, built and not yet attached.
+	exec("CREATE INDEX " + ahead + "_ordering ON " + ahead + " (ordering_key, id) WHERE ordering_key IS NOT NULL")
+
+	held, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(ctx) }()
+	if _, err := held.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)", pgsqlHistoryLockKey); err != nil {
+		t.Fatal(err)
+	}
+	pcfg := h.pool.Config()
+	pcfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	type result struct {
+		res driver.HistoryMaintainResult
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := testdb.Driver(pool).Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{
+			FailedRetention: 48 * time.Hour, LockTimeout: 10 * time.Second,
+		})
+		done <- result{res, err}
+	}()
+	// The drop has listed the partitions the index lacks and waits for the
+	// lock.
+	waitFor(t, func() bool {
+		return h.count(`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+			AND classid::bigint = (hashtext(current_schema())::bigint & 4294967295) AND objid = $1 AND objsubid = 2`, pgsqlHistoryLockKey) > 0
+	})
+	if _, err := held.Exec(ctx, "ALTER INDEX hopper_job_history_failed_ordering ATTACH PARTITION "+ahead+"_ordering"); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	if r.err != nil || !slices.Equal(r.res.Kept, []string{old}) || slices.Contains(r.res.Dropped, old) {
+		t.Errorf("retention under repeatable read beside an attach = %+v, %v", r.res, r.err)
+	}
+}
+
 // pgsqlHistoryLockKey is the driver's HistoryLockKey ("hoph").
 const pgsqlHistoryLockKey int32 = 0x686f7068
