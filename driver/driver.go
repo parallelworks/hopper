@@ -866,7 +866,7 @@ type HistoryMaintainResult struct {
 	// later pass retries them.
 	Deferred []string
 	// Kept names storage units past retention that wait for HistoryIndex to
-	// build their index: one whose build is under way, or the last one its
+	// build their index: one whose build is under way or about to start, or the last one its
 	// outcome table's index lacks, which dropping first would leave that
 	// index unable to complete. A later pass drops them.
 	Kept []string
@@ -879,6 +879,11 @@ type HistoryIndexParams struct {
 	// Skip names storage units (partitions on Postgres) to leave for a later
 	// pass, and indexes not to try to repair (HistoryIndexResult.Invalid).
 	Skip []string
+	// LockTimeout bounds how long repairing an index waits for its lock,
+	// during which the queries of the storage unit it locks queue behind
+	// it, as HistoryMaintainParams.LockTimeout does. Zero means the engine's
+	// default.
+	LockTimeout time.Duration
 }
 
 // HistoryIndexResult reports what an index pass could not finish.
@@ -893,6 +898,10 @@ type HistoryIndexResult struct {
 	// Postgres's May 2026 minor releases. Queries that need it read every
 	// partition instead.
 	Invalid []string
+	// Deferred names indexes whose repair could not get its lock within
+	// LockTimeout, held off by a transaction that read or wrote the storage
+	// unit it locks; a later pass retries them.
+	Deferred []string
 }
 
 // SubscriptionRow is a topic subscription: messages published to a topic

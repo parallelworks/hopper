@@ -62,10 +62,11 @@ type Client[TTx any] struct {
 	isLeader   atomic.Bool
 	leaderPoke chan struct{}
 	// settleAfter and promoteAfter are where the leader's next batch and
-	// workflow sweeps resume, and ddlDeferrals counts its consecutive
-	// passes with deferred partition work.
+	// workflow sweeps resume, ddlDeferrals counts its consecutive passes
+	// with deferred partition work, and keptPasses those that kept a
+	// partition past retention for its index.
 	settleAfter, promoteAfter driver.JobID
-	ddlDeferrals              int
+	ddlDeferrals, keptPasses  int
 	streamPoke                chan struct{}
 
 	events *eventBus

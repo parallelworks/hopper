@@ -364,7 +364,9 @@ const maxIndexBackoffShift = 6
 // leader. A partition whose build outlasts the session's statement_timeout
 // is retried at doubling intervals, so that it neither holds up the others
 // nor costs a futile build every interval, and so is an index the server
-// cannot repair, with a warning each time.
+// cannot repair, with a warning each time. A repair that cannot get its lock
+// waits longer on each pass, as deferred partition work does, and is warned
+// about once it has been deferred ddlDeferralsWarn passes in a row.
 func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{}) {
 	select {
 	case <-ctx.Done():
@@ -386,6 +388,7 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		timedOut[name] = b
 		return wait
 	}
+	deferrals := 0
 	for {
 		var skip []string
 		for name, b := range timedOut {
@@ -393,7 +396,8 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 				skip = append(skip, name)
 			}
 		}
-		res, err := c.exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: skip})
+		timeout := ddlLockTimeout(deferrals)
+		res, err := c.exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: skip, LockTimeout: timeout})
 		if err != nil && ctx.Err() == nil {
 			c.logger.WarnContext(ctx, "hopper: index history", "error", err)
 		}
@@ -405,6 +409,17 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 			c.logger.WarnContext(ctx, "hopper: a history index stays invalid, so queries that need it read every partition; "+
 				"Postgres repairs it from its May 2026 minor releases (18.4, 17.10, 16.14, 15.18, 14.23) on",
 				"index", name, "retry_in", retryIn(name))
+		}
+		if len(res.Deferred) == 0 {
+			deferrals = 0
+		} else {
+			deferrals++
+			level := slog.LevelDebug
+			if deferrals >= ddlDeferralsWarn {
+				level = slog.LevelWarn
+			}
+			c.logger.Log(ctx, level, "hopper: history index repair deferred: a transaction that used the partition held its lock",
+				"indexes", res.Deferred, "lock_timeout", timeout, "passes", deferrals)
 		}
 		select {
 		case <-ctx.Done():
@@ -460,8 +475,16 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
 	}
-	if len(res.Kept) > 0 {
-		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built", "kept", res.Kept)
+	if len(res.Kept) == 0 {
+		c.keptPasses = 0
+	} else {
+		c.keptPasses++
+		level := slog.LevelInfo
+		if c.keptPasses >= ddlDeferralsWarn {
+			level = slog.LevelWarn
+		}
+		c.logger.Log(ctx, level, "hopper: history partitions past retention kept until their index is built",
+			"kept", res.Kept, "passes", c.keptPasses)
 	}
 	if len(res.Deferred) == 0 {
 		c.ddlDeferrals = 0

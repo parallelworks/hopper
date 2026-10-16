@@ -59,12 +59,16 @@
   at doubling intervals with a warning; raise the timeout for hopper's role
   until the warnings stop. Until a partition has its unique-key index, an insert
   with `UniqueOpts.Finished` reads that partition in full. Retention keeps the
-  last partition without an index past its retention until it has one. Releases
+  last partition without an index past its retention until it has one, and a
+  warning that partitions have been kept for five passes means their builds keep
+  failing: look for the `statement_timeout` warning. Releases
   up to 0.7.0 could instead drop it first and leave the outcome table's index
   invalid, unused by the planner. The leader repairs that on Postgres's May 2026
   minor releases (18.4, 17.10, 16.14, 15.18, 14.23) and later; on earlier ones
   it warns that the index stays invalid, and updating Postgres's minor version
-  lets it finish.
+  lets it finish. The repair waits for transactions that read the partition it
+  locks; a warning that it has been deferred for five passes means such
+  transactions keep overlapping.
 - **`UniqueOpts.Finished`.** Each such job is looked up in every history
   partition of the outcomes it counts, one index lookup each, so the cost
   grows with retention. With the default 24 hours of completed history, a

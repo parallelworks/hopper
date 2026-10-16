@@ -448,15 +448,20 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
 
 	// A transaction that read every history partition holds the re-attach
-	// off: the pass leaves the index to the next, neither waiting for the
-	// reader nor reporting the index.
+	// off: the pass reports the index deferred, for the next to retry,
+	// without waiting for the reader or reporting the index invalid.
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
 	if _, err := d.UnwrapTx(tx).JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10}); err != nil {
 		t.Fatal(err)
 	}
-	if held, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil || len(held.Invalid) != 0 {
+	start := time.Now()
+	held, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{LockTimeout: 50 * time.Millisecond})
+	if err != nil || len(held.Invalid) != 0 || !slices.Equal(held.Deferred, []string{"hopper_job_history_failed_ordering"}) {
 		t.Errorf("revalidation behind a reader = %+v, %v", held, err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("revalidation behind a reader took %s", took)
 	}
 	if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass"); v != "false" {
 		t.Errorf("hopper_job_history_failed_ordering valid behind a reader = %s", v)
@@ -501,18 +506,28 @@ var onceAgain = driver.JobInsertParams{
 	UniqueFinished: []driver.JobState{driver.JobStateCompleted},
 }
 
-// reattachRevalidates reports whether attaching a partition's index again
-// marks its parent valid, as Postgres does from the May 2026 releases (17.10)
-// on.
+// reattachRevalidates runs ReattachRevalidates on the fixture's database.
 func reattachRevalidates[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx]) bool {
 	t.Helper()
-	f.Exec(ctx, t, d, "CREATE TABLE revalidate_probe (k int) PARTITION BY LIST (k)")
-	f.Exec(ctx, t, d, "CREATE TABLE revalidate_probe_1 PARTITION OF revalidate_probe FOR VALUES IN (1)")
-	f.Exec(ctx, t, d, "CREATE INDEX revalidate_probe_k ON revalidate_probe (k)")
-	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'revalidate_probe_k'::regclass")
-	f.Exec(ctx, t, d, "ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k_idx")
-	valid := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'revalidate_probe_k'::regclass") == "true"
-	f.Exec(ctx, t, d, "DROP TABLE revalidate_probe")
+	return ReattachRevalidates(
+		func(query string) { f.Exec(ctx, t, d, query) },
+		func(query string) string { return f.QueryText(ctx, t, d, query) })
+}
+
+// ReattachRevalidates reports whether attaching a partition's index again
+// marks its parent valid, as Postgres does from the May 2026 releases (18.4,
+// 17.10, 16.14, 15.18, 14.23) on, which decides whether HistoryIndex can
+// repair an outcome table's index or reports it in
+// HistoryIndexResult.Invalid. exec runs a statement and queryText returns the
+// single text value a query selects, both on a Postgres database a test owns.
+func ReattachRevalidates(exec func(query string), queryText func(query string) string) bool {
+	exec("CREATE TABLE revalidate_probe (k int) PARTITION BY LIST (k)")
+	exec("CREATE TABLE revalidate_probe_1 PARTITION OF revalidate_probe FOR VALUES IN (1)")
+	exec("CREATE INDEX revalidate_probe_k ON revalidate_probe (k)")
+	exec("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'revalidate_probe_k'::regclass")
+	exec("ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k_idx")
+	valid := queryText("SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'revalidate_probe_k'::regclass") == "true"
+	exec("DROP TABLE revalidate_probe")
 	return valid
 }
 
@@ -579,6 +594,38 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if v := valid(); v != "true" {
 		t.Errorf("valid after retention dropped the indexed partition = %s", v)
+	}
+
+	// A build that has taken its partition's lock and not started yet, or
+	// runs as a role whose progress this one cannot see: retention keeps
+	// the partition rather than dropping it under the build, and drops the
+	// others past retention.
+	pending := redeclare("20000106", "20000107")
+	const buildLock = "hashtext(current_schema() || '.' || $1), 1752133737" // HistoryIndexLockKey
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		f.Exec(ctx, t, d, "SELECT pg_advisory_xact_lock("+buildLock+"), pg_sleep(2)", pending[0])
+	}()
+	for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
+		"SELECT (NOT pg_try_advisory_xact_lock("+buildLock+"))::text", pending[0]) != "true"; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the build's lock was not taken")
+		}
+	}
+	res, err = exec.HistoryMaintain(ctx, keep)
+	if err != nil || !slices.Equal(res.Kept, pending[:1]) || !slices.Equal(res.Dropped, pending[1:]) {
+		t.Errorf("maintain while a build holds a partition = %+v, %v", res, err)
+	}
+	<-released
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, pending[:1]) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the build = %+v, %v", res, err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after the build = %s", v)
 	}
 
 	// Retention dropping partitions while the leader builds the others'.
