@@ -1149,35 +1149,34 @@ session lock would not survive a transaction pooler. A build on an outcome table
 `DEFAULT` partition also holds the lock keyed to that table, which partition creation
 under it tries without waiting, deferring the partition (§7.10) while the build
 runs: attaching a partition scans the `DEFAULT` partition under a lock that the build
-holds, while the build waits for the attach's transaction. Each build also holds the
-lock keyed to its partition, from before it starts until its index is attached;
-retention tries it before dropping an expired partition, and keeps a partition whose
-lock is held (`HistoryMaintainResult.Kept`) rather than wait for a build that waits for
-it in turn. It also tries the lock keyed to the outcome table, and keeps the expired
-partitions while the table's `DEFAULT` partition is being built: a drop takes `ACCESS
-EXCLUSIVE` locks on the table and then on its `DEFAULT` partition, so it would hold
-every query of the table up while it waited for the build, which waits for the drop's
-snapshot in turn. Retention holds those locks only while it drops the partition, and
-creation the table's only while it creates one, in share mode, which a build's
-exclusive hold conflicts with and an overlapping leader's retention or creation does
-not: a lock found held always means a build. A build waits for them, under the
-doubling lock timeout of deferred partition work, and skips a partition dropped
-meanwhile; one that times out, behind a transaction left open with the lock, is
-reported deferred (`HistoryIndexResult.Deferred`) rather than stall the pass, and
-every other leader's, behind the schema's build lock. A drop the deadlock detector
-picks over a build waiting for its snapshot is deferred. A build cut short by the end of a term
-leaves an invalid index, which the next build drops and builds again. Postgres marks
-an outcome table's index valid only in the attach that completes it, so retention
-does not drop the last partition without an index before it is built: before
-Postgres's May 2026 releases (18.4, 17.10, 16.14, 15.18, 14.23), nothing short of a
-catalog update could mark the index valid after that. While an outcome table's index
-is not yet valid, a drop checks, under the history maintenance lock that attaches
-take too, whether the partition is the last one the index lacks, and if it is keeps
-it until the build attaches its index: that one partition outlives retention by its
-build, once, after an upgrade. Once every index is valid, or no partition lacks an
-invalid one (an index an earlier release left invalid, below), no partition is being
-built, and a drop skips the locks and the check. The leader logs kept partitions at
-Info once per maintenance interval: a kept partition only
+holds, while the build waits for the attach's transaction. Retention tries the same
+lock, and keeps the expired partitions (`HistoryMaintainResult.Kept`) while the
+table's `DEFAULT` partition is being built: a drop takes `ACCESS EXCLUSIVE` locks on
+the table and then on its `DEFAULT` partition, so it would hold every query of the
+table up while it waited for the build, which waits for the drop's snapshot in turn.
+Retention holds the lock only while it drops a partition, and creation only while it
+creates one, in share mode, which a build's exclusive hold conflicts with and an
+overlapping leader's retention or creation does not: a lock found held always means a
+build. The `DEFAULT` partition's build waits for it, under the doubling lock timeout
+of deferred partition work; one that times out, behind a transaction left open with
+the lock, is reported deferred (`HistoryIndexResult.Deferred`) rather than stall the
+pass, and every other leader's, behind the schema's build lock. A drop the deadlock
+detector picks over a build waiting for its snapshot is deferred. A build cut short by
+the end of a term leaves an invalid index, which the next build drops and builds
+again. A build of a partition dropped since it was listed, or during the build, is
+skipped. Postgres marks an outcome table's index valid only in the attach that
+completes it, so retention does not drop the last partition without an index before
+it is built: before Postgres's May 2026 releases (18.4, 17.10, 16.14, 15.18, 14.23),
+nothing short of a catalog update could mark the index valid after that. Retention
+keeps every partition that an invalid index of its table lacks, not only the last,
+until its index is attached. That needs no lock and no recheck: a partition only ever
+goes from lacking an index to having it attached, so a list read before the drops
+keeps at worst a partition indexed since, which the next pass drops, and a build runs
+only on a partition that lacks its index, so none is dropped under its build. The
+cost is building, once after an upgrade declared an index, the partitions retention
+drops next. Once every index is valid, or no partition lacks an invalid one (an index
+an earlier release left invalid, below), nothing is kept. The leader logs kept
+partitions at Info once per maintenance interval: a kept partition only
 waits for its build, and every way a build fails already warns, a timeout each time,
 an error each pass, and a deferred attach from its fifth pass in a row. An index an
 earlier release left invalid is revalidated by attaching again the index of its
@@ -1188,23 +1187,29 @@ rather than by its version, which forks number their own way, and asks again on 
 pass with an index to repair, so a server updated in place is repaired without a
 restart; where it does not, the index is reported invalid without locking the
 partition. A repair that fails, its question included, is reported as the pass's
-error once the indexes after it are built. The attach waits for its locks under the same
+error once the indexes after it are built. The question's tables are named the same
+in every session, so another leader's question, or one that stalled, holds it off:
+it waits no longer than the attach's lock timeout below, and the repair is deferred. The attach waits for its locks under the same
 doubling timeout as deferred partition work (`HistoryIndexParams.LockTimeout`), since
 the partition's queries queue behind it; so does the attach that ends a build. One
 that cannot get them is reported (`HistoryIndexResult.Deferred`, naming the
 partition's index for a build's, whose partition's other indexes wait for that pass
 rather than be built for their attaches to wait behind the same holder) and retried
 on the next pass, which attaches a built
-index without building it again. A pass that finds another session holding the
-schema's build lock, another leader's pass or one that stalled, reports the index it
-would have built as deferred too. The leader warns once some index work, of any index,
+index without building it again. The leader warns once some index work, of any index,
 has been deferred five passes in a row; a pass that fails before it reaches that work
-neither ends the run nor extends it. A repair whose partition retention dropped meanwhile is left to
+neither ends the run nor extends it. A pass that finds another session holding the
+schema's build lock, another leader's pass or one that stalled, ends there and
+reports the index it would have built (`HistoryIndexResult.Busy`), which the leader
+warns about from the fifth such pass in a row; it waited for no lock, so it does not
+lengthen the next pass's lock timeout as a deferral does. A repair whose partition retention dropped meanwhile is left to
 the next pass. An index the server cannot repair, or that the attach left invalid, is
 reported (`HistoryIndexResult.Invalid`), and the leader warns at doubling intervals,
-up to 8 maintenance intervals, that queries needing it read every partition until
-Postgres is updated: the update that repairs it arrives without a new term, and the
-next try after it repairs the index. A build that runs past the session's
+up to 8 maintenance intervals, that queries needing it read every partition, and that
+Postgres before its May 2026 releases cannot repair it: the update that repairs it
+arrives without a new term, and the next try after it repairs the index. A partition's
+or index's backoff ends once a pass that tried it finishes without reporting it again,
+so that a later failure starts over at the shortest wait. A build that runs past the session's
 `statement_timeout` is canceled by it: its
 leftover is dropped, the pass goes on to the other partitions, and the leader retries
 that partition at doubling intervals, up to 64 maintenance intervals, warning each

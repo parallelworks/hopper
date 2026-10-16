@@ -380,13 +380,9 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 	}
 	ticker := time.NewTicker(c.tuning.maintenanceInterval)
 	defer ticker.Stop()
-	type backoff struct {
-		failures int
-		next     time.Time
-	}
 	// backoffs holds the partitions whose build timed out and the indexes
 	// reported invalid, each retried once its next try is due.
-	backoffs := map[string]backoff{}
+	backoffs := map[string]indexBackoff{}
 	retryIn := func(name string, maxShift int) time.Duration {
 		b := backoffs[name]
 		b.failures++
@@ -395,7 +391,7 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		backoffs[name] = b
 		return wait
 	}
-	deferrals := 0
+	deferrals, busy := 0, 0
 	for {
 		var skip []string
 		for name, b := range backoffs {
@@ -413,14 +409,24 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 				"partition", name, "retry_in", retryIn(name, maxIndexBackoffShift))
 		}
 		for _, name := range res.Invalid {
-			c.logger.WarnContext(ctx, "hopper: a history index stays invalid, so queries that need it read every partition; "+
-				"Postgres repairs it from its May 2026 minor releases (18.4, 17.10, 16.14, 15.18, 14.23) on",
+			c.logger.WarnContext(ctx, "hopper: a history index stays invalid although every partition is indexed, and the server "+
+				"cannot repair it, so queries that need it read every partition; Postgres before its May 2026 minor releases "+
+				"(18.4, 17.10, 16.14, 15.18, 14.23) cannot",
 				"index", name, "retry_in", retryIn(name, maxInvalidBackoffShift))
 		}
+		settleBackoffs(backoffs, skip, res, err)
+		// Only waits for a lock lengthen the next pass's lock timeout; a
+		// pass that found another session's index pass under way waited for
+		// nothing.
 		deferrals = nextDeferrals(deferrals, len(res.Deferred) > 0, err)
 		if len(res.Deferred) > 0 {
-			c.logger.Log(ctx, repeatLevel(deferrals), "hopper: history index work deferred: a transaction that used the partition, one left open with its maintenance lock, or another session's index pass held its lock",
+			c.logger.Log(ctx, repeatLevel(deferrals), "hopper: history index work deferred: a transaction that used the partition, one left open with its maintenance lock, or another leader's history maintenance held its lock",
 				"indexes", res.Deferred, "lock_timeout", timeout, "passes", deferrals)
+		}
+		busy = nextDeferrals(busy, res.Busy != "", err)
+		if res.Busy != "" {
+			c.logger.Log(ctx, repeatLevel(busy), "hopper: history indexing held off: another session holds the schema's index build lock, another leader's pass or one that stalled",
+				"index", res.Busy, "passes", busy)
 		}
 		select {
 		case <-ctx.Done():
@@ -507,6 +513,28 @@ func nextDeferrals(n int, deferred bool, err error) int {
 		return n
 	}
 	return 0
+}
+
+// indexBackoff is when indexLoop next tries a partition whose build timed
+// out, or an index reported invalid, after failures in a row.
+type indexBackoff struct {
+	failures int
+	next     time.Time
+}
+
+// settleBackoffs forgets the backoffs of the names a pass tried, not
+// skipping them, without reporting them again, so that a later failure
+// starts over at the shortest wait. A pass that failed, was held off or
+// deferred work may not have reached them, and forgets none.
+func settleBackoffs(backoffs map[string]indexBackoff, skipped []string, res driver.HistoryIndexResult, err error) {
+	if err != nil || res.Busy != "" || len(res.Deferred) > 0 {
+		return
+	}
+	for name := range backoffs {
+		if !slices.Contains(skipped, name) && !slices.Contains(res.TimedOut, name) && !slices.Contains(res.Invalid, name) {
+			delete(backoffs, name)
+		}
+	}
 }
 
 // repeatLevel is the level of a record about something that has lasted

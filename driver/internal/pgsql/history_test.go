@@ -55,7 +55,7 @@ func TestReattachRevalidatesAsksEachTime(t *testing.T) {
 	var probes int
 	e := &Executor{Conn: probeConn{probes: &probes}, Schema: NewSchema("")}
 	for range 2 {
-		if ok, err := e.reattachRevalidates(context.Background()); err != nil || !ok {
+		if ok, err := e.reattachRevalidates(context.Background(), "200ms"); err != nil || !ok {
 			t.Fatalf("reattachRevalidates = %v, %v", ok, err)
 		}
 	}
@@ -78,6 +78,22 @@ func TestRevalidateIndexReportsProbeFailure(t *testing.T) {
 	}
 	if slices.ContainsFunc(execs, func(q string) bool { return strings.Contains(q, "ATTACH PARTITION") }) {
 		t.Errorf("attach after a failed probe: %q", execs)
+	}
+}
+
+// A probe whose wait for another session's probe ends at the lock timeout
+// defers the repair, as the attach's own lock waits do, rather than fail it.
+func TestRevalidateIndexDefersHeldProbe(t *testing.T) {
+	var probes int
+	var execs []string
+	e := &Executor{Conn: probeConn{probes: &probes, execs: &execs}, Schema: NewSchema("")}
+	held := func() (bool, error) { return false, codedError("55P03") }
+	invalid, deferred, err := e.revalidateIndex(context.Background(), "hopper_job_history_failed_ordering", "200ms", held)
+	if err != nil || invalid || !deferred {
+		t.Fatalf("revalidateIndex behind a held probe = %v, %v, %v", invalid, deferred, err)
+	}
+	if slices.ContainsFunc(execs, func(q string) bool { return strings.Contains(q, "ATTACH PARTITION") }) {
+		t.Errorf("attach after a held probe: %q", execs)
 	}
 }
 

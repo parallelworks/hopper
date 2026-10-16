@@ -866,10 +866,11 @@ type HistoryMaintainResult struct {
 	// later pass retries them.
 	Deferred []string
 	// Kept names storage units past retention that wait for HistoryIndex to
-	// build their index: one whose build, or the build of its outcome
-	// table's DEFAULT partition, is under way or about to start, or the last
-	// one its outcome table's index lacks, which dropping first would leave
-	// that index unable to complete. A later pass drops them.
+	// build their index: those an invalid index of their outcome table
+	// lacks, which dropping first could leave that index unable to
+	// complete, and while the build of the outcome table's DEFAULT
+	// partition is under way, every one past retention. A later pass drops
+	// them.
 	Kept []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64
@@ -883,9 +884,9 @@ type HistoryIndexParams struct {
 	// LockTimeout bounds how long attaching a built index, or repairing an
 	// index, waits for its lock, during which the queries of the storage
 	// unit it locks queue behind it, as HistoryMaintainParams.LockTimeout
-	// does, and how long a build waits for its storage unit's maintenance
-	// lock, held by retention or partition creation. Zero means the
-	// engine's default.
+	// does, and how long the build of an outcome table's DEFAULT storage
+	// unit waits for the table's maintenance lock, held by retention or
+	// partition creation. Zero means the engine's default.
 	LockTimeout time.Duration
 }
 
@@ -904,12 +905,14 @@ type HistoryIndexResult struct {
 	// Deferred names indexes whose build (a storage unit's index), attach
 	// (the same, once built) or repair (an outcome table's) could not get its
 	// lock within LockTimeout, held off by a transaction that read or wrote
-	// the storage unit it locks, or that holds the unit's maintenance lock; a
-	// later pass retries them, without building a built index again. It also
-	// names the index a pass would have built next when another session
-	// holds the engine's build lock (another leader's pass, or one that
-	// stalled), which the pass does not wait for and ends at.
+	// the storage unit it locks, or that holds its table's maintenance lock; a
+	// later pass retries them, without building a built index again.
 	Deferred []string
+	// Busy, when not empty, names the index the pass would have built next
+	// when it ended there, finding the engine's build lock held by another
+	// session (another leader's pass, or one that stalled), which it does
+	// not wait for. Unlike Deferred, nothing waited for a lock.
+	Busy string
 }
 
 // SubscriptionRow is a topic subscription: messages published to a topic

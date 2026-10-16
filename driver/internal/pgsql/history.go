@@ -32,8 +32,7 @@ type historyGroup struct {
 
 // HistoryLockKey is the pg_advisory_xact_lock key that serializes changes to
 // the history partitions and their indexes: partition creation between
-// overlapping leaders, index attaches, and a retention drop's check that it
-// is not dropping the last partition an outcome table's index lacks. It is
+// overlapping leaders, and index attaches. It is
 // combined with the schema, so installations sharing a database do not queue
 // behind each other.
 const HistoryLockKey int32 = 0x686f7068 // "hoph"
@@ -133,10 +132,18 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 		// once one is deferred the rest are deferred untried.
 		if keep > 0 {
 			cutoff := now.Add(-keep)
+			lacking, err := e.lackingInvalidIndexes(ctx, g.parent)
+			if err != nil {
+				return res, err
+			}
 			blocked := false
 			for name := range existing {
 				from, ok := g.parse(name)
 				if !ok || !from.Add(g.period).Before(cutoff) {
+					continue
+				}
+				if _, ok := lacking[name]; ok {
+					res.Kept = append(res.Kept, name)
 					continue
 				}
 				if blocked {
@@ -171,7 +178,8 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 }
 
 // defaultDDLLockTimeout bounds how long a partition's creation or drop, a
-// build's wait for its partition's HistoryIndexLockKey, or an index's attach
+// DEFAULT partition's build's wait for its table's HistoryIndexLockKey, or an
+// index's attach
 // or repair waits for its lock, unless HistoryMaintainParams or
 // HistoryIndexParams.LockTimeout says otherwise. While it waits, every
 // statement that needs the same table queues behind it, and a transaction
@@ -225,7 +233,7 @@ type partitionOutcome int
 
 const (
 	partitionDropped partitionOutcome = iota
-	// partitionKept waits for its index (keepForIndex).
+	// partitionKept waits for its outcome table's DEFAULT partition's build.
 	partitionKept
 	// partitionDeferred could not get its locks, for the next pass to retry.
 	partitionDeferred
@@ -236,26 +244,31 @@ const (
 // period. (DETACH CONCURRENTLY would avoid it, but Postgres refuses it while
 // a DEFAULT partition exists.) The wait is bounded by lockTimeout: a drop
 // that cannot get the lock in time, or that the deadlock detector picks over
-// a concurrent index build waiting for it, is deferred. A partition that
-// must wait for its index (keepForIndex) is kept, having done nothing.
+// a concurrent index build waiting for it, is deferred.
+//
+// A build on the outcome table's DEFAULT partition holds HistoryIndexLockKey
+// combined with the table for its whole run. DROP locks the table and then
+// the DEFAULT partition, whose new constraint it writes: it would hold every
+// query of the table up while it waits for the build, which waits for this
+// transaction's snapshot in turn. The partition is kept instead, and the
+// key, held in share mode to the end of the transaction, keeps such a build
+// from starting before the drop commits.
 func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lockTimeout string) (partitionOutcome, error) {
 	var kept bool
 	err := e.withTx(ctx, func(tx Tx) error {
-		// keepForIndex checks the partitions an index lacks again once it
-		// holds HistoryLockKey, which needs a snapshot taken after the wait:
-		// read committed takes one per statement, and the server's default
-		// (default_transaction_isolation) may be stricter.
-		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
-			return err
-		}
 		if err := setLockTimeout(ctx, tx, lockTimeout); err != nil {
 			return err
 		}
-		var err error
-		if kept, err = e.keepForIndex(ctx, tx, g.parent, name); err != nil || kept {
-			return err
+		if hasHistoryIndexes(g.parent) {
+			free, err := tryHistoryIndexLockShared(ctx, tx, e.Schema.Name+"."+g.parent)
+			if err != nil {
+				return fmt.Errorf("hopper: lock history indexing: %w", err)
+			}
+			if kept = !free; kept {
+				return nil
+			}
 		}
-		_, err = tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name))
+		_, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name))
 		return err
 	})
 	switch {
@@ -269,99 +282,41 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lock
 	return partitionDropped, nil
 }
 
-// keepForIndex reports whether a partition past retention must stay until
-// HistoryIndex has attached its index: while its index, or the index of its
-// outcome table's DEFAULT partition, is being built, or when it is the last
-// partition an outcome table's index lacks. Postgres
-// marks an outcome table's index valid only in the attach that completes it,
-// so dropping that partition first would leave the index invalid for good on
-// releases before May 2026 (18.4, 17.10, 16.14, 15.18, 14.23), where
-// attaching an index again does not revalidate it. Retention of that one
-// partition waits for its build, once, after an upgrade declared an index.
-// The last-partition check runs under HistoryLockKey, which attachIndex
-// takes too, so that an attach elsewhere does not count this partition as
-// unindexed and commit beside the drop.
-func (e *Executor) keepForIndex(ctx context.Context, tx Tx, parent, name string) (bool, error) {
+// lackingInvalidIndexes lists the partitions of the outcome table parent
+// that lack one of its invalid indexes, which retention keeps until
+// HistoryIndex has attached them. Postgres marks an outcome table's index
+// valid only in the attach that completes it, so dropping the last partition
+// it lacks first would leave the index invalid for good on releases before
+// May 2026 (18.4, 17.10, 16.14, 15.18, 14.23), where attaching an index
+// again does not revalidate it. Keeping every partition that lacks one,
+// rather than only the last, needs no lock: a partition only ever goes from
+// lacking an index to having it attached, so a list read before the drop
+// keeps at worst a partition indexed since, which a later pass drops. A
+// build runs only on a partition that lacks its index, so none is dropped
+// under it. The cost is building, once after an upgrade declared an index,
+// the partitions that retention drops next.
+func (e *Executor) lackingInvalidIndexes(ctx context.Context, parent string) (map[string]struct{}, error) {
 	if !hasHistoryIndexes(parent) {
-		return false, nil
+		return nil, nil
 	}
-	// A partition lacks its index, or has a build under way, only while its
-	// outcome table's index is invalid, and an index once valid stays valid:
-	// outside the window after an upgrade declared one, a drop stops here,
-	// unlocked.
-	invalid, err := scanStrings(tx.Query(ctx, `
+	invalid, err := scanStrings(e.Conn.Query(ctx, `
 		SELECT c.relname FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
 		WHERE x.indrelid = to_regclass($1) AND NOT x.indisvalid`, e.Schema.Table(parent)))
 	if err != nil {
-		return false, fmt.Errorf("hopper: check indexes of %s: %w", parent, err)
+		return nil, fmt.Errorf("hopper: check indexes of %s: %w", parent, err)
 	}
-	if len(invalid) == 0 {
-		return false, nil
-	}
-	// An index an earlier release left invalid with every partition indexed
-	// stays so until Postgres can repair it (HistoryIndexResult.Invalid).
-	// The partitions an index lacks only ever shrink, and a build runs only
-	// on one of them until its attach commits, so with none lacking an
-	// invalid index no build is under way and none is the last: the drop
-	// stops here too, unlocked.
-	lacking, err := e.partitionsLackingIndexes(ctx, tx, parent, invalid)
-	if err != nil {
-		return false, err
-	}
-	if !slices.ContainsFunc(lacking, func(names []string) bool { return len(names) > 0 }) {
-		return false, nil
-	}
-	// A build of the partition's index holds HistoryIndexLockKey combined
-	// with the partition from before it starts until its index is attached
-	// (indexHistoryPartitionLocked). The build waits for the transactions
-	// older than it, this one among them, so a drop waiting for the build's
-	// lock would deadlock with it: the partition is kept instead.
-	//
-	// A build on the outcome table's DEFAULT partition holds the key
-	// combined with the table for its whole run. DROP locks the table and
-	// then the DEFAULT partition, whose new constraint it writes: it would
-	// hold every query of the table up while it waits for the build, which
-	// waits for this transaction's snapshot in turn. The partition is kept
-	// instead.
-	//
-	// Held to the end of this transaction, each key also keeps its build
-	// from starting before the drop commits.
-	for _, key := range []string{name, parent} {
-		free, err := tryHistoryIndexLockShared(ctx, tx, e.Schema.Name+"."+key)
-		if err != nil {
-			return false, fmt.Errorf("hopper: lock history indexing: %w", err)
-		}
-		if !free {
-			return true, nil
-		}
-	}
-	if err := lockHistoryMaintenance(ctx, tx, e.Schema.Name); err != nil {
-		return false, err
-	}
-	if lacking, err = e.partitionsLackingIndexes(ctx, tx, parent, invalid); err != nil {
-		return false, err
-	}
-	for _, unindexed := range lacking {
-		if len(unindexed) == 1 && unindexed[0] == name {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// partitionsLackingIndexes lists, for each history index of the outcome
-// table parent named in indexes, the partitions that lack it.
-func (e *Executor) partitionsLackingIndexes(ctx context.Context, tx Tx, parent string, indexes []string) ([][]string, error) {
-	var lacking [][]string
+	lacking := map[string]struct{}{}
 	for _, x := range historyIndexes {
-		if x.parent != parent || !slices.Contains(indexes, x.name()) {
+		if x.parent != parent || !slices.Contains(invalid, x.name()) {
 			continue
 		}
-		unindexed, err := scanStrings(tx.Query(ctx, unindexedPartitions, e.Schema.Table(parent), e.Schema.Table(x.name())))
+		unindexed, err := scanStrings(e.Conn.Query(ctx, unindexedPartitions, e.Schema.Table(parent), e.Schema.Table(x.name())))
 		if err != nil {
 			return nil, fmt.Errorf("hopper: check index %s: %w", x.name(), err)
 		}
-		lacking = append(lacking, unindexed)
+		for _, n := range unindexed {
+			lacking[n] = struct{}{}
+		}
 	}
 	return lacking, nil
 }
@@ -405,18 +360,16 @@ const unindexedPartitions = `
 // overlapping leaders index one at a time; the one that does not get the
 // lock leaves the work to the other.
 //
-// A build also holds the key combined with the schema and its partition,
-// which retention tries before dropping the partition and keeps it if it is
-// held (keepForIndex). A build on an outcome table's DEFAULT partition holds
-// the key combined with the schema and that table as well. Partition
+// A build on an outcome table's DEFAULT partition also holds the key
+// combined with the schema and that table. Partition
 // creation under the table tries it without waiting, and leaves the
 // partition to its next pass while the build runs: its attach scans the
 // DEFAULT partition, which the build holds, while the build waits for the
 // attach's transaction to end. A build elsewhere does not conflict with the
 // attach. Retention tries the table's key as well, and keeps the partitions
-// past it while it is held: a drop locks the DEFAULT partition too. A build
-// waits for the partition's and the table's keys, which creation and
-// retention hold only briefly.
+// past it while it is held: a drop locks the DEFAULT partition too. The
+// build waits for the table's key, which creation and retention hold only
+// briefly.
 //
 // The CREATE INDEX CONCURRENTLY cannot run in a transaction, so the locks are
 // held by a transaction of their own, which stays open and idle on another
@@ -435,7 +388,7 @@ func tryHistoryIndexLock(ctx context.Context, tx Conn, name string) (bool, error
 
 // tryHistoryIndexLockShared tries HistoryIndexLockKey combined with name in
 // share mode, for the rest of tx. Retention and partition creation hold a
-// partition's or table's key this way, so that they hold off a build, which
+// table's key this way, so that they hold off a build, which
 // takes it exclusively, without holding off each other: a key found taken
 // means a build.
 func tryHistoryIndexLockShared(ctx context.Context, tx Conn, name string) (bool, error) {
@@ -468,7 +421,7 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 	lockTimeout := lockTimeoutSetting(params.LockTimeout)
 	// Whether the server's re-attach repairs an index is asked at most once
 	// a pass, however many indexes need repair.
-	probe := sync.OnceValues(func() (bool, error) { return e.reattachRevalidates(ctx) })
+	probe := sync.OnceValues(func() (bool, error) { return e.reattachRevalidates(ctx, lockTimeout) })
 	var repairErr error
 	for _, x := range historyIndexes {
 		parent, parentIndex := x.parent, x.name()
@@ -507,7 +460,7 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 				// Another session holds the schema's build lock: another
 				// leader's pass, or one that stalled. It is reported, so that
 				// a holder that never lets go is warned about.
-				res.Deferred = append(res.Deferred, leaf+x.suffix)
+				res.Busy = leaf + x.suffix
 				return res, repairErr
 			}
 		}
@@ -538,15 +491,16 @@ var errStatementTimeout = errors.New("hopper: index build exceeded statement_tim
 // it without building it again.
 var errAttachDeferred = errors.New("hopper: index attach deferred")
 
-// errBuildDeferred marks a build that could not get its partition's
-// HistoryIndexLockKey within the lock timeout; a later pass builds it.
+// errBuildDeferred marks a DEFAULT partition's build that could not get its
+// table's HistoryIndexLockKey within the lock timeout; a later pass builds
+// it.
 var errBuildDeferred = errors.New("hopper: index build deferred")
 
 // indexHistoryPartitionLocked indexes one partition under
 // HistoryIndexLockKey, and reports false, having done nothing, if another
 // leader holds it, indexing. The lock is held per partition, so that
-// creation and retention defer a table's partitions for at most one
-// partition's build.
+// creation and retention defer a table's partitions for at most one build
+// of its DEFAULT partition.
 func (e *Executor) indexHistoryPartitionLocked(ctx context.Context, x historyIndex, leaf, lockTimeout string) (bool, error) {
 	lock, err := e.Conn.Begin(ctx)
 	if err != nil {
@@ -567,23 +521,17 @@ func (e *Executor) indexHistoryPartitionLocked(ctx context.Context, x historyInd
 	if !locked {
 		return false, nil
 	}
-	// Retention holds the partition's key only while it decides whether to
-	// drop the partition and drops it, never waiting for a build meanwhile,
-	// so the build waits for it, and finds the partition gone if it was
-	// dropped. The wait is bounded like a drop's, so that a transaction left
-	// open with the key does not stall the pass, and every other leader's,
-	// behind the schema's key.
-	if err := setLockTimeout(ctx, lock, lockTimeout); err != nil {
-		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
-	}
-	keys := []string{e.Schema.Name + "." + leaf}
 	if leaf == x.parent+"_default" {
-		// The table's key likewise, which partition creation and retention
-		// hold only while they create or drop a partition of the table.
-		keys = append(keys, e.Schema.Name+"."+x.parent)
-	}
-	for _, key := range keys {
-		if err := lockHistoryIndex(ctx, lock, key); err != nil {
+		// Partition creation and retention hold the table's key only while
+		// they create or drop a partition of the table, never waiting for a
+		// build meanwhile, so the build waits for them. The wait is bounded
+		// like a drop's, so that a transaction left open with the key does
+		// not stall the pass, and every other leader's, behind the schema's
+		// key.
+		if err := setLockTimeout(ctx, lock, lockTimeout); err != nil {
+			return false, fmt.Errorf("hopper: lock history indexing: %w", err)
+		}
+		if err := lockHistoryIndex(ctx, lock, e.Schema.Name+"."+x.parent); err != nil {
 			if waitEnded(ctx, err) {
 				return false, fmt.Errorf("%w: %s: %w", errBuildDeferred, leaf, err)
 			}
@@ -690,7 +638,7 @@ func (e *Executor) attachIndex(ctx context.Context, parentIndex, index, lockTime
 // revalidateIndex marks an outcome table's index valid when no partition
 // lacks its index any more but the attach that would have completed it never
 // ran, because an earlier release's retention dropped the last partition
-// without one first (keepForIndex). Attaching a partition's index again makes
+// without one first (lackingInvalidIndexes). Attaching a partition's index again makes
 // Postgres count the attached indexes again from its May 2026 releases on;
 // earlier ones do not, and it reports invalid when the index stays invalid.
 // The attach waits for its locks no longer than lockTimeout, the way a
@@ -719,9 +667,14 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout
 		return false, false, fmt.Errorf("hopper: check index %s: %w", parentIndex, err)
 	}
 	// On a release whose attach does not count again, the attach would only
-	// queue the partition's queries behind it for nothing.
+	// queue the partition's queries behind it for nothing. A probe held off
+	// by another session's (another leader's, or one that stalled) defers
+	// the repair like the attach's own locks.
 	repairs, err := probe()
 	if err != nil {
+		if waitEnded(ctx, err) {
+			return false, true, nil
+		}
 		return false, false, err
 	}
 	if !repairs {
@@ -754,13 +707,19 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout
 // which the leader backs off: a server updated in place, or a fork that
 // backports the change under the same version, is repaired without a
 // restart. drivertest's ReattachRevalidates repeats it for the tests'
-// expectations.
-func (e *Executor) reattachRevalidates(ctx context.Context) (valid bool, err error) {
+// expectations. Its tables' names are the same in every session using the
+// schema, so a concurrent probe, uncommitted, holds this one's off until it
+// ends; the wait is bounded by lockTimeout, so that a leader that stalls
+// mid-probe does not stall this one's pass.
+func (e *Executor) reattachRevalidates(ctx context.Context, lockTimeout string) (valid bool, err error) {
 	tx, err := e.Conn.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("hopper: probe index revalidation: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := setLockTimeout(ctx, tx, lockTimeout); err != nil {
+		return false, fmt.Errorf("hopper: probe index revalidation: %w", err)
+	}
 	table, index := e.Schema.Table("hopper_revalidate_probe"), e.Schema.Table("hopper_revalidate_probe_k")
 	for _, q := range []string{
 		"CREATE TABLE " + table + " (k int) PARTITION BY LIST (k)",
@@ -818,8 +777,9 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// Two leaders can overlap briefly; serialize them on an advisory lock
 	// held for this transaction, then check whether the other one has
 	// already created the partition. The lock timeout bounds the wait for
-	// it too: retention holds it across a drop, and a leader that stalls
-	// there would otherwise stall this one's loop, lease renewal included.
+	// it too: a leader that stalls while it holds it, creating a partition
+	// or attaching an index, would otherwise stall this one's loop, lease
+	// renewal included.
 	// Partitions are created periods ahead, so this one is deferred instead.
 	if err = setLockTimeout(ctx, tx, lockTimeout); err != nil {
 		return false, false, fmt.Errorf("hopper: create partition %s: %w", name, err)

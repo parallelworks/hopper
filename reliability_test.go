@@ -903,6 +903,48 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	}
 }
 
+// TestRevalidationProbeWaitIsBounded leaves an outcome table's index invalid
+// with every partition indexed, and holds open a transaction that created
+// the repair probe's table, as a leader that stalled mid-probe would. The
+// pass's own probe waits for it no longer than the lock timeout and reports
+// the repair deferred, rather than stall the index pass until it ends.
+func TestRevalidationProbeWaitIsBounded(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	repairs := reattachRevalidates(t, h)
+	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	const index = "hopper_job_history_failed_ordering"
+	if _, err := h.pool.Exec(ctx, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '"+index+"'::regclass"); err != nil {
+		t.Fatal(err)
+	}
+	stalled, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stalled.Rollback(ctx) })
+	if _, err := stalled.Exec(ctx, "CREATE TABLE hopper_revalidate_probe (k int) PARTITION BY LIST (k)"); err != nil {
+		t.Fatal(err)
+	}
+	// A regression waits for the stalled probe: the deadline turns that into
+	// a failure rather than a hung test.
+	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	res, err := h.d.Executor().HistoryIndex(bounded, driver.HistoryIndexParams{LockTimeout: 50 * time.Millisecond})
+	if err != nil || !slices.Equal(res.Deferred, []string{index}) || len(res.Invalid) != 0 {
+		t.Errorf("repair beside a stalled probe = %+v, %v", res, err)
+	}
+	if err := stalled.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err = h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{})
+	if err != nil || len(res.Deferred) != 0 || (len(res.Invalid) == 0) != repairs {
+		t.Errorf("repair after the stalled probe = %+v, %v", res, err)
+	}
+}
+
 // reattachRevalidates runs drivertest.ReattachRevalidates on the harness's
 // database.
 func reattachRevalidates(t *testing.T, h *harness) bool {
@@ -1162,88 +1204,6 @@ func TestHistoryDropOutlastsStatementTimeoutAcrossLocks(t *testing.T) {
 	res, err := testdb.Driver(pool).Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{FailedRetention: 48 * time.Hour, LockTimeout: time.Second})
 	if err != nil || !slices.Contains(res.Deferred, old) {
 		t.Errorf("drop waiting on two locks past statement_timeout = %+v, %v", res, err)
-	}
-}
-
-// TestRetentionRechecksUnderStricterIsolation runs retention on sessions
-// whose default_transaction_isolation is repeatable read. The partition past
-// retention is one of two that the failed table's ordering-key index lacks,
-// and the other's index is attached while the drop waits for the history
-// maintenance lock. The drop's check under the lock must see that attach and
-// keep the partition, now the last the index lacks, rather than read the
-// partitions from before its wait and drop it.
-func TestRetentionRechecksUnderStricterIsolation(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t)
-	ctx := context.Background()
-	exec := func(query string) {
-		t.Helper()
-		if _, err := h.pool.Exec(ctx, query); err != nil {
-			t.Fatalf("%s: %v", query, err)
-		}
-	}
-	if _, err := h.d.Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err != nil {
-		t.Fatal(err)
-	}
-	var ahead string
-	if err := h.pool.QueryRow(ctx, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-		WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`).Scan(&ahead); err != nil {
-		t.Fatal(err)
-	}
-	const old = "hopper_job_history_failed_20000101"
-	exec("DROP INDEX hopper_job_history_failed_ordering")
-	exec("CREATE TABLE " + old + " (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)")
-	exec("ALTER TABLE hopper_job_history_failed ATTACH PARTITION " + old + " FOR VALUES FROM ('2000-01-01Z') TO ('2000-01-02Z')")
-	exec("CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id) WHERE ordering_key IS NOT NULL")
-	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{Skip: []string{old, ahead}}); err != nil {
-		t.Fatal(err)
-	}
-	// The partition ahead's index, built and not yet attached.
-	exec("CREATE INDEX " + ahead + "_ordering ON " + ahead + " (ordering_key, id) WHERE ordering_key IS NOT NULL")
-
-	held, err := h.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = held.Rollback(ctx) }()
-	if _, err := held.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)", pgsqlHistoryLockKey); err != nil {
-		t.Fatal(err)
-	}
-	pcfg := h.pool.Config()
-	pcfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
-	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Closed after held lets go of the lock, which a failed test leaves
-	// the drop waiting for on one of the pool's connections.
-	t.Cleanup(pool.Close)
-	type result struct {
-		res driver.HistoryMaintainResult
-		err error
-	}
-	done := make(chan result, 1)
-	go func() {
-		res, err := testdb.Driver(pool).Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{
-			FailedRetention: 48 * time.Hour, LockTimeout: 10 * time.Second,
-		})
-		done <- result{res, err}
-	}()
-	// The drop has listed the partitions the index lacks and waits for the
-	// lock.
-	waitFor(t, func() bool {
-		return h.count(`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
-			AND classid::bigint = (hashtext(current_schema())::bigint & 4294967295) AND objid = $1 AND objsubid = 2`, pgsqlHistoryLockKey) > 0
-	})
-	if _, err := held.Exec(ctx, "ALTER INDEX hopper_job_history_failed_ordering ATTACH PARTITION "+ahead+"_ordering"); err != nil {
-		t.Fatal(err)
-	}
-	if err := held.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	r := <-done
-	if r.err != nil || !slices.Equal(r.res.Kept, []string{old}) || slices.Contains(r.res.Dropped, old) {
-		t.Errorf("retention under repeatable read beside an attach = %+v, %v", r.res, r.err)
 	}
 }
 
