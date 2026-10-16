@@ -1213,6 +1213,16 @@ func lockOutIndexBuilds(ctx context.Context, tx Conn, schema string) error {
 			}
 			marked = true
 		}
+		// The server reads other sessions' activity, the progress view's
+		// included, once a transaction and shows the same view for the rest
+		// of it, and this loop runs in the migration's transaction: without
+		// a fresh view each pass, a build started after the first pass, such
+		// as one the leader starts once it has dropped an invalid index,
+		// would never be seen, and a backend listed by the first pass would
+		// be canceled again on every pass, whatever it ran since.
+		if _, err := tx.Exec(ctx, "SELECT pg_stat_clear_snapshot()"); err != nil {
+			return fmt.Errorf("hopper: cancel index builds: %w", err)
+		}
 		// The builds are found and canceled in one statement: a backend
 		// listed by one statement and canceled by the next could have
 		// finished its build meanwhile, and the cancel would hit whatever

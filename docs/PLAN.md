@@ -1884,7 +1884,10 @@ observability without new machinery.
   fails for it) fails the migration with an error saying which role may, rather than
   being waited for: the build, in its last phase, waits for every older snapshot,
   among them those of migrations queued for the migration lock this one holds, so the
-  wait would never end. While it cancels,
+  wait would never end. It looks for builds every 50 ms until it has the lock, each time
+  after `pg_stat_clear_snapshot()`: the server shows a transaction the activity it first
+  read for the rest of it, so a build the leader started after the first look (once it
+  had dropped an invalid index, say) would never be seen. While it cancels,
   the migration holds `HistoryIndexCancelKey`, which the leader tries after a build
   fails with SQLSTATE 57014: held, the failure was the migration's cancel; free, it was
   the session's `statement_timeout` or an operator's cancel, which are not told apart.

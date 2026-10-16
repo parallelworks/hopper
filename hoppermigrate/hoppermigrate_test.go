@@ -573,6 +573,93 @@ func TestMigrationCancelsIndexBuild(t *testing.T) {
 	}
 }
 
+// TestMigrationCancelsBuildStartedWhileItWaits holds the indexing lock, as
+// the leader does while it drops an invalid index before building it again,
+// so that a migration starts looking for builds to cancel before there is
+// one, and then starts the build. The migration cancels it, though the
+// server shows a transaction the activity it first read for the rest of it.
+func TestMigrationCancelsBuildStartedWhileItWaits(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	// HistoryIndexLockKey ("hopi"), which the leader holds while it indexes,
+	// and HistoryIndexCancelKey ("hopc"), which the migration takes once it
+	// looks for builds.
+	const indexLockKey, cancelKey int32 = 0x686f7069, 0x686f7063
+	indexing, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = indexing.Rollback(ctx) })
+	if _, err := indexing.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)", indexLockKey); err != nil {
+		t.Fatal(err)
+	}
+	mctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	migrated := make(chan error, 1)
+	go func() {
+		_, err := hoppermigrate.Down(mctx, d, &hoppermigrate.Options{Logger: logger, Target: 16})
+		migrated <- err
+	}()
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(10 * time.Millisecond) {
+		var looking bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND granted
+			AND classid = hashtext(current_schema())::oid AND objid = $1::oid AND objsubid = 2)`, cancelKey).Scan(&looking); err != nil {
+			t.Fatal(err)
+		}
+		if looking {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the migration did not start looking for builds")
+		}
+	}
+	// A few of the migration's passes see no build.
+	time.Sleep(300 * time.Millisecond)
+
+	// The build waits for a snapshot held open, as the leader's does for a
+	// long transaction.
+	held, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Rollback(ctx) })
+	if _, err := held.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.Exec(ctx, "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	built := make(chan error, 1)
+	go func() {
+		_, err := pool.Exec(ctx, `CREATE INDEX CONCURRENTLY hopper_job_history_completed_default_ordering
+			ON hopper_job_history_completed_default (ordering_key, id) WHERE ordering_key IS NOT NULL`)
+		built <- err
+	}()
+	select {
+	case err := <-built:
+		if err == nil || !strings.Contains(err.Error(), "57014") {
+			t.Errorf("the build started while the migration waited = %v, want it canceled (57014)", err)
+		}
+	case <-time.After(30 * time.Second):
+		// The build can be waiting for the migration's transaction too,
+		// which waits for the lock: let both go.
+		t.Error("the migration did not cancel a build started while it waited")
+		_ = held.Rollback(ctx)
+		_ = indexing.Rollback(ctx)
+		<-built
+	}
+	_ = indexing.Rollback(ctx)
+	if err := <-migrated; err != nil {
+		t.Errorf("Down: %v", err)
+	}
+}
+
 // TestMigrationFailsOnBuildItMayNotCancel runs a migration as a role that
 // may not cancel the leader's build, a superuser's, while the build is held
 // up. The migration fails at once, saying why, and leaves the build to
