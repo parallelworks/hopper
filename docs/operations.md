@@ -66,9 +66,11 @@
   invalid, unused by the planner. The leader repairs that on Postgres's May 2026
   minor releases (18.4, 17.10, 16.14, 15.18, 14.23) and later; on earlier ones
   it warns that the index stays invalid, and updating Postgres's minor version
-  lets it finish. The repair waits for transactions that read the partition it
-  locks; a warning that it has been deferred for five passes means such
-  transactions keep overlapping.
+  lets it finish, within 8 maintenance intervals. Attaching a built index, and
+  the repair, wait for transactions that read the partition they lock; a
+  warning that an attach has been deferred for five passes means such
+  transactions keep overlapping. A warning that partitions have been kept
+  for five passes is not raised while their build is still running.
 - **`UniqueOpts.Finished`.** Each such job is looked up in every history
   partition of the outcomes it counts, one index lookup each, so the cost
   grows with retention. With the default 24 hours of completed history, a

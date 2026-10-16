@@ -791,7 +791,9 @@ func TestLeaderBacksOffTimedOutIndexBuilds(t *testing.T) {
 // TestLeaderReportsInvalidHistoryIndex leaves an outcome table's index
 // invalid with every partition indexed, as an earlier release's retention
 // could. The leader repairs it where Postgres's re-attach counts the attached
-// indexes again, and otherwise warns, at doubling intervals.
+// indexes again, and otherwise warns, at doubling intervals capped at eight
+// maintenance intervals, so that a server updated to a release that repairs
+// it is not left waiting for the longer backoff of a timed-out build.
 func TestLeaderReportsInvalidHistoryIndex(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -824,7 +826,7 @@ func TestLeaderReportsInvalidHistoryIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	tun := fastTuning
-	tun.Maintenance = 250 * time.Millisecond
+	tun.Maintenance = 100 * time.Millisecond
 	c.SetTuning(tun)
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -840,10 +842,11 @@ func TestLeaderReportsInvalidHistoryIndex(t *testing.T) {
 		return
 	}
 	waitFor(t, func() bool { return logs.count(index) > 0 })
-	// As with timed-out builds: after waits of 0.5, 1 and 2 seconds.
-	time.Sleep(3 * time.Second)
-	if n := logs.count(index); n < 2 || n > 4 {
-		t.Errorf("%s reported %d times in three seconds, want 2 to 4", index, n)
+	// After waits of 0.2, 0.4 and then 0.8 seconds: 8 reports in five
+	// seconds, against 5 if the waits went on doubling.
+	time.Sleep(5 * time.Second)
+	if n := logs.count(index); n < 6 || n > 9 {
+		t.Errorf("%s reported %d times in five seconds, want 6 to 9", index, n)
 	}
 }
 
@@ -877,7 +880,7 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	if _, err := reader.Exec(ctx, "SELECT count(*) FROM hopper_job_history WHERE ordering_key = 'lane'"); err != nil {
 		t.Fatal(err)
 	}
-	logs := &timeoutLog{counts: map[string]int{}, message: "repair deferred", key: "passes", level: slog.LevelWarn}
+	logs := &timeoutLog{counts: map[string]int{}, message: "attach deferred", key: "passes", level: slog.LevelWarn}
 	c, err := hopper.NewClient(h.d, &hopper.Config{
 		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
 		Logger: slog.New(logs),
@@ -928,6 +931,72 @@ func TestLeaderWarnsAboutKeptPartition(t *testing.T) {
 	if n := logs.count("4"); n != 0 {
 		t.Errorf("warned after 4 passes")
 	}
+}
+
+// TestLeaderDoesNotWarnAboutPartitionKeptForBuild keeps the last partition
+// an outcome table's index lacks past retention while a build holds it, for
+// more passes than the warning waits for: a long build is reported at Info,
+// and does not count towards the warning.
+func TestLeaderDoesNotWarnAboutPartitionKeptForBuild(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	const old = "hopper_job_history_failed_20000101"
+	for _, query := range []string{
+		"DROP INDEX hopper_job_history_failed_ordering",
+		"CREATE TABLE " + old + " (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)",
+		"ALTER TABLE hopper_job_history_failed ATTACH PARTITION " + old + " FOR VALUES FROM ('2000-01-01Z') TO ('2000-01-02Z')",
+		"CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id) WHERE ordering_key IS NOT NULL",
+	} {
+		if _, err := h.pool.Exec(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{Skip: []string{old}}); err != nil {
+		t.Fatal(err)
+	}
+	// The partition's build lock (HistoryIndexLockKey), held as a build
+	// holds it.
+	build, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = build.Rollback(ctx) })
+	if _, err := build.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema() || '.' || $1), 1752133737)", old); err != nil {
+		t.Fatal(err)
+	}
+	kept := &timeoutLog{counts: map[string]int{}, message: "kept while their index is built", key: "kept"}
+	counted := &timeoutLog{counts: map[string]int{}, message: "kept until their index is built", key: "passes"}
+	c := h.client(&hopper.Config{
+		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
+		Logger: slog.New(teeHandler{kept, counted}), FailedRetention: 48 * time.Hour,
+	})
+	tun := fastTuning
+	tun.Maintenance = 100 * time.Millisecond
+	c.SetTuning(tun)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return kept.count("["+old+"]") > 6 })
+	if n := counted.count("1"); n != 0 {
+		t.Errorf("a partition kept for a build under way counted towards the warning %d times", n)
+	}
+}
+
+// teeHandler hands each record to every one of its handlers.
+type teeHandler []slog.Handler
+
+func (t teeHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (t teeHandler) WithAttrs([]slog.Attr) slog.Handler       { return t }
+func (t teeHandler) WithGroup(string) slog.Handler            { return t }
+
+func (t teeHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, h := range t {
+		if err := h.Handle(ctx, r.Clone()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // timedOutBuilds starts a leader whose sessions have a statement_timeout

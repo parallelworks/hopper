@@ -40,6 +40,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", c.clientID.Load())
 				c.emit(EventLeaderElected, nil, "")
 				lastMaintenance = time.Time{}
+				c.keptPasses = 0
 				term = c.startTerm(ctx)
 			}
 			c.rescue(ctx)
@@ -353,6 +354,11 @@ func (c *Client[TTx]) pruneClients(ctx context.Context) {
 // at 64 maintenance intervals.
 const maxIndexBackoffShift = 6
 
+// maxInvalidBackoffShift caps the retry interval of an index reported
+// invalid at 8 maintenance intervals: the minor release that repairs it
+// arrives without a new term, and the next try repairs it.
+const maxInvalidBackoffShift = 3
+
 // indexLoop builds history indexes an upgrade declared (HistoryIndex) once
 // the term's first history maintenance has run, and then every maintenance
 // interval. It runs beside the leader loop, not in it: a concurrent index
@@ -380,10 +386,10 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		next     time.Time
 	}
 	timedOut := map[string]backoff{}
-	retryIn := func(name string) time.Duration {
+	retryIn := func(name string, maxShift int) time.Duration {
 		b := timedOut[name]
 		b.failures++
-		wait := c.tuning.maintenanceInterval << min(b.failures, maxIndexBackoffShift)
+		wait := c.tuning.maintenanceInterval << min(b.failures, maxShift)
 		b.next = time.Now().Add(wait)
 		timedOut[name] = b
 		return wait
@@ -403,22 +409,18 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		}
 		for _, name := range res.TimedOut {
 			c.logger.WarnContext(ctx, "hopper: a history partition's index build ran past statement_timeout; raise it for this role to let the build finish",
-				"partition", name, "retry_in", retryIn(name))
+				"partition", name, "retry_in", retryIn(name, maxIndexBackoffShift))
 		}
 		for _, name := range res.Invalid {
 			c.logger.WarnContext(ctx, "hopper: a history index stays invalid, so queries that need it read every partition; "+
 				"Postgres repairs it from its May 2026 minor releases (18.4, 17.10, 16.14, 15.18, 14.23) on",
-				"index", name, "retry_in", retryIn(name))
+				"index", name, "retry_in", retryIn(name, maxInvalidBackoffShift))
 		}
 		if len(res.Deferred) == 0 {
 			deferrals = 0
 		} else {
 			deferrals++
-			level := slog.LevelDebug
-			if deferrals >= ddlDeferralsWarn {
-				level = slog.LevelWarn
-			}
-			c.logger.Log(ctx, level, "hopper: history index repair deferred: a transaction that used the partition held its lock",
+			c.logger.Log(ctx, repeatLevel(deferrals, slog.LevelDebug), "hopper: history index attach deferred: a transaction that used the partition held its lock",
 				"indexes", res.Deferred, "lock_timeout", timeout, "passes", deferrals)
 		}
 		select {
@@ -459,6 +461,9 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 // is missing when its period starts sends that period's history to the
 // DEFAULT partition.
 func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
+	// A pass after one that deferred work retries it on the next leader
+	// pass, ahead of the maintenance interval.
+	retry := c.ddlDeferrals > 0
 	timeout := ddlLockTimeout(c.ddlDeferrals)
 	res, err := c.exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{
 		CompletedRetention: c.cfg.CompletedRetention,
@@ -475,29 +480,39 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
 	}
-	if len(res.Kept) == 0 {
+	// Kept partitions wait for the index loop, which runs every maintenance
+	// interval, so only those passes count towards the warning, and only
+	// while a partition waits for a build that is not under way: a long
+	// build is no failure.
+	switch {
+	case len(res.Kept) == len(res.Building):
 		c.keptPasses = 0
-	} else {
-		c.keptPasses++
-		level := slog.LevelInfo
-		if c.keptPasses >= ddlDeferralsWarn {
-			level = slog.LevelWarn
+		if len(res.Kept) > 0 && !retry {
+			c.logger.InfoContext(ctx, "hopper: history partitions past retention kept while their index is built", "kept", res.Kept)
 		}
-		c.logger.Log(ctx, level, "hopper: history partitions past retention kept until their index is built",
-			"kept", res.Kept, "passes", c.keptPasses)
+	case !retry:
+		c.keptPasses++
+		c.logger.Log(ctx, repeatLevel(c.keptPasses, slog.LevelInfo), "hopper: history partitions past retention kept until their index is built",
+			"kept", res.Kept, "building", res.Building, "passes", c.keptPasses)
 	}
 	if len(res.Deferred) == 0 {
 		c.ddlDeferrals = 0
 		return true
 	}
 	c.ddlDeferrals++
-	level := slog.LevelDebug
-	if c.ddlDeferrals >= ddlDeferralsWarn {
-		level = slog.LevelWarn
-	}
-	c.logger.Log(ctx, level, "hopper: history partitions deferred: a transaction that wrote history held their lock",
+	c.logger.Log(ctx, repeatLevel(c.ddlDeferrals, slog.LevelDebug), "hopper: history partitions deferred: a transaction that wrote history held their lock",
 		"deferred", res.Deferred, "lock_timeout", timeout, "passes", c.ddlDeferrals)
 	return false
+}
+
+// repeatLevel is the level of a record about something that has lasted
+// passes passes in a row: level, and a warning from the ddlDeferralsWarn-th
+// on.
+func repeatLevel(passes int, level slog.Level) slog.Level {
+	if passes >= ddlDeferralsWarn {
+		return slog.LevelWarn
+	}
+	return level
 }
 
 // Deferred partition work is retried on every leader pass, each time

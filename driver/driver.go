@@ -866,10 +866,14 @@ type HistoryMaintainResult struct {
 	// later pass retries them.
 	Deferred []string
 	// Kept names storage units past retention that wait for HistoryIndex to
-	// build their index: one whose build is under way or about to start, or the last one its
-	// outcome table's index lacks, which dropping first would leave that
-	// index unable to complete. A later pass drops them.
+	// build their index: one whose build, or the build of its outcome
+	// table's DEFAULT partition, is under way or about to start, or the last
+	// one its outcome table's index lacks, which dropping first would leave
+	// that index unable to complete. A later pass drops them.
 	Kept []string
+	// Building names those of Kept whose build is under way; the others
+	// wait for a build that has not started or keeps failing.
+	Building []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64
 }
@@ -879,10 +883,10 @@ type HistoryIndexParams struct {
 	// Skip names storage units (partitions on Postgres) to leave for a later
 	// pass, and indexes not to try to repair (HistoryIndexResult.Invalid).
 	Skip []string
-	// LockTimeout bounds how long repairing an index waits for its lock,
-	// during which the queries of the storage unit it locks queue behind
-	// it, as HistoryMaintainParams.LockTimeout does. Zero means the engine's
-	// default.
+	// LockTimeout bounds how long attaching a built index, or repairing an
+	// index, waits for its lock, during which the queries of the storage
+	// unit it locks queue behind it, as HistoryMaintainParams.LockTimeout
+	// does. Zero means the engine's default.
 	LockTimeout time.Duration
 }
 
@@ -898,9 +902,11 @@ type HistoryIndexResult struct {
 	// Postgres's May 2026 minor releases. Queries that need it read every
 	// partition instead.
 	Invalid []string
-	// Deferred names indexes whose repair could not get its lock within
+	// Deferred names indexes whose attach (a storage unit's index, once
+	// built) or repair (an outcome table's) could not get its lock within
 	// LockTimeout, held off by a transaction that read or wrote the storage
-	// unit it locks; a later pass retries them.
+	// unit it locks; a later pass retries them, without building a built
+	// index again.
 	Deferred []string
 }
 

@@ -1153,8 +1153,13 @@ holds, while the build waits for the attach's transaction. Each build also holds
 lock keyed to its partition, from before it starts until its index is attached;
 retention tries it before dropping an expired partition, and keeps a partition whose
 lock is held (`HistoryMaintainResult.Kept`) rather than wait for a build that waits for
-it in turn. Retention holds that lock only while it drops the partition, so a build
-waits for it and skips a partition dropped meanwhile. A drop the deadlock detector
+it in turn. It also tries the lock keyed to the outcome table, and keeps the expired
+partitions while the table's `DEFAULT` partition is being built: a drop takes `ACCESS
+EXCLUSIVE` locks on the table and then on its `DEFAULT` partition, so it would hold
+every query of the table up while it waited for the build, which waits for the drop's
+snapshot in turn. Retention holds those locks only while it drops the partition, and
+creation the table's only while it creates one, so a build waits for them and skips
+a partition dropped meanwhile. A drop the deadlock detector
 picks over a build waiting for its snapshot is deferred. A build cut short by the end of a term
 leaves an invalid index, which the next build drops and builds again. Postgres marks
 an outcome table's index valid only in the attach that completes it, so retention
@@ -1165,17 +1170,23 @@ is not yet valid, a drop checks, under the history maintenance lock that attache
 take too, whether the partition is the last one the index lacks, and if it is keeps
 it until the build attaches its index: that one partition outlives retention by its
 build, once, after an upgrade. Once every index is valid, no partition is being built,
-and a drop skips both locks and the check. The leader logs kept partitions, and warns
-once it has kept some for five passes in a row, which means their builds keep failing. An index an earlier release left
+and a drop skips the locks and the check. The leader logs kept partitions, and warns
+once it has kept one whose build is not under way (`HistoryMaintainResult.Building`
+lists those whose build lock is held) for five maintenance passes in a row (the retries
+of deferred work on the leader passes between them do not count), which means their
+builds keep failing; a long build is no failure, and resets the count. An index an earlier release left
 invalid is revalidated by attaching one of its partitions' indexes again, which
 releases from May 2026 on count anew. The attach waits for its locks under the same
 doubling timeout as deferred partition work (`HistoryIndexParams.LockTimeout`), since
-the partition's queries queue behind it; one that cannot get them is reported
-(`HistoryIndexResult.Deferred`) and retried on the next pass, and the leader warns
-once a repair has been deferred five passes in a row. One whose partition retention
+the partition's queries queue behind it; so does the attach that ends a build. One
+that cannot get them is reported (`HistoryIndexResult.Deferred`, naming the
+partition's index for a build's) and retried on the next pass, which attaches a built
+index without building it again, and the leader warns once an attach has been deferred
+five passes in a row. One whose partition retention
 dropped meanwhile is left to the next pass; where that leaves it invalid (`HistoryIndexResult.Invalid`), the leader warns
-at doubling intervals that queries needing it read every partition until Postgres is
-updated. A build that runs past the session's `statement_timeout` is canceled by it: its
+at doubling intervals, up to 8 maintenance intervals, that queries needing it read
+every partition until Postgres is updated: the update that repairs it arrives without
+a new term, and the next try after it repairs the index. A build that runs past the session's `statement_timeout` is canceled by it: its
 leftover is dropped, the pass goes on to the other partitions, and the leader retries
 that partition at doubling intervals, up to 64 maintenance intervals, warning each
 time that the timeout should be raised for hopper's role. The build cannot lift the
