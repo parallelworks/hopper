@@ -1,7 +1,7 @@
 # Contributing to hopper
 
 - Every change goes through a pull request against `canary`.
-- PR titles follow [Conventional Commits](https://www.conventionalcommits.org)
+- Commit messages and PR titles follow [Conventional Commits](https://www.conventionalcommits.org)
   (`feat(client): ...`, `fix(rescuer): ...`, `docs: ...`). PRs are squash-merged, so the
   title becomes the commit.
 - The core module depends only on the Go standard library and `github.com/jackc/pgx/v5`.

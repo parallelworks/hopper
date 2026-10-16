@@ -24,8 +24,8 @@ Development tools (golangci-lint) are pinned in `tools/go.mod` and run with
 ## Pull requests
 
 - Branch from `canary` and open the PR against `canary`.
-- Title the PR with a [Conventional Commit](https://www.conventionalcommits.org)
-  prefix (`feat(client): ...`, `fix(rescuer): ...`, `docs: ...`). PRs are
+- Write commit messages and the PR title as [Conventional Commits](https://www.conventionalcommits.org)
+  (`feat(client): ...`, `fix(rescuer): ...`, `docs: ...`). PRs are
   squash-merged, so the title becomes the commit message.
 - Keep [docs/PLAN.md](docs/PLAN.md) current: it is the design of record, and a
   behavior change lands in the same PR as its plan update.
