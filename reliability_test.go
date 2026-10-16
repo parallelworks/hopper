@@ -549,9 +549,8 @@ func TestLeaderWaitsOutFailingGroup(t *testing.T) {
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, func() bool {
-		return logs.count("hopper: history partitions deferred: a transaction that wrote history, or other history maintenance, held their lock") > 0
-	})
+	// A failed pass logs what it deferred with its error.
+	waitFor(t, func() bool { return logs.count("hopper: maintain history") > 0 })
 	time.Sleep(5 * fastTuning.LeaderInterval)
 	if n := logs.count("hopper: maintain history"); n != 1 {
 		t.Errorf("failing maintenance ran %d times within one maintenance interval, want 1", n)
