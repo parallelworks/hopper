@@ -1415,7 +1415,10 @@ partitioned the same way, whose partitions the leader creates and drops beside
 history's, each in a transaction of its own. A tags partition is dropped only once its
 history partition is gone, after it in the same pass or in a later one, so that a job
 in history always keeps its tags rows; a tags partition left without its history
-partition indexes nothing a listing returns. Neither creation nor a drop locks both
+partition indexes nothing a listing returns. A period that never had a history
+partition has its jobs in history's `DEFAULT` partition, so tags partitions are dropped
+only in a pass whose history outcome group has pruned its `DEFAULT` partition; while
+that prune fails, they wait. Neither creation nor a drop locks both
 tables: a finalize locks history before its tags and a listing by tag the tags before
 history, so a statement that held one parent while it waited for the other could
 deadlock with either. A history partition that has no tags partition beside it, as one
@@ -1466,13 +1469,8 @@ deferred work with it, but work it deferred lengthens the next try's lock timeou
 on a pass without a failure, so that a failure that lasts does not hold the other
 groups' deferred work at the shortest timeout for good. Deferrals are logged at debug level, and as a warning from the fifth pass in a
 row. Retention periods are set in `Config` and enforced by the leader, so the leader's
-settings apply cluster-wide. A group whose maintenance fails (history's outcome
-tables, the stream log, history's tags tables) leaves the others maintained in the
-same pass, which reports the failures together: a partition ahead that is missing
-when its period starts sends that period's rows to the `DEFAULT` partition. A pass that
-failed is run again at the next maintenance interval, its deferrals included, since a
-retry on the next leader pass would run the failing group again every few seconds; a
-pass that deferred nothing ends the run of deferrals, failed or not.
+settings apply cluster-wide. The groups maintained this way are history's outcome
+tables, the stream log and history's tags tables.
 
 The defaults follow common practice: job queues keep successful jobs briefly and
 failures longer, while brokers such as RabbitMQ and SQS delete a message once it is

@@ -102,11 +102,21 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 	// A group whose maintenance fails leaves the others to theirs: the
 	// partitions ahead of each, and its retention, are independent.
 	var errs []error
+	// retained records the groups whose retention ran in full this pass. A
+	// tags group drops its time partitions only once the history group it
+	// mirrors has pruned its DEFAULT partition: a period whose history
+	// partition never existed has its jobs there, and dropping their tags
+	// partition before them would leave jobs in history that no listing by
+	// tag finds.
+	retained := map[string]bool{}
 	for _, g := range historyGroups {
 		// A tags group keeps its rows as long as the history it mirrors.
-		if err := e.maintainGroup(ctx, g, now, retention[cmp.Or(g.mirrors, g.parent)], lockTimeout, &res); err != nil {
+		mayDrop := g.mirrors == "" || retained[g.mirrors]
+		ok, err := e.maintainGroup(ctx, g, now, retention[cmp.Or(g.mirrors, g.parent)], lockTimeout, mayDrop, &res)
+		if err != nil {
 			errs = append(errs, err)
 		}
+		retained[g.parent] = ok
 	}
 	return res, errors.Join(errs...)
 }
@@ -116,13 +126,16 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 // to the next pass, but not the group's other steps: a failure that lasts,
 // such as an attach whose scan of a DEFAULT partition grown large outlasts
 // statement_timeout, would otherwise also stop the drops and the DEFAULT
-// prune that let the group recover. The errors are reported together.
-func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.Time, keep time.Duration, lockTimeout string, res *driver.HistoryMaintainResult) error {
+// prune that let the group recover. The errors are reported together. The
+// time partitions are dropped only when mayDrop. It reports whether its
+// retention ran in full: every expired partition dropped, kept or deferred,
+// and the DEFAULT partition pruned, or retention is off.
+func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.Time, keep time.Duration, lockTimeout string, mayDrop bool, res *driver.HistoryMaintainResult) (retained bool, err error) {
 	existing, err := e.partitionsOf(ctx, g.parent)
 	if err != nil {
 		// Without the list, neither the partitions ahead nor those past
 		// retention are known, but the DEFAULT partition's prune needs none.
-		return errors.Join(err, e.pruneDefault(ctx, g, keep, res))
+		return false, errors.Join(err, e.pruneDefault(ctx, g, keep, res))
 	}
 	var errs []error
 
@@ -160,35 +173,40 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 	// Drop partitions whose whole period is past retention. Every drop
 	// waits for the same lock on the parent, so as with the attaches,
 	// once one is deferred the rest are deferred untried.
+	var expired []string
 	if keep > 0 {
 		cutoff := now.Add(-keep)
-		// Read once, before the first drop, and only when a partition is
-		// past retention: most passes drop nothing.
-		lacking := sync.OnceValues(func() (map[string][]string, error) { return e.lackingInvalidIndexes(ctx, g.parent) })
-		mirrored := sync.OnceValues(func() (map[string]bool, error) { return e.mirroredPartitions(ctx, g, existing, cutoff) })
-		blocked := false
 		for name := range existing {
-			from, ok := g.parse(name)
-			if !ok || !from.Add(g.period).Before(cutoff) {
-				continue
+			if from, ok := g.parse(name); ok && from.Add(g.period).Before(cutoff) {
+				expired = append(expired, name)
 			}
+		}
+	}
+	dropsFailed := false
+	if mayDrop && len(expired) > 0 {
+		// Read once, before the first drop: most passes drop nothing.
+		lacking := sync.OnceValues(func() (map[string][]string, error) { return e.lackingInvalidIndexes(ctx, g.parent) })
+		mirrored, err := e.mirroredPartitions(ctx, g, expired)
+		if err != nil {
+			errs = append(errs, err)
+			dropsFailed = true
+			expired = nil
+		}
+		blocked := false
+		for _, name := range expired {
 			// A tags partition goes only once its history partition is
 			// gone: dropped first, the jobs it indexes would drop out of
 			// listings by tag. The two are never dropped together: a
 			// finalize locks history before its tags, and a listing by
 			// tag the tags before history, so a drop holding one parent
 			// while it waits for the other could deadlock with either.
-			still, err := mirrored()
-			if err != nil {
-				errs = append(errs, err)
-				break
-			}
-			if still[name] {
+			if mirrored[name] {
 				continue
 			}
 			unindexed, err := lacking()
 			if err != nil {
 				errs = append(errs, err)
+				dropsFailed = true
 				break
 			}
 			needs := unindexed[name]
@@ -203,6 +221,7 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 			outcome, err := e.dropPartition(ctx, g, name, needs, lockTimeout)
 			if err != nil {
 				errs = append(errs, err)
+				dropsFailed = true
 				break
 			}
 			switch outcome {
@@ -216,7 +235,8 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 			}
 		}
 	}
-	return errors.Join(append(errs, e.pruneDefault(ctx, g, keep, res))...)
+	pruneErr := e.pruneDefault(ctx, g, keep, res)
+	return mayDrop && !dropsFailed && pruneErr == nil, errors.Join(append(errs, pruneErr)...)
 }
 
 // pruneDefault deletes the rows of g's DEFAULT partition past retention,
@@ -942,22 +962,17 @@ func (e *Executor) partitionsOf(ctx context.Context, parent string) (map[string]
 	return out, nil
 }
 
-// mirroredPartitions reports which of g's partitions past cutoff still have
-// the partition of g.mirrors for the same period, in one statement for the
-// whole group: a tags partition goes only once its history partition is gone.
-func (e *Executor) mirroredPartitions(ctx context.Context, g historyGroup, existing map[string]struct{}, cutoff time.Time) (map[string]bool, error) {
-	if g.mirrors == "" {
+// mirroredPartitions reports which of g's expired partitions, names, still
+// have the partition of g.mirrors for the same period, in one statement for
+// the whole group: a tags partition goes only once its history partition is
+// gone.
+func (e *Executor) mirroredPartitions(ctx context.Context, g historyGroup, names []string) (map[string]bool, error) {
+	if g.mirrors == "" || len(names) == 0 {
 		return nil, nil
 	}
-	var names, mirrors []string
-	for name := range existing {
-		if from, ok := g.parse(name); ok && from.Add(g.period).Before(cutoff) {
-			names = append(names, name)
-			mirrors = append(mirrors, e.Schema.Table(g.mirrors+strings.TrimPrefix(name, g.parent)))
-		}
-	}
-	if len(names) == 0 {
-		return nil, nil
+	mirrors := make([]string, len(names))
+	for i, name := range names {
+		mirrors[i] = e.Schema.Table(g.mirrors + strings.TrimPrefix(name, g.parent))
 	}
 	found, err := scanStrings(e.Conn.Query(ctx, `
 		SELECT n FROM unnest($1::text[], $2::text[]) AS m(n, mirror) WHERE to_regclass(m.mirror) IS NOT NULL`,

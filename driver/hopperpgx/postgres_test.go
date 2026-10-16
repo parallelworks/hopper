@@ -195,6 +195,83 @@ func TestHistoryMaintainGoesPastGroupError(t *testing.T) {
 	}
 }
 
+// TestHistoryMaintainRetainsPastCreateError has the stream log's partition
+// ahead fail to attach on every pass, and checks that the group's retention
+// still runs: its partition past retention is dropped, and its DEFAULT
+// partition pruned.
+func TestHistoryMaintainRetainsPastCreateError(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	for _, q := range []string{
+		// Rows of both days ahead, so that the pass fails whichever day it
+		// runs in.
+		`INSERT INTO hopper_stream_events (topic, created_at)
+		 SELECT 't', date_trunc('day', now(), 'UTC') + make_interval(days => d, hours => 1) FROM generate_series(1, 2) d`,
+		`INSERT INTO hopper_stream_events (topic, created_at) VALUES ('t', now() - interval '30 days')`,
+		`CREATE TABLE hopper_stream_events_20200101 PARTITION OF hopper_stream_events
+		 FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-02 00:00:00+00')`,
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{StreamRetention: 24 * time.Hour})
+	if err == nil {
+		t.Fatal("HistoryMaintain with a stream log partition that cannot attach = nil error")
+	}
+	if !slices.Contains(res.Dropped, "hopper_stream_events_20200101") || res.Pruned != 1 {
+		t.Errorf("stream log retention past its creation error = %+v; want hopper_stream_events_20200101 dropped and 1 row pruned", res)
+	}
+}
+
+// TestTagsPartitionKeptWhileHistoryPruneFails has a tagged job of a period
+// whose history partition never existed, so that it is in history's DEFAULT
+// partition while its tags rows are in that period's tags partition. While
+// the DEFAULT partition's prune fails, the tags partition past retention is
+// kept, so that the job, still in history, is still listed by its tag; once
+// the prune takes the job, the tags partition goes too.
+func TestTagsPartitionKeptWhileHistoryPruneFails(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	const tagsPartition = "hopper_job_history_tags_completed_2020010100"
+	var id string
+	for _, q := range []string{
+		`CREATE TABLE ` + tagsPartition + ` PARTITION OF hopper_job_history_tags_completed
+		 FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`,
+		`CREATE FUNCTION refuse_prune() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'prune refused'; END $$`,
+		`CREATE TRIGGER refuse_prune BEFORE DELETE ON hopper_job_history_completed_default
+		 FOR EACH ROW EXECUTE FUNCTION refuse_prune()`,
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts,
+		  scheduled_at, args, metadata, errors, await, created_at, finalized_at, tags)
+		VALUES (hopper_uuidv7(), 1, 'k', 'default', 'completed', 2, 1, 1, now(), '{}', '{}', '[]', false, now(),
+		  '2020-01-01 00:30:00+00', '["old"]') RETURNING id::text`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	p := driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, FailedRetention: 7 * 24 * time.Hour}
+	res, err := exec.HistoryMaintain(ctx, p)
+	if err == nil || slices.Contains(res.Dropped, tagsPartition) {
+		t.Errorf("maintenance while history's prune fails = %+v, %v; want an error and %s kept", res, err, tagsPartition)
+	}
+	listed, err := exec.JobList(ctx, driver.JobListParams{TagsAny: []string{"old"}, Limit: 10})
+	if err != nil || len(listed) != 1 || listed[0].ID.String() != id {
+		t.Errorf("job in history's DEFAULT partition listed by tag = %+v, %v", listed, err)
+	}
+	if _, err := pool.Exec(ctx, "DROP TRIGGER refuse_prune ON hopper_job_history_completed_default"); err != nil {
+		t.Fatal(err)
+	}
+	res, err = exec.HistoryMaintain(ctx, p)
+	if err != nil || !slices.Contains(res.Dropped, tagsPartition) {
+		t.Errorf("maintenance once history's prune runs = %+v, %v; want %s dropped", res, err, tagsPartition)
+	}
+}
+
 func TestHistoryMaintainConcurrentLeaders(t *testing.T) {
 	t.Parallel()
 	ctx, _, exec := setup(t)
