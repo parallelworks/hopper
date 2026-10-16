@@ -37,6 +37,8 @@ jobs:
         run: |
           go mod tidy -diff
           (cd tools && go mod tidy -diff)
+          # dev (make devstack) needs a newer Go than the modules CI builds.
+          (cd tools/dev && GOTOOLCHAIN=auto go mod tidy -diff)
           (cd hopperotel && go mod tidy -diff)
           (cd hopperui && go mod tidy -diff)
       - name: Lint

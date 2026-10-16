@@ -1,0 +1,14 @@
+{
+  "name": "hopper",
+  "postgres": {
+    "port": 54329,
+    "parameters": {
+      "fsync": "off",
+      "synchronous_commit": "off",
+      "max_connections": "300"
+    }
+  },
+  "env": {
+    "HOPPER_TEST_DATABASE_URL": "{postgres_test}"
+  }
+}

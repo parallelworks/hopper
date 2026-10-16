@@ -7,20 +7,29 @@ Thanks for helping build hopper. The rules that apply to every change are in
 
 hopper needs Go (the version in `go.mod`) and a PostgreSQL 14+ database for the
 integration tests. `make devstack` runs one natively, with nothing to install:
-the first run downloads the Postgres binaries, and the data persists in
-`.devstack/` until `make reset`.
+the first run downloads the Postgres binaries (Postgres 18), and the data
+persists in `.devstack/` until `make reset`, which wants `make devstack`
+stopped first.
 
 ```sh
 make devstack  # Postgres on localhost:54329, until interrupted
 make check     # lint + tests, in another terminal
 ```
 
-To use a database you already run, set `HOPPER_TEST_DATABASE_URL`. Every test
-creates its own schema and drops it afterwards, so tests run in parallel and
-leave nothing behind. Without the variable, integration tests are skipped.
+A script can start `make devstack` in the background and wait for it with
+`make devstack-wait`. A container left from the old `make pg` holds the same
+port: stop it with `docker stop hopper-postgres`.
 
-Development tools (golangci-lint) are pinned in `tools/go.mod` and run with
-`go tool`, so there is nothing to install globally.
+To test against another Postgres, such as one of the other versions CI runs,
+set `HOPPER_TEST_DATABASE_URL`. Every test creates its own schema and drops it
+afterwards, so tests run in parallel; a test binary that is killed leaves its
+schemas behind, which `make reset` clears. Without a database, integration
+tests are skipped.
+
+Development tools are pinned and run with `go tool`, so there is nothing to
+install globally: golangci-lint in `tools/go.mod`, and dev, which runs
+`make devstack`, in `tools/dev/go.mod`, with the newer Go it needs (fetched
+by the `go` command unless `GOTOOLCHAIN=local`).
 
 ## Pull requests
 
