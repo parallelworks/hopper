@@ -3,6 +3,7 @@ package hopper
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
@@ -185,6 +186,23 @@ type JobFilter struct {
 	// After starts the listing after the given job, for paging: pass the
 	// last ID of one page to get the next.
 	After JobID
+	// IDs lists only the jobs with one of the given IDs.
+	IDs []JobID
+	// Priorities lists only the jobs with one of the given priorities.
+	Priorities []Priority
+	// TagsAny lists jobs with at least one of the tags, and TagsAll jobs
+	// with all of them. Both can be set, each with at most MaxTags distinct
+	// tags.
+	TagsAny []string
+	TagsAll []string
+	// Metadata, a JSON object, lists jobs whose metadata contains it: every
+	// key it has, with an equal value, where an object value contains the
+	// same way and an array value contains each of its elements, as
+	// Postgres's jsonb containment (@>) does. {"tenant": "acme"} lists the
+	// jobs with that tenant, whatever else their metadata holds. Unlike
+	// tags, it has no index: it narrows what the other filters find, and
+	// alone reads every job.
+	Metadata json.RawMessage
 }
 
 // jobsPageSize is how many jobs Jobs fetches at a time.
@@ -198,18 +216,28 @@ func (c *Client[TTx]) Jobs(ctx context.Context, filter JobFilter) iter.Seq2[*Job
 }
 
 // JobsTx is Jobs inside the caller's transaction, so that jobs inserted with
-// InsertTx can be listed before the transaction commits.
+// InsertTx can be listed before the transaction commits. A filter the
+// database refuses (ErrInvalidFilter) leaves the transaction usable.
 func (c *Client[TTx]) JobsTx(ctx context.Context, tx TTx, filter JobFilter) iter.Seq2[*JobRow, error] {
 	return c.jobs(ctx, c.driver.UnwrapTx(tx), filter)
 }
 
 func (c *Client[TTx]) jobs(ctx context.Context, exec driver.Executor, filter JobFilter) iter.Seq2[*JobRow, error] {
 	return func(yield func(*JobRow, error) bool) {
+		if err := checkJobFilter(filter); err != nil {
+			yield(nil, err)
+			return
+		}
+		priorities := make([]int, len(filter.Priorities))
+		for i, p := range filter.Priorities {
+			priorities[i] = int(p)
+		}
 		after := filter.After
 		for {
 			page, err := exec.JobList(ctx, driver.JobListParams{
 				Queue: filter.Queue, Kinds: filter.Kinds, States: filter.States, OrderingKey: filter.OrderingKey,
 				NewestFirst: filter.NewestFirst, After: after, Limit: jobsPageSize,
+				IDs: filter.IDs, Priorities: priorities, TagsAny: filter.TagsAny, TagsAll: filter.TagsAll, Metadata: filter.Metadata,
 			})
 			if err != nil {
 				yield(nil, err)

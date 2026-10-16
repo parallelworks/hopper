@@ -55,9 +55,14 @@
 - **`statement_timeout`.** After the v13 and v14 upgrades the leader builds
   indexes on each existing history partition with `CREATE INDEX CONCURRENTLY`, which
   runs under the pool's `statement_timeout` and waits for every older
-  transaction in the database. A build that runs past the timeout is retried
-  at doubling intervals with a warning; raise the timeout for hopper's role
-  until the warnings stop. A timeout that ends a partition's creation or drop, or an
+  transaction in the database. A migration run meanwhile cancels the build
+  rather than wait for it, and the leader builds it again later. A leader of
+  a release before v17's, which is the one running while `migrate up` applies
+  v17, cannot tell that cancel from a timeout: it logs the timeout warning
+  below once for the partition and retries it later, and the warning can be
+  ignored. A build that runs past the timeout, or that an operator cancels, is
+  retried at doubling intervals with a warning; if nobody canceled it, raise
+  the timeout for hopper's role until the warnings stop. A timeout that ends a partition's creation or drop, or an
   index's attach, while it waits for its locks defers that work like a lock timeout;
   one that ends a partition's attach while it scans the DEFAULT partition, grown
   large during a long leader outage, is logged as an error each maintenance
@@ -191,7 +196,8 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
 
 ```sh
 hopper [-schema NAME] migrate up|down|version
-hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
+hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-priority P] \
+  [-tag T]... [-any-tag T]... [-metadata JSON] [-id ID]... [-newest] [-limit N]
 hopper jobs get|retry|cancel|delete <id>
 hopper jobs retry -from-start <id>
 hopper queues list|pause|resume [name]

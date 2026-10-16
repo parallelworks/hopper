@@ -8,9 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/hopper/driver"
 	"github.com/parallelworks/hopper/driver/hopperpgx"
@@ -95,9 +102,9 @@ func TestHistoryMaintain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 3 hourly and 2 daily periods ahead of the current ones, and 2 daily
-	// stream partitions.
-	if len(res.Created) != 3+2+2 {
+	// 3 hourly and 2 daily periods ahead of the current ones, for history and
+	// for its tags rows, and 2 daily stream partitions.
+	if len(res.Created) != 2*(3+2)+2 {
 		t.Errorf("created = %v", res.Created)
 	}
 	next := "hopper_job_history_completed_" + time.Now().UTC().Add(time.Hour).Format("2006010215")
@@ -161,6 +168,33 @@ func TestHistoryMaintain(t *testing.T) {
 	}
 }
 
+// TestHistoryMaintainGoesPastGroupError checks that a group whose
+// maintenance fails leaves the others maintained: with the stream log's
+// partition ahead failing to attach, history's tags still get theirs.
+func TestHistoryMaintainGoesPastGroupError(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	var now time.Time
+	if err := pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	day := now.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+	// The DEFAULT partition holds a row of the day ahead, which that day's
+	// partition cannot be attached past.
+	if _, err := pool.Exec(ctx, "INSERT INTO hopper_stream_events (topic, created_at) VALUES ('t', $1)", day.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err == nil {
+		t.Fatal("HistoryMaintain with a stream log partition that cannot attach = nil error")
+	}
+	hour := now.UTC().Truncate(time.Hour).Add(time.Hour)
+	var exists bool
+	if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", "hopper_job_history_tags_completed_"+hour.Format("2006010215")).Scan(&exists); err != nil || !exists {
+		t.Errorf("history tags partition ahead exists = %t, %v; want it created past the stream log's error", exists, err)
+	}
+}
+
 func TestHistoryMaintainConcurrentLeaders(t *testing.T) {
 	t.Parallel()
 	ctx, _, exec := setup(t)
@@ -210,4 +244,381 @@ func TestListenerFailsWhenBackendTerminated(t *testing.T) {
 		}
 	}
 	_ = l.Close(ctx)
+}
+
+// TestTagsAllWalksRarerTag checks that TagsAll walks the rarer of two tags
+// that both reach the count's cap, by the live tags table's statistics: the
+// common tag's 1,900 jobs come first in ID order, so walking it would read
+// them all before the first job that has both.
+func TestTagsAllWalksRarerTag(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	common := insertParams("common", 1900)
+	for i := range common {
+		common[i].Tags = []string{"every"}
+	}
+	both := insertParams("both", 1100)
+	for i := range both {
+		both[i].Tags = []string{"every", "some"}
+	}
+	for _, p := range [][]driver.JobInsertParams{common, both} {
+		if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, "ANALYZE hopper_job_tags"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // read only
+	jobs, err := d.UnwrapTx(tx).JobList(ctx, driver.JobListParams{TagsAll: []string{"every", "some"}, Limit: 20})
+	if err != nil || len(jobs) != 20 {
+		t.Fatalf("JobList = %d jobs, %v", len(jobs), err)
+	}
+	// The counts read up to 1,000 entries of each tag; the walk of "some"
+	// reads a page's worth more, and that of "every" 1,900.
+	var read int64
+	if err := tx.QueryRow(ctx, "SELECT pg_stat_get_xact_tuples_returned('hopper_job_tags_pkey'::regclass)").Scan(&read); err != nil {
+		t.Fatal(err)
+	}
+	if read > 3000 {
+		t.Errorf("TagsAll read %d tags entries, as if it walked the common tag", read)
+	}
+}
+
+// TestTagsAllWalksTagRareInEachTable lists by two tags across the live table
+// and history, where the common tag has few live jobs: its count is under the
+// cap in one table, but it has many more jobs than the other tag, which is
+// past the cap in both. The listing walks the other one.
+func TestTagsAllWalksTagRareInEachTable(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	insert := func(kind string, n int, tags ...string) {
+		t.Helper()
+		p := insertParams(kind, n)
+		for i := range p {
+			p[i].Tags = tags
+		}
+		if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("old", 20000, "old")
+	insert("new_done", 1200, "new")
+	if _, err := pool.Exec(ctx, `WITH d AS (DELETE FROM hopper_jobs RETURNING *)
+		INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at,
+		  args, metadata, errors, await, created_at, finalized_at, tags)
+		SELECT id, seq, kind, queue, 'completed', priority, attempt, max_attempts, scheduled_at,
+		  args, metadata, errors, await, created_at, now(), tags FROM d`); err != nil {
+		t.Fatal(err)
+	}
+	insert("new", 1200, "new")
+	insert("both", 5, "old", "new")
+	if _, err := pool.Exec(ctx, "ANALYZE hopper_job_tags; ANALYZE hopper_job_history_tags"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // read only
+	jobs, err := d.UnwrapTx(tx).JobList(ctx, driver.JobListParams{TagsAll: []string{"old", "new"}, Limit: 20})
+	if err != nil || len(jobs) != 5 {
+		t.Fatalf("JobList = %d jobs, %v; want 5", len(jobs), err)
+	}
+	// The counts read up to 1,000 entries of each tag in each table, and the
+	// walk of "new" its 2,405; that of "old" would read its 20,000 in history.
+	var read int64
+	if err := tx.QueryRow(ctx, `SELECT coalesce(sum(pg_stat_get_xact_tuples_returned(x.indexrelid)), 0)::bigint
+		FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid
+		WHERE c.relnamespace = current_schema()::regnamespace AND c.relname LIKE 'hopper\_job%tags%'`).Scan(&read); err != nil {
+		t.Fatal(err)
+	}
+	if read > 10000 {
+		t.Errorf("TagsAll read %d tags entries, as if it walked the tag with few live jobs and many in history", read)
+	}
+}
+
+// TestTagsReinsertUnderSameIDFails deletes a tagged job and inserts it
+// again under its ID in one statement. The live tags table's insert trigger
+// adds the job's rows before the delete's statement trigger has removed the
+// old ones, so the statement fails, rather than leave the job without its
+// tags rows, and the job and its rows stay as they were.
+func TestTagsReinsertUnderSameIDFails(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	p := insertParams("reinsert", 1)
+	p[0].Tags = []string{"a", "b"}
+	if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := pool.Exec(ctx, `WITH d AS (DELETE FROM hopper_jobs RETURNING *) INSERT INTO hopper_jobs (id, kind, queue, args, tags) SELECT id, kind, queue, args, tags FROM d`)
+	var pgErr interface{ SQLState() string }
+	if !errors.As(err, &pgErr) || pgErr.SQLState() != "23505" {
+		t.Fatalf("reinsert under the same ID = %v, want a unique violation", err)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM hopper_job_tags t JOIN hopper_jobs j USING (id) WHERE j.tags ? t.tag`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Errorf("%d tags rows after the failed reinsert, want 2", rows)
+	}
+}
+
+// TestTagsAndFiltersInLatin1 works in a database whose encoding lacks some
+// characters. A listing by a queue, tag or Metadata in them fails with
+// ErrInvalidFilter, since no job can match it, and hopper_tags counts a
+// tag's bytes in UTF-8, as InsertOpts.Tags does.
+func TestTagsAndFiltersInLatin1(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	// The client sends UTF-8, which the server converts to LATIN1.
+	u, err := url.Parse(testdb.Database(t, "ENCODING 'LATIN1' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	q.Set("client_encoding", "UTF8")
+	u.RawQuery = q.Encode()
+	pool := testdb.PoolIn(t, u.String())
+	exec := testdb.Driver(pool).Executor()
+	for name, p := range map[string]driver.JobListParams{
+		"a queue":  {Queue: "日本", Metadata: json.RawMessage(`{"a": 1}`)},
+		"a tag":    {TagsAny: []string{"日本"}},
+		"tags":     {TagsAll: []string{"a", "日本"}},
+		"Metadata": {Queue: "default", Metadata: json.RawMessage(`{"a": "日本"}`)},
+	} {
+		p.Limit = 1
+		_, err := exec.JobList(ctx, p)
+		if !errors.Is(err, driver.ErrInvalidFilter) {
+			t.Errorf("JobList with %s LATIN1 lacks = %v, want ErrInvalidFilter", name, err)
+		}
+	}
+	// A tag's 255 bytes are counted in UTF-8, as a Go client counts them,
+	// though each é is one byte in LATIN1.
+	for n, ok := range map[int]bool{127: true, 128: false} {
+		_, err := pool.Exec(ctx, "SELECT hopper_tags(jsonb_build_array(repeat('é', $1)))", n)
+		if (err == nil) != ok {
+			t.Errorf("hopper_tags of %d é (%d UTF-8 bytes) = %v, want accepted %t", n, 2*n, err, ok)
+		}
+	}
+	// So are a batch callback's, which a direct SQL write to the batch row
+	// can make longer: a callback is not given a tag a listing refuses.
+	long := strings.Repeat("é", 200)
+	batch, err := exec.BatchInsert(ctx, driver.BatchInsertParams{Total: 1, OnComplete: &driver.JobInsertParams{Kind: "done", Queue: "callbacks", Priority: 1, MaxAttempts: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE hopper_batches SET on_complete = jsonb_set(on_complete, '{tags}', jsonb_build_array('cb', $1::text)) WHERE id = $2::uuid", long, batch.String()); err != nil {
+		t.Fatal(err)
+	}
+	shard := insertParams("shard", 1)
+	shard[0].BatchID = batch
+	if _, err := exec.JobInsertMany(ctx, shard, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	client := register(t, ctx, exec)
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: client, Limit: 1})
+	if err != nil || len(claimed.Jobs) != 1 {
+		t.Fatalf("claim = %+v, %v", claimed, err)
+	}
+	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{ID: claimed.Jobs[0].ID, AttemptedBy: client, State: driver.JobStateCompleted, Archive: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	callbacks, err := exec.JobList(ctx, driver.JobListParams{Queue: "callbacks", Limit: 10})
+	if err != nil || len(callbacks) != 1 || !slices.Equal(callbacks[0].Tags, []string{"cb"}) {
+		t.Errorf("callback whose batch row has a tag of 400 UTF-8 bytes = %+v, %v; want tags [cb]", callbacks, err)
+	}
+}
+
+// TestTagsControlCharactersInWIN1252 checks hopper_tags in a database whose
+// encoding gives printable characters, such as the euro sign, the bytes
+// 0x80 to 0x9F, which are C1 controls as code points: it refuses the
+// control characters InsertOpts.Tags refuses, and only those.
+func TestTagsControlCharactersInWIN1252(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	u, err := url.Parse(testdb.Database(t, "ENCODING 'WIN1252' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	q.Set("client_encoding", "UTF8")
+	u.RawQuery = q.Encode()
+	pool := testdb.PoolIn(t, u.String())
+	for tag, ok := range map[string]bool{"€100": true, "Š…‰": true, "a\nb": false, "a\x7fb": false} {
+		_, err := pool.Exec(ctx, "SELECT hopper_tags(jsonb_build_array($1::text))", tag)
+		if (err == nil) != ok {
+			t.Errorf("hopper_tags of %q = %v, want accepted %t", tag, err, ok)
+		}
+	}
+}
+
+// TestJobListStoredRowErrorIsNotFilter checks that a listing failing on a
+// stored row, not on its filters, is not reported as ErrInvalidFilter: a job
+// whose args have no form in the session's client encoding fails the
+// conversion of its row (22P05), a data exception like a refused filter's.
+func TestJobListStoredRowErrorIsNotFilter(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	p := insertParams("stored", 1)
+	p[0].Args = json.RawMessage(`{"name": "日本"}`)
+	if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // read only
+	if _, err := tx.Exec(ctx, "SET LOCAL client_encoding = 'LATIN1'"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.UnwrapTx(tx).JobList(ctx, driver.JobListParams{Queue: "default", Limit: 10})
+	if err == nil || errors.Is(err, driver.ErrInvalidFilter) {
+		t.Errorf("JobList of a row the client encoding lacks = %v, want the listing's own error", err)
+	}
+}
+
+// statementCounter counts the statements a pool runs.
+type statementCounter struct{ n atomic.Int64 }
+
+func (c *statementCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	c.n.Add(1)
+	return ctx
+}
+
+func (*statementCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// TestRetentionChecksTagsPartitionsTogether checks that retention finds which
+// expired tags partitions still have their history partition in one
+// statement for the group, not one for each: with history's drops deferred,
+// a pass over 20 such partitions runs no more statements than one over one.
+func TestRetentionChecksTagsPartitionsTogether(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	cfg := pool.Config()
+	counter := &statementCounter{}
+	cfg.ConnConfig.Tracer = counter
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(traced.Close)
+	maintain := testdb.Driver(traced).Executor()
+	p := driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, FailedRetention: 7 * 24 * time.Hour}
+	if _, err := exec.HistoryMaintain(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	addHour := func(h int) {
+		t.Helper()
+		from := time.Date(2020, 1, 1, h, 0, 0, 0, time.UTC)
+		for _, parent := range []string{"hopper_job_history_completed", "hopper_job_history_tags_completed"} {
+			if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s_%s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')`,
+				parent, from.Format("2006010215"), parent, from.Format(time.RFC3339), from.Add(time.Hour).Format(time.RFC3339))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// A transaction that wrote history holds every drop of its partitions
+	// off, so each pass defers them and keeps their tags partitions.
+	pass := func() int64 {
+		t.Helper()
+		held, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer held.Rollback(ctx) //nolint:errcheck // read only
+		if _, err := held.Exec(ctx, "LOCK TABLE hopper_job_history_completed IN ROW EXCLUSIVE MODE"); err != nil {
+			t.Fatal(err)
+		}
+		// A pass that created a partition ahead, as one does when the test
+		// straddles the hour, ran that creation's statements too; the next
+		// pass creates none.
+		for {
+			before := counter.n.Load()
+			res, err := maintain.HistoryMaintain(ctx, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range res.Dropped {
+				if strings.HasPrefix(name, "hopper_job_history_tags_completed_2020") {
+					t.Fatalf("pass dropped %s while its history partition is held", name)
+				}
+			}
+			if len(res.Created) == 0 {
+				return counter.n.Load() - before
+			}
+		}
+	}
+	addHour(0)
+	one := pass()
+	for h := 1; h < 20; h++ {
+		addHour(h)
+	}
+	if many := pass(); many != one {
+		t.Errorf("retention over 20 tags partitions waiting for history ran %d statements, over one %d; want the same", many, one)
+	}
+}
+
+// TestHistoryTagsRowsUnique checks that history's tags rows are unique: a
+// TRUNCATE of a history partition fires none of history's triggers and leaves
+// its jobs' tags rows, and reinserting its rows would add a second copy of
+// them, which a listing by tag would show as the job twice.
+func TestHistoryTagsRowsUnique(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	if _, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, FailedRetention: 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	p := insertParams("restored", 1)
+	p[0].Tags = []string{"restored"}
+	if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	client := register(t, ctx, exec)
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: client, Limit: 1})
+	if err != nil || len(claimed.Jobs) != 1 {
+		t.Fatalf("claim = %+v, %v", claimed, err)
+	}
+	id := claimed.Jobs[0].ID
+	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{ID: id, AttemptedBy: client, State: driver.JobStateCompleted, Archive: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	var partition string
+	if err := pool.QueryRow(ctx, "SELECT tableoid::regclass::text FROM hopper_job_history WHERE id = $1::uuid", id.String()).Scan(&partition); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	for _, q := range []string{
+		"CREATE TEMP TABLE restore AS SELECT * FROM " + partition,
+		"TRUNCATE " + partition,
+	} {
+		if _, err := conn.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	_, err = conn.Exec(ctx, "INSERT INTO hopper_job_history SELECT * FROM restore")
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		t.Errorf("reinsert of a truncated partition's tagged rows = %v, want a unique violation", err)
+	}
+	listed, err := exec.JobList(ctx, driver.JobListParams{TagsAny: []string{"restored"}, Limit: 10})
+	if err != nil || len(listed) > 1 {
+		t.Errorf("listing by tag after the reinsert = %d jobs, %v; want the job at most once", len(listed), err)
+	}
 }

@@ -151,6 +151,8 @@ func (u *ui[TTx]) fail(w http.ResponseWriter, err error) {
 		// The page showed the job before it started, or before another job
 		// took its unique key.
 		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, hopper.ErrInvalidFilter):
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, context.Canceled):
 		http.Error(w, "canceled", 499)
 	default:
@@ -292,6 +294,11 @@ func (u *ui[TTx]) jobs(w http.ResponseWriter, r *http.Request) {
 	}
 	if s := q.Get("state"); s != "" {
 		filter.States = []hopper.JobState{hopper.JobState(s)}
+	}
+	for _, t := range q["tag"] {
+		if t != "" {
+			filter.TagsAll = append(filter.TagsAll, t)
+		}
 	}
 	if a := q.Get("after"); a != "" {
 		id, err := hopper.ParseJobID(a)

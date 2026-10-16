@@ -8,17 +8,20 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/internal/jobtags"
 )
 
 var jobColumns = []string{
 	"id", "kind", "queue", "state", "priority", "attempt", "max_attempts",
 	"scheduled_at", "attempted_at", "attempted_by", "args", "metadata", "errors",
 	"unique_key", "ordering_key", "partition_key", "batch_id", "expires_at", "cancel_requested_at", "await", "created_at",
-	"snooze_reason", "progress",
+	"snooze_reason", "progress", "tags",
 }
 
 // JobColumns lists hopper_jobs columns in scan order. prefix qualifies them
@@ -52,12 +55,13 @@ func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 		args, metadata, output, progress jsonText
 		errs                             attemptErrors
 		batchID                          nullUUID
+		tags                             tagList
 	)
 	dest := []any{
 		&j.ID, &j.Kind, &j.Queue, &state, &priority, &attempt, &maxAttempts,
 		&j.ScheduledAt, &attemptedAt, &attemptedBy, &args, &metadata, &errs,
 		&uniqueKey, &orderingKey, &partKey, &batchID, &expiresAt, &cancelAt, &j.Await, &j.CreatedAt,
-		&snoozeReason, &progress,
+		&snoozeReason, &progress, &tags,
 	}
 	if history {
 		dest = append(dest, &finalizedAt, &output)
@@ -72,6 +76,7 @@ func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 	j.Args, j.Metadata, j.Output = args.raw(), metadata.raw(), output.raw()
 	j.Errors = []driver.AttemptError(errs)
 	j.UniqueKey, j.OrderingKey, j.PartitionKey = uniqueKey.String, orderingKey.String, partKey.String
+	j.Tags = []string(tags)
 	// Only a snoozed job is waiting for a reason. A client of the previous
 	// release neither clears it on claim nor on finalize, so during a rolling
 	// deploy a running or retrying row can still hold one.
@@ -114,14 +119,14 @@ const jobInsertSQL = `
 WITH p AS (
   SELECT * FROM unnest(
     $1::text[], $2::text[], $3::smallint[], $4::smallint[], $5::timestamptz[], $6::jsonb[], $7::jsonb[], $8::text[],
-    $9::float8[], $10::boolean[], $11::text[], $12::text[], $13::uuid[]
-  ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key, ttl, await, ordering_key, partition_key, batch_id)
+    $9::float8[], $10::boolean[], $11::text[], $12::text[], $13::uuid[], $14::jsonb[]
+  ) AS p(kind, queue, priority, max_attempts, scheduled_at, args, metadata, unique_key, ttl, await, ordering_key, partition_key, batch_id, tags)
 )
-INSERT INTO {{schema}}.hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await, ordering_key, partition_key, batch_id)
+INSERT INTO {{schema}}.hopper_jobs (kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, unique_key, expires_at, await, ordering_key, partition_key, batch_id, tags)
 SELECT p.kind, p.queue,
        CASE WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state,
        p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata, p.unique_key,
-       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key, p.partition_key, p.batch_id
+       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key, p.partition_key, p.batch_id, p.tags
 FROM p
 ON CONFLICT (kind, unique_key) WHERE unique_key IS NOT NULL DO UPDATE SET ` + "%s" + `
 RETURNING ` + "%s" + `, (xmax <> 0) AS duplicate`
@@ -131,6 +136,7 @@ const (
 	conflictReplaceSet = `
   args         = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.args         ELSE EXCLUDED.args         END,
   metadata     = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.metadata     ELSE EXCLUDED.metadata     END,
+  tags         = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.tags         ELSE EXCLUDED.tags         END,
   priority     = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.priority     ELSE EXCLUDED.priority     END,
   max_attempts = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.max_attempts ELSE EXCLUDED.max_attempts END,
   scheduled_at = CASE WHEN hopper_jobs.state = 'running' THEN hopper_jobs.scheduled_at ELSE EXCLUDED.scheduled_at END,
@@ -188,7 +194,7 @@ func (e *Executor) jobInsert(ctx context.Context, params []driver.JobInsertParam
 		kinds, queues, uniqueKeys, ordering, partitions = make([]string, n), make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 		priorities, maxAttempts                         = make([]int, n), make([]int, n)
 		scheduledAt                                     = make([]time.Time, n)
-		args, metadata                                  = make([][]byte, n), make([][]byte, n)
+		args, metadata, tags                            = make([][]byte, n), make([][]byte, n), make([][]byte, n)
 		ttls                                            = make([]float64, n)
 		awaits                                          = make([]bool, n)
 		batches                                         = make([]driver.JobID, n)
@@ -206,6 +212,7 @@ func (e *Executor) jobInsert(ctx context.Context, params []driver.JobInsertParam
 		scheduledAt[i] = p.ScheduledAt
 		args[i] = []byte(jsonOrEmptyObject(p.Args))
 		metadata[i] = []byte(jsonOrEmptyObject(p.Metadata))
+		tags[i] = TagsJSON(p.Tags)
 		ttls[i] = max(p.TTL, 0).Seconds()
 		awaits[i] = p.Await
 	}
@@ -216,7 +223,7 @@ func (e *Executor) jobInsert(ctx context.Context, params []driver.JobInsertParam
 	queryArgs := []any{
 		textArray(kinds), textArray(queues), intArray(priorities), intArray(maxAttempts), timeArray(scheduledAt),
 		jsonArray(args), jsonArray(metadata), nullableTextArray(uniqueKeys), floatArray(ttls), boolArray(awaits),
-		nullableTextArray(ordering), nullableTextArray(partitions), uuidArray(batches),
+		nullableTextArray(ordering), nullableTextArray(partitions), uuidArray(batches), jsonArray(tags),
 	}
 	var (
 		results []driver.JobInsertResult
@@ -390,12 +397,7 @@ func uniqueHistory(ctx context.Context, conn Conn, params []driver.JobInsertPara
 	if len(ords) == 0 {
 		return found, nil
 	}
-	table := "hopper_job_history"
-	if !failed {
-		table = "hopper_job_history_completed"
-	} else if !completed {
-		table = "hopper_job_history_failed"
-	}
+	table := outcomeTable("hopper_job_history", completed, failed)
 	type hit struct {
 		ord int
 		job *driver.JobRow
@@ -880,18 +882,169 @@ var (
 	jobListPendingSQL = ` AND state = 'pending' AND id IN (SELECT job_id FROM {{schema}}.hopper_job_deps)`
 )
 
+// rarestTagSQL picks, in the listing's own statement, the tag of the n tags
+// in the array parameter $param with the fewest jobs, counting at most
+// rarestTagCap of each in the tags tables the listing walks (live, the part
+// of history's it reads, or both), for a TagsAll listing to walk: every job
+// it lists has that tag too. The counts are summed over the tables and the
+// sum is capped at rarestTagCap too: a tag at the cap in one table is common,
+// however few rows it has in another, and an uncapped sum would rank it below
+// a tag just past the cap in both. Tags whose sums both reach the cap are told
+// apart by the statistics of the partitions of the tables it walks: a tag's
+// most common frequency in each, times its rows, estimates the tag's rows
+// there, so that a listing of history is not decided by the live table's. The
+// live table is analyzed by the leader, and history's partitions by
+// autovacuum; the schema's name is $schemaParam. It is a WITH query, so the
+// listing's arms share one count.
+//
+// The tables' leaves are the live table itself, which pg_partition_tree
+// lists no rows for, and history's partitions. They and the estimates are
+// materialized, so that each is read once a statement: inlined into the
+// ORDER BY, pg_stats' join ran pg_partition_tree again for each of its rows
+// and each tag, a cost that grows with the square of history's partitions
+// (half a second a tag for 380 of them).
+func rarestTagSQL(param, schemaParam, n int, tables []string) (with, tag string) {
+	if n == 1 {
+		return "", fmt.Sprintf("($%d::text[])[1]", param)
+	}
+	limit := strconv.Itoa(rarestTagCap)
+	counts := make([]string, len(tables))
+	names := make([]string, len(tables))
+	for i, table := range tables {
+		counts[i] = fmt.Sprintf("(SELECT count(*) FROM (SELECT FROM {{schema}}.%s t WHERE t.tag = u.tag ORDER BY t.id LIMIT %s) c%d)", table, limit, i)
+		names[i] = "'" + table + "'"
+	}
+	return fmt.Sprintf(`WITH rarest_leaves AS MATERIALIZED (
+  SELECT coalesce(p.relid, w.rel) AS relid
+  FROM (SELECT to_regclass(quote_ident($%[2]d) || '.' || name) FROM unnest(ARRAY[%[1]s]) name) w(rel)
+  LEFT JOIN LATERAL pg_partition_tree(w.rel) p ON true
+  WHERE w.rel IS NOT NULL AND coalesce(p.isleaf, true)
+), rarest_estimates AS MATERIALIZED (
+  SELECT m.v AS tag, sum(m.f * greatest(c.reltuples, 0)) AS n
+  FROM rarest_leaves l JOIN pg_class c ON c.oid = l.relid
+  JOIN pg_stats s ON s.schemaname = $%[2]d AND s.tablename = c.relname AND s.attname = 'tag' AND NOT s.inherited
+  CROSS JOIN unnest(s.most_common_vals::text::text[], s.most_common_freqs) m(v, f)
+  WHERE m.v = ANY($%[3]d::text[])
+  GROUP BY m.v
+), rarest AS (
+  SELECT u.tag FROM unnest($%[3]d::text[]) WITH ORDINALITY u(tag, o)
+  ORDER BY least(%[4]s, %[5]s), coalesce((SELECT e.n FROM rarest_estimates e WHERE e.tag = u.tag), 0), u.o LIMIT 1
+) `, strings.Join(names, ", "), schemaParam, param, strings.Join(counts, " + "), limit), "(SELECT tag FROM rarest)"
+}
+
+// rarestTagCap bounds rarestTagSQL's count of each tag, so that choosing costs
+// a few index pages however common the tags are. The counts are ordered by
+// ID, as the index is, so that the planner reads the index rather than the
+// table even when it takes the tag for a common one.
+const rarestTagCap = 1000
+
+// tagArms returns a tag listing's arms over the live (or the history) table:
+// for each of the n tags in the array parameter $param, the tag's rows of the
+// tags table past the cursor $4 in listing order, each job looked up by its
+// key with jobs, the arm's job query and filter, until the page is full.
+// A page then reads about as many rows as it holds, however common the tags
+// are, and the page's jobs are among each arm's. A job with several of the
+// tags comes from each of their arms, so a listing with more than one arm
+// per table merges them with DISTINCT ON (id): each arm still reads at most
+// a page, however much the tags overlap, where leaving an earlier tag's jobs
+// out of each later arm walked the whole range of a tag whose jobs mostly
+// have an earlier one too. A single tag may be given as an SQL expression,
+// tag, instead.
+//
+// The walk is ordered and limited in the same query as the lookup, so that
+// the planner merges history's partitions in index order even when it takes
+// the tag for a rare one, as a generic plan does; ordering a subquery's walk
+// sorted every row of the tag past the cursor. The OFFSET 0 keeps it from
+// joining the walk to a scan of the whole job table instead, and from
+// narrowing the walk by the job query's filter: narrow adds to the walk's
+// own WHERE what the tags table holds beside the tag (tagWalk).
+//
+// The lookup also checks the walked tag on the job's own row, which it has
+// read already, so that a tags row the column no longer holds lists nothing:
+// a TRUNCATE of one of history's partitions fires none of history's
+// triggers, which keep its tags rows, and a write with the triggers
+// disabled fires none at all.
+func tagArms(param, n int, newestFirst bool, tag, jobs, order string, walk tagWalk) []string {
+	cmp := ">"
+	if newestFirst {
+		cmp = "<"
+	}
+	match := " AND id = t.id AND tags ? t.tag"
+	if walk.history {
+		match = " AND state = t.state AND finalized_at = t.finalized_at AND id = t.id AND tags ? t.tag"
+	}
+	walkOrder := strings.Replace(order, "ORDER BY id", "ORDER BY t.id", 1)
+	arms := make([]string, n)
+	for k := range n {
+		expr := fmt.Sprintf("($%d::text[])[%d]", param, k+1)
+		if tag != "" {
+			expr = tag
+		}
+		arms[k] = fmt.Sprintf("SELECT j.* FROM {{schema}}.%s t CROSS JOIN LATERAL (%s%s OFFSET 0) j WHERE t.tag = %s AND t.id %s $4::uuid%s",
+			walk.table, jobs, match, expr, cmp, walk.narrow) + walkOrder
+	}
+	return arms
+}
+
+// tagWalk is the tags table a listing's arms over the live table or history
+// walk, and the conditions on its rows that narrow the walk to the jobs the
+// listing can return: the IDs it asks for, and in history the states, by
+// which history's tags table is partitioned as history is. Without them, a
+// page by IDs or by a finished state walked every row of the tag past the
+// cursor, looking each job up only to drop it.
+type tagWalk struct {
+	table, narrow string
+	history       bool
+}
+
+// historyTagsTable is the part of history's tags table that holds the
+// finished states listed: an outcome's partition when they are all of one
+// outcome, as history's are, or the whole table.
+func historyTagsTable(states []driver.JobState) string {
+	var completed, failed bool
+	for _, s := range states {
+		switch s {
+		case driver.JobStateCompleted:
+			completed = true
+		case driver.JobStateCanceled, driver.JobStateDiscarded:
+			failed = true
+		}
+	}
+	return outcomeTable("hopper_job_history_tags", completed, failed)
+}
+
+// outcomeTable is the part of a table partitioned by outcome, as history
+// and its tags rows are, that holds the outcomes named: root's completed
+// or failed partition when only one is, or root itself.
+func outcomeTable(root string, completed, failed bool) string {
+	switch {
+	case completed && !failed:
+		return root + "_completed"
+	case failed && !completed:
+		return root + "_failed"
+	}
+	return root
+}
+
 // maxJobID starts a newest-first listing that has no cursor.
 var maxJobID = driver.JobID{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 
 // errOrderingKeyNeedsQueue refuses a key listing across queues: a key is a
-// lane only within its queue.
-var errOrderingKeyNeedsQueue = errors.New("hopper: list jobs: an ordering key is listed within a queue; set the queue")
+// lane only within its queue. It is a filter JobList cannot list by.
+var errOrderingKeyNeedsQueue = fmt.Errorf("%w: an ordering key is listed within a queue; set the queue", driver.ErrInvalidFilter)
 
-// JobList implements driver.Executor. The ordering key is matched only when
-// set, as a plain equality, so the ordering-key indexes serve it.
+// JobList implements driver.Executor. The ordering key, IDs, priorities
+// and metadata are matched only when set, each as a plain condition, so that
+// the indexes on them serve it: the ordering-key indexes and the primary
+// keys. Tags are found through the tags tables (tagArms).
 func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]*driver.JobRow, error) {
 	if params.OrderingKey != "" && params.Queue == "" {
 		return nil, errOrderingKeyNeedsQueue
+	}
+	for _, p := range params.Priorities {
+		if _, err := smallint(p, "Priorities"); err != nil {
+			return nil, fmt.Errorf("%w: %w", driver.ErrInvalidFilter, err)
+		}
 	}
 	live, history := false, false
 	for _, s := range params.States {
@@ -912,36 +1065,203 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	if params.NewestFirst && after.IsZero() {
 		after = maxJobID
 	}
-	args := []any{params.Queue, textArray(params.Kinds), textArray(states), uuidParam(after), max(params.Limit, 1)}
-	filter, order := jobListFilterSQL+" AND id > $4::uuid", " ORDER BY id LIMIT $5"
+	// The limit is a constant, as the claim's is (jobClaimSQL): as a
+	// parameter, a cached generic plan would cost the listing as if it
+	// returned a tenth of the table, and choose parallel scans and JIT
+	// compilation that take longer than the page itself.
+	args := []any{params.Queue, textArray(params.Kinds), textArray(states), uuidParam(after)}
+	limit := strconv.Itoa(max(params.Limit, 1))
+	filter, order := jobListFilterSQL+" AND id > $4::uuid", " ORDER BY id LIMIT "+limit
 	if params.NewestFirst {
-		filter, order = jobListFilterSQL+" AND id < $4::uuid", " ORDER BY id DESC LIMIT $5"
+		filter, order = jobListFilterSQL+" AND id < $4::uuid", " ORDER BY id DESC LIMIT "+limit
+	}
+	where := func(cond string, arg any) {
+		args = append(args, arg)
+		filter += fmt.Sprintf(" AND "+cond, len(args))
 	}
 	if params.OrderingKey != "" {
-		filter += " AND ordering_key = $6"
-		args = append(args, params.OrderingKey)
+		where("ordering_key = $%d", params.OrderingKey)
 	}
-	var arms []string
-	if live {
-		if params.OrderingKey == "" {
-			arms = append(arms, jobListLiveSQL+filter)
-		} else {
-			arms = append(arms, jobListLiveSQL+filter+jobListKeyedSQL, jobListLiveSQL+filter+jobListPendingSQL)
+	liveWalk := tagWalk{table: "hopper_job_tags"}
+	historyWalk := tagWalk{table: historyTagsTable(params.States), history: true}
+	if len(params.IDs) > 0 {
+		where("id = ANY($%d::uuid[])", uuidArray(params.IDs))
+		liveWalk.narrow = fmt.Sprintf(" AND t.id = ANY($%d::uuid[])", len(args))
+		historyWalk.narrow = liveWalk.narrow
+	}
+	if len(params.States) > 0 {
+		historyWalk.narrow += " AND t.state::text = ANY($3::text[])"
+	}
+	if len(params.Priorities) > 0 {
+		where("priority = ANY($%d::smallint[])", intArray(params.Priorities))
+	}
+	if len(params.Metadata) > 0 {
+		where("metadata @> $%d::jsonb", string(params.Metadata))
+	}
+	// A tag listing walks the tags tables in ID order from the cursor, one
+	// tag at a time: TagsAll's rarest tag, the rest checked on the job's row,
+	// or each of TagsAny's.
+	var (
+		walk func(jobs string, w tagWalk) []string
+		with string
+		// merge is set when a job can come from more than one arm of a
+		// table: TagsAny's arms, one per tag.
+		merge bool
+	)
+	// Repeats are dropped: each of TagsAll's would be counted again to choose
+	// the rarest, and each of TagsAny's would walk its range again, so a
+	// filter that repeats one tag would cost as much as one with that many.
+	tagsAll, tagsAny := jobtags.Distinct(params.TagsAll), jobtags.Distinct(params.TagsAny)
+	switch {
+	case len(tagsAll) > 0:
+		args = append(args, textArray(tagsAll))
+		all, schema := len(args), 0
+		if len(tagsAll) > 1 {
+			filter += fmt.Sprintf(" AND tags ?& $%d::text[]", all)
+			args = append(args, e.Schema.Name)
+			schema = len(args)
+		}
+		if len(tagsAny) > 0 {
+			where("tags ?| $%d::text[]", textArray(tagsAny))
+		}
+		var tables []string
+		if live {
+			tables = append(tables, liveWalk.table)
+		}
+		if history {
+			tables = append(tables, historyWalk.table)
+		}
+		var tag string
+		with, tag = rarestTagSQL(all, schema, len(tagsAll), tables)
+		walk = func(jobs string, w tagWalk) []string {
+			return tagArms(all, 1, params.NewestFirst, tag, jobs, order, w)
+		}
+	case len(tagsAny) > 0:
+		args = append(args, textArray(tagsAny))
+		anyTags := len(args)
+		merge = len(tagsAny) > 1
+		walk = func(jobs string, w tagWalk) []string {
+			return tagArms(anyTags, len(tagsAny), params.NewestFirst, "", jobs, order, w)
 		}
 	}
-	if history {
-		arms = append(arms, jobListHistorySQL+filter)
+	var arms []string
+	switch {
+	case live && walk != nil:
+		arms = append(arms, walk(jobListLiveSQL+filter, liveWalk)...)
+	case live && params.OrderingKey == "":
+		arms = append(arms, jobListLiveSQL+filter+order)
+	case live:
+		arms = append(arms, jobListLiveSQL+filter+jobListKeyedSQL+order, jobListLiveSQL+filter+jobListPendingSQL+order)
+	}
+	if history && walk != nil {
+		arms = append(arms, walk(jobListHistorySQL+filter, historyWalk)...)
+	} else if history {
+		arms = append(arms, jobListHistorySQL+filter+order)
 	}
 	query := arms[0]
 	if len(arms) > 1 {
-		query = "(" + strings.Join(arms, order+") UNION ALL (") + order + ")"
+		query = "(" + strings.Join(arms, ") UNION ALL (") + ")"
+		if merge {
+			// A job is in the live table or in history, never both, so
+			// its copies are equal rows; any one of them will do.
+			query = "SELECT DISTINCT ON (id) * FROM (" + query + ") u"
+		}
+		query += order
 	}
-	query += order
-	jobs, err := historyJobs(e.Conn.Query(ctx, query, args...))
+	// The query's text varies with the filters, so it is expanded without
+	// the schema's cache, which keeps every text it is given.
+	query = e.Schema.expand(with + query)
+	// In the caller's transaction, a filter the server refuses would abort
+	// it, though the error says only that the filter was invalid; a
+	// savepoint (withTx, which rolls back to it even when ctx is done) keeps
+	// the transaction usable. It costs two round trips, so it is taken only
+	// for filters the server could refuse.
+	var (
+		jobs []*driver.JobRow
+		err  error
+	)
+	if e.InTx && refusable(params, states, tagsAll, tagsAny) {
+		err = e.withTx(ctx, func(tx Tx) error {
+			var qerr error
+			jobs, qerr = historyJobs(tx.Query(ctx, query, args...))
+			return qerr
+		})
+	} else {
+		jobs, err = historyJobs(e.Conn.Query(ctx, query, args...))
+	}
 	if err != nil {
+		if code := sqlState(err); strings.HasPrefix(code, "22") || code == "54001" {
+			if ferr := e.checkFilters(ctx, params, states, tagsAll, tagsAny); ferr != nil {
+				return nil, ferr
+			}
+		}
 		return nil, fmt.Errorf("hopper: list jobs: %w", err)
 	}
 	return jobs, nil
+}
+
+// refusable reports whether the server could refuse a listing's filters
+// (see checkFilters). Text of ASCII characters other than NUL is valid in
+// every server encoding, and IDs and priorities are checked before the
+// listing, so only Metadata and other text can be refused.
+func refusable(params driver.JobListParams, states, tagsAll, tagsAny []string) bool {
+	if len(params.Metadata) > 0 {
+		return true
+	}
+	odd := func(s string) bool {
+		return strings.ContainsFunc(s, func(r rune) bool { return r == 0 || r >= utf8.RuneSelf })
+	}
+	for _, list := range [][]string{{params.Queue, params.OrderingKey}, params.Kinds, states, tagsAll, tagsAny} {
+		if slices.ContainsFunc(list, odd) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkFilters tells a listing that failed with a data exception (class 22)
+// or too deep a nesting (54001) whether its filters were the cause. Their text
+// (the queue, kinds, states, ordering key and tags; a state is any string a
+// caller passes, such as the web UI's query parameter) and Metadata are the
+// listing's only inputs whose values the server can
+// refuse: text with a NUL or with characters the database's encoding lacks,
+// and what jsonb's input refuses (bytes that are not UTF-8, a \u0000 escape,
+// an unpaired surrogate, a number beyond numeric's range, nesting deeper than
+// its stack allows). The listing's own error cannot tell them from a stored
+// row's, so the filters are given to the server again on their own. It
+// returns ErrInvalidFilter when the server refuses them, and nil otherwise.
+func (e *Executor) checkFilters(ctx context.Context, params driver.JobListParams, states, tagsAll, tagsAny []string) error {
+	var (
+		casts []string
+		args  []any
+	)
+	cast := func(typ string, arg any) {
+		args = append(args, arg)
+		casts = append(casts, fmt.Sprintf("$%d::%s", len(args), typ))
+	}
+	cast("text", params.Queue)
+	cast("text[]", textArray(params.Kinds))
+	cast("text[]", textArray(states))
+	cast("text", params.OrderingKey)
+	cast("text[]", textArray(tagsAll))
+	cast("text[]", textArray(tagsAny))
+	if len(params.Metadata) > 0 {
+		cast("jsonb", string(params.Metadata))
+	}
+	check := func(c Conn) error {
+		_, err := c.Exec(ctx, "SELECT "+strings.Join(casts, ", "), args...)
+		return err
+	}
+	var err error
+	if e.InTx {
+		err = e.withTx(ctx, func(tx Tx) error { return check(tx) })
+	} else {
+		err = check(e.Conn)
+	}
+	if code := sqlState(err); strings.HasPrefix(code, "22") || code == "54001" {
+		return fmt.Errorf("%w: %w", driver.ErrInvalidFilter, err)
+	}
+	return nil
 }
 
 // jobLockStateSQL locks a live job's row and reads its state, which the
@@ -1071,13 +1391,38 @@ RETURNING %s`, JobColumns(""))
 	jobRetryHistorySQL = fmt.Sprintf(`
 WITH h AS (DELETE FROM {{schema}}.hopper_job_history WHERE id = $1 RETURNING *)
 INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata,
-  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, progress, logs)
+  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, progress, logs, tags)
 SELECT id, kind, queue, 'available', priority, attempt,
   CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END, statement_timestamp(), args, metadata,
-  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, CASE WHEN $2 THEN NULL ELSE progress END, logs
+  errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, CASE WHEN $2 THEN NULL ELSE progress END, logs,
+  %s
 FROM h
-RETURNING %s`, JobColumns(""))
+RETURNING %s`, storedTagsSQL("tags"), JobColumns(""))
 )
+
+// storedTagsSQL returns the tags a stored tags value, expr, holds, as a
+// value hopper_jobs accepts: its distinct non-empty strings in order, NULL
+// for none. hopper writes only such values, but a direct SQL write can
+// store anything, and tagList and hopper_tags_of read it the same way.
+func storedTagsSQL(expr string) string { return keptTagsSQL(expr, "") }
+
+// callbackTagsSQL is storedTagsSQL for a batch callback's tags, which also
+// drops a tag longer than an insert accepts (MaxTagBytes). BatchInsert
+// stores only checked tags, so only a direct SQL write to the batch row
+// stores a longer one, and one past the tags table's largest index row would
+// fail the finalize that completes the batch, with every other job in it.
+// Its bytes are counted in UTF-8, as hopper_tags and the Go client count
+// them, whatever the database's encoding, so that a callback is never given
+// a tag a listing refuses as too long.
+func callbackTagsSQL(expr string) string {
+	return keptTagsSQL(expr, " AND octet_length(convert_to(e #>> '{}', 'UTF8')) <= "+strconv.Itoa(jobtags.MaxBytes))
+}
+
+func keptTagsSQL(expr, cond string) string {
+	return `(SELECT jsonb_agg(e ORDER BY n) FROM (SELECT DISTINCT ON (e) e, n
+     FROM jsonb_array_elements(CASE WHEN jsonb_typeof(` + expr + `) = 'array' THEN ` + expr + ` END) WITH ORDINALITY AS t(e, n)
+     WHERE jsonb_typeof(e) = 'string' AND e <> '""'` + cond + ` ORDER BY e, n) d)`
+}
 
 // IsUniqueViolation reports a unique_violation error from the transport.
 // Transports wrap their error type so that this can tell.

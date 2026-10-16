@@ -43,6 +43,12 @@ func (s *Schema) SQL(query string) string {
 	return resolved
 }
 
+// expand is SQL without the cache, for a statement built per call, whose
+// texts vary with its inputs and would grow the cache without bound.
+func (s *Schema) expand(query string) string {
+	return strings.ReplaceAll(query, "{{schema}}", quoteIdent(s.Name))
+}
+
 // Wrap qualifies templates without changing the underlying connection.
 func (s *Schema) Wrap(c Conn) Conn { return schemaConn{Conn: c, schema: s} }
 

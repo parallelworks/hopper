@@ -43,6 +43,7 @@ form { display: inline; margin: 0; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0 0 12px; }
 dt { color: var(--dim); }
 dd { margin: 0; }
+.tag { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 12px; border: 1px solid var(--dim); color: inherit; text-decoration: none; }
 .state { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid currentColor; }
 .state.ok, .state.completed { color: var(--ok); }
 .state.available, .state.scheduled, .state.pending { color: var(--wait); }

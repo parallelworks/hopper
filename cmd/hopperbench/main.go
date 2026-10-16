@@ -20,6 +20,7 @@
 //	throughput  no-op jobs preloaded, then drained by -clients clients
 //	mixed       as throughput, with all four priorities interleaved
 //	scheduled   as throughput, with jobs scheduled up to 500ms in the future
+//	tagged      as throughput, with two tags on every job
 //	retry       as throughput, with every job failing its first attempt
 //	insert      InsertMany in batches of 100 (the unnest statement)
 //	copy        InsertMany in batches of 5000 (the COPY path)
@@ -45,6 +46,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -155,6 +157,10 @@ func run(ctx context.Context, url, schema string, scenarios []string, opts optio
 			r, err = b.drain(ctx, "scheduled", b.params(opts.jobs, func(_ int, o *hopper.InsertOpts) {
 				o.ScheduledAt = start.Add(time.Duration(rand.IntN(500)) * time.Millisecond)
 			}), noopWorker)
+		case "tagged":
+			r, err = b.drain(ctx, "tagged", b.params(opts.jobs, func(i int, o *hopper.InsertOpts) {
+				o.Tags = []string{"bench", "tenant:" + strconv.Itoa(i%100)}
+			}), noopWorker)
 		case "retry":
 			r, err = b.drain(ctx, "retry", b.params(opts.jobs, nil), failOnceWorker)
 		case "insert":
@@ -220,9 +226,13 @@ type bench struct {
 // reset empties the tables and preloads -history rows of history, spread
 // over the last day into hourly partitions as a running system would have
 // them, so finalizes during the run land in the current hour's small
-// partition rather than in a large DEFAULT one.
+// partition rather than in a large DEFAULT one. History's tags rows (schema
+// v17) get the same hourly partitions, as the leader keeps them beside
+// history's.
 func (b *bench) reset(ctx context.Context) error {
-	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_clients, hopper_leader, hopper_periodic"); err != nil {
+	// The tags tables (schema v17) are listed so that their truncate
+	// triggers find them empty, rather than truncating them one by one.
+	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic"); err != nil {
 		return err
 	}
 	if b.opts.history > 0 {
@@ -234,6 +244,8 @@ func (b *bench) reset(ctx context.Context) error {
 			    start := (date_trunc('hour', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - make_interval(hours => h);
 			    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF hopper_job_history_completed FOR VALUES FROM (%L) TO (%L)',
 			      'hopper_job_history_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDDHH24'), start, start + interval '1 hour');
+			    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF hopper_job_history_tags_completed FOR VALUES FROM (%L) TO (%L)',
+			      'hopper_job_history_tags_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDDHH24'), start, start + interval '1 hour');
 			  END LOOP;
 			END $$`); err != nil {
 			return fmt.Errorf("preload partitions: %w", err)

@@ -2,11 +2,17 @@ package hoppermigrate_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/parallelworks/hopper/driver"
 	"github.com/parallelworks/hopper/hoppermigrate"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
@@ -27,7 +33,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 16
+	const latest = 17
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -355,5 +361,542 @@ func TestDownDropsUnattachedHistoryIndexes(t *testing.T) {
 	}
 	if n := indexes("ordering"); n != 0 {
 		t.Errorf("%d ordering indexes after Down, want 0", n)
+	}
+}
+
+// TestTagsUpgrade upgrades a database with jobs, live and in history, to
+// v17: they have no tags, a tagged job's tags rows follow it from the live
+// table to history, and a downgrade then drops the tags tables, triggers
+// and functions with the column.
+func TestTagsUpgrade(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
+		t.Fatal(err)
+	}
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const archive = `INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at,
+		  args, metadata, errors, await, created_at, finalized_at%[1]s)
+		SELECT id, seq, kind, queue, 'completed', priority, attempt, max_attempts, scheduled_at,
+		  args, metadata, errors, await, created_at, now()%[1]s FROM hopper_jobs WHERE %[2]s`
+	// A time partition the leader made before the upgrade, named for the
+	// current hour, and wide enough that the test does not leave it.
+	hour := time.Now().UTC().Truncate(time.Hour)
+	partition := "hopper_job_history_completed_" + hour.Format("2006010215")
+	exec(fmt.Sprintf("CREATE TABLE %s PARTITION OF hopper_job_history_completed FOR VALUES FROM ('%s') TO ('%s')",
+		partition, hour.Add(-time.Hour).Format(time.RFC3339), hour.Add(2*time.Hour).Format(time.RFC3339)))
+	// One of a period past, which no job is finalized into any more.
+	past := "hopper_job_history_completed_" + hour.Add(-5*time.Hour).Format("2006010215")
+	exec(fmt.Sprintf("CREATE TABLE %s PARTITION OF hopper_job_history_completed FOR VALUES FROM ('%s') TO ('%s')",
+		past, hour.Add(-5*time.Hour).Format(time.RFC3339), hour.Add(-4*time.Hour).Format(time.RFC3339)))
+	exec("INSERT INTO hopper_jobs (kind) SELECT 'k' FROM generate_series(1, 100)")
+	exec(fmt.Sprintf(archive, "", "true"))
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	count := func(q string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, q, args...).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count("SELECT count(*) FROM hopper_jobs WHERE tags IS NULL") + count("SELECT count(*) FROM hopper_job_history WHERE tags IS NULL"); n != 200 {
+		t.Errorf("%d jobs without tags after the upgrade, want 200", n)
+	}
+	var id string
+	if err := pool.QueryRow(ctx, `SELECT hopper_insert('k', '{}', '{"tags": ["a", "b"]}')::text`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if n := count("SELECT count(*) FROM hopper_job_tags WHERE id = $1::uuid", id); n != 2 {
+		t.Errorf("%d live tags rows for the tagged job, want 2", n)
+	}
+	exec(fmt.Sprintf(archive, ", tags", "id = '"+id+"'"))
+	exec("DELETE FROM hopper_jobs WHERE id = $1::uuid", id)
+	if l, h := count("SELECT count(*) FROM hopper_job_tags"), count("SELECT count(*) FROM hopper_job_history_tags WHERE id = $1::uuid AND state = 'completed'", id); l != 0 || h != 2 {
+		t.Errorf("after the move to history: %d live tags rows, want 0, and %d history tags rows, want 2", l, h)
+	}
+	// The upgrade gave history's time partition its tags partition, where
+	// the job's tags rows went with it.
+	if n := count("SELECT count(*) FROM "+strings.Replace(partition, "history_", "history_tags_", 1)+" WHERE id = $1::uuid", id); n != 2 {
+		t.Errorf("%d tags rows beside the job's history partition, want 2", n)
+	}
+	// Tags compare by their bytes, whatever the database's collation.
+	if n := count(`SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+		WHERE c.relnamespace = current_schema()::regnamespace AND c.relname LIKE 'hopper\_job%tags%' AND a.attname = 'tag'
+		  AND a.attcollation <> 'pg_catalog."C"'::regcollation`); n != 0 {
+		t.Errorf("%d tags tables' tag columns use a collation other than C", n)
+	}
+	if n := count("SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relname = $1",
+		strings.Replace(past, "history_", "history_tags_", 1)); n != 0 {
+		t.Errorf("the past period's history partition got %d tags partitions, want 0", n)
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if n := count(`SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace AND relname LIKE 'hopper\_job%tags%'`) +
+		count(`SELECT count(*) FROM pg_proc WHERE pronamespace = current_schema()::regnamespace AND proname LIKE 'hopper\_%tags%'`) +
+		count(`SELECT count(*) FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid WHERE c.relnamespace = current_schema()::regnamespace AND g.tgname LIKE 'hopper\_%tags%'`) +
+		count("SELECT count(*) FROM pg_attribute WHERE attname = 'tags' AND attrelid IN ('hopper_jobs'::regclass, 'hopper_job_history'::regclass)"); n != 0 {
+		t.Errorf("%d tags objects left after Down", n)
+	}
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatalf("Up again: %v", err)
+	}
+}
+
+// TestTagsUpgradeLocksOnlyInItsRetryLoop upgrades to v17 while another
+// schema's history time partition is held, as its leader holds one while it
+// drops it, and while a session briefly holds this schema's hopper_schema.
+// Index scans are off, so that the listing of history's time partitions is
+// planned as a scan of the whole catalog, as Postgres may plan it. Listing
+// them takes no lock on any partition, and only the retry loop gives up on
+// a lock after its lock_timeout: the rest of the migration waits for one.
+func TestTagsUpgradeLocksOnlyInItsRetryLoop(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	other := testdb.EmptyPool(t, 0)
+	if _, err := other.Exec(ctx, `CREATE TABLE hopper_job_history_completed (finalized_at timestamptz) PARTITION BY RANGE (finalized_at);
+		CREATE TABLE hopper_job_history_completed_p PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2026-01-01') TO ('2026-01-02')`); err != nil {
+		t.Fatal(err)
+	}
+	dropping, err := other.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dropping.Rollback(ctx) //nolint:errcheck // cleanup
+	if _, err := dropping.Exec(ctx, "LOCK TABLE hopper_job_history_completed_p IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+
+	pool := testdb.EmptyPool(t, 0)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, testdb.Driver(pool), &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
+		t.Fatal(err)
+	}
+	hour := time.Now().UTC().Truncate(time.Hour)
+	partition := "hopper_job_history_completed_" + hour.Format("2006010215")
+	// Two hours wide, so that the period has not ended by the time the
+	// upgrade copies it, should the test straddle the hour.
+	if _, err := pool.Exec(ctx, fmt.Sprintf("CREATE TABLE %s PARTITION OF hopper_job_history_completed FOR VALUES FROM ('%s') TO ('%s')",
+		partition, hour.Format(time.RFC3339), hour.Add(2*time.Hour).Format(time.RFC3339))); err != nil {
+		t.Fatal(err)
+	}
+	held, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.Exec(ctx, "LOCK TABLE hopper_schema IN SHARE MODE"); err != nil {
+		_ = held.Rollback(ctx)
+		t.Fatal(err)
+	}
+	// The commit is the goroutine's alone, and the test waits for it on any
+	// way out, so that the transaction is never used from two goroutines.
+	committed := make(chan struct{})
+	go func() {
+		defer close(committed)
+		time.Sleep(500 * time.Millisecond)
+		_ = held.Commit(ctx)
+	}()
+	defer func() { <-committed }()
+	cfg := pool.Config().Copy()
+	cfg.ConnConfig.RuntimeParams["enable_indexscan"] = "off"
+	cfg.ConnConfig.RuntimeParams["enable_bitmapscan"] = "off"
+	scans, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scans.Close()
+	uctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := hoppermigrate.Up(uctx, testdb.Driver(scans), &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatalf("Up while another schema's partition and this schema's hopper_schema were held: %v", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM pg_class WHERE relname = $1 AND relnamespace = current_schema()::regnamespace",
+		"hopper_job_history_tags_completed_"+hour.Format("2006010215")).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("history's time partition has %d tags partitions, want 1", n)
+	}
+}
+
+// TestMigrationCancelsIndexBuild runs a migration while the leader builds a
+// history index (a fresh schema's DEFAULT partitions have none), held up by
+// an old snapshot elsewhere. The migration cancels the build instead of
+// waiting on it, which would never end: the build holds a lock the
+// migration needs and, in its last phase, waits for the migration's
+// statement. The index is built afterwards.
+func TestMigrationCancelsIndexBuild(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	held, built := startHeldBuild(ctx, t, pool, d)
+	// Well short of the 10 minutes a migration would wait on the build, and
+	// long enough for the migration lock, which the database's other
+	// schemas' migrations take too.
+	mctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	if _, err := hoppermigrate.Down(mctx, d, &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
+		t.Fatalf("Down while an index builds: %v", err)
+	}
+	if err := <-built; err == nil {
+		t.Error("the canceled build reported no error")
+	}
+	if err := held.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	var valid bool
+	if err := pool.QueryRow(ctx, "SELECT indisvalid FROM pg_index WHERE indexrelid = 'hopper_job_history_completed_default_ordering'::regclass").Scan(&valid); err != nil || !valid {
+		t.Errorf("hopper_job_history_completed_default_ordering valid = %t, %v", valid, err)
+	}
+}
+
+// TestMigrationFailsOnBuildItMayNotCancel runs a migration as a role that
+// may not cancel the leader's build, a superuser's, while the build is held
+// up. The migration fails at once, saying why, and leaves the build to
+// finish: waiting for it could deadlock with migrations queued for the
+// migration lock, whose snapshots the build waits for.
+func TestMigrationFailsOnBuildItMayNotCancel(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	var (
+		owner string
+		super bool
+	)
+	if err := pool.QueryRow(ctx, "SELECT rolname, rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&owner, &super); err != nil {
+		t.Fatal(err)
+	}
+	if !super {
+		t.Skip("the test database's role is not a superuser, whose build another role may not cancel")
+	}
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	// A role with the owner's privileges, so that it may migrate, but not a
+	// superuser's.
+	role := pgx.Identifier{pool.Config().ConnConfig.RuntimeParams["search_path"] + "_migrator"}.Sanitize()
+	if _, err := pool.Exec(ctx, "CREATE ROLE "+role+" NOLOGIN; GRANT "+pgx.Identifier{owner}.Sanitize()+" TO "+role); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(ctx, "REASSIGN OWNED BY "+role+" TO current_user; DROP OWNED BY "+role+"; DROP ROLE "+role); err != nil {
+			t.Errorf("drop role: %v", err)
+		}
+	})
+	cfg := pool.Config().Copy()
+	cfg.ConnConfig.RuntimeParams["role"] = strings.Trim(role, `"`)
+	limited, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer limited.Close()
+
+	held, built := startHeldBuild(ctx, t, pool, d)
+	mctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	_, err = hoppermigrate.Down(mctx, testdb.Driver(limited), &hoppermigrate.Options{Logger: logger, Target: 16})
+	if err == nil || !strings.Contains(err.Error(), "may not cancel") {
+		t.Fatalf("Down with a build it may not cancel = %v, want the error saying so", err)
+	}
+	select {
+	case err := <-built:
+		t.Fatalf("the build ended while held: %v", err)
+	default:
+	}
+	if err := held.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-built; err != nil {
+		t.Errorf("the build: %v", err)
+	}
+	if _, err := hoppermigrate.Down(mctx, testdb.Driver(limited), &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
+		t.Errorf("Down after the build: %v", err)
+	}
+}
+
+// TestMigrationLeavesOperatorBuilds runs a migration while the leader holds
+// the indexing lock and an operator builds an index of their own,
+// concurrently, on a history partition the leader indexes, held up by an old
+// snapshot. The migration cancels only the leader's builds, so it waits for
+// the lock and leaves the operator's build alone.
+func TestMigrationLeavesOperatorBuilds(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	var schema string
+	if err := pool.QueryRow(ctx, "SELECT current_schema()").Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	// HistoryIndexLockKey ("hopi"), which the leader holds while it
+	// indexes.
+	indexing, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = indexing.Rollback(ctx) }()
+	if _, err := indexing.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", schema, int32(0x686f7069)); err != nil {
+		t.Fatal(err)
+	}
+	held, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(ctx) }()
+	if _, err := held.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.Exec(ctx, "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	built := make(chan error, 1)
+	go func() {
+		_, err := pool.Exec(ctx, "CREATE INDEX CONCURRENTLY operator_finalized ON hopper_job_history_completed_default (finalized_at)")
+		built <- err
+	}()
+	for deadline := time.Now().Add(time.Minute); ; time.Sleep(10 * time.Millisecond) {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_progress_create_index p JOIN pg_class c ON c.oid = p.relid
+			WHERE c.relnamespace = current_schema()::regnamespace`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the operator's build did not start")
+		}
+	}
+	mctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	migrated := make(chan error, 1)
+	go func() {
+		_, err := hoppermigrate.Down(mctx, d, &hoppermigrate.Options{Logger: logger, Target: 16})
+		migrated <- err
+	}()
+	select {
+	case err := <-built:
+		t.Fatalf("the operator's build ended while the migration waited for the indexing lock: %v", err)
+	case err := <-migrated:
+		t.Fatalf("the migration ran while the indexing lock was held: %v", err)
+	case <-time.After(time.Second):
+	}
+	// The operator's build would finish only once every older snapshot in
+	// the database had gone, other tests' held ones included, while the
+	// migration holds the lock their migrations queue for; it is canceled
+	// here instead, before the migration goes on.
+	if _, err := pool.Exec(ctx, `SELECT pg_cancel_backend(p.pid) FROM pg_stat_progress_create_index p
+		JOIN pg_class c ON c.oid = p.relid WHERE c.relnamespace = current_schema()::regnamespace`); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-built; err == nil {
+		t.Error("the operator's build finished while held")
+	}
+	if _, err := pool.Exec(ctx, "DROP INDEX operator_finalized"); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := indexing.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-migrated; err != nil {
+		t.Errorf("Down: %v", err)
+	}
+}
+
+// startHeldBuild starts the leader's history index build, held up in its
+// wait for older snapshots by one that held keeps, and returns once the build
+// is under way. built yields the build's result.
+func startHeldBuild(ctx context.Context, t *testing.T, pool *pgxpool.Pool, d driver.Driver[pgx.Tx]) (held pgx.Tx, built chan error) {
+	t.Helper()
+	held, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Rollback(ctx) })
+	if _, err := held.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.Exec(ctx, "SELECT 1"); err != nil {
+		t.Fatal(err)
+	}
+	built = make(chan error, 1)
+	go func() {
+		_, err := d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{})
+		built <- err
+	}()
+	for deadline := time.Now().Add(time.Minute); ; {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_progress_create_index p JOIN pg_class c ON c.oid = p.relid
+			WHERE c.relnamespace = current_schema()::regnamespace`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 {
+			break
+		}
+		select {
+		case err := <-built:
+			t.Fatalf("the index pass ended before its build was seen: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no index build started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return held, built
+}
+
+// TestMigrationLeavesOtherDatabasesBuilds migrates a database made from
+// another as its template, whose relations share the other's OIDs, while the
+// other's leader builds a history index and this one's holds the indexing
+// lock, so that the migration looks for builds to cancel. It cancels none of
+// the other database's.
+func TestMigrationLeavesOtherDatabasesBuilds(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	logger := slog.New(slog.DiscardHandler)
+	const schema = "hopper_template"
+	open := func(dbURL string) *pgxpool.Pool {
+		t.Helper()
+		cfg, err := pgxpool.ParseConfig(dbURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.ConnConfig.RuntimeParams["search_path"] = schema
+		pool, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		return pool
+	}
+	templateURL := testdb.Database(t, "")
+	pool := open(templateURL)
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hoppermigrate.Up(ctx, testdb.Driver(pool), &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	pool.Close()
+	template := pool.Config().ConnConfig.Database
+	copied := open(testdb.Database(t, "TEMPLATE "+pgx.Identifier{template}.Sanitize()))
+	pool = open(templateURL)
+
+	// HistoryIndexLockKey ("hopi"), which the copy's leader holds while it
+	// indexes.
+	indexing, err := copied.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = indexing.Rollback(ctx) }()
+	if _, err := indexing.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", schema, int32(0x686f7069)); err != nil {
+		t.Fatal(err)
+	}
+	held, built := startHeldBuild(ctx, t, pool, testdb.Driver(pool))
+	mctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	migrated := make(chan error, 1)
+	go func() {
+		_, err := hoppermigrate.Down(mctx, testdb.Driver(copied), &hoppermigrate.Options{Logger: logger, Target: 16})
+		migrated <- err
+	}()
+	select {
+	case err := <-built:
+		t.Fatalf("the template's build ended while its copy migrated: %v", err)
+	case err := <-migrated:
+		t.Fatalf("the copy migrated while its indexing lock was held: %v", err)
+	case <-time.After(time.Second):
+	}
+	if err := indexing.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-migrated; err != nil {
+		t.Fatalf("Down on the copy: %v", err)
+	}
+	if err := held.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-built; err != nil {
+		t.Errorf("the template's build: %v", err)
+	}
+}
+
+// TestTagsUpgradeCopiesBoundsInAnyDateStyle upgrades to v17 from a session
+// whose DateStyle writes a timestamp's zone as an abbreviation that
+// timezone_abbreviations reads as another zone's (Asia/Shanghai's CST as US
+// Central's, before Postgres 18). The tags partition v17 gives history's time
+// partition covers the same period.
+func TestTagsUpgradeCopiesBoundsInAnyDateStyle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, testdb.Driver(pool), &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
+		t.Fatal(err)
+	}
+	hour := time.Now().UTC().Truncate(time.Hour)
+	partition := "hopper_job_history_completed_" + hour.Format("2006010215")
+	// Two hours wide, so that the period has not ended by the time the
+	// upgrade copies it, should the test straddle the hour.
+	if _, err := pool.Exec(ctx, fmt.Sprintf("CREATE TABLE %s PARTITION OF hopper_job_history_completed FOR VALUES FROM ('%s') TO ('%s')",
+		partition, hour.Format(time.RFC3339), hour.Add(2*time.Hour).Format(time.RFC3339))); err != nil {
+		t.Fatal(err)
+	}
+	cfg := pool.Config().Copy()
+	cfg.ConnConfig.RuntimeParams["datestyle"] = "SQL, DMY"
+	cfg.ConnConfig.RuntimeParams["timezone"] = "Asia/Shanghai"
+	styled, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer styled.Close()
+	if _, err := hoppermigrate.Up(ctx, testdb.Driver(styled), &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	var history, tags string
+	if err := pool.QueryRow(ctx, `SELECT pg_get_expr(h.relpartbound, h.oid), coalesce(pg_get_expr(g.relpartbound, g.oid), '')
+		FROM pg_class h LEFT JOIN pg_class g ON g.relname = $2 AND g.relnamespace = h.relnamespace
+		WHERE h.relname = $1 AND h.relnamespace = current_schema()::regnamespace`,
+		partition, strings.Replace(partition, "history_", "history_tags_", 1)).Scan(&history, &tags); err != nil {
+		t.Fatal(err)
+	}
+	if tags != history {
+		t.Errorf("tags partition bound %q, want history's %q", tags, history)
 	}
 }

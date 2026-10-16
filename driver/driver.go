@@ -40,6 +40,11 @@ var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 // which an error without it may have ended before.
 var ErrHistoryIndexRepair = errors.New("hopper: repair history index")
 
+// ErrInvalidFilter is returned by JobList for a filter it cannot list by,
+// such as Metadata holding a number beyond what Postgres's numeric stores,
+// or a tag in characters the database's encoding lacks.
+var ErrInvalidFilter = errors.New("hopper: invalid job filter")
+
 // Driver binds the core to a storage engine. TTx is the engine's transaction
 // type (pgx.Tx for hopperpgx), so that transactional inserts only accept a
 // transaction from the right engine.
@@ -321,12 +326,16 @@ type Executor interface {
 	// pass is running. The live table churns at the job rate, and on
 	// Postgres every claim walks the claim index past the entries of jobs
 	// that have left, so pickup latency climbs between vacuums; autovacuum
-	// looks only every autovacuum_naptime (a minute by default). Engines
-	// without such maintenance return zero values.
+	// looks only every autovacuum_naptime (a minute by default). On Postgres
+	// the live tags table (schema v17), whose index a listing by tag walks,
+	// is kept the same way, and each table is kept whether or not the
+	// other's maintenance fails. Engines without such maintenance return
+	// zero values.
 	JobsMaintain(ctx context.Context) (JobsMaintainResult, error)
 }
 
-// JobsMaintainResult reports what JobsMaintain did.
+// JobsMaintainResult reports what JobsMaintain did: Vacuumed and Analyzed
+// are set when it vacuumed or analyzed any of the tables it keeps.
 type JobsMaintainResult struct {
 	Vacuumed bool
 	Analyzed bool
@@ -403,6 +412,8 @@ type JobRow struct {
 	UniqueKey    string
 	OrderingKey  string
 	PartitionKey string
+	// Tags are the job's tags, in the order inserted, or nil.
+	Tags []string
 	// BatchID is the batch the job belongs to, or zero.
 	BatchID JobID
 	// ExpiresAt is the TTL deadline, or zero. A job still waiting to run
@@ -495,6 +506,8 @@ type JobInsertParams struct {
 	ScheduledAt time.Time
 	Args        json.RawMessage
 	Metadata    json.RawMessage
+	// Tags label the job for listings. They are distinct and not empty.
+	Tags []string
 	// UniqueKey is empty for non-unique jobs.
 	UniqueKey string
 	// UniqueFinished lists finished states in which a job in history with
@@ -525,9 +538,9 @@ type ConflictAction int
 const (
 	// ConflictSkip keeps the existing job and reports it as a duplicate.
 	ConflictSkip ConflictAction = iota
-	// ConflictReplace updates the existing job's args, metadata, priority,
-	// max attempts and schedule, unless it is running. It is still reported
-	// as a duplicate.
+	// ConflictReplace updates the existing job's args, metadata, tags,
+	// priority, max attempts and schedule, unless it is running. It is
+	// still reported as a duplicate.
 	ConflictReplace
 )
 
@@ -568,6 +581,18 @@ type JobListParams struct {
 	// greater ID, or a smaller one when NewestFirst) are returned.
 	After JobID
 	Limit int
+	// IDs matches jobs with any of the IDs, and Priorities jobs with any of
+	// the priorities.
+	IDs        []JobID
+	Priorities []int
+	// TagsAny matches jobs with at least one of the tags, and TagsAll jobs
+	// with every one of them.
+	TagsAny []string
+	TagsAll []string
+	// Metadata, a JSON object, matches jobs whose metadata contains it:
+	// every key it has, with the same value, compared the same way
+	// recursively for objects and arrays.
+	Metadata json.RawMessage
 }
 
 // QueueRow is a queue's cluster-wide state.
@@ -882,7 +907,8 @@ type HistoryMaintainResult struct {
 	// build lock, every one that lacks an invalid index. A later pass drops
 	// them.
 	Kept []string
-	// Pruned counts rows deleted individually, outside partition drops.
+	// Pruned counts the jobs and stream events deleted individually,
+	// outside partition drops; the tags rows deleted with them are not counted.
 	Pruned int64
 }
 
@@ -905,8 +931,8 @@ type HistoryIndexParams struct {
 // HistoryIndexResult reports what an index pass could not finish.
 type HistoryIndexResult struct {
 	// TimedOut names storage units whose build ran past the session's
-	// statement timeout. What the build left is removed, and the pass goes
-	// on to the rest.
+	// statement timeout, or was canceled by an operator. What the build
+	// left is removed, and the pass goes on to the rest.
 	TimedOut []string
 	// Invalid names indexes that stay invalid although every storage unit
 	// under them is indexed, after the pass's repair: on Postgres, an outcome

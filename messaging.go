@@ -227,7 +227,7 @@ func (c *Client[TTx]) publish(ctx context.Context, exec driver.Executor, msg Top
 	if opts.Priority == 0 {
 		opts.Priority = PriorityNormal
 	}
-	if opts.Priority < PriorityHigh || opts.Priority > PriorityLowest {
+	if !opts.Priority.valid() {
 		return nil, fmt.Errorf("hopper: priority %d is out of range 1..4", opts.Priority)
 	}
 	if opts.Delay < 0 || opts.TTL < 0 {

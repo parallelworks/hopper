@@ -239,6 +239,7 @@ res, err := client.InsertTx(ctx, tx, SendEmail{UserID: 42, Tmpl: "welcome"}, &ho
     Priority:    hopper.PriorityHigh,
     ScheduledAt: time.Now().Add(time.Hour),
     Unique:      &hopper.UniqueOpts{ByArgs: true, ByPeriod: 24 * time.Hour, OnConflict: hopper.UniqueReplace},
+    Tags:        []string{"tenant:acme", "onboarding"}, // for finding the job later
 })
 res.Job.ID; res.Duplicate
 
@@ -272,6 +273,11 @@ for job, err := range client.Jobs(ctx, hopper.JobFilter{
 for job, err := range client.Jobs(ctx, hopper.JobFilter{
     Queue: "billing", OrderingKey: "customer:42", NewestFirst: true,
 }) { ... }                           // one key's lane, latest first
+
+for job, err := range client.Jobs(ctx, hopper.JobFilter{
+    TagsAll: []string{"tenant:acme"}, Metadata: json.RawMessage(`{"region": "eu"}`),
+    Priorities: []hopper.Priority{hopper.PriorityHigh},
+}) { ... }                           // by tags (any or all), metadata containment, priority or ID
 
 client.Queues().Pause(ctx, "email")
 client.Queues().Add(ctx, "tenant_42", hopper.QueueConfig{MaxWorkers: 5}) // runtime, multi-tenant
@@ -465,7 +471,9 @@ CREATE TABLE hopper_jobs (
   snooze_reason       text,                      -- why a snoozed job waits (schema v9); live table only
   wake_requested_at   timestamptz,               -- JobRetryOrderingKey reached the job while it ran (schema v10); live table only
   progress            jsonb,                     -- last step finished, cursor and time (schema v15); kept in history
-  logs                jsonb                      -- the latest attempts' log lines (schema v16); kept in history
+  logs                jsonb,                     -- the latest attempts' log lines (schema v16); kept in history
+  tags                jsonb                      -- array of strings, NULL for none (schema v17); kept in history, with the same CHECK
+    CHECK (jsonb_typeof(tags) = 'array' AND NOT jsonb_path_exists(tags, 'strict $[*] ? (@.type() != "string")')) NOT VALID
 ) WITH (fillfactor = 70);
 
 -- Claim path: the only index the hot query touches.
@@ -510,6 +518,18 @@ CREATE INDEX hopper_job_history_completed_unique ON ONLY hopper_job_history_comp
   WHERE unique_key IS NOT NULL;
 CREATE INDEX hopper_job_history_failed_unique ON ONLY hopper_job_history_failed (kind, unique_key, finalized_at)
   WHERE unique_key IS NOT NULL;
+
+-- A tag's jobs in ID order, for JobList by tag (schema v17): one row per tag of each
+-- tagged job, kept in step with the tags column by triggers (§7.2).
+-- Tags compare by their bytes (COLLATE "C"), whatever the database's collation.
+CREATE TABLE hopper_job_tags (tag text COLLATE "C" NOT NULL, id uuid NOT NULL, PRIMARY KEY (tag, id))
+  WITH (vacuum_truncate = false);                -- and hopper_jobs' autovacuum settings
+CREATE TABLE hopper_job_history_tags (
+  state hopper_job_state NOT NULL, finalized_at timestamptz NOT NULL, tag text COLLATE "C" NOT NULL,
+  id uuid NOT NULL
+) PARTITION BY LIST (state);                    -- partitioned as hopper_job_history is
+CREATE UNIQUE INDEX hopper_job_history_tags_tag                -- a job's tags rows are unique
+  ON hopper_job_history_tags (tag, id, state, finalized_at);
 
 -- Liveness: one lease row per running client process.
 CREATE TABLE hopper_clients (
@@ -573,7 +593,9 @@ dependency edges, which only live workflow jobs have, so a key listing reads nei
 the whole queue nor a new index on the hot table. Schema v14 adds the history index on
 `(kind, unique_key, finalized_at)` for finding a unique key's finished jobs (§7.2),
 declared and built the same way. Schema v15 adds `progress` to `hopper_jobs` and
-history (§7.5), and v16 adds `logs` the same way (§7.5).
+history (§7.5), and v16 adds `logs` the same way (§7.5). Schema v17 adds `tags` the
+same way, with `hopper_job_tags`, `hopper_job_history_tags` (whose time partitions the
+leader keeps with history's) and the triggers that maintain them (§7.2).
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -636,7 +658,7 @@ skew between pods cannot cause early or duplicate execution.
   by kind alone. The key is stored as canonical text, with no hashing, so it is
   FIPS-clean and readable in SQL. Keys over 1 KiB are rejected at insert. The insert
   statement's `ON CONFLICT ... DO UPDATE` returns the existing job for a duplicate;
-  `UniqueReplace` updates the args, metadata, priority, attempts and `scheduled_at` of a
+  `UniqueReplace` updates the args, metadata, tags, priority, attempts and `scheduled_at` of a
   non-running duplicate, which gives debouncing. Within one batch, later inputs with the
   same key resolve to the first.
 - **Finished duplicates:** `UniqueOpts.Finished` names finished states (completed,
@@ -665,6 +687,131 @@ skew between pods cannot cause early or duplicate execution.
   the insert, so the batch still completes. Within a batch, a later input with the same
   key that counts different finished states is inserted in a statement after the
   earlier one's, as if inserted on its own.
+- **Tags:** `InsertOpts.Tags` labels a job for listings, for example by tenant or
+  release. Tags are strings of 1 to 255 bytes without control characters, at most 64
+  distinct per job; repeats are dropped and the order kept. `hopper_insert` takes a
+  `tags` array, checked the same way by `hopper_tags` (§10), which names the control
+  characters by code point, as Go's `unicode.IsControl` does, rather than with
+  `[[:cntrl:]]`, whose meaning varies with the database's collation, and looks for them
+  in the tag's UTF-8 bytes, since a regex reads a single-byte encoding's bytes as code
+  points (WIN1252's euro sign is byte 0x80). They are stored on the
+  job's row as a jsonb array, NULL for none, rather than `text[]`: both drivers read
+  jsonb the same way, while database/sql transports return arrays in formats that
+  differ. The insert sends them as one more `jsonb[]` element per job, NULL for an
+  untagged one. A `NOT VALID` CHECK (adding it reads no rows) refuses anything but an
+  array of strings, in `hopper_jobs` and in history alike, so that a direct SQL write
+  to either cannot store a value the readers must guess at.
+- **Finding jobs by tag:** a listing pages in ID order from a cursor, which no index on
+  the tags column can serve: a GIN index finds a tag's rows in no particular order, so
+  a page would read every match past the cursor, and Postgres keeps no statistics on
+  jsonb elements to choose between that and walking the primary key, which reads the
+  whole table for a rare tag. So each tag of each job also has a row in
+  `hopper_job_tags (tag, id)`, or in `hopper_job_history_tags (state, finalized_at,
+  tag, id)` once the job is in history, whose btree walks one tag's jobs in ID order;
+  a page costs about its size, for a rare tag or a common one. Triggers on
+  `hopper_jobs` and `hopper_job_history` keep the rows in step with the column on every
+  write, whoever makes it: COPY, the SQL contract, a replacing insert, a retry from
+  history, a delete, and on history a write aimed at an outcome table or a partition.
+  An insert uses a row trigger whose `WHEN (NEW.tags IS NOT NULL)`
+  is checked before the trigger is queued, so an untagged insert pays nothing; a
+  statement trigger would copy every new row, payload and all, into its transition
+  table. A delete from `hopper_jobs` uses a statement trigger, whose transition table keeps large values
+  where they are stored, so a batch of finalizes costs one statement, not one per job;
+  it is planned on each call that has tagged rows, since a plan cached for one batch's
+  size is wrong for another's. A `TRUNCATE`, which fires no delete trigger, truncates
+  the table's tags table from a `TRUNCATE` trigger, unless the same statement has
+  already emptied it. An update of a live job's `tags`, which only a replacing
+  insert makes, or of its `id`, uses a row trigger. History's triggers are all row
+  triggers, which Postgres gives each of a partitioned table's partitions, present and
+  future, so they fire for a write aimed at an outcome table or a partition too; a
+  statement trigger fires only for its own table. History is deleted from and updated
+  only by retries, retention's prune of its `DEFAULT` partitions and direct SQL, so a
+  row trigger there costs little, and nothing for an untagged job. History's tags rows
+  are keyed by the job's `state` and `finalized_at` too, and an update of either can move the job to
+  another partition, which Postgres runs as a delete and an insert, firing those
+  triggers; an update within its partition fires the update trigger, which replaces
+  the job's tags rows. A `TRUNCATE` of one of history's partitions fires no trigger of
+  history's: the tags rows it leaves go with their partition, or with the `DEFAULT`
+  partition's prune, at retention, and listings skip them. History's tags rows are
+  unique, as `hopper_job_tags`' are, so reinserting such a partition's rows fails
+  (23505) rather than adding a second copy of each job's tags rows, which would list
+  the job twice. A tagged job pays an index insert per tag when inserted and a
+  delete and an insert per tag when finalized. History's table is partitioned as history is, and
+  the leader creates and drops its time partitions with history's (§7.10), so
+  retention stays a partition drop. A listing by tag has an arm per tag and table (live
+  and history): it walks the tag's rows in ID order from the cursor, looks each row's
+  job up by key in a `LATERAL` subquery fenced with `OFFSET 0`, and stops at the page
+  size. The lookup checks the walked tag on the job's row too (`tags ? t.tag`), so
+  that a tags row the column no longer holds lists nothing, whatever left it: a
+  `TRUNCATE` of a partition, or a write with the triggers disabled. The walk is narrowed by what the tags table holds beside the tag, since the
+  fence keeps the job query's filter out of it: the listing's `IDs`, and in history its
+  states, walking only an outcome's partition of the tags table when the states are all
+  of one outcome. Without that, a page by IDs, or by `discarded` for a tag on many
+  completed jobs, walked every row of the tag and looked each job up only to drop it.
+  The page's jobs are among each arm's, and the arms are merged. The fence keeps
+  the planner from joining the walk to a scan of the whole job table, which it prefers
+  when it cannot tell how common a tag is; ordering and limiting the walk in the same
+  query as the lookup makes it merge history's partitions in index order even when it
+  takes the tag for a rare one, as a generic plan does, where ordering the walk in a
+  subquery sorted every row of the tag. A job with several of `TagsAny`'s tags comes
+  from each of their arms, and the merge keeps one (`DISTINCT ON (id)`), so each arm
+  reads at most a page however much the tags overlap; leaving an earlier tag's jobs out
+  of each later arm instead walked the whole range of a tag whose jobs mostly had an
+  earlier one (seconds a page for two tags on the same 600,000 jobs). Repeated tags are
+  dropped, in `TagsAll` as in `TagsAny`, so that a filter repeating one tag costs no more
+  than one naming it once. `TagsAll` walks its rarest tag and checks
+  the rest on the job's row (`tags ?& $n`): the listing's statement counts each tag up
+  to 1,000 rows in each table it reads, caps the sum at 1,000 too (a tag at the cap
+  in one table is common however few rows it has in the other, and an uncapped sum
+  ranked it below a tag just past the cap in both), and tells tags that both reach
+  the cap apart by their estimated rows in the tables it walks: each leaf's most common frequency in
+  `pg_stats` times its rows, the live tags table's kept by the leader's analyze and
+  history's partitions' by autovacuum, so that a listing of history is not decided by
+  the live table's. The leaves and the estimates are read once a statement, since
+  inlined per tag pg_stats' join listed the partitions again for each of its rows, a
+  cost that grows with the square of history's partitions. Each page chooses again: the count ignores the cursor, so every page of a
+  listing picks the same tag while the jobs stay put, and it reads at most 1,000 index
+  entries per tag and table, a fraction of a millisecond. Carrying the choice from one
+  page to the next would need `JobList` to report it, a change to the driver interface
+  that saves less than a page's own lookups cost. The listing's limit is a constant in its SQL, as the claim's is (§7.3): a
+  cached generic plan for a parameter would cost the page as a tenth of the table and
+  choose parallel scans and JIT compilation. On Postgres 18 with a million live and a
+  million finished jobs, under generic plans, a page of 20 took 0.3 ms for a tag on
+  every job, 0.1 ms for one on 18, 0.4 ms for both with `TagsAny`, and 1.2 ms with
+  `TagsAll` for the common tag and one on 2,000 jobs.
+- **Other filters:** `JobFilter.IDs` and `Priorities` match any of the given values,
+  and `Metadata`, a JSON object, matches jobs whose metadata contains it (jsonb `@>`).
+  Metadata has no index, since one would cost every insert; it narrows what the other
+  filters find. Each filter is added to the listing's SQL only when set, as a plain
+  condition. A filter that cannot list (an ordering key without a queue, an
+  out-of-range priority, `Metadata` that is not a JSON object or that jsonb's input
+  refuses, a queue, kind, state or tag that the database's text refuses, a tag no job could
+  have, or more distinct `TagsAny` or `TagsAll` than `MaxTags`, which bounds a
+  listing's arms) fails with `ErrInvalidFilter`. What the server's input refuses is
+  left to it: text with a NUL or a character the database's encoding lacks, and for
+  jsonb also bytes that are not UTF-8, a `\u0000` escape, an unpaired surrogate, a
+  number beyond numeric's range, and nesting past the server's stack. No statement
+  checks a filter before the listing, so a paged listing costs one statement a page.
+  A data exception (class 22) or 54001 from the listing can also come from a stored
+  row, such as one whose text has no UTF-8 form, so only then are the filters' values
+  given to the server again on their own: if it refuses them, the listing fails with
+  `ErrInvalidFilter`, wrapping the server's error, which names the value, and
+  otherwise with the listing's own error.
+  In the caller's transaction (`JobsTx`), a listing whose filters the server could
+  refuse runs under a savepoint, so that a refusal leaves the transaction usable
+  rather than aborted. Only `Metadata` and text with a NUL or beyond ASCII can be
+  refused, since ASCII is valid in every server encoding, so other listings skip the
+  savepoint's two extra round trips.
+- **Tags in a rolling deploy:** a client of the previous release drops a job's tags
+  wherever it writes the row anew, since its statements name the columns it knows:
+  when it moves a tagged job it finalizes to history, retries one from history, or
+  inserts a batch's callbacks. The triggers keep the tags tables in step with what it
+  writes. The empty string and repeats, which the CHECK allows and only a direct SQL
+  write stores, are left out wherever tags are read, they get no tags rows, and a
+  retry from history brings the job back without them. A batch callback's stored tags
+  read the same way, less any longer than `MaxTagBytes`: only a direct SQL write to the
+  batch row stores one, and one past the tags index's largest row would fail the
+  finalize that completes the batch.
 - **Wake-up:** an insert inside a caller's transaction sends
   `pg_notify('hopper_insert', queue)` in the same pipelined batch as the insert, once
   per queue. Postgres delivers notifications only on commit and collapses identical
@@ -1263,7 +1410,22 @@ instead. A schedule with no recorded slot starts from its next slot.
 ### 7.10 Retention
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.
 Retention is enforced by dropping whole partitions, so there is no `DELETE`, no dead
-tuples and no vacuum work. The leader creates partitions several intervals ahead
+tuples and no vacuum work. Their tags rows (schema v17, §7.2) live in `hopper_job_history_tags`,
+partitioned the same way, whose partitions the leader creates and drops beside
+history's, each in a transaction of its own. A tags partition is dropped only once its
+history partition is gone, after it in the same pass or in a later one, so that a job
+in history always keeps its tags rows; a tags partition left without its history
+partition indexes nothing a listing returns. Neither creation nor a drop locks both
+tables: a finalize locks history before its tags and a listing by tag the tags before
+history, so a statement that held one parent while it waited for the other could
+deadlock with either. A history partition that has no tags partition beside it, as one
+a previous release's leader creates, sends its jobs' tags rows to the tags table's
+`DEFAULT` partition, whose prune keeps the rows of jobs still in history. v17 gives
+history's partitions for the current period and those ahead theirs, so that a job's
+tags rows are in its job's partition from the upgrade on. A past period's partition
+gets none: jobs are finalized into history at `now()`, so only a direct SQL write
+could give one tags rows, which the `DEFAULT` partition keeps, and a long retention
+would otherwise create a table and index per period in the migration's transaction. The leader creates partitions several intervals ahead
 (three hours for `completed`, two days for `failed`), on election and every five
 minutes. A partition is created standalone and then attached, which takes only a
 `SHARE UPDATE EXCLUSIVE` lock on the parent. Only future periods are created and no
@@ -1304,7 +1466,13 @@ deferred work with it, but work it deferred lengthens the next try's lock timeou
 on a pass without a failure, so that a failure that lasts does not hold the other
 groups' deferred work at the shortest timeout for good. Deferrals are logged at debug level, and as a warning from the fifth pass in a
 row. Retention periods are set in `Config` and enforced by the leader, so the leader's
-settings apply cluster-wide.
+settings apply cluster-wide. A group whose maintenance fails (history's outcome
+tables, the stream log, history's tags tables) leaves the others maintained in the
+same pass, which reports the failures together: a partition ahead that is missing
+when its period starts sends that period's rows to the `DEFAULT` partition. A pass that
+failed is run again at the next maintenance interval, its deferrals included, since a
+retry on the next leader pass would run the failing group again every few seconds; a
+pass that deferred nothing ends the run of deferrals, failed or not.
 
 The defaults follow common practice: job queues keep successful jobs briefly and
 failures longer, while brokers such as RabbitMQ and SQS delete a message once it is
@@ -1704,11 +1872,42 @@ observability without new machinery.
   statement (`CREATE INDEX CONCURRENTLY`, `NOT VALID`
   constraints, and so on). A migration runs in a transaction, where `CONCURRENTLY` is
   not allowed and a partitioned table cannot take it at all, so an index on history
-  is declared `ON ONLY` and built per partition by the leader (schema v13 and v14). A change that needs `ACCESS EXCLUSIVE`, such as adding a
+  is declared `ON ONLY` and built per partition by the leader (schema v13 and v14).
+  A migration first takes the lock the leader builds those indexes under
+  (`HistoryIndexLockKey`), cancelling a build under way to get it, which the leader
+  redoes on a later pass: a build and a migration would otherwise wait on each other
+  unseen, the migration for the table lock the build holds and the build, in its last
+  phase, for the migration's statement to end. Every migration cancels, whether or not
+  it touches history: an upgrade's migrations run back to back, so a build is
+  restarted at most once an upgrade, which costs less than a rule for which scripts may
+  leave builds running. A build the migration's role may not cancel (pg_cancel_backend
+  fails for it) fails the migration with an error saying which role may, rather than
+  being waited for: the build, in its last phase, waits for every older snapshot,
+  among them those of migrations queued for the migration lock this one holds, so the
+  wait would never end. While it cancels,
+  the migration holds `HistoryIndexCancelKey`, which the leader tries after a build
+  fails with SQLSTATE 57014: held, the failure was the migration's cancel; free, it was
+  the session's `statement_timeout` or an operator's cancel, which are not told apart.
+  The error's message would tell them apart only in the server's language, and the
+  `statement_timeout` a query on a pooled connection reads need not be the one the
+  build ran under. After the migration's cancel the pass ends, so that the leader
+  starts nothing while the migration runs, and the next pass drops the invalid index
+  the build left; after a timeout or an operator's cancel the leader drops it at once,
+  reports the partition, which it backs off and warns about, and goes on to the next.
+  The migration's transaction is read committed, and keeps no snapshot between its statements, so the build never waits
+  for it while it waits for the lock. A change that needs `ACCESS EXCLUSIVE`, such as adding a
   column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v13 and v14
   for the `SHARE` lock that declaring a history index takes, which finalizes wait for), because a lock
   request queued behind an open transaction on the table would hold up every claim
-  behind it; claims wait at most one try at a time. Between tries it sleeps a jittered,
+  behind it; claims wait at most one try at a time. A try that changes both `hopper_jobs`
+  and history (v17) locks them first, `hopper_jobs` before history, the order a finalize
+  takes them in: a finalize that has `hopper_jobs` and waits for history would otherwise
+  hold up the try until its timeout, and under steady finalizes almost every try would
+  fail that way. From v17 the short timeout is set inside the loop and restored after
+  it, so that the migration's other statements wait for a lock as any statement does
+  rather than fail on a brief conflict; v17's listing of history's time partitions
+  also reads their bounds from the catalog alone, without opening them, as a scan of
+  the catalog may reach any schema's partitions. Between tries it sleeps a jittered,
   growing interval capped at a second, raises a `NOTICE` every 10 seconds while it
   waits, and gives up with an error after 10 minutes, so a transaction held open for
   longer fails the migration (end it and run `Up` again) rather than stalling it
@@ -1751,8 +1950,8 @@ observability without new machinery.
   `hopperbench` command.
 - **Web UI (`hopperui` module):** `hopperui.New(client, cfg)` is an embeddable
   `http.Handler`, mounted under a prefix with `http.StripPrefix`, for browsing queues
-  (depths, limits, paused state), jobs and history (filtered by queue, state and kind,
-  paged by ID), a job's args, metadata, output and errors, workflows as a DAG (SVG, laid
+  (depths, limits, paused state), jobs and history (filtered by queue, state, kind and
+  tag, paged by ID), a job's tags, args, metadata, output and errors, workflows as a DAG (SVG, laid
   out by dependency depth), subscriptions, stream consumers and clients. Retry, cancel,
   delete (behind a confirmation), pause, resume and seek are offered only when the application supplies
   `Config.Authorize`, which is asked before every action; without it the UI is

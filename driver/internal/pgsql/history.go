@@ -28,6 +28,9 @@ type historyGroup struct {
 	ahead int
 	// format names a partition by its period start (in UTC).
 	format string
+	// mirrors is, for a table of history's tags rows, the outcome table
+	// whose partitions its own follow period for period.
+	mirrors string
 }
 
 // HistoryLockKey is the pg_advisory_xact_lock key that serializes changes to
@@ -49,6 +52,12 @@ var historyGroups = []historyGroup{
 	{root: "hopper_job_history", parent: "hopper_job_history_completed", timeColumn: "finalized_at", period: time.Hour, ahead: 3, format: "2006010215"},
 	{root: "hopper_job_history", parent: "hopper_job_history_failed", timeColumn: "finalized_at", period: 24 * time.Hour, ahead: 2, format: "20060102"},
 	{root: "hopper_stream_events", parent: "hopper_stream_events", timeColumn: "created_at", period: 24 * time.Hour, ahead: 2, format: "20060102"},
+	// History's tags rows (schema v17), partitioned as history is, so that
+	// retention drops them with their jobs. A tags partition is dropped
+	// only once its history partition is gone, in a statement of its own:
+	// these groups come after history's, so a pass drops both.
+	{root: "hopper_job_history_tags", parent: "hopper_job_history_tags_completed", timeColumn: "finalized_at", period: time.Hour, ahead: 3, format: "2006010215", mirrors: "hopper_job_history_completed"},
+	{root: "hopper_job_history_tags", parent: "hopper_job_history_tags_failed", timeColumn: "finalized_at", period: 24 * time.Hour, ahead: 2, format: "20060102", mirrors: "hopper_job_history_failed"},
 }
 
 func (g historyGroup) name(start time.Time) string {
@@ -94,7 +103,8 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 	// partitions ahead of each, and its retention, are independent.
 	var errs []error
 	for _, g := range historyGroups {
-		if err := e.maintainGroup(ctx, g, now, retention[g.parent], lockTimeout, &res); err != nil {
+		// A tags group keeps its rows as long as the history it mirrors.
+		if err := e.maintainGroup(ctx, g, now, retention[cmp.Or(g.mirrors, g.parent)], lockTimeout, &res); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -155,10 +165,25 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 		// Read once, before the first drop, and only when a partition is
 		// past retention: most passes drop nothing.
 		lacking := sync.OnceValues(func() (map[string][]string, error) { return e.lackingInvalidIndexes(ctx, g.parent) })
+		mirrored := sync.OnceValues(func() (map[string]bool, error) { return e.mirroredPartitions(ctx, g, existing, cutoff) })
 		blocked := false
 		for name := range existing {
 			from, ok := g.parse(name)
 			if !ok || !from.Add(g.period).Before(cutoff) {
+				continue
+			}
+			// A tags partition goes only once its history partition is
+			// gone: dropped first, the jobs it indexes would drop out of
+			// listings by tag. The two are never dropped together: a
+			// finalize locks history before its tags, and a listing by
+			// tag the tags before history, so a drop holding one parent
+			// while it waits for the other could deadlock with either.
+			still, err := mirrored()
+			if err != nil {
+				errs = append(errs, err)
+				break
+			}
+			if still[name] {
 				continue
 			}
 			unindexed, err := lacking()
@@ -196,13 +221,28 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 
 // pruneDefault deletes the rows of g's DEFAULT partition past retention,
 // keep, which cannot be dropped by period, adding their count to res. A zero
-// keep keeps everything.
+// keep keeps everything. History's delete trigger, a row trigger and so its
+// partitions' too, deletes the jobs' tags rows, which are not counted. A tags
+// row in a DEFAULT partition can belong to a job in one of history's time
+// partitions, which stays until its whole period is past, so the tags' prune
+// keeps the rows whose job is still there, and takes those a job left
+// without its trigger (a TRUNCATE of a partition).
 func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.Duration, res *driver.HistoryMaintainResult) error {
 	if keep <= 0 {
 		return nil
 	}
+	table := e.Schema.Table(g.parent + "_default")
+	if g.mirrors != "" {
+		if _, err := e.Conn.Exec(ctx, fmt.Sprintf(`
+			DELETE FROM %s t WHERE finalized_at < now() - make_interval(secs => $1::float8)
+			  AND NOT EXISTS (SELECT 1 FROM %s h WHERE h.state = t.state AND h.finalized_at = t.finalized_at AND h.id = t.id)`,
+			table, e.Schema.Table("hopper_job_history")), keep.Seconds()); err != nil {
+			return fmt.Errorf("hopper: prune %s_default: %w", g.parent, err)
+		}
+		return nil
+	}
 	n, err := e.Conn.Exec(ctx,
-		fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", e.Schema.Table(g.parent+"_default"), g.timeColumn),
+		fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", table, g.timeColumn),
 		keep.Seconds())
 	if err != nil {
 		return fmt.Errorf("hopper: prune %s_default: %w", g.parent, err)
@@ -504,8 +544,8 @@ func tryAdvisoryXactLock(ctx context.Context, tx Conn, name string, key int32, s
 // created since an index was declared get theirs when they are attached, so
 // this finds work only after an upgrade, once per partition and index. An index a canceled build
 // left invalid is dropped and built again. A build canceled by the
-// session's statement timeout is reported, and the pass goes on to the next
-// partition.
+// session's statement timeout or by an operator is reported, and the pass
+// goes on to the next partition; a migration's cancel ends the pass.
 func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexParams) (driver.HistoryIndexResult, error) {
 	var res driver.HistoryIndexResult
 	if e.InTx {
@@ -534,7 +574,7 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 			}
 			done, err := e.indexHistoryPartitionLocked(ctx, x, leaf, lockTimeout)
 			switch {
-			case errors.Is(err, errStatementTimeout):
+			case errors.Is(err, errBuildCanceled):
 				res.TimedOut = append(res.TimedOut, leaf)
 				skip = append(skip, leaf)
 				complete = false
@@ -590,9 +630,9 @@ func repairError(err error) error {
 	return fmt.Errorf("%w: %w", driver.ErrHistoryIndexRepair, err)
 }
 
-// errStatementTimeout marks a build the session's statement_timeout
-// canceled.
-var errStatementTimeout = errors.New("hopper: index build exceeded statement_timeout")
+// errBuildCanceled marks a build canceled by the session's statement_timeout
+// or by an operator, not by a migration; a later pass builds it again.
+var errBuildCanceled = errors.New("hopper: index build canceled")
 
 // errAttachDeferred marks a built index whose attach could not get its locks
 // within the lock timeout. The index stays, valid, and a later pass attaches
@@ -658,7 +698,7 @@ func (e *Executor) indexHistoryPartitionLocked(ctx context.Context, x historyInd
 // listed, or during the build, is skipped.
 func (e *Executor) indexHistoryPartition(ctx context.Context, x historyIndex, leaf, lockTimeout string) error {
 	err := e.buildHistoryIndex(ctx, x, leaf, lockTimeout)
-	if err == nil || errors.Is(err, errStatementTimeout) || errors.Is(err, errAttachDeferred) {
+	if err == nil || errors.Is(err, errBuildCanceled) || errors.Is(err, errAttachDeferred) {
 		return err
 	}
 	var gone bool
@@ -694,12 +734,29 @@ func (e *Executor) buildHistoryIndex(ctx context.Context, x historyIndex, leaf, 
 		if _, err := e.Conn.Exec(ctx, "CREATE INDEX CONCURRENTLY IF NOT EXISTS "+quoteIdent(index)+" ON "+e.Schema.Table(leaf)+
 			" "+x.definition); err != nil {
 			if statementTimedOut(ctx, err) {
-				// The build left an invalid index behind, which would cost
-				// every write to the partition until the next attempt.
+				// 57014 is the session's statement_timeout, a cancel by a
+				// migration (lockOutIndexBuilds), or an operator's. A migration
+				// holds HistoryIndexCancelKey until it commits, and the pass
+				// ends so that the leader starts nothing while it runs; the next
+				// pass drops what its cancel left. Otherwise the build left an
+				// invalid index behind, which would cost every write to the
+				// partition until the next attempt, so it is dropped, the
+				// partition is reported and backed off, and the pass goes on.
+				// A timeout and an operator's cancel are not told apart: only
+				// the message, in the server's language, says which it was,
+				// and the statement_timeout a pooled connection read need not
+				// be the build's.
+				free, qerr := tryAdvisoryXactLock(ctx, e.Conn, e.Schema.Name, HistoryIndexCancelKey, true)
+				if qerr != nil {
+					return fmt.Errorf("hopper: index partition %s: %w", leaf, errors.Join(err, qerr))
+				}
+				if !free {
+					return fmt.Errorf("hopper: index partition %s: %w", leaf, err)
+				}
 				if _, derr := e.Conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+e.Schema.Table(index)); derr != nil {
 					return fmt.Errorf("hopper: drop invalid index %s: %w", index, derr)
 				}
-				return fmt.Errorf("%w: %s: %w", errStatementTimeout, leaf, err)
+				return fmt.Errorf("%w: %s: %w", errBuildCanceled, leaf, err)
 			}
 			if deadlocked(err) {
 				// The deadlock detector chose the build over another
@@ -885,6 +942,36 @@ func (e *Executor) partitionsOf(ctx context.Context, parent string) (map[string]
 	return out, nil
 }
 
+// mirroredPartitions reports which of g's partitions past cutoff still have
+// the partition of g.mirrors for the same period, in one statement for the
+// whole group: a tags partition goes only once its history partition is gone.
+func (e *Executor) mirroredPartitions(ctx context.Context, g historyGroup, existing map[string]struct{}, cutoff time.Time) (map[string]bool, error) {
+	if g.mirrors == "" {
+		return nil, nil
+	}
+	var names, mirrors []string
+	for name := range existing {
+		if from, ok := g.parse(name); ok && from.Add(g.period).Before(cutoff) {
+			names = append(names, name)
+			mirrors = append(mirrors, e.Schema.Table(g.mirrors+strings.TrimPrefix(name, g.parent)))
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	found, err := scanStrings(e.Conn.Query(ctx, `
+		SELECT n FROM unnest($1::text[], $2::text[]) AS m(n, mirror) WHERE to_regclass(m.mirror) IS NOT NULL`,
+		textArray(names), textArray(mirrors)))
+	if err != nil {
+		return nil, fmt.Errorf("hopper: check partitions of %s: %w", g.mirrors, err)
+	}
+	out := make(map[string]bool, len(found))
+	for _, n := range found {
+		out[n] = true
+	}
+	return out, nil
+}
+
 // createPartition creates a time partition for a future period and attaches
 // it. It returns false if another leader created the partition meanwhile,
 // and deferred if it could not get its locks within lockTimeout.
@@ -1041,6 +1128,11 @@ func MigrationApply(ctx context.Context, conn Conn, schema *Schema, version int,
 			err = errors.Join(err, tx.Rollback(context.WithoutCancel(ctx)))
 		}
 	}()
+	// Read committed keeps no snapshot between statements, which
+	// lockOutIndexBuilds relies on, whatever the server's default.
+	if _, err = tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		return err
+	}
 	if up {
 		var exists bool
 		if err = tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", schema.Name).Scan(&exists); err != nil {
@@ -1051,6 +1143,9 @@ func MigrationApply(ctx context.Context, conn Conn, schema *Schema, version int,
 				return err
 			}
 		}
+	}
+	if err = lockOutIndexBuilds(ctx, tx, schema.Name); err != nil {
+		return err
 	}
 	// Migration scripts use unqualified DDL; this setting is transaction-local
 	// and never changes the application's pooled connections.
@@ -1076,6 +1171,95 @@ func MigrationApply(ctx context.Context, conn Conn, schema *Schema, version int,
 	}
 	return tx.Commit(ctx)
 }
+
+// lockOutIndexBuilds takes HistoryIndexLockKey for the rest of a migration's
+// transaction, so that the leader starts no index build meanwhile, and
+// cancels a build under way to get it. A build and a migration would
+// otherwise wait on each other unseen: the migration for the table lock the
+// build holds, and the build, in its last phase, for the migration's
+// statement to end. The leader builds the index again on a later pass. Only
+// the leader's own builds are canceled, those of an index historyIndexes
+// names on a partition it indexes, so that an operator's build is left
+// alone, elsewhere in the schema or on history's partitions alike. A build
+// this role may not cancel fails the migration
+// (errBuildNotCancelable). The transaction
+// keeps no snapshot between these statements, so a build never waits for it
+// here.
+func lockOutIndexBuilds(ctx context.Context, tx Conn, schema string) error {
+	var parents, suffixes []string
+	for _, x := range historyIndexes {
+		if p := quoteIdent(schema) + "." + quoteIdent(x.parent); !slices.Contains(parents, p) {
+			parents = append(parents, p)
+		}
+		if !slices.Contains(suffixes, x.suffix) {
+			suffixes = append(suffixes, x.suffix)
+		}
+	}
+	deadline := time.Now().Add(10 * time.Minute)
+	marked := false
+	for {
+		locked, err := tryAdvisoryXactLock(ctx, tx, schema, HistoryIndexLockKey, false)
+		if err != nil || locked {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("hopper: the leader's history indexing held the schema for 10 minutes, and this role found no build to cancel: " +
+				"a role without pg_read_all_stats sees no other role's builds, and the leader also holds the schema while it drops an invalid index " +
+				"or attaches one, which can wait for a long transaction; run the migration as a role that sees the build, or once the leader's indexing has finished")
+		}
+		if !marked {
+			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", schema, HistoryIndexCancelKey); err != nil {
+				return fmt.Errorf("hopper: cancel index builds: %w", err)
+			}
+			marked = true
+		}
+		// The builds are found and canceled in one statement: a backend
+		// listed by one statement and canceled by the next could have
+		// finished its build meanwhile, and the cancel would hit whatever
+		// it ran next, such as an application's query on the same pool.
+		// The view lists every database's builds, and a database made from
+		// another as its template shares its relations' OIDs, so only this
+		// database's builds are matched. The leader names a partition's
+		// index after the partition (indexHistoryPartition), and a
+		// concurrent build has committed its index's catalog row before it
+		// waits for anything, so the index's name tells the leader's builds
+		// from an operator's on the same partitions.
+		if _, err := tx.Exec(ctx, `
+			SELECT pg_cancel_backend(p.pid) FROM pg_stat_progress_create_index p
+			JOIN pg_inherits i ON i.inhrelid = p.relid
+			JOIN pg_class l ON l.oid = p.relid
+			JOIN pg_class x ON x.oid = p.index_relid
+			WHERE p.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND i.inhparent IN (SELECT to_regclass(n) FROM unnest($1::text[]) n) AND p.command = 'CREATE INDEX CONCURRENTLY'
+			  AND x.relname IN (SELECT (l.relname || s)::name FROM unnest($2::text[]) s)`,
+			textArray(parents), textArray(suffixes)); err != nil {
+			if sqlState(err) == "42501" {
+				return fmt.Errorf("%w: %w", errBuildNotCancelable, err)
+			}
+			return fmt.Errorf("hopper: cancel index builds: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// errBuildNotCancelable fails a migration that cannot cancel a build. It
+// fails rather than wait for the build, which may run for hours and, in its
+// last phase, waits for every older snapshot, among them those of migrations
+// queued for the migration lock this one holds: the wait would never end.
+var errBuildNotCancelable = errors.New("hopper: a history index build holds the schema, and this role may not cancel it " +
+	"(that takes the privileges of the build's role or of pg_signal_backend, and a superuser's build a superuser); " +
+	"run the migration as a role that may, or once the build has finished")
+
+// HistoryIndexCancelKey is the pg_advisory_xact_lock key, combined with the
+// schema, that a migration holds from before it cancels the leader's index
+// builds until it commits. A build that fails with 57014, which a statement
+// timeout and a cancel share, was canceled by a migration if the key is held:
+// the message would tell them apart only in the server's language.
+const HistoryIndexCancelKey int32 = 0x686f7063 // "hopc"
 
 // MigrationLockKey is the pg_advisory_lock key held while migrating.
 const MigrationLockKey int64 = 0x686f707065725f6d // "hopper_m"

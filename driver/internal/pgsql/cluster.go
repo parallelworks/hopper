@@ -396,23 +396,43 @@ const analyzeEvery = 30 * time.Second
 // plans and a CPU-starved server feels the replanning. The sample is kept
 // small; nothing here needs fine histograms. Both skip, rather than wait,
 // when autovacuum holds the lock, since that pass does the same work.
+//
+// The live tags table churns with tagged jobs, and a listing by tag walks
+// its index, so it is kept the same way, except that its analyze keeps the
+// server's statistics target. Each table is kept whether or not the other's
+// maintenance fails, such as a vacuum of a large hopper_jobs that runs past
+// the role's statement_timeout on every pass.
 func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
 	var res driver.JobsMaintainResult
 	if e.InTx {
 		return res, errors.New("hopper: live table maintenance must run on the pool, not in a transaction")
 	}
+	var errs []error
+	for _, table := range []string{"hopper_jobs", "hopper_job_tags"} {
+		vacuumed, analyzed, err := e.maintainLiveTable(ctx, table)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		res.Vacuumed = res.Vacuumed || vacuumed
+		res.Analyzed = res.Analyzed || analyzed
+	}
+	return res, errors.Join(errs...)
+}
+
+func (e *Executor) maintainLiveTable(ctx context.Context, table string) (vacuumed, analyzed bool, err error) {
 	var dead, live, modified int64
 	var believed, sinceAnalyze float64
-	err := e.Conn.QueryRow(ctx, `
+	err = e.Conn.QueryRow(ctx, `
 		SELECT s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, c.reltuples,
 		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
 		FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
-		WHERE s.relid = to_regclass($1)`, e.Schema.Table("hopper_jobs")).Scan(&dead, &live, &modified, &believed, &sinceAnalyze)
+		WHERE s.relid = to_regclass($1)`, e.Schema.Table(table)).Scan(&dead, &live, &modified, &believed, &sinceAnalyze)
 	if errors.Is(err, ErrNoRows) {
-		return res, nil
+		return false, false, nil
 	}
 	if err != nil {
-		return res, fmt.Errorf("hopper: live table statistics: %w", err)
+		return false, false, fmt.Errorf("hopper: %s statistics: %w", table, err)
 	}
 	if dead >= vacuumDeadRows {
 		// TRUNCATE false: a vacuum otherwise ends by trying, for up to five
@@ -420,30 +440,33 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 		// pages, and whenever it briefly gets one every claim and finalize
 		// waits behind it. A churning live table reuses those pages within
 		// seconds anyway.
-		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, TRUNCATE false) {{schema}}.hopper_jobs"); err != nil {
-			return res, fmt.Errorf("hopper: vacuum live table: %w", err)
+		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, TRUNCATE false) "+e.Schema.Table(table)); err != nil {
+			return false, false, fmt.Errorf("hopper: vacuum %s: %w", table, err)
 		}
-		res.Vacuumed = true
-		return res, nil
+		return true, false, nil
 	}
 	floor := func(v float64) float64 { return max(v, 100) }
 	sizeOff := believed >= 0 && (float64(live) >= 10*floor(believed) || believed >= 10*floor(float64(live)))
 	churned := modified >= 1000 && modified*10 >= live && sinceAnalyze >= analyzeEvery.Seconds()
 	if !sizeOff && !churned {
-		return res, nil
+		return false, false, nil
 	}
 	err = e.withTx(ctx, func(tx Tx) error {
-		if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = 10"); err != nil {
-			return err
+		// The tags table keeps the server's target: a listing by several
+		// tags (rarestTagSQL) tells common tags apart by its most common
+		// values, of which a target of 10 would keep only ten.
+		if table == "hopper_jobs" {
+			if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = 10"); err != nil {
+				return err
+			}
 		}
-		_, err := tx.Exec(ctx, "ANALYZE (SKIP_LOCKED) {{schema}}.hopper_jobs")
+		_, err := tx.Exec(ctx, "ANALYZE (SKIP_LOCKED) "+e.Schema.Table(table))
 		return err
 	})
 	if err != nil {
-		return res, fmt.Errorf("hopper: analyze live table: %w", err)
+		return false, false, fmt.Errorf("hopper: analyze %s: %w", table, err)
 	}
-	res.Analyzed = true
-	return res, nil
+	return false, true, nil
 }
 
 // AnalyzeForTest analyzes the live table as it is, for the conformance

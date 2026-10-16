@@ -43,7 +43,7 @@ import (
 func finishedColumns(errorsExpr, logsExpr, outputExpr, archiveExpr, stateExpr, doneChannelParam string) string {
 	return fmt.Sprintf(`j.id, j.seq, j.kind, j.queue, j.priority, j.attempt, j.max_attempts, j.scheduled_at, j.attempted_at,
     j.attempted_by, j.args, j.metadata, %s AS errors, j.unique_key, j.ordering_key, j.partition_key, j.batch_id,
-    j.expires_at, j.cancel_requested_at, j.await, j.created_at, j.progress, %s AS logs, %s AS output, %s AS archive,
+    j.expires_at, j.cancel_requested_at, j.await, j.created_at, j.progress, j.tags, %s AS logs, %s AS output, %s AS archive,
     %s AS final_state, CASE WHEN j.await THEN pg_notify(%s, j.id::text) END AS notified`,
 		errorsExpr, logsExpr, outputExpr, archiveExpr, stateExpr, doneChannelParam)
 }
@@ -61,7 +61,7 @@ func appendErrorSQL(message string) string {
 // finalized_at and output, as history rows scan.
 const finishedSelectColumns = `id, kind, queue, final_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
   attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id, expires_at,
-  cancel_requested_at, await, created_at, NULL::text AS snooze_reason, progress, now() AS finalized_at, output`
+  cancel_requested_at, await, created_at, NULL::text AS snooze_reason, progress, tags, now() AS finalized_at, output`
 
 // batchProgressSQL sums a batch's progress rows, joined LATERAL to a
 // relation that has the batch's id as id.
@@ -71,15 +71,16 @@ const batchProgressSQL = `LATERAL (SELECT coalesce(sum(p.done), 0) AS done, coal
 // batchCallbacksSQL returns the CTE that inserts the callbacks of the
 // batches a CTE named batches has just completed, and notifies their
 // queues. BatchInsert rejects a priority or max_attempts out of range, and
-// those of rows written before it did are clamped, so that one batch's
-// callback cannot fail the statement that completes or settles others.
+// those of rows written before it did are clamped, and its tags read as
+// callbackTagsSQL reads them, so that one batch's callback cannot fail the
+// statement that completes or settles others.
 func batchCallbacksSQL(insertChannelParam string) string {
 	return `callbacks AS (
-  INSERT INTO {{schema}}.hopper_jobs (kind, queue, priority, max_attempts, args, metadata)
+  INSERT INTO {{schema}}.hopper_jobs (kind, queue, priority, max_attempts, args, metadata, tags)
   SELECT cb->>'kind', coalesce(cb->>'queue', 'default'),
     least(greatest(coalesce((cb->>'priority')::numeric, 2), 1), 4)::smallint,
     least(greatest(coalesce((cb->>'max_attempts')::numeric, 25), 1), 32767)::smallint, coalesce(cb->'args', '{}'),
-    coalesce(cb->'metadata', '{}') || jsonb_build_object('batch_id', b.id::text, 'batch_failed', b.failed)
+    coalesce(cb->'metadata', '{}') || jsonb_build_object('batch_id', b.id::text, 'batch_failed', b.failed), ` + callbackTagsSQL("cb->'tags'") + `
   FROM batches b, LATERAL (VALUES (CASE WHEN b.failed = 0 THEN b.on_success ELSE b.on_failure END), (b.on_complete)) AS v(cb)
   WHERE cb IS NOT NULL
   RETURNING pg_notify(` + insertChannelParam + `, queue)
@@ -92,10 +93,10 @@ const archivedSQL = `archived AS (
   INSERT INTO {{schema}}.hopper_job_history (
     id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
     attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, progress, logs, finalized_at, output)
+    expires_at, cancel_requested_at, await, created_at, progress, tags, logs, finalized_at, output)
   SELECT id, seq, kind, queue, final_state::{{schema}}.hopper_job_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
     attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, progress, logs, now(), output
+    expires_at, cancel_requested_at, await, created_at, progress, tags, logs, now(), output
   FROM done WHERE archive
   RETURNING id
 )`
@@ -235,14 +236,14 @@ var workflowJobInsertSQL = `
 WITH p AS (
   SELECT * FROM unnest(
     $1::uuid[], $2::text[], $3::text[], $4::smallint[], $5::smallint[], $6::timestamptz[], $7::jsonb[], $8::jsonb[],
-    $9::float8[], $10::boolean[], $11::text[], $12::text[], $13::boolean[]
-  ) AS p(id, kind, queue, priority, max_attempts, scheduled_at, args, metadata, ttl, await, ordering_key, partition_key, pending)
+    $9::float8[], $10::boolean[], $11::text[], $12::text[], $13::boolean[], $15::jsonb[]
+  ) AS p(id, kind, queue, priority, max_attempts, scheduled_at, args, metadata, ttl, await, ordering_key, partition_key, pending, tags)
 )
-INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, expires_at, await, ordering_key, partition_key, batch_id)
+INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, max_attempts, scheduled_at, args, metadata, expires_at, await, ordering_key, partition_key, batch_id, tags)
 SELECT p.id, p.kind, p.queue,
        CASE WHEN p.pending THEN 'pending' WHEN p.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state,
        p.priority, p.max_attempts, coalesce(p.scheduled_at, now()), p.args, p.metadata,
-       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key, p.partition_key, $14::uuid
+       CASE WHEN p.ttl > 0 THEN now() + make_interval(secs => p.ttl) END, p.await, p.ordering_key, p.partition_key, $14::uuid, p.tags
 FROM p
 RETURNING ` + JobColumns("") + `, false AS duplicate`
 
@@ -263,7 +264,7 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		kinds, queues, ordering, partitions = make([]string, n), make([]string, n), make([]string, n), make([]string, n)
 		priorities, maxAttempts             = make([]int, n), make([]int, n)
 		scheduledAt                         = make([]time.Time, n)
-		args, metadata                      = make([][]byte, n), make([][]byte, n)
+		args, metadata, tags                = make([][]byte, n), make([][]byte, n), make([][]byte, n)
 		ttls                                = make([]float64, n)
 		awaits                              = make([]bool, n)
 		queueSet                            = map[string]struct{}{}
@@ -281,7 +282,7 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return nil, err
 		}
 		kinds[i], queues[i], scheduledAt[i] = p.Kind, p.Queue, p.ScheduledAt
-		args[i], metadata[i] = []byte(jsonOrEmptyObject(p.Args)), []byte(jsonOrEmptyObject(p.Metadata))
+		args[i], metadata[i], tags[i] = []byte(jsonOrEmptyObject(p.Args)), []byte(jsonOrEmptyObject(p.Metadata)), TagsJSON(p.Tags)
 		ttls[i], awaits[i], ordering[i], partitions[i] = p.TTL.Seconds(), p.Await, p.OrderingKey, p.PartitionKey
 		if _, seen := queueSet[p.Queue]; !pending[i] && !seen {
 			queueSet[p.Queue] = struct{}{}
@@ -324,7 +325,7 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		res.Jobs, err = scanInsertResults(tx.Query(ctx, workflowJobInsertSQL,
 			uuidArray(ids), textArray(kinds), textArray(queues), intArray(priorities), intArray(maxAttempts), timeArray(scheduledAt),
 			jsonArray(args), jsonArray(metadata), floatArray(ttls), boolArray(awaits),
-			nullableTextArray(ordering), nullableTextArray(partitions), boolArray(pending), uuidParam(res.ID)))
+			nullableTextArray(ordering), nullableTextArray(partitions), boolArray(pending), uuidParam(res.ID), jsonArray(tags)))
 		if err != nil {
 			return fmt.Errorf("insert jobs: %w", err)
 		}

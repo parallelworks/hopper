@@ -27,6 +27,7 @@ SELECT hopper.hopper_insert('send_email', '{"user_id": 42, "tmpl": "welcome"}',
 | `ttl_seconds` | number | Discard the job if it is still waiting to run this long after the insert: before its first attempt, between retries or while snoozed. |
 | `ordering_key` | string | Serialize with other jobs of the same key in the queue. |
 | `await` | bool | Announce the finalize on `hopper_done`. |
+| `tags` | array of strings | Labels for `JobFilter.TagsAny` and `TagsAll`, as `InsertOpts.Tags`: at most 64 distinct, each 1 to 255 bytes without control characters; repeats are dropped. Since schema v17. |
 
 Unique keys built by the Go client have the form documented in
 `hopper.UniqueOpts`; a producer that must share a key with Go code should

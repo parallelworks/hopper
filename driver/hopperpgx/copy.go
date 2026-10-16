@@ -77,6 +77,7 @@ func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertP
 			OrderingKey:  p.OrderingKey,
 			PartitionKey: p.PartitionKey,
 			BatchID:      p.BatchID,
+			Tags:         p.Tags,
 			CreatedAt:    now,
 		}
 		var expiresAt pgtype.Timestamptz
@@ -91,10 +92,10 @@ func (e *executor) JobInsertCopy(ctx context.Context, params []driver.JobInsertP
 			pgtype.Text{String: p.OrderingKey, Valid: p.OrderingKey != ""},
 			pgtype.Text{String: p.PartitionKey, Valid: p.PartitionKey != ""},
 			pgtype.UUID{Bytes: p.BatchID, Valid: !p.BatchID.IsZero()},
-			j.CreatedAt,
+			j.CreatedAt, pgsql.TagsJSON(p.Tags),
 		}
 	}
-	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "expires_at", "await", "ordering_key", "partition_key", "batch_id", "created_at"}
+	columns := []string{"id", "kind", "queue", "state", "priority", "max_attempts", "scheduled_at", "args", "metadata", "expires_at", "await", "ordering_key", "partition_key", "batch_id", "created_at", "tags"}
 	copied, err := copier.CopyFrom(ctx, pgx.Identifier{e.Schema.Name, "hopper_jobs"}, columns, pgx.CopyFromRows(values))
 	if err != nil {
 		return nil, fmt.Errorf("hopperpgx: copy jobs: %w", err)
