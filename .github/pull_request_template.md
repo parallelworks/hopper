@@ -1,6 +1,6 @@
 ## Summary
 
-<!-- What does this change and why? PR titles must follow Conventional Commits, e.g. `feat(client): add snooze`. -->
+<!-- What does this change and why? Commit messages and PR titles must follow Conventional Commits, e.g. `feat(client): add snooze`. -->
 
 ## Testing
 
