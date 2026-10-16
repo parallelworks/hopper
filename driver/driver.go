@@ -866,8 +866,9 @@ type HistoryMaintainResult struct {
 	// later pass retries them.
 	Deferred []string
 	// Kept names storage units past retention that wait for HistoryIndex to
-	// build their index, which dropping them first would leave their outcome
-	// table's index unable to complete; a later pass drops them.
+	// build their index: one whose build is under way, or the last one its
+	// outcome table's index lacks, which dropping first would leave that
+	// index unable to complete. A later pass drops them.
 	Kept []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64

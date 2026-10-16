@@ -446,6 +446,25 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	// when told to skip it.
 	repairs := reattachRevalidates(ctx, t, f, d)
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
+
+	// A transaction that read every history partition holds the re-attach
+	// off: the pass leaves the index to the next, neither waiting for the
+	// reader nor reporting the index.
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
+	if _, err := d.UnwrapTx(tx).JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil || len(held.Invalid) != 0 {
+		t.Errorf("revalidation behind a reader = %+v, %v", held, err)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass"); v != "false" {
+		t.Errorf("hopper_job_history_failed_ordering valid behind a reader = %s", v)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+
 	res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{})
 	if err != nil {
 		t.Fatal(err)

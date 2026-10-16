@@ -378,6 +378,14 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		next     time.Time
 	}
 	timedOut := map[string]backoff{}
+	retryIn := func(name string) time.Duration {
+		b := timedOut[name]
+		b.failures++
+		wait := c.tuning.maintenanceInterval << min(b.failures, maxIndexBackoffShift)
+		b.next = time.Now().Add(wait)
+		timedOut[name] = b
+		return wait
+	}
 	for {
 		var skip []string
 		for name, b := range timedOut {
@@ -388,14 +396,6 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		res, err := c.exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: skip})
 		if err != nil && ctx.Err() == nil {
 			c.logger.WarnContext(ctx, "hopper: index history", "error", err)
-		}
-		retryIn := func(name string) time.Duration {
-			b := timedOut[name]
-			b.failures++
-			wait := c.tuning.maintenanceInterval << min(b.failures, maxIndexBackoffShift)
-			b.next = time.Now().Add(wait)
-			timedOut[name] = b
-			return wait
 		}
 		for _, name := range res.TimedOut {
 			c.logger.WarnContext(ctx, "hopper: a history partition's index build ran past statement_timeout; raise it for this role to let the build finish",

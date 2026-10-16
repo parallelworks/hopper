@@ -1149,10 +1149,10 @@ session lock would not survive a transaction pooler. A build on an outcome table
 `DEFAULT` partition also holds the lock keyed to that table, which partition creation
 under it tries without waiting, deferring the partition (§7.10) while the build
 runs: attaching a partition scans the `DEFAULT` partition under a lock that the build
-holds, while the build waits for the attach's transaction. A drop of an expired
-partition that a build holds is not dropped while the build runs, and one the
-deadlock detector picks over a build waiting for its snapshot is deferred; a
-partition dropped during its build is skipped. A build cut short by the end of a term
+holds, while the build waits for the attach's transaction. An expired partition
+that a build holds is not dropped while the build runs, and a drop the deadlock
+detector picks over a build waiting for its snapshot is deferred; a partition
+dropped during its build is skipped. A build cut short by the end of a term
 leaves an invalid index, which the next build drops and builds again. Postgres marks
 an outcome table's index valid only in the attach that completes it, so retention
 does not drop the last partition without an index before it is built: before
@@ -1164,8 +1164,9 @@ it (`HistoryMaintainResult.Kept`) until the build attaches its index: that one
 partition outlives retention by its build, once, after an upgrade. Once every index
 is valid, a drop skips the check and the lock. An index an earlier release left
 invalid is revalidated by attaching one of its partitions' indexes again, which
-releases from May 2026 on count anew, waiting for its locks no longer than a drop
-does; where that leaves it invalid (`HistoryIndexResult.Invalid`), the leader warns
+releases from May 2026 on count anew, waiting for its locks no longer than a drop's
+first attempt does, and leaving the index to the next pass when it cannot get them
+or retention dropped that partition meanwhile; where that leaves it invalid (`HistoryIndexResult.Invalid`), the leader warns
 at doubling intervals that queries needing it read every partition until Postgres is
 updated. A build that runs past the session's `statement_timeout` is canceled by it: its
 leftover is dropped, the pass goes on to the other partitions, and the leader retries

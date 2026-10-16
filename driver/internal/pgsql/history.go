@@ -174,11 +174,23 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 // holds it off until that transaction ends; the next pass retries.
 const defaultDDLLockTimeout = 200 * time.Millisecond
 
-// lockNotAvailable reports whether err is a lock_timeout expiry.
-func lockNotAvailable(err error) bool {
+// sqlState returns err's SQLSTATE, or "" if it carries none.
+func sqlState(err error) string {
 	var coded interface{ SQLState() string }
-	return errors.As(err, &coded) && coded.SQLState() == "55P03"
+	if errors.As(err, &coded) {
+		return coded.SQLState()
+	}
+	return ""
 }
+
+// lockNotAvailable reports whether err is a lock_timeout expiry.
+func lockNotAvailable(err error) bool { return sqlState(err) == "55P03" }
+
+// deadlocked reports whether err is a deadlock the server broke.
+func deadlocked(err error) bool { return sqlState(err) == "40P01" }
+
+// undefinedTable reports whether err names a relation that does not exist.
+func undefinedTable(err error) bool { return sqlState(err) == "42P01" }
 
 // dropPartition drops a partition past retention. DROP takes a brief
 // ACCESS EXCLUSIVE lock on the parent for the catalog change, once per
@@ -192,10 +204,11 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lock
 		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+lockTimeout+"'"); err != nil {
 			return err
 		}
+		var err error
 		if kept, err = e.keepForIndex(ctx, tx, g.parent, name); err != nil || kept {
 			return err
 		}
-		_, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name))
+		_, err = tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name))
 		return err
 	})
 	if lockNotAvailable(err) || deadlocked(err) {
@@ -205,12 +218,6 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lock
 		return false, false, fmt.Errorf("hopper: drop partition %s: %w", name, err)
 	}
 	return !kept, kept, nil
-}
-
-// deadlocked reports whether err is a deadlock the server broke.
-func deadlocked(err error) bool {
-	var coded interface{ SQLState() string }
-	return errors.As(err, &coded) && coded.SQLState() == "40P01"
 }
 
 // keepForIndex reports whether a partition past retention must stay until
@@ -230,8 +237,11 @@ func (e *Executor) keepForIndex(ctx context.Context, tx Tx, parent, name string)
 	}
 	// A build waits for the transactions older than it, this one among
 	// them, so a drop waiting on the build's lock would deadlock with it.
+	// The view lists every database's builds, and relation OIDs are only
+	// unique within one.
 	var building bool
-	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_progress_create_index WHERE relid = to_regclass($1))",
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_progress_create_index
+		WHERE relid = to_regclass($1) AND datid = (SELECT oid FROM pg_database WHERE datname = current_database()))`,
 		e.Schema.Table(name)).Scan(&building); err != nil {
 		return false, fmt.Errorf("hopper: check index builds on %s: %w", name, err)
 	}
@@ -459,8 +469,7 @@ func (e *Executor) buildHistoryIndex(ctx context.Context, x historyIndex, leaf s
 	if !valid.Valid || !valid.Bool {
 		if _, err := e.Conn.Exec(ctx, "CREATE INDEX CONCURRENTLY IF NOT EXISTS "+quoteIdent(index)+" ON "+e.Schema.Table(leaf)+
 			" "+x.definition); err != nil {
-			var coded interface{ SQLState() string }
-			if ctx.Err() == nil && errors.As(err, &coded) && coded.SQLState() == "57014" {
+			if ctx.Err() == nil && sqlState(err) == "57014" {
 				// The build left an invalid index behind, which would cost
 				// every write to the partition until the next attempt.
 				if _, derr := e.Conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+e.Schema.Table(index)); derr != nil {
@@ -511,8 +520,9 @@ func (e *Executor) attachIndex(ctx context.Context, parentIndex, index, lockTime
 // Postgres count the attached indexes again from its May 2026 releases on;
 // earlier ones do not, and it reports true when the index stays invalid. The
 // attach waits for its locks no longer than a partition's creation or drop
-// does, since every query of that partition queues behind it; a pass that
-// cannot get them leaves the index to the next.
+// first does (defaultDDLLockTimeout), since every query of that partition
+// queues behind it; a pass that cannot get them, or whose partition retention
+// dropped since it was picked, leaves the index to the next.
 func (e *Executor) revalidateIndex(ctx context.Context, parentIndex string) (invalid bool, err error) {
 	var child sql.NullString
 	err = e.Conn.QueryRow(ctx, `
@@ -527,7 +537,7 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex string) (inv
 	}
 	timeout := fmt.Sprintf("%dms", defaultDDLLockTimeout.Milliseconds())
 	if err := e.attachIndex(ctx, parentIndex, child.String, timeout); err != nil {
-		if lockNotAvailable(err) {
+		if lockNotAvailable(err) || undefinedTable(err) {
 			return false, nil
 		}
 		return false, err
