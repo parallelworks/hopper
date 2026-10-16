@@ -408,8 +408,8 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 		return res, errors.New("hopper: live table maintenance must run on the pool, not in a transaction")
 	}
 	var errs []error
-	for _, table := range []string{"hopper_jobs", "hopper_job_tags"} {
-		vacuumed, analyzed, err := e.maintainLiveTable(ctx, table)
+	for _, t := range liveTables {
+		vacuumed, analyzed, err := e.maintainLiveTable(ctx, t.name, t.statisticsTarget)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -420,7 +420,20 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 	return res, errors.Join(errs...)
 }
 
-func (e *Executor) maintainLiveTable(ctx context.Context, table string) (vacuumed, analyzed bool, err error) {
+// liveTables are the tables JobsMaintain keeps, with the statistics target
+// their analyze uses, or zero for the server's. The tags table keeps the
+// server's target: a listing by several tags (rarestTagSQL) tells common
+// tags apart by its most common values, of which a target of 10 would keep
+// only ten.
+var liveTables = []struct {
+	name             string
+	statisticsTarget int
+}{
+	{"hopper_jobs", 10},
+	{"hopper_job_tags", 0},
+}
+
+func (e *Executor) maintainLiveTable(ctx context.Context, table string, statisticsTarget int) (vacuumed, analyzed bool, err error) {
 	var dead, live, modified int64
 	var believed, sinceAnalyze float64
 	err = e.Conn.QueryRow(ctx, `
@@ -452,11 +465,8 @@ func (e *Executor) maintainLiveTable(ctx context.Context, table string) (vacuume
 		return false, false, nil
 	}
 	err = e.withTx(ctx, func(tx Tx) error {
-		// The tags table keeps the server's target: a listing by several
-		// tags (rarestTagSQL) tells common tags apart by its most common
-		// values, of which a target of 10 would keep only ten.
-		if table == "hopper_jobs" {
-			if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = 10"); err != nil {
+		if statisticsTarget > 0 {
+			if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = "+strconv.Itoa(statisticsTarget)); err != nil {
 				return err
 			}
 		}
