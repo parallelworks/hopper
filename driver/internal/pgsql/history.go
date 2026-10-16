@@ -185,9 +185,14 @@ func lockTimeoutSetting(d time.Duration) string {
 }
 
 // setLockTimeout bounds the lock waits of the rest of tx by lockTimeout, a
-// lockTimeoutSetting value.
+// lockTimeoutSetting value. A session statement_timeout no longer than that
+// would end a wait first, as a cancel the caller cannot tell from a failure
+// rather than a lock timeout it defers, so it is raised to twice the lock
+// timeout for the rest of tx.
 func setLockTimeout(ctx context.Context, tx Conn, lockTimeout string) error {
-	_, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+lockTimeout+"'")
+	_, err := tx.Exec(ctx, `SELECT set_config('lock_timeout', $1, true),
+		CASE WHEN current_setting('statement_timeout')::interval BETWEEN interval '1 microsecond' AND $1::interval
+		THEN set_config('statement_timeout', (extract(epoch FROM $1::interval) * 2000)::bigint::text, true) END`, lockTimeout)
 	return err
 }
 
@@ -474,8 +479,15 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 				complete = false
 				continue
 			}
-			if err != nil || !done {
+			if err != nil {
 				return res, err
+			}
+			if !done {
+				// Another session holds the schema's build lock: another
+				// leader's pass, or one that stalled. It is reported, so that
+				// a holder that never lets go is warned about.
+				res.Deferred = append(res.Deferred, leaf+x.suffix)
+				return res, nil
 			}
 		}
 		if !complete || slices.Contains(skip, parentIndex) {
@@ -658,13 +670,21 @@ func (e *Executor) attachIndex(ctx context.Context, parentIndex, index, lockTime
 // The attach waits for its locks no longer than lockTimeout, the way a
 // partition's creation or drop does, since every query of that partition
 // queues behind it; a pass that cannot get them reports the index deferred,
-// and one whose partition retention dropped since it was picked leaves the
-// index to the next. probe is the pass's reattachRevalidates.
+// and one whose partition was dropped since it was picked leaves the index to
+// the next. The partition is the furthest ahead, which finalizes do not write
+// to yet and retention does not drop, picked by the partition's name rather
+// than its index's, which Postgres may have truncated: the attach locks the
+// index exclusively, which would hold up the finalizes into the current
+// period's partition. probe is the pass's reattachRevalidates.
 func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout string, probe func() (bool, error)) (invalid, deferred bool, err error) {
 	var child sql.NullString
 	err = e.Conn.QueryRow(ctx, `
-		SELECT (SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-		        WHERE i.inhparent = x.indexrelid LIMIT 1)
+		SELECT (SELECT c.relname FROM pg_inherits i
+		        JOIN pg_class c ON c.oid = i.inhrelid
+		        JOIN pg_index ci ON ci.indexrelid = i.inhrelid
+		        JOIN pg_class t ON t.oid = ci.indrelid
+		        WHERE i.inhparent = x.indexrelid
+		        ORDER BY pg_get_expr(t.relpartbound, t.oid) = 'DEFAULT', t.relname DESC LIMIT 1)
 		FROM pg_index x WHERE x.indexrelid = to_regclass($1) AND NOT x.indisvalid`, e.Schema.Table(parentIndex)).Scan(&child)
 	if errors.Is(err, ErrNoRows) || (err == nil && !child.Valid) {
 		return false, false, nil
@@ -673,13 +693,11 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout
 		return false, false, fmt.Errorf("hopper: check index %s: %w", parentIndex, err)
 	}
 	// On a release whose attach does not count again, the attach would only
-	// queue the partition's queries behind it for nothing. A role that may
-	// not create temporary tables tries the attach itself.
-	repairs, err := probe()
-	if err != nil && sqlState(err) != "42501" {
-		return false, false, err
-	}
-	if err == nil && !repairs {
+	// queue the partition's queries behind it for nothing. A server the probe
+	// fails on, such as for a role that may not create temporary tables, tries
+	// the attach itself, rather than end the pass before the indexes after
+	// this one are built.
+	if repairs, err := probe(); err == nil && !repairs {
 		return true, false, nil
 	}
 	if err := e.attachIndex(ctx, parentIndex, child.String, lockTimeout); err != nil {
@@ -704,7 +722,28 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout
 // transaction it rolls back, the case revalidateIndex repairs: a partitioned
 // index left invalid by the drop of the one partition that lacked it. It
 // asks the server rather than its version, which forks number their own way.
+// The answer changes only with the server's build, so it is kept per
+// version() string, and the probe runs once per build a process meets.
 func (e *Executor) reattachRevalidates(ctx context.Context) (bool, error) {
+	var version string
+	if err := e.Conn.QueryRow(ctx, "SELECT version()").Scan(&version); err != nil {
+		return false, fmt.Errorf("hopper: probe index revalidation: %w", err)
+	}
+	if v, ok := revalidates.Load(version); ok {
+		return v.(bool), nil
+	}
+	valid, err := e.probeReattach(ctx)
+	if err == nil {
+		revalidates.Store(version, valid)
+	}
+	return valid, err
+}
+
+// revalidates holds reattachRevalidates' answers by version() string.
+var revalidates sync.Map
+
+// probeReattach runs reattachRevalidates' probe.
+func (e *Executor) probeReattach(ctx context.Context) (bool, error) {
 	tx, err := e.Conn.Begin(ctx)
 	if err != nil {
 		return false, err

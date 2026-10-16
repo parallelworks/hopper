@@ -69,10 +69,12 @@
   it warns that the index stays invalid, and updating Postgres's minor version
   lets it finish, within 8 maintenance intervals. Attaching a built index, and
   the repair, wait for transactions that read the partition they lock; a
-  warning that an attach has been deferred for five passes means such
-  transactions keep overlapping, or that a transaction left open holds a
-  partition's maintenance lock, which a build waits for under the same
-  timeout.
+  warning that history index work has been deferred for five passes in a row
+  means such transactions keep overlapping, that a transaction left open holds
+  a partition's maintenance lock, which a build waits for under the same
+  timeout, or that another session holds the schema's index build lock: a
+  stalled leader, which `pg_locks` shows holding an advisory lock with
+  `objid` 1752133737.
 - **`UniqueOpts.Finished`.** Each such job is looked up in every history
   partition of the outcomes it counts, one index lookup each, so the cost
   grows with retention. With the default 24 hours of completed history, a

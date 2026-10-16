@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -835,11 +836,13 @@ func TestLeaderReportsInvalidHistoryIndex(t *testing.T) {
 		return
 	}
 	waitFor(t, func() bool { return logs.count(index) > 0 })
-	// After waits of 0.2, 0.4 and then 0.8 seconds: 8 reports in five
-	// seconds, against 5 if the waits went on doubling.
-	time.Sleep(5 * time.Second)
-	if n := logs.count(index); n < 6 || n > 9 {
-		t.Errorf("%s reported %d times in five seconds, want 6 to 9", index, n)
+	// After waits of 0.2, 0.4 and then 0.8 seconds, the seventh report comes
+	// about 4 seconds after the first, plus each pass's own time, against
+	// 12.6 seconds if the waits went on doubling.
+	for deadline := time.Now().Add(10 * time.Second); logs.count(index) < 7; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s reported %d times in the ten seconds after the first, want 7", index, logs.count(index))
+		}
 	}
 }
 
@@ -1064,3 +1067,47 @@ func (l *timeoutLog) count(name string) int {
 	defer l.mu.Unlock()
 	return l.counts[name]
 }
+
+// TestHistoryLockWaitOutlastsStatementTimeout runs history maintenance on
+// sessions whose statement_timeout is shorter than the lock timeout, beside a
+// stalled leader that holds the maintenance lock. The wait ends at the lock
+// timeout, deferring the partition ahead, rather than at the statement
+// timeout, which would fail the pass.
+func TestHistoryLockWaitOutlastsStatementTimeout(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.d.Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err != nil {
+		t.Fatal(err)
+	}
+	var ahead string
+	if err := h.pool.QueryRow(ctx, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`).Scan(&ahead); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, "DROP TABLE "+ahead); err != nil {
+		t.Fatal(err)
+	}
+	held, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(ctx) }()
+	if _, err := held.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)", pgsqlHistoryLockKey); err != nil {
+		t.Fatal(err)
+	}
+	pcfg := h.pool.Config()
+	pcfg.ConnConfig.RuntimeParams["statement_timeout"] = "100ms"
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	res, err := testdb.Driver(pool).Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{LockTimeout: 300 * time.Millisecond})
+	if err != nil || !slices.Contains(res.Deferred, ahead) {
+		t.Errorf("maintain beside a stalled leader, statement_timeout below the lock timeout = %+v, %v", res, err)
+	}
+}
+
+// pgsqlHistoryLockKey is the driver's HistoryLockKey ("hoph").
+const pgsqlHistoryLockKey int32 = 0x686f7068

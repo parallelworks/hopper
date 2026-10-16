@@ -369,9 +369,9 @@ const maxInvalidBackoffShift = 3
 // leader. A partition whose build outlasts the session's statement_timeout
 // is retried at doubling intervals, so that it neither holds up the others
 // nor costs a futile build every interval, and so is an index the server
-// cannot repair, with a warning each time. A repair that cannot get its lock
-// waits longer on each pass, as deferred partition work does, and is warned
-// about once it has been deferred ddlDeferralsWarn passes in a row.
+// cannot repair, with a warning each time. Index work that cannot get its
+// lock waits longer on each pass, as deferred partition work does, and is
+// warned about once some has been deferred ddlDeferralsWarn passes in a row.
 func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{}) {
 	select {
 	case <-ctx.Done():
@@ -384,19 +384,21 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		failures int
 		next     time.Time
 	}
-	timedOut := map[string]backoff{}
+	// backoffs holds the partitions whose build timed out and the indexes
+	// reported invalid, each retried once its next try is due.
+	backoffs := map[string]backoff{}
 	retryIn := func(name string, maxShift int) time.Duration {
-		b := timedOut[name]
+		b := backoffs[name]
 		b.failures++
 		wait := c.tuning.maintenanceInterval << min(b.failures, maxShift)
 		b.next = time.Now().Add(wait)
-		timedOut[name] = b
+		backoffs[name] = b
 		return wait
 	}
 	deferrals := 0
 	for {
 		var skip []string
-		for name, b := range timedOut {
+		for name, b := range backoffs {
 			if time.Now().Before(b.next) {
 				skip = append(skip, name)
 			}
@@ -419,7 +421,7 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 			deferrals = 0
 		} else {
 			deferrals++
-			c.logger.Log(ctx, repeatLevel(deferrals), "hopper: history index work deferred: a transaction that used the partition, or one left open with its maintenance lock, held its lock",
+			c.logger.Log(ctx, repeatLevel(deferrals), "hopper: history index work deferred: a transaction that used the partition, one left open with its maintenance lock, or another session's index pass held its lock",
 				"indexes", res.Deferred, "lock_timeout", timeout, "passes", deferrals)
 		}
 		select {

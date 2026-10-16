@@ -1180,18 +1180,22 @@ built, and a drop skips the locks and the check. The leader logs kept partitions
 Info once per maintenance interval: a kept partition only
 waits for its build, and every way a build fails already warns, a timeout each time,
 an error each pass, and a deferred attach from its fifth pass in a row. An index an
-earlier release left invalid is revalidated by attaching one of its partitions'
-indexes again, which releases from May 2026 on count anew. The pass first asks the server whether its
+earlier release left invalid is revalidated by attaching again the index of its
+furthest partition ahead, which no finalize writes to yet: releases from May 2026 on
+count the attached indexes anew. The pass first asks the server whether its
 attach counts anew, on temporary tables in a transaction it rolls back, rather than by
 its version, which forks number their own way; where it does not, the index is
-reported invalid without locking the partition (a role that may not create temporary
-tables tries the attach itself). The attach waits for its locks under the same
+reported invalid without locking the partition (where the question fails, as for a
+role that may not create temporary tables, the pass tries the attach itself rather
+than stop before the indexes after it). The attach waits for its locks under the same
 doubling timeout as deferred partition work (`HistoryIndexParams.LockTimeout`), since
 the partition's queries queue behind it; so does the attach that ends a build. One
 that cannot get them is reported (`HistoryIndexResult.Deferred`, naming the
 partition's index for a build's) and retried on the next pass, which attaches a built
-index without building it again, and the leader warns once an attach has been deferred
-five passes in a row. A repair whose partition retention dropped meanwhile is left to
+index without building it again. A pass that finds another session holding the
+schema's build lock, another leader's pass or one that stalled, reports the index it
+would have built as deferred too. The leader warns once some index work, of any index,
+has been deferred five passes in a row. A repair whose partition retention dropped meanwhile is left to
 the next pass. An index the server cannot repair, or that the attach left invalid, is
 reported (`HistoryIndexResult.Invalid`), and the leader warns at doubling intervals,
 up to 8 maintenance intervals, that queries needing it read every partition until
@@ -1251,7 +1255,9 @@ therefore holds up a group's finalizes for at most that timeout per kind of DDL 
 pass. A creation's wait for the history maintenance lock, which an overlapping leader's
 creation, retention or attach holds, runs under the same timeout, so a leader that
 stalls holding it defers the partitions ahead rather than stall this leader's loop and
-its lease renewal. Deferrals are logged at debug level, and as a warning from the fifth pass in a
+its lease renewal. A session `statement_timeout` no longer than the lock timeout would end
+these waits first, with a cancel that reads as a failure rather than a deferral, so they
+raise it to twice the lock timeout for their transaction. Deferrals are logged at debug level, and as a warning from the fifth pass in a
 row. Retention periods are set in `Config` and enforced by the leader, so the leader's
 settings apply cluster-wide.
 

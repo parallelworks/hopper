@@ -511,6 +511,32 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 
+	// The re-attach takes the partition furthest ahead, which nothing reads
+	// or writes yet: a statement reading every other partition, the DEFAULT
+	// one and the current period's among them, does not hold it off.
+	if repairs {
+		others := strings.Split(f.QueryText(ctx, t, d, `SELECT string_agg(format('(SELECT count(*) FROM %I)', c.relname), ',')
+			FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = 'hopper_job_history_failed'::regclass
+			  AND c.relname <> (SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+			    WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default')`), ",")
+		released := make(chan struct{})
+		go func() {
+			defer close(released)
+			f.Exec(ctx, t, d, "SELECT pg_sleep(2), "+strings.Join(others, ", "))
+		}()
+		for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d, `SELECT EXISTS (SELECT FROM pg_locks
+			WHERE relation = 'hopper_job_history_failed_default_ordering'::regclass AND pid <> pg_backend_pid())::text`) != "true"; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("the reader of the other partitions did not start")
+			}
+		}
+		res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{LockTimeout: 50 * time.Millisecond})
+		if err != nil || len(res.Deferred)+len(res.Invalid) != 0 {
+			t.Errorf("revalidation beside readers of the other partitions = %+v, %v", res, err)
+		}
+		<-released
+	}
+
 	res, err = exec.HistoryIndex(ctx, driver.HistoryIndexParams{})
 	if err != nil {
 		t.Fatal(err)
@@ -642,45 +668,37 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	// the partition rather than dropping it under the build, and drops the
 	// others past retention.
 	pending := redeclare("20000106", "20000107")
-	// holdIndexLock holds HistoryIndexLockKey combined with name for two
-	// seconds, through lock (exclusively, as a build does, or in share mode,
-	// as retention and partition creation do), and returns once it is held,
-	// with a channel closed once it is released.
-	holdIndexLock := func(lock, name string) <-chan struct{} {
+	const (
+		buildLock       = "hashtext(current_schema() || '.' || $1), 1752133737" // HistoryIndexLockKey
+		maintenanceLock = "hashtext(current_schema()), 1752133736"              // HistoryLockKey
+		schemaBuildLock = "hashtext(current_schema()), 1752133737"              // HistoryIndexLockKey, schema-wide
+	)
+	// holdLock holds the advisory lock key, with args for its parameters,
+	// for two seconds, through lock (pg_advisory_xact_lock, exclusively, or
+	// pg_advisory_xact_lock_shared), and returns once it is held, with a
+	// channel closed once it is released.
+	holdLock := func(lock, key string, args ...any) <-chan struct{} {
 		t.Helper()
-		const buildLock = "hashtext(current_schema() || '.' || $1), 1752133737" // HistoryIndexLockKey
 		released := make(chan struct{})
 		go func() {
 			defer close(released)
-			f.Exec(ctx, t, d, "SELECT "+lock+"("+buildLock+"), pg_sleep(2)", name)
+			f.Exec(ctx, t, d, "SELECT "+lock+"("+key+"), pg_sleep(2)", args...)
 		}()
 		for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
-			"SELECT (NOT pg_try_advisory_xact_lock("+buildLock+"))::text", name) != "true"; time.Sleep(10 * time.Millisecond) {
+			"SELECT (NOT pg_try_advisory_xact_lock("+key+"))::text", args...) != "true"; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
-				t.Fatal("the build's lock was not taken")
+				t.Fatalf("%s(%s) was not taken", lock, key)
 			}
 		}
 		return released
 	}
+	// holdIndexLock holds HistoryIndexLockKey combined with name through
+	// lock: exclusively, as a build does, or in share mode, as retention and
+	// partition creation do.
+	holdIndexLock := func(lock, name string) <-chan struct{} { t.Helper(); return holdLock(lock, buildLock, name) }
 	holdBuildLock := func(name string) <-chan struct{} { t.Helper(); return holdIndexLock("pg_advisory_xact_lock", name) }
-	// holdMaintenanceLock holds HistoryLockKey for two seconds, as a stalled
-	// leader would.
-	holdMaintenanceLock := func() <-chan struct{} {
-		t.Helper()
-		const maintenanceLock = "hashtext(current_schema()), 1752133736" // HistoryLockKey
-		released := make(chan struct{})
-		go func() {
-			defer close(released)
-			f.Exec(ctx, t, d, "SELECT pg_advisory_xact_lock("+maintenanceLock+"), pg_sleep(2)")
-		}()
-		for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
-			"SELECT (NOT pg_try_advisory_xact_lock("+maintenanceLock+"))::text") != "true"; time.Sleep(10 * time.Millisecond) {
-			if time.Now().After(deadline) {
-				t.Fatal("the history maintenance lock was not taken")
-			}
-		}
-		return released
-	}
+	// holdMaintenanceLock holds HistoryLockKey, as a stalled leader would.
+	holdMaintenanceLock := func() <-chan struct{} { t.Helper(); return holdLock("pg_advisory_xact_lock", maintenanceLock) }
 	released := holdBuildLock(pending[0])
 	res, err = exec.HistoryMaintain(ctx, keep)
 	if err != nil || !slices.Equal(res.Kept, pending[:1]) || !slices.Equal(res.Dropped, pending[1:]) {
@@ -757,6 +775,22 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if v := valid(); v != "true" {
 		t.Errorf("valid after the deferred build = %s", v)
+	}
+
+	// A session that holds the schema's build lock, another leader's pass
+	// or one that stalled, holds every build off: the pass reports the work
+	// deferred, so that a holder that never lets go is warned about.
+	unbuilt := redeclare("20000111")
+	released = holdLock("pg_advisory_xact_lock", schemaBuildLock)
+	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil || len(res.Deferred) == 0 {
+		t.Errorf("index while another session holds the schema's build lock = %+v, %v", res, err)
+	}
+	<-released
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, unbuilt) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the schema's build lock was let go = %+v, %v", res, err)
 	}
 
 	// An overlapping leader that stalls while it holds the history
