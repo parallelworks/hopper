@@ -11,6 +11,9 @@ import (
 type Schema struct {
 	Name    string
 	queries sync.Map
+	// revalidates holds reattachRevalidates' answers by the server's start
+	// time and version.
+	revalidates sync.Map
 }
 
 // NewSchema resolves the default namespace.

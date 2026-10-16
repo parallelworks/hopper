@@ -112,6 +112,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"HistoryMaintain", testHistoryMaintain[TTx]},
 		{"HistoryMaintainWhileInUse", testHistoryMaintainWhileInUse[TTx]},
 		{"HistoryIndexes", testHistoryIndexes[TTx]},
+		{"HistoryRetentionCompletesIndex", testHistoryRetentionCompletesIndex[TTx]},
 		{"Now", testNow[TTx]},
 		{"Subscriptions", testSubscriptions[TTx]},
 		{"Publish", testPublish[TTx]},

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/hopper"
+	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/drivertest"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
 
@@ -786,12 +789,264 @@ func TestLeaderBacksOffTimedOutIndexBuilds(t *testing.T) {
 	})
 }
 
+// TestLeaderReportsInvalidHistoryIndex leaves an outcome table's index
+// invalid with every partition indexed, as an earlier release's retention
+// could. The leader repairs it where Postgres's re-attach counts the attached
+// indexes again, and otherwise warns, at doubling intervals capped at eight
+// maintenance intervals, so that a server updated to a release that repairs
+// it is not left waiting for the longer backoff of a timed-out build.
+func TestLeaderReportsInvalidHistoryIndex(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	repairs := reattachRevalidates(t, h)
+	exec := func(query string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	const index = "hopper_job_history_failed_ordering"
+	exec("UPDATE pg_index SET indisvalid = false WHERE indexrelid = '" + index + "'::regclass")
+	logs := &timeoutLog{counts: map[string]int{}, message: "stays invalid", key: "index"}
+	c, err := hopper.NewClient(h.d, &hopper.Config{
+		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
+		Logger: slog.New(logs),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := fastTuning
+	tun.Maintenance = 100 * time.Millisecond
+	c.SetTuning(tun)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Stop(context.Background()) })
+	if repairs {
+		waitFor(t, func() bool {
+			return h.count("SELECT indisvalid::int FROM pg_index WHERE indexrelid = '"+index+"'::regclass") == 1
+		})
+		if n := logs.count(index); n != 0 {
+			t.Errorf("repaired index reported %d times", n)
+		}
+		return
+	}
+	waitFor(t, func() bool { return logs.count(index) > 0 })
+	// After waits of 0.2, 0.4 and then 0.8 seconds, the seventh report comes
+	// about 4 seconds after the first, plus each pass's own time, against
+	// 12.6 seconds if the waits went on doubling.
+	for deadline := time.Now().Add(10 * time.Second); logs.count(index) < 7; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s reported %d times in the ten seconds after the first, want 7", index, logs.count(index))
+		}
+	}
+}
+
+// TestLeaderBacksOffDeferredIndexRepair leaves an outcome table's index
+// invalid with every partition indexed, and holds the re-attach that would
+// repair it off with a transaction that read history. Each pass waits longer
+// for the lock, as deferred partition work does, and the leader warns from
+// the fifth deferred pass in a row on.
+func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	if !reattachRevalidates(t, h) {
+		t.Skip("this Postgres release cannot repair the index, which is reported invalid without an attach (TestLeaderReportsInvalidHistoryIndex)")
+	}
+	// The repair re-attaches the index of the failed table's partition
+	// furthest ahead, which is the one the reader holds, whatever day the
+	// test runs on: a partition the leader creates when the day turns comes
+	// before it.
+	for _, q := range []string{
+		"CREATE TABLE hopper_job_history_failed_21000101 (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)",
+		"ALTER TABLE hopper_job_history_failed ATTACH PARTITION hopper_job_history_failed_21000101 FOR VALUES FROM ('2100-01-01') TO ('2100-01-02')",
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	const index = "hopper_job_history_failed_ordering"
+	if _, err := h.pool.Exec(ctx, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '"+index+"'::regclass"); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Rollback(ctx) })
+	// The reader holds only that partition and its indexes, so that the
+	// partitions the leader creates ahead, whose attaches lock the DEFAULT
+	// partitions, are never deferred behind it, and the index loop, which
+	// waits for the first maintenance, starts.
+	if _, err := reader.Exec(ctx, "SELECT count(*) FROM hopper_job_history_failed_21000101 WHERE ordering_key = 'lane'"); err != nil {
+		t.Fatal(err)
+	}
+	logs := &timeoutLog{counts: map[string]int{}, message: "index work deferred", key: "passes", level: slog.LevelWarn}
+	c, err := hopper.NewClient(h.d, &hopper.Config{
+		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
+		Logger: slog.New(logs),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := fastTuning
+	tun.Maintenance = 100 * time.Millisecond
+	c.SetTuning(tun)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Stop(context.Background()) })
+	waitFor(t, func() bool { return logs.count("5") > 0 })
+	if n := logs.count("4"); n != 0 {
+		t.Errorf("warned after 4 deferred passes")
+	}
+	if v := h.count("SELECT indisvalid::int FROM pg_index WHERE indexrelid = '" + index + "'::regclass"); v != 0 {
+		t.Errorf("%s repaired behind the reader", index)
+	}
+}
+
+// TestRevalidationProbeWaitIsBounded leaves an outcome table's index invalid
+// with every partition indexed, and holds open a transaction that created
+// the repair probe's table, as a leader that stalled mid-probe would. The
+// pass's own probe waits for it no longer than the lock timeout and reports
+// the repair deferred, rather than stall the index pass until it ends.
+func TestRevalidationProbeWaitIsBounded(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	repairs := reattachRevalidates(t, h)
+	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	const index = "hopper_job_history_failed_ordering"
+	if _, err := h.pool.Exec(ctx, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '"+index+"'::regclass"); err != nil {
+		t.Fatal(err)
+	}
+	stalled, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stalled.Rollback(ctx) })
+	if _, err := stalled.Exec(ctx, "CREATE TABLE hopper_revalidate_probe (k int) PARTITION BY LIST (k)"); err != nil {
+		t.Fatal(err)
+	}
+	// A regression waits for the stalled probe: the deadline turns that into
+	// a failure rather than a hung test.
+	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	res, err := h.d.Executor().HistoryIndex(bounded, driver.HistoryIndexParams{LockTimeout: 50 * time.Millisecond})
+	if err != nil || !slices.Equal(res.Deferred, []string{index}) || len(res.Invalid) != 0 {
+		t.Errorf("repair beside a stalled probe = %+v, %v", res, err)
+	}
+	if err := stalled.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err = h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{})
+	if err != nil || len(res.Deferred) != 0 || (len(res.Invalid) == 0) != repairs {
+		t.Errorf("repair after the stalled probe = %+v, %v", res, err)
+	}
+}
+
+// reattachRevalidates runs drivertest.ReattachRevalidates on the harness's
+// database.
+func reattachRevalidates(t *testing.T, h *harness) bool {
+	t.Helper()
+	ctx := context.Background()
+	return drivertest.ReattachRevalidates(func(query string) {
+		t.Helper()
+		if _, err := h.pool.Exec(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}, func(query string) string {
+		t.Helper()
+		var v string
+		if err := h.pool.QueryRow(ctx, query).Scan(&v); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		return v
+	})
+}
+
+// lastUnindexedPartition attaches a partition from 2000 to the failed outcome
+// table before its ordering-key index is declared, as on an installation
+// upgraded to schema v13, and indexes every other partition, leaving that one
+// the last the index lacks. It returns the partition's name.
+func lastUnindexedPartition(t *testing.T, h *harness) string {
+	t.Helper()
+	ctx := context.Background()
+	const old = "hopper_job_history_failed_20000101"
+	for _, query := range []string{
+		"DROP INDEX hopper_job_history_failed_ordering",
+		"CREATE TABLE " + old + " (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)",
+		"ALTER TABLE hopper_job_history_failed ATTACH PARTITION " + old + " FOR VALUES FROM ('2000-01-01Z') TO ('2000-01-02Z')",
+		"CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id) WHERE ordering_key IS NOT NULL",
+	} {
+		if _, err := h.pool.Exec(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{Skip: []string{old}}); err != nil {
+		t.Fatal(err)
+	}
+	return old
+}
+
+// TestLeaderWarnsAboutKeptPartition makes the last partition an outcome
+// table's index lacks pass retention while its build keeps running past the
+// session's statement_timeout. Retention keeps the partition, logged at Info,
+// and its failing build is warned about by name.
+func TestLeaderWarnsAboutKeptPartition(t *testing.T) {
+	t.Parallel()
+	var old string
+	kept := &timeoutLog{counts: map[string]int{}, message: "kept until their index is built", key: "kept"}
+	timedOut := &timeoutLog{counts: map[string]int{}, message: "statement_timeout", key: "partition", level: slog.LevelWarn}
+	timedOutBuildsLogging(t, 100*time.Millisecond, teeHandler{kept, timedOut}, func(h *harness) {
+		old = lastUnindexedPartition(t, h)
+	}, func(cfg *hopper.Config) { cfg.FailedRetention = 48 * time.Hour })
+	waitFor(t, func() bool { return kept.count("["+old+"]") > 0 && timedOut.count(old) > 0 })
+}
+
+// teeHandler hands each record to every one of its handlers.
+type teeHandler []slog.Handler
+
+func (t teeHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (t teeHandler) WithAttrs([]slog.Attr) slog.Handler       { return t }
+func (t teeHandler) WithGroup(string) slog.Handler            { return t }
+
+func (t teeHandler) Handle(ctx context.Context, r slog.Record) error {
+	for _, h := range t {
+		if err := h.Handle(ctx, r.Clone()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // timedOutBuilds starts a leader whose sessions have a statement_timeout
 // that every index build overruns, waiting for a snapshot held open, and
 // counts the timed-out builds it logs.
 func timedOutBuilds(t *testing.T, maintenance time.Duration) *timeoutLog {
 	t.Helper()
+	logs := &timeoutLog{counts: map[string]int{}, message: "statement_timeout", key: "partition"}
+	timedOutBuildsLogging(t, maintenance, logs, func(*harness) {}, func(*hopper.Config) {})
+	return logs
+}
+
+// timedOutBuildsLogging is timedOutBuilds with the leader logging to logs,
+// setup run on the harness before the snapshot is taken, and configure
+// applied to the client's configuration.
+func timedOutBuildsLogging(t *testing.T, maintenance time.Duration, logs slog.Handler, setup func(*harness), configure func(*hopper.Config)) {
+	t.Helper()
 	h := newHarness(t)
+	setup(h)
 	ctx := context.Background()
 	held, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -811,11 +1066,12 @@ func timedOutBuilds(t *testing.T, maintenance time.Duration) *timeoutLog {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	logs := &timeoutLog{counts: map[string]int{}}
-	c, err := hopper.NewClient(testdb.Driver(pool), &hopper.Config{
+	cfg := &hopper.Config{
 		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
 		Logger: slog.New(logs),
-	})
+	}
+	configure(cfg)
+	c, err := hopper.NewClient(testdb.Driver(pool), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -826,13 +1082,17 @@ func timedOutBuilds(t *testing.T, maintenance time.Duration) *timeoutLog {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.Stop(context.Background()) })
-	return logs
 }
 
-// timeoutLog counts the index loop's timed-out builds per partition.
+// timeoutLog counts the index loop's records whose message contains
+// message, by their key attribute: timed-out builds per partition,
+// unrepairable indexes, or the passes a warning repeats over. Records below
+// level (Info unless set) are left out.
 type timeoutLog struct {
-	mu     sync.Mutex
-	counts map[string]int
+	mu           sync.Mutex
+	counts       map[string]int
+	message, key string
+	level        slog.Level
 }
 
 func (l *timeoutLog) Enabled(context.Context, slog.Level) bool { return true }
@@ -840,11 +1100,11 @@ func (l *timeoutLog) WithAttrs([]slog.Attr) slog.Handler       { return l }
 func (l *timeoutLog) WithGroup(string) slog.Handler            { return l }
 
 func (l *timeoutLog) Handle(_ context.Context, r slog.Record) error {
-	if !strings.Contains(r.Message, "statement_timeout") {
+	if !strings.Contains(r.Message, l.message) || r.Level < l.level {
 		return nil
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "partition" {
+		if a.Key == l.key {
 			l.mu.Lock()
 			l.counts[a.Value.String()]++
 			l.mu.Unlock()
@@ -854,8 +1114,108 @@ func (l *timeoutLog) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-func (l *timeoutLog) count(partition string) int {
+func (l *timeoutLog) count(name string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.counts[partition]
+	return l.counts[name]
 }
+
+// TestHistoryLockWaitOutlastsStatementTimeout runs history maintenance on
+// sessions whose statement_timeout is shorter than the lock timeout, beside a
+// stalled leader that holds the history maintenance lock. The statement
+// timeout ends the wait before the lock timeout does, and the partition ahead
+// is deferred, as a lock timeout would defer it, rather than fail the pass.
+func TestHistoryLockWaitOutlastsStatementTimeout(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.d.Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err != nil {
+		t.Fatal(err)
+	}
+	var ahead string
+	if err := h.pool.QueryRow(ctx, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`).Scan(&ahead); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, "DROP TABLE "+ahead); err != nil {
+		t.Fatal(err)
+	}
+	held, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = held.Rollback(ctx) }()
+	if _, err := held.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema()), $1)", pgsqlHistoryLockKey); err != nil {
+		t.Fatal(err)
+	}
+	pcfg := h.pool.Config()
+	pcfg.ConnConfig.RuntimeParams["statement_timeout"] = "100ms"
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	res, err := testdb.Driver(pool).Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{LockTimeout: 300 * time.Millisecond})
+	if err != nil || !slices.Contains(res.Deferred, ahead) {
+		t.Errorf("maintain beside a stalled leader, statement_timeout below the lock timeout = %+v, %v", res, err)
+	}
+}
+
+// TestHistoryDropOutlastsStatementTimeoutAcrossLocks drops a partition past
+// retention on sessions whose statement_timeout is longer than the lock
+// timeout, while its parent and then the partition are held. Each wait ends
+// within the lock timeout, but the two together outlast statement_timeout:
+// the drop is deferred, rather than fail the pass.
+func TestHistoryDropOutlastsStatementTimeoutAcrossLocks(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.d.Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err != nil {
+		t.Fatal(err)
+	}
+	const old = "hopper_job_history_failed_20000101"
+	for _, q := range []string{
+		"CREATE TABLE " + old + " (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)",
+		"ALTER TABLE hopper_job_history_failed ATTACH PARTITION " + old + " FOR VALUES FROM ('2000-01-01Z') TO ('2000-01-02Z')",
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	hold := func(query string) pgxTx {
+		t.Helper()
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = tx.Rollback(ctx) })
+		if _, err := tx.Exec(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+	// DROP locks the parent first, then the partition.
+	parent := hold("LOCK TABLE ONLY hopper_job_history_failed IN ACCESS SHARE MODE")
+	hold("LOCK TABLE " + old + " IN ACCESS SHARE MODE")
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(700 * time.Millisecond)
+		_ = parent.Rollback(ctx)
+	}()
+	defer func() { <-released }()
+	pcfg := h.pool.Config()
+	pcfg.ConnConfig.RuntimeParams["statement_timeout"] = "1500ms"
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	res, err := testdb.Driver(pool).Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{FailedRetention: 48 * time.Hour, LockTimeout: time.Second})
+	if err != nil || !slices.Contains(res.Deferred, old) {
+		t.Errorf("drop waiting on two locks past statement_timeout = %+v, %v", res, err)
+	}
+}
+
+// pgsqlHistoryLockKey is the driver's HistoryLockKey ("hoph").
+const pgsqlHistoryLockKey int32 = 0x686f7068

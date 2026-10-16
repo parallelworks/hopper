@@ -35,6 +35,11 @@ var ErrUniqueConflict = errors.New("hopper: a live job with the same unique key 
 // transaction holds the job's row.
 var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 
+// ErrHistoryIndexRepair wraps the error Executor.HistoryIndex returns when
+// only the repair of an index failed: the pass did the rest of its work,
+// which an error without it may have ended before.
+var ErrHistoryIndexRepair = errors.New("hopper: repair history index")
+
 // Driver binds the core to a storage engine. TTx is the engine's transaction
 // type (pgx.Tx for hopperpgx), so that transactional inserts only accept a
 // transaction from the right engine.
@@ -303,7 +308,9 @@ type Executor interface {
 	// finalizes that write there. Building takes as long as the partitions
 	// are large and can wait for long transactions anywhere in the database,
 	// so it runs apart from the leader's other duties. It is idempotent, and
-	// finds nothing to do once every partition has its indexes.
+	// finds nothing to do once every partition has its indexes. A repair
+	// that fails is reported once the rest of the pass is done, in an error
+	// wrapping ErrHistoryIndexRepair.
 	HistoryIndex(ctx context.Context, params HistoryIndexParams) (HistoryIndexResult, error)
 	// JobsMaintain keeps the live table fit between the engine's own
 	// maintenance passes: it reclaims the space and index entries of jobs
@@ -865,6 +872,16 @@ type HistoryMaintainResult struct {
 	// transaction that has not ended, such as one that wrote history; a
 	// later pass retries them.
 	Deferred []string
+	// Kept names storage units past retention that wait for HistoryIndex to
+	// build their index: those an invalid index of their outcome table
+	// lacks that its DEFAULT unit already has, which dropping first could
+	// leave that index unable to complete. While the build of the outcome
+	// table's DEFAULT partition is under way, every one past retention is
+	// kept, and while a build of another of its partitions, or another
+	// leader's retention or partition creation, holds the table's index
+	// build lock, every one that lacks an invalid index. A later pass drops
+	// them.
+	Kept []string
 	// Pruned counts rows deleted individually, outside partition drops.
 	Pruned int64
 }
@@ -874,6 +891,15 @@ type HistoryIndexParams struct {
 	// Skip names storage units (partitions on Postgres) to leave for a later
 	// pass.
 	Skip []string
+	// SkipRepair names indexes not to try to repair this pass
+	// (HistoryIndexResult.Invalid).
+	SkipRepair []string
+	// LockTimeout bounds how long attaching a built index, or repairing an
+	// index, waits for its lock, during which the queries of the storage
+	// unit it locks queue behind it, as HistoryMaintainParams.LockTimeout
+	// does, and how long a build waits for its outcome table's index build
+	// lock, held by retention or partition creation. Zero means the engine's default.
+	LockTimeout time.Duration
 }
 
 // HistoryIndexResult reports what an index pass could not finish.
@@ -882,6 +908,24 @@ type HistoryIndexResult struct {
 	// statement timeout. What the build left is removed, and the pass goes
 	// on to the rest.
 	TimedOut []string
+	// Invalid names indexes that stay invalid although every storage unit
+	// under them is indexed, after the pass's repair: on Postgres, an outcome
+	// table's index left invalid by an earlier release, which releases before
+	// Postgres's May 2026 minors cannot repair, or one whose repair failed
+	// with the error the pass returns. Queries that need it read every
+	// partition instead.
+	Invalid []string
+	// Deferred names indexes whose build (a storage unit's index), attach
+	// (the same, once built) or repair (an outcome table's) could not get its
+	// lock within LockTimeout, held off by a transaction that read or wrote
+	// the storage unit it locks, or that holds its table's index build lock; a
+	// later pass retries them, without building a built index again.
+	Deferred []string
+	// Busy, when not empty, names the index the pass would have built next
+	// when it ended there, finding the engine's build lock held by another
+	// session (another leader's pass, or one that stalled), which it does
+	// not wait for. Unlike Deferred, nothing waited for a lock.
+	Busy string
 }
 
 // SubscriptionRow is a topic subscription: messages published to a topic

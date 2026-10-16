@@ -403,6 +403,45 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Error("a skipped partition was indexed")
 	}
 
+	// A transaction that read history holds off the attach of an index
+	// built (here, before the reader, which a concurrent build would wait
+	// for): the pass reports it deferred without waiting for the reader,
+	// and leaves the index, valid, for a later pass to attach without
+	// building it again. The partition's other index is left for that pass
+	// too, rather than built for its attach to wait behind the same reader.
+	f.Exec(ctx, t, d, "CREATE INDEX hopper_job_history_failed_default_ordering ON hopper_job_history_failed_default (ordering_key, id) WHERE ordering_key IS NOT NULL")
+	reader, commitReader, rollbackReader := f.Begin(ctx, t, d)
+	defer rollbackReader() //nolint:errcheck // already committed on the happy path
+	if _, err := d.UnwrapTx(reader).JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10}); err != nil {
+		t.Fatal(err)
+	}
+	failedOnly := driver.HistoryIndexParams{Skip: []string{"hopper_job_history_completed_default"}, LockTimeout: 50 * time.Millisecond}
+	start := time.Now()
+	res, err := exec.HistoryIndex(ctx, failedOnly)
+	if err != nil || !slices.Equal(res.Deferred, []string{"hopper_job_history_failed_default_ordering"}) {
+		t.Errorf("attach behind a reader = %+v, %v", res, err)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT (to_regclass('hopper_job_history_failed_default_unique') IS NULL)::text"); v != "true" {
+		t.Error("the partition's next index was built behind its deferred attach")
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("attach behind a reader took %s", took)
+	}
+	built := f.QueryText(ctx, t, d, "SELECT 'hopper_job_history_failed_default_ordering'::regclass::oid::text")
+	if v := f.QueryText(ctx, t, d, `SELECT (x.indisvalid AND NOT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = x.indexrelid))::text
+		FROM pg_index x WHERE x.indexrelid = 'hopper_job_history_failed_default_ordering'::regclass`); v != "true" {
+		t.Errorf("deferred index valid and unattached = %s", v)
+	}
+	if err := commitReader(); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryIndex(ctx, failedOnly); err != nil || len(res.Deferred) != 0 {
+		t.Errorf("attach after the reader = %+v, %v", res, err)
+	}
+	if v := f.QueryText(ctx, t, d, `SELECT (EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = $1::oid))::text`, built); v != "true" {
+		t.Error("the deferred index was not attached as built")
+	}
+
 	// What a canceled CREATE INDEX CONCURRENTLY leaves: an invalid index
 	// under the name maintenance uses.
 	for _, index := range []string{"hopper_job_history_completed_default_ordering", "hopper_job_history_completed_default_unique"} {
@@ -439,14 +478,104 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("history by unique key = %+v", res[0].Job)
 	}
 
-	// What retention dropping the last partition without an index leaves:
-	// every partition's index attached, and the outcome table's not valid.
+	// What an earlier release's retention could leave by dropping the last
+	// partition without an index: every partition's index attached, and
+	// the outcome table's not valid. Only releases whose attach counts again
+	// can repair it; on others, HistoryIndex reports it, and leaves it alone
+	// when told to skip it.
+	repairs := reattachRevalidates(ctx, t, f, d)
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
-	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+
+	// A probe that fails, here on a table in its way, is reported once the
+	// pass has gone on to the indexes after it: both repairs report it, as
+	// a failed repair (driver.ErrHistoryIndexRepair), not a failed pass, and
+	// their indexes as invalid, for the leader to back off. The driver
+	// keeps a probe's answer until the server restarts, so this is its
+	// first: no repair has run before in this test.
+	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_unique'::regclass")
+	f.Exec(ctx, t, d, "CREATE TABLE hopper_revalidate_probe ()")
+	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); !errors.Is(err, driver.ErrHistoryIndexRepair) ||
+		strings.Count(err.Error(), "probe index revalidation") != 2 || len(res.Invalid) != 2 || len(res.Deferred) != 0 {
+		t.Errorf("revalidation with its probe failing = %+v, %v", res, err)
+	}
+	f.Exec(ctx, t, d, "DROP TABLE hopper_revalidate_probe")
+	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = true WHERE indexrelid = 'hopper_job_history_failed_unique'::regclass")
+
+	// A transaction that read every history partition holds the re-attach
+	// off: where the attach repairs, the pass reports the index deferred,
+	// for the next to retry, without waiting for the reader; where it
+	// cannot, the pass reports it invalid without trying.
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
+	if _, err := d.UnwrapTx(tx).JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10}); err != nil {
 		t.Fatal(err)
 	}
-	if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass"); v != "true" {
-		t.Errorf("hopper_job_history_failed_ordering valid after revalidation = %s", v)
+	start = time.Now()
+	held, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{LockTimeout: 50 * time.Millisecond})
+	wantInvalid, wantDeferred := []string(nil), []string{"hopper_job_history_failed_ordering"}
+	if !repairs {
+		wantInvalid, wantDeferred = wantDeferred, nil
+	}
+	if err != nil || !slices.Equal(held.Invalid, wantInvalid) || !slices.Equal(held.Deferred, wantDeferred) {
+		t.Errorf("revalidation behind a reader = %+v, %v", held, err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("revalidation behind a reader took %s", took)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass"); v != "false" {
+		t.Errorf("hopper_job_history_failed_ordering valid behind a reader = %s", v)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The re-attach takes the partition furthest ahead, which finalizes do
+	// not write to yet: a statement reading every other partition, the
+	// DEFAULT one and the current period's among them, does not hold it off.
+	// A reader that cannot narrow by finalized_at reads that partition too,
+	// and holds the re-attach off for up to the lock timeout.
+	if repairs {
+		others := f.QueryText(ctx, t, d, `SELECT string_agg(format('(SELECT count(*) FROM %I)', c.relname), ', ')
+			FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = 'hopper_job_history_failed'::regclass
+			  AND c.relname <> (SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+			    WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default')`)
+		released := make(chan struct{})
+		go func() {
+			defer close(released)
+			f.Exec(ctx, t, d, "SELECT pg_sleep(2), "+others)
+		}()
+		t.Cleanup(func() { <-released })
+		for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d, `SELECT EXISTS (SELECT FROM pg_locks
+			WHERE relation = 'hopper_job_history_failed_default_ordering'::regclass AND pid <> pg_backend_pid())::text`) != "true"; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("the reader of the other partitions did not start")
+			}
+		}
+		res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{LockTimeout: 50 * time.Millisecond})
+		if err != nil || len(res.Deferred)+len(res.Invalid) != 0 {
+			t.Errorf("revalidation beside readers of the other partitions = %+v, %v", res, err)
+		}
+		<-released
+	}
+
+	res, err = exec.HistoryIndex(ctx, driver.HistoryIndexParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "true"
+	if !repairs {
+		want = "false"
+		if !slices.Equal(res.Invalid, []string{"hopper_job_history_failed_ordering"}) {
+			t.Errorf("unrepairable indexes = %q", res.Invalid)
+		}
+		if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{SkipRepair: res.Invalid}); err != nil || len(res.Invalid) != 0 {
+			t.Errorf("skipped unrepairable index reported = %+v, %v", res, err)
+		}
+	} else if len(res.Invalid) != 0 {
+		t.Errorf("repaired index reported unrepairable: %q", res.Invalid)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass"); v != want {
+		t.Errorf("hopper_job_history_failed_ordering valid after revalidation = %s, want %s", v, want)
 	}
 }
 
@@ -463,6 +592,391 @@ const unattachedHistoryIndexes = `
 var onceAgain = driver.JobInsertParams{
 	Kind: "k", Queue: "default", Priority: 2, MaxAttempts: 3, UniqueKey: "once",
 	UniqueFinished: []driver.JobState{driver.JobStateCompleted},
+}
+
+// reattachRevalidates runs ReattachRevalidates on the fixture's database.
+func reattachRevalidates[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx]) bool {
+	t.Helper()
+	return ReattachRevalidates(
+		func(query string) { f.Exec(ctx, t, d, query) },
+		func(query string) string { return f.QueryText(ctx, t, d, query) })
+}
+
+// ReattachRevalidates reports whether attaching a partition's index again
+// marks its parent valid, as Postgres does from the May 2026 releases (18.4,
+// 17.10, 16.14, 15.18, 14.23) on, which decides whether HistoryIndex can
+// repair an outcome table's index or reports it in
+// HistoryIndexResult.Invalid. It runs the driver's own probe: the parent's
+// index left invalid by dropping the one partition without an index, then
+// attached again. exec runs a statement and queryText returns the single
+// text value a query selects, both on a Postgres database a test owns.
+func ReattachRevalidates(exec func(query string), queryText func(query string) string) bool {
+	exec("CREATE TABLE revalidate_probe (k int) PARTITION BY LIST (k)")
+	exec("CREATE TABLE revalidate_probe_1 PARTITION OF revalidate_probe FOR VALUES IN (1)")
+	exec("CREATE TABLE revalidate_probe_2 PARTITION OF revalidate_probe FOR VALUES IN (2)")
+	exec("CREATE INDEX revalidate_probe_k ON ONLY revalidate_probe (k)")
+	exec("CREATE INDEX revalidate_probe_1_k ON revalidate_probe_1 (k)")
+	exec("ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k")
+	exec("DROP TABLE revalidate_probe_2")
+	exec("ALTER INDEX revalidate_probe_k ATTACH PARTITION revalidate_probe_1_k")
+	valid := queryText("SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'revalidate_probe_k'::regclass") == "true"
+	exec("DROP TABLE revalidate_probe")
+	return valid
+}
+
+// testHistoryRetentionCompletesIndex covers retention dropping the last
+// partitions an outcome table's index lacks, after a schema upgrade
+// declared it: the index must end valid, which nothing can do afterwards on
+// releases before May 2026.
+func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	keep := driver.HistoryMaintainParams{FailedRetention: 48 * time.Hour}
+	if _, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{}); err != nil {
+		t.Fatal(err)
+	}
+	// Past partitions attached before the ordering-key index was declared,
+	// as on an installation upgraded to schema v13.
+	redeclare := func(days ...string) []string {
+		t.Helper()
+		f.Exec(ctx, t, d, "DROP INDEX hopper_job_history_failed_ordering")
+		var names []string
+		for _, day := range days {
+			from, err := time.Parse("20060102", day)
+			if err != nil {
+				t.Fatal(err)
+			}
+			name := "hopper_job_history_failed_" + day
+			f.Exec(ctx, t, d, "CREATE TABLE "+name+" (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)")
+			f.Exec(ctx, t, d, "ALTER TABLE hopper_job_history_failed ATTACH PARTITION "+name+" FOR VALUES FROM ('"+
+				from.Format(time.RFC3339)+"') TO ('"+from.AddDate(0, 0, 1).Format(time.RFC3339)+"')")
+			names = append(names, name)
+		}
+		f.Exec(ctx, t, d, "CREATE INDEX hopper_job_history_failed_ordering ON ONLY hopper_job_history_failed (ordering_key, id) WHERE ordering_key IS NOT NULL")
+		return names
+	}
+	valid := func() string {
+		t.Helper()
+		return f.QueryText(ctx, t, d, "SELECT indisvalid::text FROM pg_index WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
+	}
+	// failedOnly leaves out the other groups' partitions, whose next period
+	// (the completed table's hour, the stream's day) may come due during
+	// the test and be created, or deferred behind a lock it holds.
+	failedOnly := func(names []string) []string {
+		return slices.DeleteFunc(slices.Clone(names), func(n string) bool { return !strings.HasPrefix(n, "hopper_job_history_failed_") })
+	}
+
+	old := redeclare("20000101")
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: old}); err != nil {
+		t.Fatal(err)
+	}
+	if v := valid(); v != "false" {
+		t.Fatalf("valid with a partition unindexed = %s", v)
+	}
+	// Retention keeps the partition until it is indexed.
+	res, err := exec.HistoryMaintain(ctx, keep)
+	if err != nil || !slices.Contains(res.Kept, old[0]) || slices.Contains(res.Dropped, old[0]) {
+		t.Fatalf("maintain with the last unindexed partition past retention = %+v, %v", res, err)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT (to_regclass($1) IS NOT NULL)::text", old[0]); v != "true" {
+		t.Fatalf("kept partition exists = %s", v)
+	}
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid once the kept partition is indexed = %s", v)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Contains(res.Dropped, old[0]) || len(res.Kept) != 0 {
+		t.Errorf("maintain after indexing = %+v, %v", res, err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after retention dropped the indexed partition = %s", v)
+	}
+
+	// While the DEFAULT partition, which retention never drops, still lacks
+	// the index, retention drops the partitions past it that lack it too:
+	// the DEFAULT partition's attach completes the index.
+	pending := redeclare("20000106", "20000107")
+	res, err = exec.HistoryMaintain(ctx, keep)
+	if err != nil || !slices.Equal(slices.Sorted(slices.Values(failedOnly(res.Dropped))), pending) || len(res.Kept) != 0 {
+		t.Errorf("maintain with the DEFAULT partition unindexed = %+v, %v", res, err)
+	}
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after the DEFAULT partition's build = %s", v)
+	}
+
+	// Once the DEFAULT partition has the index, every partition it lacks is
+	// kept, not only the last: a partition only ever goes from lacking the
+	// index to having it, so retention needs no lock to keep it from
+	// dropping the last one while an attach elsewhere commits.
+	pending = redeclare("20000108", "20000109")
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: pending}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = exec.HistoryMaintain(ctx, keep)
+	if err != nil || !slices.Equal(slices.Sorted(slices.Values(res.Kept)), pending) || len(failedOnly(res.Dropped)) != 0 {
+		t.Errorf("maintain with two unindexed partitions past retention = %+v, %v", res, err)
+	}
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(slices.Sorted(slices.Values(failedOnly(res.Dropped))), pending) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the builds = %+v, %v", res, err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after the builds = %s", v)
+	}
+
+	// A pass builds the DEFAULT partition last, so that partitions that
+	// expire during a long pass are dropped, the DEFAULT partition lacking
+	// the index too, rather than kept for a build. A statement whose
+	// snapshot the first build waits for shows which partition that is.
+	ordered := redeclare("20000110")
+	snapshot := make(chan struct{})
+	go func() { defer close(snapshot); f.Exec(ctx, t, d, "SELECT pg_sleep(2)") }()
+	t.Cleanup(func() { <-snapshot })
+	for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
+		"SELECT count(*)::text FROM pg_stat_activity WHERE query = 'SELECT pg_sleep(2)' AND datname = current_database()") == "0"; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the snapshot holder did not start")
+		}
+	}
+	built := make(chan error, 1)
+	go func() { _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); built <- err }()
+	var first string
+	for deadline := time.Now().Add(10 * time.Second); first == ""; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no build started")
+		}
+		first = f.QueryText(ctx, t, d, `SELECT coalesce(min(c.relname), '') FROM pg_stat_progress_create_index p
+			JOIN pg_class c ON c.oid = p.relid WHERE c.relnamespace = current_schema()::regnamespace`)
+	}
+	if strings.HasSuffix(first, "_default") {
+		t.Errorf("first build of a pass = %s, want a time partition", first)
+	}
+	if err := <-built; err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(failedOnly(res.Dropped), ordered) {
+		t.Errorf("maintain after the ordered pass = %+v, %v", res, err)
+	}
+
+	const (
+		buildLock       = "hashtext(current_schema() || '.' || $1), 1752133737" // HistoryIndexLockKey
+		maintenanceLock = "hashtext(current_schema()), 1752133736"              // HistoryLockKey
+		schemaBuildLock = "hashtext(current_schema()), 1752133737"              // HistoryIndexLockKey, schema-wide
+	)
+	// holdLock holds the advisory lock key, with args for its parameters,
+	// for two seconds, through lock (pg_advisory_xact_lock, exclusively, or
+	// pg_advisory_xact_lock_shared), and returns once it is held, with a
+	// channel closed once it is released.
+	holdLock := func(lock, key string, args ...any) <-chan struct{} {
+		t.Helper()
+		released := make(chan struct{})
+		go func() {
+			defer close(released)
+			f.Exec(ctx, t, d, "SELECT "+lock+"("+key+"), pg_sleep(2)", args...)
+		}()
+		// A test that stops early waits for the holder, whose own failure
+		// must be reported before the test ends.
+		t.Cleanup(func() { <-released })
+		for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
+			"SELECT (NOT pg_try_advisory_xact_lock("+key+"))::text", args...) != "true"; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s(%s) was not taken", lock, key)
+			}
+		}
+		return released
+	}
+	// holdTableLock holds HistoryIndexLockKey combined with the failed
+	// table through lock: exclusively, as its DEFAULT partition's build
+	// does, or in share mode, as retention, partition creation and the
+	// builds of its time partitions do.
+	holdTableLock := func(lock string) <-chan struct{} {
+		t.Helper()
+		return holdLock(lock, buildLock, "hopper_job_history_failed")
+	}
+	// holdMaintenanceLock holds HistoryLockKey, as a stalled leader would.
+	holdMaintenanceLock := func() <-chan struct{} { t.Helper(); return holdLock("pg_advisory_xact_lock", maintenanceLock) }
+	// indexAllButDefault indexes the failed table's partitions except its
+	// DEFAULT partition, which the index then still lacks.
+	indexAllButDefault := func() {
+		t.Helper()
+		if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: []string{"hopper_job_history_failed_default"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A build on the DEFAULT partition holds the outcome table's lock:
+	// retention keeps every partition past retention, indexed or not,
+	// rather than lock the table and then wait for the DEFAULT partition,
+	// which the build holds.
+	building := redeclare("20000108")
+	indexAllButDefault()
+	released := holdTableLock("pg_advisory_xact_lock")
+	res, err = exec.HistoryMaintain(ctx, keep)
+	if err != nil || !slices.Equal(res.Kept, building) || len(res.Dropped) != 0 {
+		t.Errorf("maintain while a build holds the DEFAULT partition = %+v, %v", res, err)
+	}
+	<-released
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, building) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the DEFAULT partition's build = %+v, %v", res, err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after the DEFAULT partition's build = %s", v)
+	}
+
+	// An overlapping leader's retention or partition creation holds the
+	// table's lock in share mode: retention drops an indexed partition
+	// rather than keep it for a build no one runs, and partition creation
+	// creates the furthest one ahead, dropped here, rather than defer it.
+	dropping := redeclare("20000109")
+	indexAllButDefault()
+	// dropAhead drops the failed table's partition furthest ahead, for
+	// partition creation to recreate, and returns its name.
+	dropAhead := func() string {
+		t.Helper()
+		ahead := f.QueryText(ctx, t, d, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+			WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`)
+		f.Exec(ctx, t, d, "DROP TABLE "+ahead)
+		return ahead
+	}
+	ahead := dropAhead()
+	released = holdTableLock("pg_advisory_xact_lock_shared")
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, dropping) || !slices.Equal(failedOnly(res.Created), []string{ahead}) ||
+		len(res.Kept)+len(failedOnly(res.Deferred)) != 0 {
+		t.Errorf("maintain beside another leader's retention = %+v, %v", res, err)
+	}
+	<-released
+
+	// A build of a time partition holds the table's lock in share mode:
+	// retention keeps a partition past it that lacks the index, which may be
+	// the one being built, rather than lock the table and wait for the
+	// build, though the DEFAULT partition lacks the index too.
+	unbuiltPast := redeclare("20000112")
+	released = holdTableLock("pg_advisory_xact_lock_shared")
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(failedOnly(res.Kept), unbuiltPast) || len(failedOnly(res.Dropped)) != 0 {
+		t.Errorf("maintain while a time partition is being built = %+v, %v", res, err)
+	}
+	<-released
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(failedOnly(res.Dropped), unbuiltPast) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the time partition's build = %+v, %v", res, err)
+	}
+
+	// A transaction left open holding the table's lock holds the DEFAULT
+	// partition's build off no longer than the lock timeout: the pass
+	// reports the build deferred rather than stall behind it.
+	stalled := redeclare("20000110")
+	indexAllButDefault()
+	released = holdTableLock("pg_advisory_xact_lock_shared")
+	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{LockTimeout: 50 * time.Millisecond}); err != nil ||
+		!slices.Contains(res.Deferred, "hopper_job_history_failed_default_ordering") {
+		t.Errorf("index behind a held table lock = %+v, %v", res, err)
+	}
+	<-released
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, stalled) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the deferred build = %+v, %v", res, err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after the deferred build = %s", v)
+	}
+
+	// A session that holds the schema's build lock, another leader's pass
+	// or one that stalled, holds every build off: the pass reports itself
+	// held off, so that a holder that never lets go is warned about, and
+	// not deferred, which would lengthen the next pass's lock waits.
+	unbuilt := redeclare("20000111")
+	released = holdLock("pg_advisory_xact_lock", schemaBuildLock)
+	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil || res.Busy == "" || len(res.Deferred) != 0 {
+		t.Errorf("index while another session holds the schema's build lock = %+v, %v", res, err)
+	}
+	<-released
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, unbuilt) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the schema's build lock was let go = %+v, %v", res, err)
+	}
+
+	// An overlapping leader that stalls while it holds the history
+	// maintenance lock holds partition creation off no longer than the lock
+	// timeout: the partition ahead is deferred, not waited for.
+	ahead = dropAhead()
+	released = holdMaintenanceLock()
+	short := keep
+	short.LockTimeout = 50 * time.Millisecond
+	if res, err := exec.HistoryMaintain(ctx, short); err != nil || !slices.Contains(res.Deferred, ahead) || len(res.Created) != 0 {
+		t.Errorf("maintain beside a stalled leader = %+v, %v", res, err)
+	}
+	<-released
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(failedOnly(res.Created), []string{ahead}) {
+		t.Errorf("maintain after the stalled leader = %+v, %v", res, err)
+	}
+
+	// Retention dropping partitions while the leader builds the others'.
+	for round := range 4 {
+		old := redeclare("20000102", "20000103", "20000104", "20000105")
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Go(func() {
+			if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+				errs <- err
+			}
+		})
+		wg.Go(func() {
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				res, err := exec.HistoryMaintain(ctx, keep)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if len(res.Deferred)+len(res.Kept) == 0 || time.Now().After(deadline) {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatal(err)
+		}
+		if v := f.QueryText(ctx, t, d, "SELECT count(to_regclass(n))::text FROM unnest($1::text[]) n", old); v != "0" {
+			t.Fatalf("round %d: %s partitions past retention left", round, v)
+		}
+		if v := valid(); v != "true" {
+			t.Fatalf("round %d: valid after retention and indexing = %s", round, v)
+		}
+	}
+
+	// An index an earlier release left invalid with every partition indexed,
+	// which Postgres before its May 2026 releases cannot repair: no partition
+	// can be the last one it lacks, so a drop neither waits for the history
+	// maintenance lock nor holds it, however long the index stays invalid.
+	indexed := "hopper_job_history_failed_20000111"
+	f.Exec(ctx, t, d, "CREATE TABLE "+indexed+" (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)")
+	f.Exec(ctx, t, d, "ALTER TABLE hopper_job_history_failed ATTACH PARTITION "+indexed+" FOR VALUES FROM ('2000-01-11Z') TO ('2000-01-12Z')")
+	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
+	maintenanceReleased := holdMaintenanceLock()
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, []string{indexed}) || len(res.Kept)+len(failedOnly(res.Deferred)) != 0 {
+		t.Errorf("maintain with an index left invalid and every partition indexed = %+v, %v", res, err)
+	}
+	<-maintenanceReleased
 }
 
 // maintainWhileReading runs the history maintenance and indexing of three

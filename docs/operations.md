@@ -57,8 +57,36 @@
   runs under the pool's `statement_timeout` and waits for every older
   transaction in the database. A build that runs past the timeout is retried
   at doubling intervals with a warning; raise the timeout for hopper's role
-  until the warnings stop. Until a partition has its unique-key index, an insert
-  with `UniqueOpts.Finished` reads that partition in full.
+  until the warnings stop. A timeout that ends a partition's creation or drop, or an
+  index's attach, while it waits for its locks defers that work like a lock timeout;
+  one that ends a partition's attach while it scans the DEFAULT partition, grown
+  large during a long leader outage, is logged as an error each maintenance
+  interval until the timeout is raised or the DEFAULT partition is pruned.
+  Until a partition has its unique-key index, an insert
+  with `UniqueOpts.Finished` reads that partition in full. Retention keeps
+  every partition past its retention that lacks an index the upgrade declared,
+  once the DEFAULT partition has it, until it has one, logged at Info; if it stays, its build is failing, and the `statement_timeout`
+  warning, an index history error, or the attach-deferred warning below says
+  why. Releases
+  up to 0.7.0 could instead drop it first and leave the outcome table's index
+  invalid, unused by the planner. The leader repairs that on Postgres's May 2026
+  minor releases (18.4, 17.10, 16.14, 15.18, 14.23) and later. On earlier ones
+  it only reports the index and warns that it stays invalid: hopper does not
+  build a replacement or declare the index again, either of which would take
+  locks on, or the index from, every partition. Update Postgres's minor
+  version to repair it; the leader does so within 8 maintenance intervals of
+  the server's restart, without a restart of its own. Attaching a built index, and
+  the repair, wait for transactions that read the partition they lock; a
+  warning that history index work has been deferred for five passes in a row
+  means such transactions keep overlapping, or that a transaction left open
+  holds an outcome table's index build lock, which its builds wait for
+  under the same timeout (`pg_locks` shows an advisory lock
+  with `objid` 1752133737). Attaches and the repair also wait, under the same
+  timeout, for the schema's history maintenance lock, which a leader stalled
+  in partition creation or an attach holds: `objid` 1752133736. A warning
+  that history indexing is held off for five passes in a row means another
+  session holds the schema's index build lock without building: a stalled
+  leader, which `pg_locks` shows holding `objid` 1752133737.
 - **`UniqueOpts.Finished`.** Each such job is looked up in every history
   partition of the outcomes it counts, one index lookup each, so the cost
   grows with retention. With the default 24 hours of completed history, a
