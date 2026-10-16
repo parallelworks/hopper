@@ -12,3 +12,6 @@ coverage.out
 /hopperbench
 /hopperui/hopperui
 /dist/
+
+# Local Postgres (make devstack)
+/.devstack/

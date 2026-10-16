@@ -6,12 +6,13 @@ Thanks for helping build hopper. The rules that apply to every change are in
 ## Local setup
 
 hopper needs Go (the version in `go.mod`) and a PostgreSQL 14+ database for the
-integration tests. The quickest way to get one is Docker:
+integration tests. `make devstack` runs one natively, with nothing to install:
+the first run downloads the Postgres binaries, and the data persists in
+`.devstack/` until `make reset`.
 
 ```sh
-make pg     # starts postgres:17-alpine on localhost:54329
-make check  # lint + tests
-make pg-down
+make devstack  # Postgres on localhost:54329, until interrupted
+make check     # lint + tests, in another terminal
 ```
 
 To use a database you already run, set `HOPPER_TEST_DATABASE_URL`. Every test

@@ -27,7 +27,7 @@ func URL(t testing.TB) string {
 	t.Helper()
 	url := os.Getenv("HOPPER_TEST_DATABASE_URL")
 	if url == "" {
-		t.Skip("HOPPER_TEST_DATABASE_URL not set; run `make pg` and `make test`")
+		t.Skip("HOPPER_TEST_DATABASE_URL not set; run `make devstack` and `make test`")
 	}
 	return url
 }
