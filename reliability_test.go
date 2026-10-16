@@ -1145,7 +1145,13 @@ func TestHistoryDropOutlastsStatementTimeoutAcrossLocks(t *testing.T) {
 	// DROP locks the parent first, then the partition.
 	parent := hold("LOCK TABLE ONLY hopper_job_history_failed IN ACCESS SHARE MODE")
 	hold("LOCK TABLE " + old + " IN ACCESS SHARE MODE")
-	time.AfterFunc(700*time.Millisecond, func() { _ = parent.Rollback(ctx) })
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(700 * time.Millisecond)
+		_ = parent.Rollback(ctx)
+	}()
+	defer func() { <-released }()
 	pcfg := h.pool.Config()
 	pcfg.ConnConfig.RuntimeParams["statement_timeout"] = "1500ms"
 	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
