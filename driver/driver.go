@@ -35,6 +35,11 @@ var ErrUniqueConflict = errors.New("hopper: a live job with the same unique key 
 // transaction holds the job's row.
 var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 
+// ErrHistoryIndexRepair wraps the error Executor.HistoryIndex returns when
+// only the repair of an index failed: the pass did the rest of its work,
+// which an error without it may have ended before.
+var ErrHistoryIndexRepair = errors.New("hopper: repair history index")
+
 // Driver binds the core to a storage engine. TTx is the engine's transaction
 // type (pgx.Tx for hopperpgx), so that transactional inserts only accept a
 // transaction from the right engine.
@@ -303,7 +308,9 @@ type Executor interface {
 	// finalizes that write there. Building takes as long as the partitions
 	// are large and can wait for long transactions anywhere in the database,
 	// so it runs apart from the leader's other duties. It is idempotent, and
-	// finds nothing to do once every partition has its indexes.
+	// finds nothing to do once every partition has its indexes. A repair
+	// that fails is reported once the rest of the pass is done, in an error
+	// wrapping ErrHistoryIndexRepair.
 	HistoryIndex(ctx context.Context, params HistoryIndexParams) (HistoryIndexResult, error)
 	// JobsMaintain keeps the live table fit between the engine's own
 	// maintenance passes: it reclaims the space and index entries of jobs
@@ -867,8 +874,8 @@ type HistoryMaintainResult struct {
 	Deferred []string
 	// Kept names storage units past retention that wait for HistoryIndex to
 	// build their index: those an invalid index of their outcome table
-	// lacks, which dropping first could leave that index unable to
-	// complete, and while the build of the outcome table's DEFAULT
+	// lacks that its DEFAULT unit already has, which dropping first could
+	// leave that index unable to complete, and while the build of the outcome table's DEFAULT
 	// partition is under way, every one past retention. A later pass drops
 	// them.
 	Kept []string
@@ -885,7 +892,7 @@ type HistoryIndexParams struct {
 	// index, waits for its lock, during which the queries of the storage
 	// unit it locks queue behind it, as HistoryMaintainParams.LockTimeout
 	// does, and how long the build of an outcome table's DEFAULT storage
-	// unit waits for the table's maintenance lock, held by retention or
+	// unit waits for the table's index build lock, held by retention or
 	// partition creation. Zero means the engine's default.
 	LockTimeout time.Duration
 }
@@ -905,7 +912,7 @@ type HistoryIndexResult struct {
 	// Deferred names indexes whose build (a storage unit's index), attach
 	// (the same, once built) or repair (an outcome table's) could not get its
 	// lock within LockTimeout, held off by a transaction that read or wrote
-	// the storage unit it locks, or that holds its table's maintenance lock; a
+	// the storage unit it locks, or that holds its table's index build lock; a
 	// later pass retries them, without building a built index again.
 	Deferred []string
 	// Busy, when not empty, names the index the pass would have built next

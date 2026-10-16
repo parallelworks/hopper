@@ -487,10 +487,11 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
 
 	// A probe that fails, here on a table in its way, is reported once the
-	// pass has gone on to the indexes after it: both repairs report it.
+	// pass has gone on to the indexes after it: both repairs report it, as
+	// a failed repair (driver.ErrHistoryIndexRepair), not a failed pass.
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_unique'::regclass")
 	f.Exec(ctx, t, d, "CREATE TABLE hopper_revalidate_probe ()")
-	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err == nil ||
+	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); !errors.Is(err, driver.ErrHistoryIndexRepair) ||
 		strings.Count(err.Error(), "probe index revalidation") != 2 || len(res.Invalid)+len(res.Deferred) != 0 {
 		t.Errorf("revalidation with its probe failing = %+v, %v", res, err)
 	}
@@ -691,19 +692,37 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("valid after retention dropped the indexed partition = %s", v)
 	}
 
-	// Every partition an invalid index lacks is kept, not only the last:
-	// a partition only ever goes from lacking the index to having it, so
-	// retention needs no lock to keep it from dropping the last one while an
-	// attach elsewhere commits.
+	// While the DEFAULT partition, which retention never drops, still lacks
+	// the index, retention drops the partitions past it that lack it too:
+	// the DEFAULT partition's attach completes the index.
 	pending := redeclare("20000106", "20000107")
 	res, err = exec.HistoryMaintain(ctx, keep)
-	if err != nil || !slices.Equal(slices.Sorted(slices.Values(res.Kept)), pending) || len(res.Dropped) != 0 {
+	if err != nil || !slices.Equal(slices.Sorted(slices.Values(failedOnly(res.Dropped))), pending) || len(res.Kept) != 0 {
+		t.Errorf("maintain with the DEFAULT partition unindexed = %+v, %v", res, err)
+	}
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if v := valid(); v != "true" {
+		t.Errorf("valid after the DEFAULT partition's build = %s", v)
+	}
+
+	// Once the DEFAULT partition has the index, every partition it lacks is
+	// kept, not only the last: a partition only ever goes from lacking the
+	// index to having it, so retention needs no lock to keep it from
+	// dropping the last one while an attach elsewhere commits.
+	pending = redeclare("20000108", "20000109")
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: pending}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = exec.HistoryMaintain(ctx, keep)
+	if err != nil || !slices.Equal(slices.Sorted(slices.Values(res.Kept)), pending) || len(failedOnly(res.Dropped)) != 0 {
 		t.Errorf("maintain with two unindexed partitions past retention = %+v, %v", res, err)
 	}
 	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
 		t.Fatal(err)
 	}
-	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(slices.Sorted(slices.Values(res.Dropped)), pending) || len(res.Kept) != 0 {
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(slices.Sorted(slices.Values(failedOnly(res.Dropped))), pending) || len(res.Kept) != 0 {
 		t.Errorf("maintain after the builds = %+v, %v", res, err)
 	}
 	if v := valid(); v != "true" {

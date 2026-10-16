@@ -64,8 +64,8 @@
   interval until the timeout is raised or the DEFAULT partition is pruned.
   Until a partition has its unique-key index, an insert
   with `UniqueOpts.Finished` reads that partition in full. Retention keeps
-  every partition past its retention that lacks an index the upgrade declared
-  until it has one, logged at Info; if it stays, its build is failing, and the `statement_timeout`
+  every partition past its retention that lacks an index the upgrade declared,
+  once the DEFAULT partition has it, until it has one, logged at Info; if it stays, its build is failing, and the `statement_timeout`
   warning, an index history error, or the attach-deferred warning below says
   why. Releases
   up to 0.7.0 could instead drop it first and leave the outcome table's index
@@ -76,7 +76,7 @@
   the repair, wait for transactions that read the partition they lock; a
   warning that history index work has been deferred for five passes in a row
   means such transactions keep overlapping, or that a transaction left open
-  holds an outcome table's maintenance lock, which its DEFAULT partition's
+  holds an outcome table's index build lock, which its DEFAULT partition's
   build waits for under the same timeout (`pg_locks` shows an advisory lock
   with `objid` 1752133737). Attaches and the repair also wait, under the same
   timeout, for the schema's history maintenance lock, which a leader stalled

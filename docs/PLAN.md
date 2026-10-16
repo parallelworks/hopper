@@ -1167,14 +1167,20 @@ again. A build of a partition dropped since it was listed, or during the build, 
 skipped. Postgres marks an outcome table's index valid only in the attach that
 completes it, so retention does not drop the last partition without an index before
 it is built: before Postgres's May 2026 releases (18.4, 17.10, 16.14, 15.18, 14.23),
-nothing short of a catalog update could mark the index valid after that. Retention
-keeps every partition that an invalid index of its table lacks, not only the last,
-until its index is attached. That needs no lock and no recheck: a partition only ever
-goes from lacking an index to having it attached, so a list read before the drops
-keeps at worst a partition indexed since, which the next pass drops, and a build runs
-only on a partition that lacks its index, so none is dropped under its build. The
-cost is building, once after an upgrade declared an index, the partitions retention
-drops next. Once every index is valid, or no partition lacks an invalid one (an index
+nothing short of a catalog update could mark the index valid after that. While the
+`DEFAULT` partition, which retention never drops, still lacks the index, its attach
+completes it, and retention drops the partitions past it as usual. Once the `DEFAULT`
+partition has it, retention keeps every partition that lacks it, not only the last,
+until its index is attached. Keeping needs no lock: a partition only ever goes from
+lacking an index to having it attached, so a list read before the drops keeps at
+worst a partition indexed since, which the next pass drops, and a build runs only on
+a partition that lacks its index, so none is dropped under its build. A drop that
+counts on the `DEFAULT` partition rechecks that it still lacks the index under the
+table's build lock, which the `DEFAULT` partition's build holds through its attach, at
+read committed whatever the session's default, so that it sees an attach that
+committed before the lock was free. The cost is building, once after an upgrade
+declared an index, the partitions past retention that the `DEFAULT` partition was
+indexed before. Once every index is valid, or no partition lacks an invalid one (an index
 an earlier release left invalid, below), nothing is kept. The leader logs kept
 partitions at Info once per maintenance interval: a kept partition only
 waits for its build, and every way a build fails already warns, a timeout each time,
@@ -1202,7 +1208,8 @@ neither ends the run nor extends it. A pass that finds another session holding t
 schema's build lock, another leader's pass or one that stalled, ends there and
 reports the index it would have built (`HistoryIndexResult.Busy`), which the leader
 warns about from the fifth such pass in a row; it waited for no lock, so it does not
-lengthen the next pass's lock timeout as a deferral does. A repair whose partition retention dropped meanwhile is left to
+lengthen the next pass's lock timeout as a deferral does, and like a failed pass it
+may have ended before the deferred work, so it does not end their run either. A repair whose partition retention dropped meanwhile is left to
 the next pass. An index the server cannot repair, or that the attach left invalid, is
 reported (`HistoryIndexResult.Invalid`), and the leader warns at doubling intervals,
 up to 8 maintenance intervals, that queries needing it read every partition, and that

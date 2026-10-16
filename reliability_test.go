@@ -876,7 +876,11 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reader.Rollback(ctx) })
-	if _, err := reader.Exec(ctx, "SELECT count(*) FROM hopper_job_history WHERE ordering_key = 'lane'"); err != nil {
+	// The reader stays off the completed table, whose DEFAULT partition it
+	// would hold: a new hour's partition ahead, due if the hour turns before
+	// the leader's first maintenance, would be deferred behind it on every
+	// pass, and the index loop would never start.
+	if _, err := reader.Exec(ctx, "SELECT count(*) FROM hopper_job_history_failed WHERE ordering_key = 'lane'"); err != nil {
 		t.Fatal(err)
 	}
 	logs := &timeoutLog{counts: map[string]int{}, message: "index work deferred", key: "passes", level: slog.LevelWarn}
@@ -1112,7 +1116,7 @@ func (l *timeoutLog) count(name string) int {
 
 // TestHistoryLockWaitOutlastsStatementTimeout runs history maintenance on
 // sessions whose statement_timeout is shorter than the lock timeout, beside a
-// stalled leader that holds the maintenance lock. The wait ends at the lock
+// stalled leader that holds the history maintenance lock. The wait ends at the lock
 // timeout, deferring the partition ahead, rather than at the statement
 // timeout, which would fail the pass.
 func TestHistoryLockWaitOutlastsStatementTimeout(t *testing.T) {

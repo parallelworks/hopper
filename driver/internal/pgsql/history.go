@@ -39,7 +39,7 @@ const HistoryLockKey int32 = 0x686f7068 // "hoph"
 
 // lockHistoryMaintenance takes HistoryLockKey for the rest of tx.
 func lockHistoryMaintenance(ctx context.Context, tx Conn, schema string) error {
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", schema, HistoryLockKey); err != nil {
+	if err := advisoryXactLock(ctx, tx, schema, HistoryLockKey); err != nil {
 		return fmt.Errorf("hopper: lock history maintenance: %w", err)
 	}
 	return nil
@@ -132,17 +132,21 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 		// once one is deferred the rest are deferred untried.
 		if keep > 0 {
 			cutoff := now.Add(-keep)
-			lacking, err := e.lackingInvalidIndexes(ctx, g.parent)
-			if err != nil {
-				return res, err
-			}
+			// Read once, before the first drop, and only when a partition is
+			// past retention: most passes drop nothing.
+			lacking := sync.OnceValues(func() (map[string][]string, error) { return e.lackingInvalidIndexes(ctx, g.parent) })
 			blocked := false
 			for name := range existing {
 				from, ok := g.parse(name)
 				if !ok || !from.Add(g.period).Before(cutoff) {
 					continue
 				}
-				if _, ok := lacking[name]; ok {
+				unindexed, err := lacking()
+				if err != nil {
+					return res, err
+				}
+				needs := unindexed[name]
+				if !lackedByDefault(needs, unindexed[g.parent+"_default"]) {
 					res.Kept = append(res.Kept, name)
 					continue
 				}
@@ -150,7 +154,7 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 					res.Deferred = append(res.Deferred, name)
 					continue
 				}
-				outcome, err := e.dropPartition(ctx, g, name, lockTimeout)
+				outcome, err := e.dropPartition(ctx, g, name, needs, lockTimeout)
 				if err != nil {
 					return res, err
 				}
@@ -233,7 +237,9 @@ type partitionOutcome int
 
 const (
 	partitionDropped partitionOutcome = iota
-	// partitionKept waits for its outcome table's DEFAULT partition's build.
+	// partitionKept waits for its outcome table's DEFAULT partition's
+	// build, or for its own, once the DEFAULT partition has an index it
+	// lacks.
 	partitionKept
 	// partitionDeferred could not get its locks, for the next pass to retry.
 	partitionDeferred
@@ -253,18 +259,48 @@ const (
 // transaction's snapshot in turn. The partition is kept instead, and the
 // key, held in share mode to the end of the transaction, keeps such a build
 // from starting before the drop commits.
-func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lockTimeout string) (partitionOutcome, error) {
+//
+// A partition that lacks invalid indexes (needs) is dropped only while the
+// DEFAULT partition still lacks them too, whose attach then completes them:
+// the build that attaches it holds the key exclusively, so the check, made
+// under the key, holds until the drop commits. It is made at read committed,
+// whatever the session's default, so that it sees an attach that committed
+// before the key was free.
+func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name string, needs []string, lockTimeout string) (partitionOutcome, error) {
 	var kept bool
 	err := e.withTx(ctx, func(tx Tx) error {
+		if len(needs) > 0 {
+			if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+				return err
+			}
+		}
 		if err := setLockTimeout(ctx, tx, lockTimeout); err != nil {
 			return err
 		}
 		if hasHistoryIndexes(g.parent) {
-			free, err := tryHistoryIndexLockShared(ctx, tx, e.Schema.Name+"."+g.parent)
+			free, err := tryAdvisoryXactLock(ctx, tx, e.Schema.Name+"."+g.parent, HistoryIndexLockKey, true)
 			if err != nil {
 				return fmt.Errorf("hopper: lock history indexing: %w", err)
 			}
 			if kept = !free; kept {
+				return nil
+			}
+		}
+		if len(needs) > 0 {
+			indexes := make([]string, len(needs))
+			for i, x := range needs {
+				indexes[i] = e.Schema.Table(x)
+			}
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+				  SELECT 1 FROM unnest($2::text[]) n
+				  JOIN pg_inherits xi ON xi.inhparent = to_regclass(n)
+				  JOIN pg_index x ON x.indexrelid = xi.inhrelid
+				  WHERE x.indrelid = to_regclass($1))`,
+				e.Schema.Table(g.parent+"_default"), textArray(indexes)).Scan(&kept); err != nil {
+				return fmt.Errorf("hopper: check indexes of %s_default: %w", g.parent, err)
+			}
+			if kept {
 				return nil
 			}
 		}
@@ -282,20 +318,21 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lock
 	return partitionDropped, nil
 }
 
-// lackingInvalidIndexes lists the partitions of the outcome table parent
-// that lack one of its invalid indexes, which retention keeps until
-// HistoryIndex has attached them. Postgres marks an outcome table's index
-// valid only in the attach that completes it, so dropping the last partition
-// it lacks first would leave the index invalid for good on releases before
-// May 2026 (18.4, 17.10, 16.14, 15.18, 14.23), where attaching an index
-// again does not revalidate it. Keeping every partition that lacks one,
-// rather than only the last, needs no lock: a partition only ever goes from
-// lacking an index to having it attached, so a list read before the drop
-// keeps at worst a partition indexed since, which a later pass drops. A
-// build runs only on a partition that lacks its index, so none is dropped
-// under it. The cost is building, once after an upgrade declared an index,
-// the partitions that retention drops next.
-func (e *Executor) lackingInvalidIndexes(ctx context.Context, parent string) (map[string]struct{}, error) {
+// lackingInvalidIndexes maps the partitions of the outcome table parent
+// that lack some of its invalid indexes to those indexes. Postgres marks an
+// outcome table's index valid only in the attach that completes it, so
+// dropping the last partition it lacks first would leave the index invalid
+// for good on releases before May 2026 (18.4, 17.10, 16.14, 15.18, 14.23),
+// where attaching an index again does not revalidate it. Retention keeps a
+// partition that lacks one until HistoryIndex has attached it, unless the
+// DEFAULT partition, which retention never drops, lacks it too
+// (lackedByDefault, rechecked by dropPartition). Keeping every such
+// partition, rather than only the last, needs no lock: a partition only ever
+// goes from lacking an index to having it attached, so a list read before
+// the drop keeps at worst a partition indexed since, which a later pass
+// drops. A build runs only on a partition that lacks its index, so none is
+// dropped under it.
+func (e *Executor) lackingInvalidIndexes(ctx context.Context, parent string) (map[string][]string, error) {
 	if !hasHistoryIndexes(parent) {
 		return nil, nil
 	}
@@ -305,7 +342,7 @@ func (e *Executor) lackingInvalidIndexes(ctx context.Context, parent string) (ma
 	if err != nil {
 		return nil, fmt.Errorf("hopper: check indexes of %s: %w", parent, err)
 	}
-	lacking := map[string]struct{}{}
+	lacking := map[string][]string{}
 	for _, x := range historyIndexes {
 		if x.parent != parent || !slices.Contains(invalid, x.name()) {
 			continue
@@ -315,10 +352,21 @@ func (e *Executor) lackingInvalidIndexes(ctx context.Context, parent string) (ma
 			return nil, fmt.Errorf("hopper: check index %s: %w", x.name(), err)
 		}
 		for _, n := range unindexed {
-			lacking[n] = struct{}{}
+			lacking[n] = append(lacking[n], x.name())
 		}
 	}
 	return lacking, nil
+}
+
+// lackedByDefault reports whether the DEFAULT partition, lacking the indexes
+// byDefault, lacks every one of needs, the indexes a partition lacks.
+func lackedByDefault(needs, byDefault []string) bool {
+	for _, x := range needs {
+		if !slices.Contains(byDefault, x) {
+			return false
+		}
+	}
+	return true
 }
 
 // historyIndex is an index declared ON ONLY a history outcome table by a
@@ -367,9 +415,11 @@ const unindexedPartitions = `
 // DEFAULT partition, which the build holds, while the build waits for the
 // attach's transaction to end. A build elsewhere does not conflict with the
 // attach. Retention tries the table's key as well, and keeps the partitions
-// past it while it is held: a drop locks the DEFAULT partition too. The
-// build waits for the table's key, which creation and retention hold only
-// briefly.
+// past it while it is held: a drop locks the DEFAULT partition too. Creation
+// and retention hold the table's key in share mode, so that they hold off a
+// build, which takes it exclusively, without holding off each other: a key
+// found taken means a build. The build waits for the table's key, which
+// creation and retention hold only briefly.
 //
 // The CREATE INDEX CONCURRENTLY cannot run in a transaction, so the locks are
 // held by a transaction of their own, which stays open and idle on another
@@ -378,30 +428,23 @@ const unindexedPartitions = `
 // different server connection, and the lock would outlive the build.
 const HistoryIndexLockKey int32 = 0x686f7069 // "hopi"
 
-// tryHistoryIndexLock tries HistoryIndexLockKey combined with name, for the
-// rest of tx.
-func tryHistoryIndexLock(ctx context.Context, tx Conn, name string) (bool, error) {
-	var locked bool
-	err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock(hashtext($1), $2)", name, HistoryIndexLockKey).Scan(&locked)
-	return locked, err
-}
-
-// tryHistoryIndexLockShared tries HistoryIndexLockKey combined with name in
-// share mode, for the rest of tx. Retention and partition creation hold a
-// table's key this way, so that they hold off a build, which
-// takes it exclusively, without holding off each other: a key found taken
-// means a build.
-func tryHistoryIndexLockShared(ctx context.Context, tx Conn, name string) (bool, error) {
-	var locked bool
-	err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock_shared(hashtext($1), $2)", name, HistoryIndexLockKey).Scan(&locked)
-	return locked, err
-}
-
-// lockHistoryIndex waits for HistoryIndexLockKey combined with name, for the
-// rest of tx.
-func lockHistoryIndex(ctx context.Context, tx Conn, name string) error {
-	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", name, HistoryIndexLockKey)
+// advisoryXactLock waits for the advisory lock key combined with name, for
+// the rest of tx.
+func advisoryXactLock(ctx context.Context, tx Conn, name string, key int32) error {
+	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", name, key)
 	return err
+}
+
+// tryAdvisoryXactLock tries the advisory lock key combined with name, in
+// share mode if shared, for the rest of tx, and reports whether it got it.
+func tryAdvisoryXactLock(ctx context.Context, tx Conn, name string, key int32, shared bool) (bool, error) {
+	fn := "pg_try_advisory_xact_lock"
+	if shared {
+		fn += "_shared"
+	}
+	var locked bool
+	err := tx.QueryRow(ctx, "SELECT "+fn+"(hashtext($1), $2)", name, key).Scan(&locked)
+	return locked, err
 }
 
 // HistoryIndex implements driver.Executor. It builds each history index of
@@ -479,7 +522,10 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 			res.Deferred = append(res.Deferred, parentIndex)
 		}
 	}
-	return res, repairErr
+	if repairErr != nil {
+		return res, fmt.Errorf("%w: %w", driver.ErrHistoryIndexRepair, repairErr)
+	}
+	return res, nil
 }
 
 // errStatementTimeout marks a build the session's statement_timeout
@@ -514,7 +560,7 @@ func (e *Executor) indexHistoryPartitionLocked(ctx context.Context, x historyInd
 	if _, err := lock.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
 		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
 	}
-	locked, err := tryHistoryIndexLock(ctx, lock, e.Schema.Name)
+	locked, err := tryAdvisoryXactLock(ctx, lock, e.Schema.Name, HistoryIndexLockKey, false)
 	if err != nil {
 		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
 	}
@@ -531,7 +577,7 @@ func (e *Executor) indexHistoryPartitionLocked(ctx context.Context, x historyInd
 		if err := setLockTimeout(ctx, lock, lockTimeout); err != nil {
 			return false, fmt.Errorf("hopper: lock history indexing: %w", err)
 		}
-		if err := lockHistoryIndex(ctx, lock, e.Schema.Name+"."+x.parent); err != nil {
+		if err := advisoryXactLock(ctx, lock, e.Schema.Name+"."+x.parent, HistoryIndexLockKey); err != nil {
 			if waitEnded(ctx, err) {
 				return false, fmt.Errorf("%w: %s: %w", errBuildDeferred, leaf, err)
 			}
@@ -796,7 +842,7 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// ahead, so this one is deferred to the next pass instead.
 	if hasHistoryIndexes(g.parent) {
 		var free bool
-		if free, err = tryHistoryIndexLockShared(ctx, tx, e.Schema.Name+"."+g.parent); err != nil {
+		if free, err = tryAdvisoryXactLock(ctx, tx, e.Schema.Name+"."+g.parent, HistoryIndexLockKey, true); err != nil {
 			return false, false, fmt.Errorf("hopper: lock history indexing: %w", err)
 		}
 		if !free {

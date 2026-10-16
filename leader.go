@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"sync"
@@ -417,13 +418,12 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 		settleBackoffs(backoffs, skip, res, err)
 		// Only waits for a lock lengthen the next pass's lock timeout; a
 		// pass that found another session's index pass under way waited for
-		// nothing.
-		deferrals = nextDeferrals(deferrals, len(res.Deferred) > 0, err)
+		// nothing, and ended there, maybe before the work deferred last time.
+		deferrals, busy = nextIndexRuns(deferrals, busy, res, err)
 		if len(res.Deferred) > 0 {
-			c.logger.Log(ctx, repeatLevel(deferrals), "hopper: history index work deferred: a transaction that used the partition, one left open with its maintenance lock, or another leader's history maintenance held its lock",
+			c.logger.Log(ctx, repeatLevel(deferrals), "hopper: history index work deferred: a transaction that used the partition, one left open with its table's index build lock, or another leader's history maintenance held its lock",
 				"indexes", res.Deferred, "lock_timeout", timeout, "passes", deferrals)
 		}
-		busy = nextDeferrals(busy, res.Busy != "", err)
 		if res.Busy != "" {
 			c.logger.Log(ctx, repeatLevel(busy), "hopper: history indexing held off: another session holds the schema's index build lock, another leader's pass or one that stalled",
 				"index", res.Busy, "passes", busy)
@@ -502,17 +502,34 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 }
 
 // nextDeferrals counts the passes in a row that deferred work, after a pass
-// that deferred some or not: a failed pass may have ended before the work
-// deferred last time, so it neither ends the run nor extends it, as
-// maintainHistory's failures leave its count.
-func nextDeferrals(n int, deferred bool, err error) int {
+// that deferred some or not: a pass that ended early (failed, or held off by
+// another session's build lock) may have ended before the work deferred last
+// time, so it neither ends the run nor extends it, as maintainHistory's
+// failures leave its count.
+func nextDeferrals(n int, deferred, endedEarly bool) int {
 	switch {
 	case deferred:
 		return n + 1
-	case err != nil:
+	case endedEarly:
 		return n
 	}
 	return 0
+}
+
+// nextIndexRuns counts, after an index pass, the passes in a row that
+// deferred work and those held off by another session's build lock. A pass
+// held off ended before the rest of its work, as a failed one did.
+func nextIndexRuns(deferrals, busy int, res driver.HistoryIndexResult, err error) (int, int) {
+	failed := indexPassFailed(err)
+	return nextDeferrals(deferrals, len(res.Deferred) > 0, failed || res.Busy != ""),
+		nextDeferrals(busy, res.Busy != "", failed)
+}
+
+// indexPassFailed reports whether a HistoryIndex pass that returned err
+// failed, and so may have ended before the rest of its work. A failed repair
+// is reported once the rest is done (driver.ErrHistoryIndexRepair).
+func indexPassFailed(err error) bool {
+	return err != nil && !errors.Is(err, driver.ErrHistoryIndexRepair)
 }
 
 // indexBackoff is when indexLoop next tries a partition whose build timed
@@ -527,7 +544,7 @@ type indexBackoff struct {
 // starts over at the shortest wait. A pass that failed, was held off or
 // deferred work may not have reached them, and forgets none.
 func settleBackoffs(backoffs map[string]indexBackoff, skipped []string, res driver.HistoryIndexResult, err error) {
-	if err != nil || res.Busy != "" || len(res.Deferred) > 0 {
+	if indexPassFailed(err) || res.Busy != "" || len(res.Deferred) > 0 {
 		return
 	}
 	for name := range backoffs {
