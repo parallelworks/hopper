@@ -381,10 +381,10 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 	}
 	ticker := time.NewTicker(c.tuning.maintenanceInterval)
 	defer ticker.Stop()
-	// backoffs holds the partitions whose build timed out and the indexes
-	// reported invalid, each retried once its next try is due.
-	backoffs := map[string]indexBackoff{}
-	retryIn := func(name string, maxShift int) time.Duration {
+	// builds holds the partitions whose build timed out, and repairs the
+	// indexes reported invalid, each retried once its next try is due.
+	builds, repairs := map[string]indexBackoff{}, map[string]indexBackoff{}
+	retryIn := func(backoffs map[string]indexBackoff, name string, maxShift int) time.Duration {
 		b := backoffs[name]
 		b.failures++
 		wait := c.tuning.maintenanceInterval << min(b.failures, maxShift)
@@ -394,28 +394,24 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 	}
 	deferrals, busy := 0, 0
 	for {
-		var skip []string
-		for name, b := range backoffs {
-			if time.Now().Before(b.next) {
-				skip = append(skip, name)
-			}
-		}
+		skip, skipRepair := notDue(builds), notDue(repairs)
 		timeout := ddlLockTimeout(deferrals)
-		res, err := c.exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: skip, LockTimeout: timeout})
+		res, err := c.exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: skip, SkipRepair: skipRepair, LockTimeout: timeout})
 		if err != nil && ctx.Err() == nil {
 			c.logger.WarnContext(ctx, "hopper: index history", "error", err)
 		}
 		for _, name := range res.TimedOut {
 			c.logger.WarnContext(ctx, "hopper: a history partition's index build ran past statement_timeout; raise it for this role to let the build finish",
-				"partition", name, "retry_in", retryIn(name, maxIndexBackoffShift))
+				"partition", name, "retry_in", retryIn(builds, name, maxIndexBackoffShift))
 		}
 		for _, name := range res.Invalid {
-			c.logger.WarnContext(ctx, "hopper: a history index stays invalid although every partition is indexed, and the server "+
-				"cannot repair it, so queries that need it read every partition; Postgres before its May 2026 minor releases "+
-				"(18.4, 17.10, 16.14, 15.18, 14.23) cannot",
-				"index", name, "retry_in", retryIn(name, maxInvalidBackoffShift))
+			c.logger.WarnContext(ctx, "hopper: a history index stays invalid although every partition is indexed, so queries "+
+				"that need it read every partition; Postgres before its May 2026 minor releases (18.4, 17.10, 16.14, 15.18, 14.23) "+
+				"cannot repair it, and a repair that failed is logged with its error",
+				"index", name, "retry_in", retryIn(repairs, name, maxInvalidBackoffShift))
 		}
-		settleBackoffs(backoffs, skip, res, err)
+		settleBackoffs(builds, skip, res.TimedOut, res, err)
+		settleBackoffs(repairs, skipRepair, res.Invalid, res, err)
 		// Only waits for a lock lengthen the next pass's lock timeout; a
 		// pass that found another session's index pass under way waited for
 		// nothing, and ended there, maybe before the work deferred last time.
@@ -473,11 +469,12 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 		StreamRetention:    c.cfg.StreamRetention,
 		LockTimeout:        timeout,
 	})
-	if err != nil {
-		if ctx.Err() == nil {
-			c.logger.ErrorContext(ctx, "hopper: maintain history", "error", err)
-		}
-		return true
+	// Each group is maintained on its own, so a pass that failed in one may
+	// still have done the others' work, which is logged as usual. It is
+	// retried at the next maintenance interval, its deferred work with it,
+	// rather than on every leader pass.
+	if err != nil && ctx.Err() == nil {
+		c.logger.ErrorContext(ctx, "hopper: maintain history", "error", err, "deferred", res.Deferred)
 	}
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
@@ -490,6 +487,9 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 		c.keptLogged = time.Now()
 		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built, or while their table's DEFAULT partition's is",
 			"kept", res.Kept)
+	}
+	if err != nil {
+		return true
 	}
 	if len(res.Deferred) == 0 {
 		c.ddlDeferrals = 0
@@ -539,16 +539,27 @@ type indexBackoff struct {
 	next     time.Time
 }
 
+// notDue lists the names in backoffs whose next try is not due yet.
+func notDue(backoffs map[string]indexBackoff) []string {
+	var names []string
+	for name, b := range backoffs {
+		if time.Now().Before(b.next) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 // settleBackoffs forgets the backoffs of the names a pass tried, not
 // skipping them, without reporting them again, so that a later failure
 // starts over at the shortest wait. A pass that failed, was held off or
 // deferred work may not have reached them, and forgets none.
-func settleBackoffs(backoffs map[string]indexBackoff, skipped []string, res driver.HistoryIndexResult, err error) {
+func settleBackoffs(backoffs map[string]indexBackoff, skipped, reported []string, res driver.HistoryIndexResult, err error) {
 	if indexPassFailed(err) || res.Busy != "" || len(res.Deferred) > 0 {
 		return
 	}
 	for name := range backoffs {
-		if !slices.Contains(skipped, name) && !slices.Contains(res.TimedOut, name) && !slices.Contains(res.Invalid, name) {
+		if !slices.Contains(skipped, name) && !slices.Contains(reported, name) {
 			delete(backoffs, name)
 		}
 	}

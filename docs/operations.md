@@ -74,13 +74,13 @@
   it only reports the index and warns that it stays invalid: hopper does not
   build a replacement or declare the index again, either of which would take
   locks on, or the index from, every partition. Update Postgres's minor
-  version to repair it; the leader does so within 8 maintenance intervals,
-  with no restart. Attaching a built index, and
+  version to repair it; the leader does so within 8 maintenance intervals of
+  the server's restart, without a restart of its own. Attaching a built index, and
   the repair, wait for transactions that read the partition they lock; a
   warning that history index work has been deferred for five passes in a row
   means such transactions keep overlapping, or that a transaction left open
-  holds an outcome table's index build lock, which its DEFAULT partition's
-  build waits for under the same timeout (`pg_locks` shows an advisory lock
+  holds an outcome table's index build lock, which its builds wait for
+  under the same timeout (`pg_locks` shows an advisory lock
   with `objid` 1752133737). Attaches and the repair also wait, under the same
   timeout, for the schema's history maintenance lock, which a leader stalled
   in partition creation or an attach holds: `objid` 1752133736. A warning

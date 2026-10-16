@@ -18,6 +18,7 @@ type probeConn struct {
 	Conn
 	probes *int
 	execs  *[]string
+	start  string
 }
 
 func (c probeConn) Begin(context.Context) (Tx, error) { *c.probes++; return probeTx{c}, nil }
@@ -36,6 +37,8 @@ func (c probeConn) QueryRow(context.Context, string, ...any) Row {
 			*d = sql.NullString{String: "hopper_job_history_failed_2000010100_ordering", Valid: true}
 		case *bool:
 			*d = true
+		case *string:
+			*d = c.start
 		}
 		return nil
 	})
@@ -50,19 +53,19 @@ type probeRow func(dest ...any) error
 
 func (r probeRow) Scan(dest ...any) error { return r(dest...) }
 
-// The server is asked again on each pass, rather than once per process,
-// so that one updated in place, or a fork that backports the fix under the
-// same version, gets its index repaired without a restart.
-func TestReattachRevalidatesAsksEachTime(t *testing.T) {
+// The server is asked once per start: a minor release, or a fork's backport
+// under the same version, takes effect only when the server restarts.
+func TestReattachRevalidatesOncePerStart(t *testing.T) {
 	var probes int
-	e := &Executor{Conn: probeConn{probes: &probes}, Schema: NewSchema("")}
-	for range 2 {
+	schema := NewSchema("")
+	for _, start := range []string{"2026-10-16 10:00:00+00 test", "2026-10-16 10:00:00+00 test", "2026-10-16 11:00:00+00 test"} {
+		e := &Executor{Conn: probeConn{probes: &probes, start: start}, Schema: schema}
 		if ok, err := e.reattachRevalidates(context.Background(), "200ms"); err != nil || !ok {
 			t.Fatalf("reattachRevalidates = %v, %v", ok, err)
 		}
 	}
 	if probes != 2 {
-		t.Errorf("%d probes for two passes, want 2", probes)
+		t.Errorf("%d probes for two server starts, want 2", probes)
 	}
 }
 
@@ -197,17 +200,22 @@ func TestDeadlockedBuildIsDeferred(t *testing.T) {
 
 // maintainConn runs HistoryMaintain's statements against a schema whose
 // failed table has one partition past retention, and fails the read of its
-// indexes. It records the statements it runs.
+// indexes, or, if failExec is set, the statements that contain it. It
+// records the statements it runs.
 type maintainConn struct {
 	Conn
-	now   time.Time
-	execs *[]string
+	now      time.Time
+	execs    *[]string
+	failExec string
 }
 
 func (c maintainConn) Begin(context.Context) (Tx, error) { return maintainTx{c}, nil }
 
 func (c maintainConn) Exec(_ context.Context, sql string, _ ...any) (int64, error) {
 	*c.execs = append(*c.execs, sql)
+	if c.failExec != "" && strings.Contains(sql, c.failExec) {
+		return 0, codedError("XX000")
+	}
 	return 0, nil
 }
 
@@ -225,7 +233,7 @@ func (c maintainConn) QueryRow(_ context.Context, sql string, _ ...any) Row {
 
 func (c maintainConn) Query(_ context.Context, sql string, args ...any) (Rows, error) {
 	switch {
-	case strings.Contains(sql, "NOT x.indisvalid"):
+	case strings.Contains(sql, "NOT x.indisvalid") && c.failExec == "":
 		return nil, codedError("57014")
 	case strings.Contains(sql, "pg_inherits") && args[0] == NewSchema("").Table("hopper_job_history_failed"):
 		return &stringRows{rows: []string{"hopper_job_history_failed_20000101"}}, nil
@@ -272,5 +280,26 @@ func TestHistoryMaintainGoesPastIndexReadError(t *testing.T) {
 	}
 	if !slices.Contains(res.Created, historyGroups[2].name(now.Truncate(historyGroups[2].period).Add(historyGroups[2].period))) {
 		t.Errorf("the stream group's partitions ahead were not created: %+v", res)
+	}
+}
+
+// A creation that fails, such as an attach whose scan of a DEFAULT partition
+// grown large outlasts statement_timeout, leaves the group's retention to
+// run: its drops, and the DEFAULT prune that shrinks what the attach scans.
+func TestHistoryMaintainGoesPastCreateError(t *testing.T) {
+	var execs []string
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	e := &Executor{Conn: maintainConn{now: now, execs: &execs, failExec: "CREATE TABLE"}, Schema: NewSchema("")}
+	res, err := e.HistoryMaintain(context.Background(), driver.HistoryMaintainParams{FailedRetention: time.Hour})
+	if sqlState(err) != "XX000" {
+		t.Errorf("HistoryMaintain error = %v, want the creation's", err)
+	}
+	if !slices.Equal(res.Dropped, []string{"hopper_job_history_failed_20000101"}) {
+		t.Errorf("the partition past retention was not dropped after a failed creation: %+v", res)
+	}
+	if !slices.ContainsFunc(execs, func(q string) bool {
+		return strings.Contains(q, "DELETE FROM") && strings.Contains(q, "hopper_job_history_failed_default")
+	}) {
+		t.Error("the failed table's DEFAULT partition was not pruned after a failed creation")
 	}
 }

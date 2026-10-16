@@ -39,7 +39,7 @@ const HistoryLockKey int32 = 0x686f7068 // "hoph"
 
 // lockHistoryMaintenance takes HistoryLockKey for the rest of tx.
 func lockHistoryMaintenance(ctx context.Context, tx Conn, schema string) error {
-	if err := advisoryXactLock(ctx, tx, schema, HistoryLockKey); err != nil {
+	if err := advisoryXactLock(ctx, tx, schema, HistoryLockKey, false); err != nil {
 		return fmt.Errorf("hopper: lock history maintenance: %w", err)
 	}
 	return nil
@@ -102,12 +102,17 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 }
 
 // maintainGroup creates g's partitions ahead and applies its retention, keep,
-// adding what it did to res.
+// adding what it did to res. A step that fails leaves the rest of that step
+// to the next pass, but not the group's other steps: a failure that lasts,
+// such as an attach whose scan of a DEFAULT partition grown large outlasts
+// statement_timeout, would otherwise also stop the drops and the DEFAULT
+// prune that let the group recover. The errors are reported together.
 func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.Time, keep time.Duration, lockTimeout string, res *driver.HistoryMaintainResult) error {
 	existing, err := e.partitionsOf(ctx, g.parent)
 	if err != nil {
 		return err
 	}
+	var errs []error
 
 	// Create the periods ahead of the current one. Every attach waits
 	// for the same locks (the parent, and the DEFAULT partition it
@@ -128,7 +133,8 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 		}
 		created, deferred, err := e.createPartition(ctx, g, name, from, from.Add(g.period), lockTimeout)
 		if err != nil {
-			return err
+			errs = append(errs, err)
+			break
 		}
 		if created {
 			res.Created = append(res.Created, name)
@@ -148,9 +154,6 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 		// past retention: most passes drop nothing.
 		lacking := sync.OnceValues(func() (map[string][]string, error) { return e.lackingInvalidIndexes(ctx, g.parent) })
 		blocked := false
-		// A failed read of the indexes leaves the group's partitions past
-		// retention to the next pass, not its DEFAULT partition's prune.
-		var lackErr error
 		for name := range existing {
 			from, ok := g.parse(name)
 			if !ok || !from.Add(g.period).Before(cutoff) {
@@ -158,7 +161,7 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 			}
 			unindexed, err := lacking()
 			if err != nil {
-				lackErr = err
+				errs = append(errs, err)
 				break
 			}
 			needs := unindexed[name]
@@ -172,7 +175,8 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 			}
 			outcome, err := e.dropPartition(ctx, g, name, needs, lockTimeout)
 			if err != nil {
-				return err
+				errs = append(errs, err)
+				break
 			}
 			switch outcome {
 			case partitionDropped:
@@ -189,12 +193,12 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 			fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", e.Schema.Table(g.parent+"_default"), g.timeColumn),
 			keep.Seconds())
 		if err != nil {
-			return errors.Join(lackErr, fmt.Errorf("hopper: prune %s_default: %w", g.parent, err))
+			errs = append(errs, fmt.Errorf("hopper: prune %s_default: %w", g.parent, err))
+		} else {
+			res.Pruned += n
 		}
-		res.Pruned += n
-		return lackErr
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // defaultDDLLockTimeout bounds how long a partition's creation or drop, a
@@ -239,7 +243,13 @@ func lockNotAvailable(err error) bool { return sqlState(err) == "55P03" }
 // that only take locks, or change the catalog once they have them: a
 // statement_timeout in one that scans a table may be its work running long.
 func waitEnded(ctx context.Context, err error) bool {
-	return lockNotAvailable(err) || (ctx.Err() == nil && sqlState(err) == "57014")
+	return lockNotAvailable(err) || statementTimedOut(ctx, err)
+}
+
+// statementTimedOut reports whether err is a statement canceled by the
+// server, such as by the session's statement_timeout, rather than by ctx.
+func statementTimedOut(ctx context.Context, err error) bool {
+	return ctx.Err() == nil && sqlState(err) == "57014"
 }
 
 // deadlocked reports whether err is a deadlock the server broke.
@@ -268,13 +278,17 @@ const (
 // that cannot get the lock in time, or that the deadlock detector picks over
 // a concurrent index build waiting for it, is deferred.
 //
-// A build on the outcome table's DEFAULT partition holds HistoryIndexLockKey
-// combined with the table for its whole run. DROP locks the table and then
-// the DEFAULT partition, whose new constraint it writes: it would hold every
-// query of the table up while it waits for the build, which waits for this
-// transaction's snapshot in turn. The partition is kept instead, and the
-// key, held in share mode to the end of the transaction, keeps such a build
-// from starting before the drop commits.
+// A build holds HistoryIndexLockKey combined with the outcome table for its
+// whole run, exclusively on the DEFAULT partition and in share mode
+// elsewhere. DROP locks the table and then the partition and the DEFAULT
+// partition, whose new constraint it writes: it would hold every query of
+// the table up while it waits for a build on either, which waits for this
+// transaction's snapshot in turn. The partition is kept instead. The key is
+// tried in share mode for a partition that has every index (needs empty),
+// which no build runs on, so that only the DEFAULT partition's build keeps
+// it, and exclusively for one that lacks some, which may be the one being
+// built. Held to the end of the transaction, it keeps such a build from
+// starting before the drop commits.
 //
 // A partition that lacks invalid indexes (needs) is dropped only while the
 // DEFAULT partition still lacks them too, whose attach then completes them:
@@ -294,7 +308,7 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name strin
 			return err
 		}
 		if hasHistoryIndexes(g.parent) {
-			free, err := tryAdvisoryXactLock(ctx, tx, e.Schema.Name+"."+g.parent, HistoryIndexLockKey, true)
+			free, err := tryAdvisoryXactLock(ctx, tx, e.Schema.Name+"."+g.parent, HistoryIndexLockKey, len(needs) == 0)
 			if err != nil {
 				return fmt.Errorf("hopper: lock history indexing: %w", err)
 			}
@@ -430,18 +444,19 @@ const unindexedPartitions = `
 // overlapping leaders index one at a time; the one that does not get the
 // lock leaves the work to the other.
 //
-// A build on an outcome table's DEFAULT partition also holds the key
-// combined with the schema and that table. Partition
-// creation under the table tries it without waiting, and leaves the
-// partition to its next pass while the build runs: its attach scans the
-// DEFAULT partition, which the build holds, while the build waits for the
-// attach's transaction to end. A build elsewhere does not conflict with the
-// attach. Retention tries the table's key as well, and keeps the partitions
-// past it while it is held: a drop locks the DEFAULT partition too. Creation
-// and retention hold the table's key in share mode, so that they hold off a
-// build, which takes it exclusively, without holding off each other: a key
-// found taken means a build. The build waits for the table's key, which
-// creation and retention hold only briefly.
+// A build also holds the key combined with the schema and its outcome
+// table: exclusively on the DEFAULT partition, in share mode elsewhere.
+// Partition creation under the table tries it in share mode without
+// waiting, and leaves the partition to its next pass while the DEFAULT
+// partition's build runs: its attach scans the DEFAULT partition, which the
+// build holds, while the build waits for the attach's transaction to end. A
+// build elsewhere does not conflict with the attach. Retention tries the
+// table's key as well, and keeps the partitions past it while a build holds
+// it: a drop locks the DEFAULT partition too, and a drop of the partition
+// being built would hold the table locked while it waits for the build. It
+// tries the key in share mode for a partition that has every index, which
+// no build runs on, and exclusively for one that lacks some. A build waits
+// for the table's key, which creation and retention hold only briefly.
 //
 // The CREATE INDEX CONCURRENTLY cannot run in a transaction, so the locks are
 // held by a transaction of their own, which stays open and idle on another
@@ -450,10 +465,14 @@ const unindexedPartitions = `
 // different server connection, and the lock would outlive the build.
 const HistoryIndexLockKey int32 = 0x686f7069 // "hopi"
 
-// advisoryXactLock waits for the advisory lock key combined with name, for
-// the rest of tx.
-func advisoryXactLock(ctx context.Context, tx Conn, name string, key int32) error {
-	_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", name, key)
+// advisoryXactLock waits for the advisory lock key combined with name, in
+// share mode if shared, for the rest of tx.
+func advisoryXactLock(ctx context.Context, tx Conn, name string, key int32, shared bool) error {
+	fn := "pg_advisory_xact_lock"
+	if shared {
+		fn += "_shared"
+	}
+	_, err := tx.Exec(ctx, "SELECT "+fn+"(hashtext($1), $2)", name, key)
 	return err
 }
 
@@ -526,28 +545,37 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 				// leader's pass, or one that stalled. It is reported, so that
 				// a holder that never lets go is warned about.
 				res.Busy = leaf + x.suffix
-				return res, repairErr
+				return res, repairError(repairErr)
 			}
 		}
-		if !complete || slices.Contains(skip, parentIndex) {
+		if !complete || slices.Contains(params.SkipRepair, parentIndex) {
 			continue
 		}
 		invalid, deferred, err := e.revalidateIndex(ctx, parentIndex, lockTimeout, probe)
 		switch {
 		case err != nil:
 			// A repair that fails, its probe included, is reported once the
-			// indexes after it are built.
+			// indexes after it are built, and the index, which stays
+			// invalid, with the indexes the server cannot repair, so that
+			// the leader backs its retries off alike.
 			repairErr = errors.Join(repairErr, err)
+			res.Invalid = append(res.Invalid, parentIndex)
 		case invalid:
 			res.Invalid = append(res.Invalid, parentIndex)
 		case deferred:
 			res.Deferred = append(res.Deferred, parentIndex)
 		}
 	}
-	if repairErr != nil {
-		return res, fmt.Errorf("%w: %w", driver.ErrHistoryIndexRepair, repairErr)
+	return res, repairError(repairErr)
+}
+
+// repairError wraps err, what a pass's failed repairs reported, in
+// driver.ErrHistoryIndexRepair, or returns nil if none failed.
+func repairError(err error) error {
+	if err == nil {
+		return nil
 	}
-	return res, nil
+	return fmt.Errorf("%w: %w", driver.ErrHistoryIndexRepair, err)
 }
 
 // errStatementTimeout marks a build the session's statement_timeout
@@ -590,22 +618,19 @@ func (e *Executor) indexHistoryPartitionLocked(ctx context.Context, x historyInd
 	if !locked {
 		return false, nil
 	}
-	if leaf == x.parent+"_default" {
-		// Partition creation and retention hold the table's key only while
-		// they create or drop a partition of the table, never waiting for a
-		// build meanwhile, so the build waits for them. The wait is bounded
-		// like a drop's, so that a transaction left open with the key does
-		// not stall the pass, and every other leader's, behind the schema's
-		// key.
-		if err := setLockTimeout(ctx, lock, lockTimeout); err != nil {
-			return false, fmt.Errorf("hopper: lock history indexing: %w", err)
+	// Partition creation and retention hold the table's key only while they
+	// create or drop a partition of the table, never waiting for a build
+	// meanwhile, so the build waits for them. The wait is bounded like a
+	// drop's, so that a transaction left open with the key does not stall
+	// the pass, and every other leader's, behind the schema's key.
+	if err := setLockTimeout(ctx, lock, lockTimeout); err != nil {
+		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
+	}
+	if err := advisoryXactLock(ctx, lock, e.Schema.Name+"."+x.parent, HistoryIndexLockKey, leaf != x.parent+"_default"); err != nil {
+		if waitEnded(ctx, err) {
+			return false, fmt.Errorf("%w: %s: %w", errBuildDeferred, leaf, err)
 		}
-		if err := advisoryXactLock(ctx, lock, e.Schema.Name+"."+x.parent, HistoryIndexLockKey); err != nil {
-			if waitEnded(ctx, err) {
-				return false, fmt.Errorf("%w: %s: %w", errBuildDeferred, leaf, err)
-			}
-			return false, fmt.Errorf("hopper: lock history indexing: %w", err)
-		}
+		return false, fmt.Errorf("hopper: lock history indexing: %w", err)
 	}
 	// A statement of its own lets go of the portal the lock's query left
 	// open, whose snapshot the build would wait for, and it keeps the server
@@ -656,7 +681,7 @@ func (e *Executor) buildHistoryIndex(ctx context.Context, x historyIndex, leaf, 
 	if !valid.Valid || !valid.Bool {
 		if _, err := e.Conn.Exec(ctx, "CREATE INDEX CONCURRENTLY IF NOT EXISTS "+quoteIdent(index)+" ON "+e.Schema.Table(leaf)+
 			" "+x.definition); err != nil {
-			if ctx.Err() == nil && sqlState(err) == "57014" {
+			if statementTimedOut(ctx, err) {
 				// The build left an invalid index behind, which would cost
 				// every write to the partition until the next attempt.
 				if _, derr := e.Conn.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+e.Schema.Table(index)); derr != nil {
@@ -664,7 +689,7 @@ func (e *Executor) buildHistoryIndex(ctx context.Context, x historyIndex, leaf, 
 				}
 				return fmt.Errorf("%w: %s: %w", errStatementTimeout, leaf, err)
 			}
-			if sqlState(err) == "40P01" {
+			if deadlocked(err) {
 				// The deadlock detector chose the build over retention's drop
 				// of the partition, which commits after this returns; a later
 				// pass finds the partition gone, or drops the invalid index
@@ -779,15 +804,26 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout
 // in a transaction it rolls back, the case revalidateIndex repairs: a
 // partitioned index left invalid by the drop of the one partition that
 // lacked it. It asks the server rather than its version, which forks number
-// their own way, and asks again on each pass that has an index to repair,
-// which the leader backs off: a server updated in place, or a fork that
-// backports the change under the same version, is repaired without a
-// restart. drivertest's ReattachRevalidates repeats it for the tests'
-// expectations. Its tables' names are the same in every session using the
+// their own way, once per server start (Schema.revalidates): the answer
+// changes only with the server's code, which a running server keeps until it
+// restarts, and the probe's DDL leaves dead catalog rows on every try.
+// drivertest's ReattachRevalidates repeats it for the tests' expectations. Its tables' names are the same in every session using the
 // schema, so a concurrent probe, uncommitted, holds this one's off until it
 // ends; the wait is bounded by lockTimeout, so that a leader that stalls
 // mid-probe does not stall this one's pass.
 func (e *Executor) reattachRevalidates(ctx context.Context, lockTimeout string) (valid bool, err error) {
+	var start string
+	if err := e.Conn.QueryRow(ctx, "SELECT pg_postmaster_start_time()::text || ' ' || version()").Scan(&start); err != nil {
+		return false, fmt.Errorf("hopper: probe index revalidation: %w", err)
+	}
+	if v, ok := e.Schema.revalidates.Load(start); ok {
+		return v.(bool), nil
+	}
+	defer func() {
+		if err == nil {
+			e.Schema.revalidates.Store(start, valid)
+		}
+	}()
 	tx, err := e.Conn.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("hopper: probe index revalidation: %w", err)

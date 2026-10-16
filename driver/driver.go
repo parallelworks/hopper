@@ -886,14 +886,16 @@ type HistoryMaintainResult struct {
 // HistoryIndexParams leaves storage units out of an index pass.
 type HistoryIndexParams struct {
 	// Skip names storage units (partitions on Postgres) to leave for a later
-	// pass, and indexes not to try to repair (HistoryIndexResult.Invalid).
+	// pass.
 	Skip []string
+	// SkipRepair names indexes not to try to repair this pass
+	// (HistoryIndexResult.Invalid).
+	SkipRepair []string
 	// LockTimeout bounds how long attaching a built index, or repairing an
 	// index, waits for its lock, during which the queries of the storage
 	// unit it locks queue behind it, as HistoryMaintainParams.LockTimeout
-	// does, and how long the build of an outcome table's DEFAULT storage
-	// unit waits for the table's index build lock, held by retention or
-	// partition creation. Zero means the engine's default.
+	// does, and how long a build waits for its outcome table's index build
+	// lock, held by retention or partition creation. Zero means the engine's default.
 	LockTimeout time.Duration
 }
 
@@ -904,9 +906,10 @@ type HistoryIndexResult struct {
 	// on to the rest.
 	TimedOut []string
 	// Invalid names indexes that stay invalid although every storage unit
-	// under them is indexed, which the server cannot repair: on Postgres, an
-	// outcome table's index left invalid by an earlier release, before
-	// Postgres's May 2026 minor releases. Queries that need it read every
+	// under them is indexed, after the pass's repair: on Postgres, an outcome
+	// table's index left invalid by an earlier release, which releases before
+	// Postgres's May 2026 minors cannot repair, or one whose repair failed
+	// with the error the pass returns. Queries that need it read every
 	// partition instead.
 	Invalid []string
 	// Deferred names indexes whose build (a storage unit's index), attach

@@ -1145,22 +1145,24 @@ clients until it finished. Each partition is built under an advisory lock
 (`HistoryIndexLockKey`), so overlapping leaders don't build on one table at once, which
 deadlocks. The build cannot run in a transaction, so the lock is held by a read
 committed transaction of its own that stays open, idle, on another connection; a
-session lock would not survive a transaction pooler. A build on an outcome table's
-`DEFAULT` partition also holds the lock keyed to that table, which partition creation
-under it tries without waiting, deferring the partition (§7.10) while the build
-runs: attaching a partition scans the `DEFAULT` partition under a lock that the build
-holds, while the build waits for the attach's transaction. Retention tries the same
-lock, and keeps the expired partitions (`HistoryMaintainResult.Kept`) while the
-table's `DEFAULT` partition is being built: a drop takes `ACCESS EXCLUSIVE` locks on
-the table and then on its `DEFAULT` partition, so it would hold every query of the
-table up while it waited for the build, which waits for the drop's snapshot in turn.
-Retention holds the lock only while it drops a partition, and creation only while it
-creates one, in share mode, which a build's exclusive hold conflicts with and an
-overlapping leader's retention or creation does not: a lock found held always means a
-build. The `DEFAULT` partition's build waits for it, under the doubling lock timeout
-of deferred partition work; one that times out, behind a transaction left open with
-the lock, is reported deferred (`HistoryIndexResult.Deferred`) rather than stall the
-pass, and every other leader's, behind the schema's build lock. A drop the deadlock
+session lock would not survive a transaction pooler. A build also holds the lock keyed
+to its outcome table: exclusively on the `DEFAULT` partition, in share mode elsewhere.
+Partition creation under the table tries it in share mode without waiting, deferring
+the partition (§7.10) while the `DEFAULT` partition is being built: attaching a
+partition scans the `DEFAULT` partition under a lock that the build holds, while the
+build waits for the attach's transaction. A build elsewhere does not conflict with the
+attach. Retention tries the same lock, and keeps the expired partitions
+(`HistoryMaintainResult.Kept`) while a build holds it: a drop takes `ACCESS EXCLUSIVE`
+locks on the table and then on the partition and the `DEFAULT` partition, so it would
+hold every query of the table up while it waited for a build on either, which waits for
+the drop's snapshot in turn. For a partition that has every index, which no build runs
+on, retention tries the lock in share mode, so that only the `DEFAULT` partition's
+build keeps it; for one that lacks some, which may be the one being built, it tries it
+exclusively. Retention holds the lock only while it drops a partition, and creation
+only while it creates one. A build waits for it, under the doubling lock timeout of
+deferred partition work; one that times out, behind a transaction left open with the
+lock, is reported deferred (`HistoryIndexResult.Deferred`) rather than stall the pass,
+and every other leader's, behind the schema's build lock. A drop the deadlock
 detector picks over a build waiting for its snapshot is deferred, and so is a build it
 picks over the drop, which has not committed when the build returns: the next pass
 finds the partition gone. A build cut short by
@@ -1175,8 +1177,7 @@ completes it, and retention drops the partitions past it as usual. Once the `DEF
 partition has it, retention keeps every partition that lacks it, not only the last,
 until its index is attached. Keeping needs no lock: a partition only ever goes from
 lacking an index to having it attached, so a list read before the drops keeps at
-worst a partition indexed since, which the next pass drops, and a build runs only on
-a partition that lacks its index, so none is dropped under its build. A drop that
+worst a partition indexed since, which the next pass drops. A drop that
 counts on the `DEFAULT` partition rechecks that it still lacks the index under the
 table's build lock, which the `DEFAULT` partition's build holds through its attach, at
 read committed whatever the session's default, so that it sees an attach that
@@ -1194,11 +1195,13 @@ earlier release left invalid is revalidated by attaching again the index of its
 furthest partition ahead, which no finalize writes to yet: releases from May 2026 on
 count the attached indexes anew. The pass first asks the server whether its
 attach counts anew, on tables of its own in the schema in a transaction it rolls back,
-rather than by its version, which forks number their own way, and asks again on each
-pass with an index to repair, so a server updated in place is repaired without a
-restart; where it does not, the index is reported invalid without locking the
+rather than by its version, which forks number their own way, once per server start
+(`pg_postmaster_start_time()`): a running server keeps its code until it restarts,
+which a minor update needs, and each question leaves dead catalog rows behind. Where
+the attach does not count anew, the index is reported invalid without locking the
 partition. A repair that fails, its question included, is reported as the pass's
-error once the indexes after it are built. The question's tables are named the same
+error once the indexes after it are built, and the index as invalid, so that the
+leader backs its retries off as it does the indexes the server cannot repair. The question's tables are named the same
 in every session, so another leader's question, or one that stalled, holds it off:
 it waits no longer than the attach's lock timeout below, and the repair is deferred. The attach waits for its locks under the same
 doubling timeout as deferred partition work (`HistoryIndexParams.LockTimeout`), since
@@ -1287,9 +1290,14 @@ fail the pass. A creation takes its attach's locks first, in statements of their
 so a `statement_timeout` that ends the attach itself, scanning a DEFAULT partition grown
 large, fails the pass, an error each maintenance interval, rather than be retried as a
 wait on every leader pass. A group whose maintenance fails, retention's read of its
-partitions' indexes included, leaves the other groups to theirs, and a failed read of
-the indexes leaves the group's partitions past retention, not its `DEFAULT` prune, to
-the next pass; the errors are reported together. Deferrals are logged at debug level, and as a warning from the fifth pass in a
+partitions' indexes included, leaves the other groups to theirs, and within a group a
+failed step leaves only the rest of that step to the next pass: a failed creation
+leaves the partitions after it, not the group's retention, and a failed read of the
+indexes or a failed drop leaves the partitions past retention, not its `DEFAULT`
+prune, so that a failure that lasts, such as an attach whose scan of a `DEFAULT`
+partition grown large outlasts `statement_timeout`, does not also stop the prune that
+lets it recover. The errors are reported together, and the leader logs what the
+pass did nonetheless. Deferrals are logged at debug level, and as a warning from the fifth pass in a
 row. Retention periods are set in `Config` and enforced by the leader, so the leader's
 settings apply cluster-wide.
 

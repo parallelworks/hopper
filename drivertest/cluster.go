@@ -488,11 +488,14 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	// A probe that fails, here on a table in its way, is reported once the
 	// pass has gone on to the indexes after it: both repairs report it, as
-	// a failed repair (driver.ErrHistoryIndexRepair), not a failed pass.
+	// a failed repair (driver.ErrHistoryIndexRepair), not a failed pass, and
+	// their indexes as invalid, for the leader to back off. The driver
+	// keeps a probe's answer until the server restarts, so this is its
+	// first: no repair has run before in this test.
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_unique'::regclass")
 	f.Exec(ctx, t, d, "CREATE TABLE hopper_revalidate_probe ()")
 	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); !errors.Is(err, driver.ErrHistoryIndexRepair) ||
-		strings.Count(err.Error(), "probe index revalidation") != 2 || len(res.Invalid)+len(res.Deferred) != 0 {
+		strings.Count(err.Error(), "probe index revalidation") != 2 || len(res.Invalid) != 2 || len(res.Deferred) != 0 {
 		t.Errorf("revalidation with its probe failing = %+v, %v", res, err)
 	}
 	f.Exec(ctx, t, d, "DROP TABLE hopper_revalidate_probe")
@@ -565,7 +568,7 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 		if !slices.Equal(res.Invalid, []string{"hopper_job_history_failed_ordering"}) {
 			t.Errorf("unrepairable indexes = %q", res.Invalid)
 		}
-		if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{Skip: res.Invalid}); err != nil || len(res.Invalid) != 0 {
+		if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{SkipRepair: res.Invalid}); err != nil || len(res.Invalid) != 0 {
 			t.Errorf("skipped unrepairable index reported = %+v, %v", res, err)
 		}
 	} else if len(res.Invalid) != 0 {
@@ -792,7 +795,8 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	// holdTableLock holds HistoryIndexLockKey combined with the failed
 	// table through lock: exclusively, as its DEFAULT partition's build
-	// does, or in share mode, as retention and partition creation do.
+	// does, or in share mode, as retention, partition creation and the
+	// builds of its time partitions do.
 	holdTableLock := func(lock string) <-chan struct{} {
 		t.Helper()
 		return holdLock(lock, buildLock, "hopper_job_history_failed")
@@ -852,6 +856,23 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("maintain beside another leader's retention = %+v, %v", res, err)
 	}
 	<-released
+
+	// A build of a time partition holds the table's lock in share mode:
+	// retention keeps a partition past it that lacks the index, which may be
+	// the one being built, rather than lock the table and wait for the
+	// build, though the DEFAULT partition lacks the index too.
+	unbuiltPast := redeclare("20000112")
+	released = holdTableLock("pg_advisory_xact_lock_shared")
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(failedOnly(res.Kept), unbuiltPast) || len(failedOnly(res.Dropped)) != 0 {
+		t.Errorf("maintain while a time partition is being built = %+v, %v", res, err)
+	}
+	<-released
+	if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(failedOnly(res.Dropped), unbuiltPast) || len(res.Kept) != 0 {
+		t.Errorf("maintain after the time partition's build = %+v, %v", res, err)
+	}
 
 	// A transaction left open holding the table's lock holds the DEFAULT
 	// partition's build off no longer than the lock timeout: the pass
