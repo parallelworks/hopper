@@ -905,7 +905,10 @@ type HistoryIndexResult struct {
 	// (the same, once built) or repair (an outcome table's) could not get its
 	// lock within LockTimeout, held off by a transaction that read or wrote
 	// the storage unit it locks, or that holds the unit's maintenance lock; a
-	// later pass retries them, without building a built index again.
+	// later pass retries them, without building a built index again. It also
+	// names the index a pass would have built next when another session
+	// holds the engine's build lock (another leader's pass, or one that
+	// stalled), which the pass does not wait for and ends at.
 	Deferred []string
 }
 

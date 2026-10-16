@@ -417,10 +417,8 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 				"Postgres repairs it from its May 2026 minor releases (18.4, 17.10, 16.14, 15.18, 14.23) on",
 				"index", name, "retry_in", retryIn(name, maxInvalidBackoffShift))
 		}
-		if len(res.Deferred) == 0 {
-			deferrals = 0
-		} else {
-			deferrals++
+		deferrals = nextDeferrals(deferrals, len(res.Deferred) > 0, err)
+		if len(res.Deferred) > 0 {
 			c.logger.Log(ctx, repeatLevel(deferrals), "hopper: history index work deferred: a transaction that used the partition, one left open with its maintenance lock, or another session's index pass held its lock",
 				"indexes", res.Deferred, "lock_timeout", timeout, "passes", deferrals)
 		}
@@ -495,6 +493,20 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	c.logger.Log(ctx, repeatLevel(c.ddlDeferrals), "hopper: history partitions deferred: a transaction that wrote history, or other history maintenance, held their lock",
 		"deferred", res.Deferred, "lock_timeout", timeout, "passes", c.ddlDeferrals)
 	return false
+}
+
+// nextDeferrals counts the passes in a row that deferred work, after a pass
+// that deferred some or not: a failed pass may have ended before the work
+// deferred last time, so it neither ends the run nor extends it, as
+// maintainHistory's failures leave its count.
+func nextDeferrals(n int, deferred bool, err error) int {
+	switch {
+	case deferred:
+		return n + 1
+	case err != nil:
+		return n
+	}
+	return 0
 }
 
 // repeatLevel is the level of a record about something that has lasted

@@ -1215,7 +1215,9 @@ func TestRetentionRechecksUnderStricterIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer pool.Close()
+	// Closed after held lets go of the lock, which a failed test leaves
+	// the drop waiting for on one of the pool's connections.
+	t.Cleanup(pool.Close)
 	type result struct {
 		res driver.HistoryMaintainResult
 		err error

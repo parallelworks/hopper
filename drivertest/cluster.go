@@ -407,9 +407,9 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	// built (here, before the reader, which a concurrent build would wait
 	// for): the pass reports it deferred without waiting for the reader,
 	// and leaves the index, valid, for a later pass to attach without
-	// building it again.
+	// building it again. The partition's other index is left for that pass
+	// too, rather than built for its attach to wait behind the same reader.
 	f.Exec(ctx, t, d, "CREATE INDEX hopper_job_history_failed_default_ordering ON hopper_job_history_failed_default (ordering_key, id) WHERE ordering_key IS NOT NULL")
-	f.Exec(ctx, t, d, "CREATE INDEX hopper_job_history_failed_default_unique ON hopper_job_history_failed_default (kind, unique_key, finalized_at) WHERE unique_key IS NOT NULL")
 	reader, commitReader, rollbackReader := f.Begin(ctx, t, d)
 	defer rollbackReader() //nolint:errcheck // already committed on the happy path
 	if _, err := d.UnwrapTx(reader).JobList(ctx, driver.JobListParams{Queue: "default", OrderingKey: "lane", Limit: 10}); err != nil {
@@ -418,8 +418,11 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	failedOnly := driver.HistoryIndexParams{Skip: []string{"hopper_job_history_completed_default"}, LockTimeout: 50 * time.Millisecond}
 	start := time.Now()
 	res, err := exec.HistoryIndex(ctx, failedOnly)
-	if err != nil || !slices.Equal(res.Deferred, []string{"hopper_job_history_failed_default_ordering", "hopper_job_history_failed_default_unique"}) {
+	if err != nil || !slices.Equal(res.Deferred, []string{"hopper_job_history_failed_default_ordering"}) {
 		t.Errorf("attach behind a reader = %+v, %v", res, err)
+	}
+	if v := f.QueryText(ctx, t, d, "SELECT (to_regclass('hopper_job_history_failed_default_unique') IS NULL)::text"); v != "true" {
+		t.Error("the partition's next index was built behind its deferred attach")
 	}
 	if took := time.Since(start); took > 5*time.Second {
 		t.Errorf("attach behind a reader took %s", took)
@@ -483,6 +486,17 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	repairs := reattachRevalidates(ctx, t, f, d)
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
 
+	// A probe that fails, here on a table in its way, is reported once the
+	// pass has gone on to the indexes after it: both repairs report it.
+	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_unique'::regclass")
+	f.Exec(ctx, t, d, "CREATE TABLE hopper_revalidate_probe ()")
+	if res, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err == nil ||
+		strings.Count(err.Error(), "probe index revalidation") != 2 || len(res.Invalid)+len(res.Deferred) != 0 {
+		t.Errorf("revalidation with its probe failing = %+v, %v", res, err)
+	}
+	f.Exec(ctx, t, d, "DROP TABLE hopper_revalidate_probe")
+	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = true WHERE indexrelid = 'hopper_job_history_failed_unique'::regclass")
+
 	// A transaction that read every history partition holds the re-attach
 	// off: where the attach repairs, the pass reports the index deferred,
 	// for the next to retry, without waiting for the reader; where it
@@ -517,15 +531,16 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	// A reader that cannot narrow by finalized_at reads that partition too,
 	// and holds the re-attach off for up to the lock timeout.
 	if repairs {
-		others := strings.Split(f.QueryText(ctx, t, d, `SELECT string_agg(format('(SELECT count(*) FROM %I)', c.relname), ',')
+		others := f.QueryText(ctx, t, d, `SELECT string_agg(format('(SELECT count(*) FROM %I)', c.relname), ', ')
 			FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid WHERE i.inhparent = 'hopper_job_history_failed'::regclass
 			  AND c.relname <> (SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-			    WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default')`), ",")
+			    WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default')`)
 		released := make(chan struct{})
 		go func() {
 			defer close(released)
-			f.Exec(ctx, t, d, "SELECT pg_sleep(2), "+strings.Join(others, ", "))
+			f.Exec(ctx, t, d, "SELECT pg_sleep(2), "+others)
 		}()
+		t.Cleanup(func() { <-released })
 		for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d, `SELECT EXISTS (SELECT FROM pg_locks
 			WHERE relation = 'hopper_job_history_failed_default_ordering'::regclass AND pid <> pg_backend_pid())::text`) != "true"; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
@@ -691,6 +706,9 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 			defer close(released)
 			f.Exec(ctx, t, d, "SELECT "+lock+"("+key+"), pg_sleep(2)", args...)
 		}()
+		// A test that stops early waits for the holder, whose own failure
+		// must be reported before the test ends.
+		t.Cleanup(func() { <-released })
 		for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
 			"SELECT (NOT pg_try_advisory_xact_lock("+key+"))::text", args...) != "true"; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
@@ -748,9 +766,16 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	// Partition creation likewise creates the furthest one ahead, dropped
 	// here, rather than defer it.
 	dropping := redeclare("20000109")
-	ahead := f.QueryText(ctx, t, d, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-		WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`)
-	f.Exec(ctx, t, d, "DROP TABLE "+ahead)
+	// dropAhead drops the failed table's partition furthest ahead, for
+	// partition creation to recreate, and returns its name.
+	dropAhead := func() string {
+		t.Helper()
+		ahead := f.QueryText(ctx, t, d, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+			WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`)
+		f.Exec(ctx, t, d, "DROP TABLE "+ahead)
+		return ahead
+	}
+	ahead := dropAhead()
 	releasedPartition := holdIndexLock("pg_advisory_xact_lock_shared", dropping[0])
 	releasedTable := holdIndexLock("pg_advisory_xact_lock_shared", "hopper_job_history_failed")
 	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(res.Dropped, dropping) || !slices.Equal(res.Created, []string{ahead}) ||
@@ -803,9 +828,7 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	// An overlapping leader that stalls while it holds the history
 	// maintenance lock holds partition creation off no longer than the lock
 	// timeout: the partition ahead is deferred, not waited for.
-	ahead = f.QueryText(ctx, t, d, `SELECT max(c.relname) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-		WHERE i.inhparent = 'hopper_job_history_failed'::regclass AND c.relname <> 'hopper_job_history_failed_default'`)
-	f.Exec(ctx, t, d, "DROP TABLE "+ahead)
+	ahead = dropAhead()
 	released = holdMaintenanceLock()
 	short := keep
 	short.LockTimeout = 50 * time.Millisecond

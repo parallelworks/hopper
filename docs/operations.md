@@ -58,7 +58,10 @@
   transaction in the database. A build that runs past the timeout is retried
   at doubling intervals with a warning; raise the timeout for hopper's role
   until the warnings stop. A timeout that ends a partition's creation or drop, or an
-  index's attach, while it waits for its locks defers that work like a lock timeout.
+  index's attach, while it waits for its locks defers that work like a lock timeout;
+  one that ends a partition's attach while it scans the DEFAULT partition, grown
+  large during a long leader outage, is logged as an error each maintenance
+  interval until the timeout is raised or the DEFAULT partition is pruned.
   Until a partition has its unique-key index, an insert
   with `UniqueOpts.Finished` reads that partition in full. Retention keeps the
   last partition without an index past its retention until it has one, logged
