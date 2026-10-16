@@ -110,7 +110,9 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.Time, keep time.Duration, lockTimeout string, res *driver.HistoryMaintainResult) error {
 	existing, err := e.partitionsOf(ctx, g.parent)
 	if err != nil {
-		return err
+		// Without the list, neither the partitions ahead nor those past
+		// retention are known, but the DEFAULT partition's prune needs none.
+		return errors.Join(err, e.pruneDefault(ctx, g, keep, res))
 	}
 	var errs []error
 
@@ -188,17 +190,25 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 				res.Deferred = append(res.Deferred, name)
 			}
 		}
-		// Rows in the DEFAULT partition cannot be dropped by period.
-		n, err := e.Conn.Exec(ctx,
-			fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", e.Schema.Table(g.parent+"_default"), g.timeColumn),
-			keep.Seconds())
-		if err != nil {
-			errs = append(errs, fmt.Errorf("hopper: prune %s_default: %w", g.parent, err))
-		} else {
-			res.Pruned += n
-		}
 	}
-	return errors.Join(errs...)
+	return errors.Join(append(errs, e.pruneDefault(ctx, g, keep, res))...)
+}
+
+// pruneDefault deletes the rows of g's DEFAULT partition past retention,
+// keep, which cannot be dropped by period, adding their count to res. A zero
+// keep keeps everything.
+func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.Duration, res *driver.HistoryMaintainResult) error {
+	if keep <= 0 {
+		return nil
+	}
+	n, err := e.Conn.Exec(ctx,
+		fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", e.Schema.Table(g.parent+"_default"), g.timeColumn),
+		keep.Seconds())
+	if err != nil {
+		return fmt.Errorf("hopper: prune %s_default: %w", g.parent, err)
+	}
+	res.Pruned += n
+	return nil
 }
 
 // defaultDDLLockTimeout bounds how long a partition's creation or drop, a
@@ -552,14 +562,16 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 			continue
 		}
 		invalid, deferred, err := e.revalidateIndex(ctx, parentIndex, lockTimeout, probe)
-		switch {
-		case err != nil:
+		if err != nil {
 			// A repair that fails, its probe included, is reported once the
 			// indexes after it are built, and the index, which stays
-			// invalid, with the indexes the server cannot repair, so that
-			// the leader backs its retries off alike.
+			// invalid (revalidateIndex reports it so), with the indexes the
+			// server cannot repair, so that the leader backs its retries off
+			// alike. A failed check of whether the index is invalid at all
+			// reports only its error.
 			repairErr = errors.Join(repairErr, err)
-			res.Invalid = append(res.Invalid, parentIndex)
+		}
+		switch {
 		case invalid:
 			res.Invalid = append(res.Invalid, parentIndex)
 		case deferred:
@@ -690,10 +702,11 @@ func (e *Executor) buildHistoryIndex(ctx context.Context, x historyIndex, leaf, 
 				return fmt.Errorf("%w: %s: %w", errStatementTimeout, leaf, err)
 			}
 			if deadlocked(err) {
-				// The deadlock detector chose the build over retention's drop
-				// of the partition, which commits after this returns; a later
-				// pass finds the partition gone, or drops the invalid index
-				// the build left and builds it again.
+				// The deadlock detector chose the build over another
+				// statement, usually retention's drop of the partition, which
+				// commits after this returns; a later pass finds the
+				// partition gone, or drops the invalid index the build left
+				// and builds it again, whatever the other statement was.
 				return fmt.Errorf("%w: %s: %w", errBuildDeferred, leaf, err)
 			}
 			return fmt.Errorf("hopper: index partition %s: %w", leaf, err)
@@ -750,7 +763,8 @@ func (e *Executor) attachIndex(ctx context.Context, parentIndex, index, lockTime
 // to yet and retention does not drop, picked by the partition's name rather
 // than its index's, which Postgres may have truncated: the attach locks the
 // index exclusively, which would hold up the finalizes into the current
-// period's partition. probe is the pass's reattachRevalidates.
+// period's partition. probe is the pass's reattachRevalidates. A repair that
+// fails once the index is found invalid reports it invalid with its error.
 func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout string, probe func() (bool, error)) (invalid, deferred bool, err error) {
 	var child sql.NullString
 	err = e.Conn.QueryRow(ctx, `
@@ -776,7 +790,7 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout
 		if waitEnded(ctx, err) {
 			return false, true, nil
 		}
-		return false, false, err
+		return true, false, err
 	}
 	if !repairs {
 		return true, false, nil
@@ -788,12 +802,12 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout
 		case undefinedTable(err):
 			return false, false, nil
 		}
-		return false, false, err
+		return true, false, err
 	}
 	var valid bool
 	if err := e.Conn.QueryRow(ctx, "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
 		e.Schema.Table(parentIndex)).Scan(&valid); err != nil {
-		return false, false, fmt.Errorf("hopper: check index %s: %w", parentIndex, err)
+		return true, false, fmt.Errorf("hopper: check index %s: %w", parentIndex, err)
 	}
 	return !valid, false, nil
 }
@@ -813,7 +827,9 @@ func (e *Executor) revalidateIndex(ctx context.Context, parentIndex, lockTimeout
 // mid-probe does not stall this one's pass.
 func (e *Executor) reattachRevalidates(ctx context.Context, lockTimeout string) (valid bool, err error) {
 	var start string
-	if err := e.Conn.QueryRow(ctx, "SELECT pg_postmaster_start_time()::text || ' ' || version()").Scan(&start); err != nil {
+	// The start time as epoch seconds, which, unlike its text, does not
+	// depend on the session's TimeZone or DateStyle.
+	if err := e.Conn.QueryRow(ctx, "SELECT extract(epoch FROM pg_postmaster_start_time())::text || ' ' || version()").Scan(&start); err != nil {
 		return false, fmt.Errorf("hopper: probe index revalidation: %w", err)
 	}
 	if v, ok := e.Schema.revalidates.Load(start); ok {

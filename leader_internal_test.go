@@ -1,11 +1,14 @@
 package hopper
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/parallelworks/hopper/driver"
 )
@@ -103,5 +106,44 @@ func TestNextIndexRuns(t *testing.T) {
 		if d, b := nextIndexRuns(4, 2, c.res, c.err); d != c.wantDeferrals || b != c.wantBusy {
 			t.Errorf("%s: nextIndexRuns(4, 2) = %d, %d, want %d, %d", c.name, d, b, c.wantDeferrals, c.wantBusy)
 		}
+	}
+}
+
+// maintainExec answers HistoryMaintain with res and err, and records the lock
+// timeouts it is asked for.
+type maintainExec struct {
+	driver.Executor
+	res      driver.HistoryMaintainResult
+	err      error
+	timeouts []time.Duration
+}
+
+func (e *maintainExec) HistoryMaintain(_ context.Context, p driver.HistoryMaintainParams) (driver.HistoryMaintainResult, error) {
+	e.timeouts = append(e.timeouts, p.LockTimeout)
+	return e.res, e.err
+}
+
+// A pass that failed in one group but deferred work in another lengthens the
+// next try's lock timeout, as a pass without a failure does, so that a
+// failure that lasts does not hold the other groups' deferred work at the
+// shortest timeout for good; it is still retried at the next maintenance
+// interval rather than on every leader pass. A failed pass that deferred
+// nothing leaves the count.
+func TestMaintainHistoryCountsDeferralsPastFailure(t *testing.T) {
+	ctx := context.Background()
+	exec := &maintainExec{res: driver.HistoryMaintainResult{Deferred: []string{"p"}}, err: errors.New("another group failed")}
+	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.DiscardHandler), tuning: defaultTuning}
+	for range 3 {
+		if !c.maintainHistory(ctx) {
+			t.Fatal("a failed pass asked to be retried on the next leader pass")
+		}
+	}
+	exec.res = driver.HistoryMaintainResult{}
+	c.maintainHistory(ctx)
+	exec.err = nil
+	c.maintainHistory(ctx)
+	want := []time.Duration{ddlLockTimeout(0), ddlLockTimeout(1), ddlLockTimeout(2), ddlLockTimeout(3), ddlLockTimeout(3)}
+	if !slices.Equal(exec.timeouts, want) || c.ddlDeferrals != 0 {
+		t.Errorf("lock timeouts = %v, then %d deferrals; want %v, then 0", exec.timeouts, c.ddlDeferrals, want)
 	}
 }

@@ -1186,7 +1186,7 @@ committed before the lock was free. A pass builds the partitions newest first an
 `DEFAULT` partition does too, and partitions that expire before the pass reaches them
 are dropped rather than built. The cost is building, once after an upgrade declared
 an index, the partitions past retention that a pass left out (timed out or deferred)
-while it indexed the `DEFAULT` partition. Once every index is valid, or no partition lacks an invalid one (an index
+while it indexed the `DEFAULT` partition. Known costs, kept for the simpler lock model: while any build of the table runs, retention keeps every expired partition that lacks an index, so a long pass after an upgrade can build a partition that expires during it before dropping it (a lock per partition would let it drop instead, at the cost of a second lock protocol); retention keeps such partitions even where the server can revalidate the index, so that the rule does not depend on the probe below; and while the `DEFAULT` partition is being built, each expired partition that lacks an index still tries the table's lock once per pass before it is kept. A build the deadlock detector cancels leaves its invalid index until the next pass drops and builds it again, whichever statement it deadlocked with. Once every index is valid, or no partition lacks an invalid one (an index
 an earlier release left invalid, below), nothing is kept. The leader logs kept
 partitions at Info once per maintenance interval: a kept partition only
 waits for its build, and every way a build fails already warns, a timeout each time,
@@ -1201,7 +1201,8 @@ which a minor update needs, and each question leaves dead catalog rows behind. W
 the attach does not count anew, the index is reported invalid without locking the
 partition. A repair that fails, its question included, is reported as the pass's
 error once the indexes after it are built, and the index as invalid, so that the
-leader backs its retries off as it does the indexes the server cannot repair. The question's tables are named the same
+leader backs its retries off as it does the indexes the server cannot repair; a failed
+check of whether the index is invalid at all is reported only as the error. The question's tables are named the same
 in every session, so another leader's question, or one that stalled, holds it off:
 it waits no longer than the attach's lock timeout below, and the repair is deferred. The attach waits for its locks under the same
 doubling timeout as deferred partition work (`HistoryIndexParams.LockTimeout`), since
@@ -1292,12 +1293,16 @@ large, fails the pass, an error each maintenance interval, rather than be retrie
 wait on every leader pass. A group whose maintenance fails, retention's read of its
 partitions' indexes included, leaves the other groups to theirs, and within a group a
 failed step leaves only the rest of that step to the next pass: a failed creation
-leaves the partitions after it, not the group's retention, and a failed read of the
+leaves the partitions after it, not the group's retention, a failed read of the
 indexes or a failed drop leaves the partitions past retention, not its `DEFAULT`
+prune, and a failed listing of the group's partitions leaves everything but that
 prune, so that a failure that lasts, such as an attach whose scan of a `DEFAULT`
 partition grown large outlasts `statement_timeout`, does not also stop the prune that
 lets it recover. The errors are reported together, and the leader logs what the
-pass did nonetheless. Deferrals are logged at debug level, and as a warning from the fifth pass in a
+pass did nonetheless. A failed pass is retried at the next maintenance interval, its
+deferred work with it, but work it deferred lengthens the next try's lock timeout as
+on a pass without a failure, so that a failure that lasts does not hold the other
+groups' deferred work at the shortest timeout for good. Deferrals are logged at debug level, and as a warning from the fifth pass in a
 row. Retention periods are set in `Config` and enforced by the leader, so the leader's
 settings apply cluster-wide.
 

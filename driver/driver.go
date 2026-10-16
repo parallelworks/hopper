@@ -875,8 +875,11 @@ type HistoryMaintainResult struct {
 	// Kept names storage units past retention that wait for HistoryIndex to
 	// build their index: those an invalid index of their outcome table
 	// lacks that its DEFAULT unit already has, which dropping first could
-	// leave that index unable to complete, and while the build of the outcome table's DEFAULT
-	// partition is under way, every one past retention. A later pass drops
+	// leave that index unable to complete. While the build of the outcome
+	// table's DEFAULT partition is under way, every one past retention is
+	// kept, and while a build of another of its partitions, or another
+	// leader's retention or partition creation, holds the table's index
+	// build lock, every one that lacks an invalid index. A later pass drops
 	// them.
 	Kept []string
 	// Pruned counts rows deleted individually, outside partition drops.

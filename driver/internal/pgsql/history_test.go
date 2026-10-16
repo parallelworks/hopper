@@ -71,18 +71,39 @@ func TestReattachRevalidatesOncePerStart(t *testing.T) {
 
 // A probe that fails is reported, rather than leave the repair to an attach
 // that queues the partition's queries behind it on a server that may not
-// repair.
+// repair, and so is the index, which stays invalid.
 func TestRevalidateIndexReportsProbeFailure(t *testing.T) {
 	var probes int
 	var execs []string
 	e := &Executor{Conn: probeConn{probes: &probes, execs: &execs}, Schema: NewSchema("")}
 	failed := func() (bool, error) { return false, errors.New("probe statement rejected") }
 	invalid, deferred, err := e.revalidateIndex(context.Background(), "hopper_job_history_failed_ordering", "200ms", failed)
-	if err == nil || invalid || deferred {
+	if err == nil || !invalid || deferred {
 		t.Fatalf("revalidateIndex after a failed probe = %v, %v, %v", invalid, deferred, err)
 	}
 	if slices.ContainsFunc(execs, func(q string) bool { return strings.Contains(q, "ATTACH PARTITION") }) {
 		t.Errorf("attach after a failed probe: %q", execs)
+	}
+}
+
+// checkFailConn lists no unindexed partition and fails every single-row
+// query, as a failed read of whether an index is invalid at all does.
+type checkFailConn struct{ Conn }
+
+func (checkFailConn) Query(context.Context, string, ...any) (Rows, error) { return &stringRows{}, nil }
+
+func (checkFailConn) QueryRow(context.Context, string, ...any) Row {
+	return probeRow(func(...any) error { return errors.New("connection reset") })
+}
+
+// A failed check of whether an index is invalid is reported as a failed
+// repair alone: the index, which may well be valid, is not reported invalid,
+// which the leader would warn the server cannot repair.
+func TestHistoryIndexCheckFailureIsNotInvalid(t *testing.T) {
+	e := &Executor{Conn: checkFailConn{}, Schema: NewSchema("")}
+	res, err := e.HistoryIndex(context.Background(), driver.HistoryIndexParams{})
+	if !errors.Is(err, driver.ErrHistoryIndexRepair) || len(res.Invalid) != 0 {
+		t.Fatalf("HistoryIndex with its index checks failing = %+v, %v", res, err)
 	}
 }
 
@@ -207,6 +228,8 @@ type maintainConn struct {
 	now      time.Time
 	execs    *[]string
 	failExec string
+	// failList fails the listing of the failed table's partitions.
+	failList bool
 }
 
 func (c maintainConn) Begin(context.Context) (Tx, error) { return maintainTx{c}, nil }
@@ -233,6 +256,8 @@ func (c maintainConn) QueryRow(_ context.Context, sql string, _ ...any) Row {
 
 func (c maintainConn) Query(_ context.Context, sql string, args ...any) (Rows, error) {
 	switch {
+	case c.failList && strings.Contains(sql, "pg_inherits") && args[0] == NewSchema("").Table("hopper_job_history_failed"):
+		return nil, codedError("XX000")
 	case strings.Contains(sql, "NOT x.indisvalid") && c.failExec == "":
 		return nil, codedError("57014")
 	case strings.Contains(sql, "pg_inherits") && args[0] == NewSchema("").Table("hopper_job_history_failed"):
@@ -301,5 +326,23 @@ func TestHistoryMaintainGoesPastCreateError(t *testing.T) {
 		return strings.Contains(q, "DELETE FROM") && strings.Contains(q, "hopper_job_history_failed_default")
 	}) {
 		t.Error("the failed table's DEFAULT partition was not pruned after a failed creation")
+	}
+}
+
+// A failed listing of a group's partitions leaves its partitions ahead and
+// past retention to the next pass, but not its DEFAULT prune, which needs no
+// list.
+func TestHistoryMaintainPrunesPastListError(t *testing.T) {
+	var execs []string
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	e := &Executor{Conn: maintainConn{now: now, execs: &execs, failList: true}, Schema: NewSchema("")}
+	_, err := e.HistoryMaintain(context.Background(), driver.HistoryMaintainParams{FailedRetention: time.Hour})
+	if sqlState(err) != "XX000" {
+		t.Errorf("HistoryMaintain error = %v, want the listing's", err)
+	}
+	if !slices.ContainsFunc(execs, func(q string) bool {
+		return strings.Contains(q, "DELETE FROM") && strings.Contains(q, "hopper_job_history_failed_default")
+	}) {
+		t.Error("the failed table's DEFAULT partition was not pruned after a failed listing")
 	}
 }

@@ -472,7 +472,10 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	// Each group is maintained on its own, so a pass that failed in one may
 	// still have done the others' work, which is logged as usual. It is
 	// retried at the next maintenance interval, its deferred work with it,
-	// rather than on every leader pass.
+	// rather than on every leader pass, but work it deferred still lengthens
+	// the next try's lock timeout: a failure that lasts must not hold the
+	// other groups' deferred work at the shortest timeout for good.
+	c.ddlDeferrals = nextDeferrals(c.ddlDeferrals, len(res.Deferred) > 0, err != nil)
 	if err != nil && ctx.Err() == nil {
 		c.logger.ErrorContext(ctx, "hopper: maintain history", "error", err, "deferred", res.Deferred)
 	}
@@ -485,17 +488,12 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	// left out, without silencing a run of them that outlasts the interval.
 	if len(res.Kept) > 0 && time.Since(c.keptLogged) >= c.tuning.maintenanceInterval {
 		c.keptLogged = time.Now()
-		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built, or while their table's DEFAULT partition's is",
+		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built, or while an index build or another leader's maintenance holds their table's index build lock",
 			"kept", res.Kept)
 	}
-	if err != nil {
+	if err != nil || len(res.Deferred) == 0 {
 		return true
 	}
-	if len(res.Deferred) == 0 {
-		c.ddlDeferrals = 0
-		return true
-	}
-	c.ddlDeferrals++
 	c.logger.Log(ctx, repeatLevel(c.ddlDeferrals), "hopper: history partitions deferred: a transaction that wrote history, or other history maintenance, held their lock",
 		"deferred", res.Deferred, "lock_timeout", timeout, "passes", c.ddlDeferrals)
 	return false
@@ -504,8 +502,8 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 // nextDeferrals counts the passes in a row that deferred work, after a pass
 // that deferred some or not: a pass that ended early (failed, or held off by
 // another session's build lock) may have ended before the work deferred last
-// time, so it neither ends the run nor extends it, as maintainHistory's
-// failures leave its count.
+// time, so it neither ends the run nor extends it unless it deferred work
+// itself. maintainHistory counts its passes the same way.
 func nextDeferrals(n int, deferred, endedEarly bool) int {
 	switch {
 	case deferred:
@@ -554,6 +552,9 @@ func notDue(backoffs map[string]indexBackoff) []string {
 // skipping them, without reporting them again, so that a later failure
 // starts over at the shortest wait. A pass that failed, was held off or
 // deferred work may not have reached them, and forgets none.
+// An index whose repair found its partition ahead dropped mid-pass, which
+// only an operator's DROP does, is settled as if it had been repaired; its
+// next failure starts the backoff again.
 func settleBackoffs(backoffs map[string]indexBackoff, skipped, reported []string, res driver.HistoryIndexResult, err error) {
 	if indexPassFailed(err) || res.Busy != "" || len(res.Deferred) > 0 {
 		return
