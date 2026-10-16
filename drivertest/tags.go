@@ -921,3 +921,62 @@ func testTagsFollowTruncate[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("listing by tag after the truncates = %v, %v", jobs, err)
 	}
 }
+
+// testTagsPagePastFilteredHistory lists by tag and by a kind that the first
+// thirty finished jobs with the tag lack, in pages smaller than that. The
+// walk of history's tags rows returns a page of keys, whose jobs the filter
+// then drops, so each page walks on until it is full: every job of the kind,
+// three finished and one live, is listed once, in order, in both directions.
+func testTagsPagePastFilteredHistory[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	tagged := func(kind string, n int) []driver.JobInsertParams {
+		p := params(kind, n)
+		for i := range p {
+			p[i].Tags = []string{"p", "q"}
+		}
+		return p
+	}
+	insert(ctx, t, exec, tagged("skip", 30))
+	var want []driver.JobID
+	for _, r := range insert(ctx, t, exec, tagged("want", 3)) {
+		want = append(want, r.Job.ID)
+	}
+	clientID := register(ctx, t, exec)
+	for _, j := range claim(ctx, t, exec, clientID, 33) {
+		finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	}
+	want = append(want, insert(ctx, t, exec, tagged("want", 1))[0].Job.ID)
+	for _, c := range []struct {
+		name string
+		p    driver.JobListParams
+	}{
+		{"any", driver.JobListParams{TagsAny: []string{"p"}}},
+		{"all", driver.JobListParams{TagsAll: []string{"p", "q"}}},
+		{"any newest first", driver.JobListParams{TagsAny: []string{"p"}, NewestFirst: true}},
+	} {
+		c.p.Kinds, c.p.Limit = []string{"want"}, 2
+		var got []driver.JobID
+		for range 10 {
+			page, err := exec.JobList(ctx, c.p)
+			if err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			if len(page) == 0 {
+				break
+			}
+			for _, j := range page {
+				got = append(got, j.ID)
+			}
+			c.p.After = page[len(page)-1].ID
+		}
+		expected := slices.Clone(want)
+		if c.p.NewestFirst {
+			slices.Reverse(expected)
+		}
+		if !slices.Equal(got, expected) {
+			t.Errorf("%s: listed %v, want %v", c.name, got, expected)
+		}
+	}
+}

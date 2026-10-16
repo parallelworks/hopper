@@ -1,12 +1,15 @@
 package pgsql
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -938,53 +941,51 @@ func rarestTagSQL(param, schemaParam, n int, tables []string) (with, tag string)
 // table even when it takes the tag for a common one.
 const rarestTagCap = 1000
 
-// tagArms returns a tag listing's arms over the live (or the history) table:
-// for each of the n tags in the array parameter $param, the tag's rows of the
-// tags table past the cursor $4 in listing order, each job looked up by its
-// key with jobs, the arm's job query and filter, until the page is full.
-// A page then reads about as many rows as it holds, however common the tags
-// are, and the page's jobs are among each arm's. A job with several of the
-// tags comes from each of their arms, so a listing with more than one arm
-// per table merges them with DISTINCT ON (id): each arm still reads at most
-// a page, however much the tags overlap, where leaving an earlier tag's jobs
-// out of each later arm walked the whole range of a tag whose jobs mostly
-// have an earlier one too. A single tag may be given as an SQL expression,
-// tag, instead.
+// tagJobsSQL returns a tag listing's arm over the live table, or over
+// history in a single statement: each tag of source, a FROM item with a tag
+// column, walks its rows of the tags table past the cursor $4 in listing
+// order, each job looked up by its key with jobs, the arm's job query and
+// filter, until the page is full, and the walks are merged, a job with
+// several of the tags once. A page then reads about as many rows a tag as
+// it holds, however common the tags are and however much they overlap. The
+// tags are a row source rather than an arm each, so that the plan, one walk
+// and one lookup, is the same however many tags are listed: an arm a tag
+// planned the lookup, and in history every partition, once for each.
 //
 // The walk is ordered and limited in the same query as the lookup, so that
-// the planner merges history's partitions in index order even when it takes
-// the tag for a rare one, as a generic plan does; ordering a subquery's walk
-// sorted every row of the tag past the cursor. The OFFSET 0 keeps it from
-// joining the walk to a scan of the whole job table instead, and from
-// narrowing the walk by the job query's filter: narrow adds to the walk's
-// own WHERE what the tags table holds beside the tag (tagWalk).
+// the planner merges the tags table's partitions in index order even when it
+// takes the tag for a rare one, as a generic plan does; ordering a
+// subquery's walk sorted every row of the tag past the cursor. The OFFSET 0
+// keeps it from joining the walk to a scan of the whole job table instead,
+// and from narrowing the walk by the job query's filter: narrow adds to the
+// walk's own WHERE what the tags table holds beside the tag (tagWalk).
 //
 // The lookup also checks the walked tag on the job's own row, which it has
 // read already, so that a tags row the column no longer holds lists nothing:
 // a TRUNCATE of one of history's partitions fires none of history's
 // triggers, which keep its tags rows, and a write with the triggers
 // disabled fires none at all.
-func tagArms(param, n int, newestFirst bool, tag, jobs, order string, walk tagWalk) []string {
-	cmp := ">"
-	if newestFirst {
-		cmp = "<"
-	}
+func tagJobsSQL(source string, w tagWalk, jobs, op, order string) string {
 	match := " AND id = t.id AND tags ? t.tag"
-	if walk.history {
+	if w.history {
 		match = " AND state = t.state AND finalized_at = t.finalized_at AND id = t.id AND tags ? t.tag"
 	}
-	walkOrder := strings.Replace(order, "ORDER BY id", "ORDER BY t.id", 1)
-	arms := make([]string, n)
-	for k := range n {
-		expr := fmt.Sprintf("($%d::text[])[%d]", param, k+1)
-		if tag != "" {
-			expr = tag
-		}
-		arms[k] = fmt.Sprintf("SELECT j.* FROM {{schema}}.%s t CROSS JOIN LATERAL (%s%s OFFSET 0) j WHERE t.tag = %s AND t.id %s $4::uuid%s",
-			walk.table, jobs, match, expr, cmp, walk.narrow) + walkOrder
-	}
-	return arms
+	return fmt.Sprintf("SELECT DISTINCT ON (j.id) j.* FROM %s CROSS JOIN LATERAL (SELECT j.* FROM {{schema}}.%s t CROSS JOIN LATERAL (%s%s OFFSET 0) j WHERE t.tag = u.tag AND t.id %s $4::uuid%s%s) j",
+		source, w.table, jobs, match, op, w.narrow, walkOrder(order)) + order
 }
+
+// tagKeysSQL returns the walk of history's tags rows for the tags of source
+// past the cursor, the expression cursor, in listing order: the key (id,
+// state, finalized_at) of each job with one of them, a page of them at most,
+// each job once. listTagsHistory reads the jobs themselves by those keys.
+func tagKeysSQL(source string, w tagWalk, op, cursor, order string) string {
+	return fmt.Sprintf("SELECT DISTINCT ON (t.id) t.id, t.state::text AS state, t.finalized_at FROM %s CROSS JOIN LATERAL (SELECT t.id, t.state, t.finalized_at FROM {{schema}}.%s t WHERE t.tag = u.tag AND t.id %s %s%s%s) t",
+		source, w.table, op, cursor, w.narrow, walkOrder(order)) + walkOrder(order)
+}
+
+// walkOrder is a listing's ORDER BY and LIMIT for the walk of a tags table,
+// aliased t.
+func walkOrder(order string) string { return strings.Replace(order, "ORDER BY id", "ORDER BY t.id", 1) }
 
 // tagWalk is the tags table a listing's arms over the live table or history
 // walk, and the conditions on its rows that narrow the walk to the jobs the
@@ -1098,15 +1099,16 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	if len(params.Metadata) > 0 {
 		where("metadata @> $%d::jsonb", string(params.Metadata))
 	}
-	// A tag listing walks the tags tables in ID order from the cursor, one
-	// tag at a time: TagsAll's rarest tag, the rest checked on the job's row,
-	// or each of TagsAny's.
+	// A tag listing walks the tags tables in ID order from the cursor:
+	// TagsAll its rarest tag, the rest checked on the job's row, and TagsAny
+	// each of its tags.
 	var (
-		walk func(jobs string, w tagWalk) []string
-		with string
-		// merge is set when a job can come from more than one arm of a
-		// table: TagsAny's arms, one per tag.
-		merge bool
+		// source is the walked tags as a FROM item with a tag column, which
+		// tagJobsSQL and tagKeysSQL join to their walk.
+		source, with, tagExpr string
+		// walked is the parameter of the tags the walk takes them from, for
+		// the job's row to be checked against.
+		walked int
 	)
 	// Repeats are dropped: each of TagsAll's would be counted again to choose
 	// the rarest, and each of TagsAny's would walk its range again, so a
@@ -1115,9 +1117,10 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	switch {
 	case len(tagsAll) > 0:
 		args = append(args, textArray(tagsAll))
-		all, schema := len(args), 0
+		walked = len(args)
+		schema := 0
 		if len(tagsAll) > 1 {
-			filter += fmt.Sprintf(" AND tags ?& $%d::text[]", all)
+			filter += fmt.Sprintf(" AND tags ?& $%d::text[]", walked)
 			args = append(args, e.Schema.Name)
 			schema = len(args)
 		}
@@ -1131,46 +1134,55 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 		if history {
 			tables = append(tables, historyWalk.table)
 		}
-		var tag string
-		with, tag = rarestTagSQL(all, schema, len(tagsAll), tables)
-		walk = func(jobs string, w tagWalk) []string {
-			return tagArms(all, 1, params.NewestFirst, tag, jobs, order, w)
-		}
+		with, tagExpr = rarestTagSQL(walked, schema, len(tagsAll), tables)
+		source = "(SELECT " + tagExpr + ") u(tag)"
 	case len(tagsAny) > 0:
 		args = append(args, textArray(tagsAny))
-		anyTags := len(args)
-		merge = len(tagsAny) > 1
-		walk = func(jobs string, w tagWalk) []string {
-			return tagArms(anyTags, len(tagsAny), params.NewestFirst, "", jobs, order, w)
+		walked = len(args)
+		source = fmt.Sprintf("unnest($%d::text[]) u(tag)", walked)
+	}
+	op := ">"
+	if params.NewestFirst {
+		op = "<"
+	}
+	run := func(c Conn) ([]*driver.JobRow, error) {
+		if source != "" && history && !e.InTx {
+			l := tagListing{
+				with: with, tagExpr: tagExpr, source: source, walked: walked, walk: historyWalk,
+				filter: filter, op: op, order: order, limit: max(params.Limit, 1), newestFirst: params.NewestFirst, after: after,
+			}
+			if live {
+				l.liveArm = func(source string) string { return tagJobsSQL(source, liveWalk, jobListLiveSQL+filter, op, order) }
+			}
+			return e.listTagsHistory(ctx, c, l, args)
 		}
-	}
-	var arms []string
-	switch {
-	case live && walk != nil:
-		arms = append(arms, walk(jobListLiveSQL+filter, liveWalk)...)
-	case live && params.OrderingKey == "":
-		arms = append(arms, jobListLiveSQL+filter+order)
-	case live:
-		arms = append(arms, jobListLiveSQL+filter+jobListKeyedSQL+order, jobListLiveSQL+filter+jobListPendingSQL+order)
-	}
-	if history && walk != nil {
-		arms = append(arms, walk(jobListHistorySQL+filter, historyWalk)...)
-	} else if history {
-		arms = append(arms, jobListHistorySQL+filter+order)
-	}
-	query := arms[0]
-	if len(arms) > 1 {
-		query = "(" + strings.Join(arms, ") UNION ALL (") + ")"
-		if merge {
-			// A job is in the live table or in history, never both, so
-			// its copies are equal rows; any one of them will do.
-			query = "SELECT DISTINCT ON (id) * FROM (" + query + ") u"
+		var arms []string
+		switch {
+		case live && source != "":
+			arms = append(arms, tagJobsSQL(source, liveWalk, jobListLiveSQL+filter, op, order))
+		case live && params.OrderingKey == "":
+			arms = append(arms, jobListLiveSQL+filter+order)
+		case live:
+			arms = append(arms, jobListLiveSQL+filter+jobListKeyedSQL+order, jobListLiveSQL+filter+jobListPendingSQL+order)
 		}
-		query += order
+		// In the caller's transaction, whose snapshot need not last from one
+		// statement to the next (read committed), history's jobs are looked
+		// up in the listing's own statement, which plans every partition of
+		// history (see listTagsHistory).
+		switch {
+		case history && source != "":
+			arms = append(arms, tagJobsSQL(source, historyWalk, jobListHistorySQL+filter, op, order))
+		case history:
+			arms = append(arms, jobListHistorySQL+filter+order)
+		}
+		query := arms[0]
+		if len(arms) > 1 {
+			query = "(" + strings.Join(arms, ") UNION ALL (") + ")" + order
+		}
+		// The query's text varies with the filters, so it is expanded without
+		// the schema's cache, which keeps every text it is given.
+		return historyJobs(c.Query(ctx, e.Schema.expand(with+query), args...))
 	}
-	// The query's text varies with the filters, so it is expanded without
-	// the schema's cache, which keeps every text it is given.
-	query = e.Schema.expand(with + query)
 	// In the caller's transaction, a filter the server refuses would abort
 	// it, though the error says only that the filter was invalid; a
 	// savepoint (withTx, which rolls back to it even when ctx is done) keeps
@@ -1183,11 +1195,11 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	if e.InTx && refusable(params, states, tagsAll, tagsAny) {
 		err = e.withTx(ctx, func(tx Tx) error {
 			var qerr error
-			jobs, qerr = historyJobs(tx.Query(ctx, query, args...))
+			jobs, qerr = run(tx)
 			return qerr
 		})
 	} else {
-		jobs, err = historyJobs(e.Conn.Query(ctx, query, args...))
+		jobs, err = run(e.Conn)
 	}
 	if err != nil {
 		if code := sqlState(err); strings.HasPrefix(code, "22") || code == "54001" {
@@ -1199,6 +1211,205 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	}
 	return jobs, nil
 }
+
+// tagListing is what listTagsHistory needs of a tag listing that reads
+// history: the walked tags (source, from the parameter walked, TagsAll's
+// chosen by with and tagExpr), the live table's arm for a given source, when
+// the listing reads that table, and history's tags walk and job filter.
+type tagListing struct {
+	with, tagExpr, source string
+	walked                int
+	liveArm               func(source string) string
+	walk                  tagWalk
+	filter, op, order     string
+	limit                 int
+	newestFirst           bool
+	after                 driver.JobID
+}
+
+// listTagsHistory lists a page by tags that reads history, in statements
+// that each plan only what they read. A lookup of history's jobs in the
+// walk's own statement plans a scan of each of history's partitions, and so
+// costs as much as the partitions a retention keeps (720 hourly ones for a
+// month), whatever the page reads. The walk of history's tags rows
+// (tagKeysSQL), partitioned by day, returns each job's key (id, state,
+// finalized_at) instead, and a second statement reads the live table's arm
+// and those jobs, whose states and times it is given as constants, from
+// which the planner keeps only the partitions they are in. The statements
+// run in one read-only transaction at repeatable read, whose snapshot they
+// share: a job moved between the live table and history in between would
+// otherwise be missed by both or listed from both.
+//
+// The second statement filters the walked jobs on what the tags rows do not
+// hold (the queue, kind, metadata and the rest), so a page can come up short
+// of the walk's; the walk then goes on from its last key, for history alone,
+// until the page is full or the tags' rows run out. A page whose jobs history
+// filters out more than it keeps takes a round trip for each page of them.
+func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, args []any) (page []*driver.JobRow, err error) {
+	tx, err := c.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, tx.Rollback(context.WithoutCancel(ctx)))
+		}
+	}()
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"); err != nil {
+		return nil, err
+	}
+	before := func(a, b driver.JobID) bool {
+		if l.newestFirst {
+			return bytes.Compare(a[:], b[:]) > 0
+		}
+		return bytes.Compare(a[:], b[:]) < 0
+	}
+	var (
+		jobs     []*driver.JobRow
+		liveFull bool
+		liveEnd  driver.JobID
+		source   = l.source
+		tagExpr  = cmp.Or(l.tagExpr, "NULL::text")
+		with     = l.with
+		cursor   = l.after
+	)
+	for first := true; ; first = false {
+		// The walk's source is joined to the chosen tag, r.tag, which it
+		// returns, so that TagsAll's rarest tag is chosen once, by the first
+		// walk, and given to the later statements as a parameter.
+		walkSource := source
+		if l.tagExpr != "" {
+			walkSource = "(SELECT r.tag) u(tag)"
+		}
+		keyArgs := append(slices.Clip(args), uuidParam(cursor))
+		keySQL, keyArgs := usedParams(with+"SELECT r.tag, k.id, k.state, k.finalized_at FROM (SELECT "+tagExpr+") r(tag) LEFT JOIN LATERAL ("+
+			tagKeysSQL(walkSource, l.walk, l.op, fmt.Sprintf("$%d::uuid", len(keyArgs)), l.order)+") k ON true", keyArgs)
+		rows, err := tx.Query(ctx, e.Schema.expand(keySQL), keyArgs...)
+		if err != nil {
+			return nil, err
+		}
+		var (
+			tag           sql.NullString
+			ids           []driver.JobID
+			states, times []string
+			walkEnd       driver.JobID
+		)
+		for rows.Next() {
+			var (
+				id    nullUUID
+				state sql.NullString
+				at    sql.NullTime
+			)
+			if err := rows.Scan(&tag, &id, &state, &at); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if !id.Valid {
+				continue
+			}
+			ids = append(ids, id.ID)
+			if !slices.Contains(states, state.String) {
+				states = append(states, state.String)
+			}
+			times = append(times, `"`+at.Time.UTC().Format("2006-01-02T15:04:05.999999Z")+`"`)
+			if len(ids) == 1 || before(walkEnd, id.ID) {
+				walkEnd = id.ID
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		walkFull := len(ids) == l.limit
+		if first && l.tagExpr != "" {
+			args = append(slices.Clip(args), tag.String)
+			tagExpr, with = fmt.Sprintf("$%d::text", len(args)), ""
+			source = "(SELECT " + tagExpr + ") u(tag)"
+		}
+
+		var arms []string
+		fetchArgs := slices.Clip(args)
+		if first && l.liveArm != nil {
+			arms = append(arms, l.liveArm(source))
+		}
+		if len(ids) > 0 {
+			fetchArgs = append(fetchArgs, uuidArray(ids))
+			// The states and times are constants, not parameters, so that the
+			// planner keeps only their partitions under a generic plan too.
+			arms = append(arms, jobListHistorySQL+l.filter+fmt.Sprintf(
+				" AND state = ANY('{%s}'::{{schema}}.hopper_job_state[]) AND finalized_at = ANY('{%s}'::timestamptz[]) AND id = ANY($%d::uuid[]) AND tags ?| $%d::text[]",
+				strings.Join(states, ","), strings.Join(times, ","), len(fetchArgs), l.walked))
+		}
+		if len(arms) > 0 {
+			fetchSQL, fetchArgs := usedParams("("+strings.Join(arms, ") UNION ALL (")+")", fetchArgs)
+			got, err := historyJobs(tx.Query(ctx, e.Schema.expand(fetchSQL), fetchArgs...))
+			if err != nil {
+				return nil, err
+			}
+			if first {
+				// Live jobs have no finalized_at.
+				n := 0
+				for _, j := range got {
+					if j.FinalizedAt.IsZero() {
+						if n == 0 || before(liveEnd, j.ID) {
+							liveEnd = j.ID
+						}
+						n++
+					}
+				}
+				liveFull = n == l.limit
+			}
+			jobs = append(jobs, got...)
+		}
+		slices.SortFunc(jobs, func(a, b *driver.JobRow) int {
+			switch {
+			case before(a.ID, b.ID):
+				return -1
+			case before(b.ID, a.ID):
+				return 1
+			}
+			return 0
+		})
+		// The jobs are known in full up to the end of each arm that came back
+		// full, the live arm's last job and the walk's last key: past it, the
+		// arm may have more.
+		end, bounded, byWalk := liveEnd, liveFull, false
+		if walkFull && (!bounded || before(walkEnd, end)) {
+			end, bounded, byWalk = walkEnd, true, true
+		}
+		known := jobs
+		if bounded {
+			known = slices.DeleteFunc(slices.Clone(jobs), func(j *driver.JobRow) bool { return before(end, j.ID) })
+		}
+		// Only a walk that ends the known jobs short of a page has more to
+		// give: a live arm that does holds a page itself.
+		if len(known) >= l.limit || !byWalk {
+			return known[:min(len(known), l.limit)], tx.Commit(ctx)
+		}
+		cursor = walkEnd
+	}
+}
+
+// usedParams numbers the parameters query refers to from $1, in the order
+// it first does, and returns their arguments of args: a parameter the
+// statement leaves out has no type the server could infer. Parameters are
+// the only $ the listing's statements hold.
+func usedParams(query string, args []any) (string, []any) {
+	renumbered := map[string]string{}
+	var used []any
+	query = paramRef.ReplaceAllStringFunc(query, func(ref string) string {
+		if n, ok := renumbered[ref]; ok {
+			return n
+		}
+		i, _ := strconv.Atoi(ref[1:])
+		used = append(used, args[i-1])
+		renumbered[ref] = "$" + strconv.Itoa(len(used))
+		return renumbered[ref]
+	})
+	return query, used
+}
+
+var paramRef = regexp.MustCompile(`\$[0-9]+`)
 
 // refusable reports whether the server could refuse a listing's filters
 // (see checkFilters). Text of ASCII characters other than NUL is valid in

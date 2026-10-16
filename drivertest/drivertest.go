@@ -80,6 +80,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"TagsPartitionWaitsForHistory", testTagsPartitionWaitsForHistory[TTx]},
 		{"TagsFollowDirectUpdates", testTagsFollowDirectUpdates[TTx]},
 		{"TagsFollowTruncate", testTagsFollowTruncate[TTx]},
+		{"TagsPagePastFilteredHistory", testTagsPagePastFilteredHistory[TTx]},
 		{"InsertTx", testInsertTx[TTx]},
 		{"Claim", testClaim[TTx]},
 		{"ClaimSkipsLocked", testClaimSkipsLocked[TTx]},

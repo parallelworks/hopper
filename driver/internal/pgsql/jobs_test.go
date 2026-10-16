@@ -23,6 +23,11 @@ func (c *listConn) Query(context.Context, string, ...any) (Rows, error) {
 	return nil, errListConn
 }
 
+func (c *listConn) Exec(context.Context, string, ...any) (int64, error) {
+	c.statements++
+	return 0, nil
+}
+
 func (c *listConn) QueryRow(context.Context, string, ...any) Row {
 	c.statements++
 	return trueRow{}

@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -740,5 +742,174 @@ func TestHistoryTagsRowsUnique(t *testing.T) {
 	listed, err := exec.JobList(ctx, driver.JobListParams{TagsAny: []string{"restored"}, Limit: 10})
 	if err != nil || len(listed) > 1 {
 		t.Errorf("listing by tag after the reinsert = %d jobs, %v; want the job at most once", len(listed), err)
+	}
+}
+
+// statementLog records the statements a pool runs, and calls after, once, at
+// the end of the first that mentions afterSQL.
+type statementLog struct {
+	mu       sync.Mutex
+	sql      []string
+	args     [][]any
+	afterSQL string
+	after    func()
+}
+
+func (l *statementLog) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sql, l.args = append(l.sql, d.SQL), append(l.args, d.Args)
+	return context.WithValue(ctx, statementSQL{}, d.SQL)
+}
+
+func (l *statementLog) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryEndData) {
+	sql, _ := ctx.Value(statementSQL{}).(string)
+	l.mu.Lock()
+	after := l.after
+	if after != nil && strings.Contains(sql, l.afterSQL) {
+		l.after = nil
+	} else {
+		after = nil
+	}
+	l.mu.Unlock()
+	if after != nil {
+		after()
+	}
+}
+
+// statementSQL keys a statement's text in the context its trace carries.
+type statementSQL struct{}
+
+// tracedDriver is a driver on pool's schema whose statements log records.
+func tracedDriver(t *testing.T, pool *pgxpool.Pool, log *statementLog) *hopperpgx.Driver {
+	t.Helper()
+	cfg := pool.Config()
+	cfg.ConnConfig.Tracer = log
+	traced, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(traced.Close)
+	return testdb.Driver(traced)
+}
+
+// TestTagListingPlansWhatItReads lists finished jobs by one tag and by eight,
+// with history holding thirty hourly partitions besides the jobs', and
+// explains each statement the listing ran. The plans scan only the history
+// partition the jobs are in, and the same tags partitions for eight tags as
+// for one: an arm per tag, each looking jobs up in every partition of
+// history, planned a scan of each of them for each tag.
+func TestTagListingPlansWhatItReads(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	start := time.Now().UTC().Truncate(time.Hour)
+	for h := 3; h < 33; h++ {
+		from := start.Add(-time.Duration(h) * time.Hour)
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE hopper_job_history_completed_%s PARTITION OF hopper_job_history_completed
+			FOR VALUES FROM ('%s') TO ('%s')`, from.Format("2006010215"), from.Format(time.RFC3339), from.Add(time.Hour).Format(time.RFC3339))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tags := []string{"t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"}
+	p := insertParams("planned", 16)
+	for i := range p {
+		p[i].Tags = tags
+	}
+	if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	clientID, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range claimed.Jobs {
+		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+			{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log := &statementLog{}
+	listing := tracedDriver(t, pool, log).Executor()
+	scans := func(params driver.JobListParams) (history, tagged int) {
+		t.Helper()
+		log.mu.Lock()
+		log.sql, log.args = nil, nil
+		log.mu.Unlock()
+		params.Limit = 10
+		page, err := listing.JobList(ctx, params)
+		if err != nil || len(page) != 10 {
+			t.Fatalf("listing %+v = %d jobs, %v", params, len(page), err)
+		}
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		for i, q := range log.sql {
+			if !strings.HasPrefix(strings.TrimSpace(q), "SELECT") && !strings.HasPrefix(strings.TrimSpace(q), "WITH") && !strings.HasPrefix(q, "(") {
+				continue
+			}
+			var plan []byte
+			if err := pool.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+q, log.args[i]...).Scan(&plan); err != nil {
+				t.Fatalf("explain %s: %v", q, err)
+			}
+			for _, rel := range regexp.MustCompile(`"Relation Name": "([^"]+)"`).FindAllStringSubmatch(string(plan), -1) {
+				switch name := rel[1]; {
+				case strings.Contains(name, "_tags"):
+					tagged++
+				case strings.HasPrefix(name, "hopper_job_history_"):
+					history++
+				}
+			}
+		}
+		return history, tagged
+	}
+	states := []driver.JobState{driver.JobStateCompleted}
+	h1, t1 := scans(driver.JobListParams{TagsAny: tags[:1], States: states})
+	h8, t8 := scans(driver.JobListParams{TagsAny: tags, States: states})
+	if h1 > 1 || h8 > 1 || t8 != t1 {
+		t.Errorf("listing by one tag planned %d history scans and %d of tags tables, by eight %d and %d; want at most 1 history scan, and the same tags scans",
+			h1, t1, h8, t8)
+	}
+}
+
+// TestTagListingSnapshotSpansStatements finalizes a tagged job into history
+// right after a listing by its tag has walked history's tags rows, before
+// the statement that reads the live table. The statements share one
+// snapshot, so the job, live in it, is listed once; each on its own snapshot,
+// the walk ran before the job was in history and the read after it had left
+// the live table, and the job was in neither.
+func TestTagListingSnapshotSpansStatements(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	p := insertParams("moved", 1)
+	p[0].Tags = []string{"m"}
+	res, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientID, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 1}); err != nil {
+		t.Fatal(err)
+	}
+	log := &statementLog{afterSQL: "LEFT JOIN LATERAL", after: func() {
+		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+			{ID: res[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+		}}); err != nil {
+			t.Error(err)
+		}
+	}}
+	page, err := tracedDriver(t, d.Pool(), log).Executor().JobList(ctx, driver.JobListParams{TagsAny: []string{"m"}, Limit: 10})
+	if err != nil || len(page) != 1 || page[0].ID != res[0].Job.ID {
+		t.Errorf("listing by tag across the job's finalize = %+v, %v; want the job once", page, err)
+	}
+	if log.after != nil {
+		t.Error("the job was not finalized during the listing")
 	}
 }
