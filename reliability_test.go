@@ -519,17 +519,18 @@ func TestLeaderRetriesDeferredPartitions(t *testing.T) {
 }
 
 // TestLeaderWaitsOutFailingGroup has a partition group failing on every
-// pass, the stream log's DEFAULT partition holding a row of the day ahead so
-// that day's partition cannot be attached, while history's partition ahead
-// is deferred. The leader retries a pass that failed only at the next
+// pass, the stream log's DEFAULT partition holding a row of each of the two
+// days ahead so that the first day's partition cannot be attached, even if
+// the leader's pass runs after midnight, while history's partition ahead is
+// deferred. The leader retries a pass that failed only at the next
 // maintenance interval, not on every leader pass, which would run the
 // failing group again each time.
 func TestLeaderWaitsOutFailingGroup(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	ctx := context.Background()
-	day := time.Now().UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
-	if _, err := h.pool.Exec(ctx, "INSERT INTO hopper_stream_events (topic, created_at) VALUES ('t', $1)", day.Add(time.Hour)); err != nil {
+	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_stream_events (topic, created_at)
+		SELECT 't', date_trunc('day', now(), 'UTC') + make_interval(days => d, hours => 1) FROM generate_series(1, 2) d`); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := h.pool.Begin(ctx)
