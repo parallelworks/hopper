@@ -1156,10 +1156,12 @@ a term leaves an invalid index, which the next build drops and builds again.
 Postgres marks an outcome table's index valid only in the attach that completes it,
 so retention must not drop the last partition without an index before it is built:
 before Postgres's May 2026 releases (17.10), nothing short of a catalog update could
-mark the index valid after that. So a drop first checks, under the history
-maintenance lock that attaches take too, whether the partition is the last one an
-outcome table's index lacks; if it is, the drop empties it, builds and attaches its
-index (instant on an empty table), and drops it. An index left invalid by an older
+mark the index valid after that. So while an outcome table's index is not yet
+valid, a drop first checks, under the history maintenance lock that attaches take
+too, whether the partition is the last one the index lacks; if it is, the drop locks
+the outcome table and then the partition, in the order queries lock them, empties
+the partition, builds and attaches its index (instant on an empty table), and drops
+it. Once every index is valid, a drop skips the check and the lock. An index left invalid by an older
 release is revalidated by attaching one of its partitions' indexes again, which
 releases from May 2026 on count anew. A build that runs past the session's `statement_timeout` is canceled by it: its
 leftover is dropped, the pass goes on to the other partitions, and the leader retries

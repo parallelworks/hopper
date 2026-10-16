@@ -444,6 +444,7 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	// outcome table's not valid. Only releases whose attach counts again
 	// can repair it.
 	if !reattachRevalidates(ctx, t, f, d) {
+		t.Log("this server's re-attach does not revalidate an index; not checking revalidation")
 		return
 	}
 	f.Exec(ctx, t, d, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'hopper_job_history_failed_ordering'::regclass")
@@ -470,10 +471,6 @@ var onceAgain = driver.JobInsertParams{
 	UniqueFinished: []driver.JobState{driver.JobStateCompleted},
 }
 
-// maintainWhileReading runs the history maintenance and indexing of three
-// overlapping leaders while eight readers list a key's jobs from history and
-// look for a unique key's duplicates there, and fails the test on any error
-// either side returns: no attach may deadlock with a reader.
 // reattachRevalidates reports whether attaching a partition's index again
 // marks its parent valid, as Postgres does from the May 2026 releases (17.10)
 // on.
@@ -533,7 +530,31 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	if v := valid(); v != "false" {
 		t.Fatalf("valid with a partition unindexed = %s", v)
 	}
-	res, err := exec.HistoryMaintain(ctx, keep)
+	// A reader holds the outcome table and then reads the partition while
+	// retention drops it, with the lock_timeout the leader reaches after a
+	// few deferrals, longer than deadlock_timeout: the drop must lock the
+	// table before the partition, as the reader does, or the two deadlock.
+	var reader sync.WaitGroup
+	reader.Go(func() {
+		f.Exec(ctx, t, d, `DO $$
+			BEGIN
+			  LOCK TABLE ONLY hopper_job_history_failed IN ACCESS SHARE MODE;
+			  PERFORM pg_sleep(0.5);
+			  PERFORM count(*) FROM `+old[0]+`;
+			END
+			$$`)
+	})
+	for deadline := time.Now().Add(5 * time.Second); f.QueryText(ctx, t, d, `SELECT count(*)::text FROM pg_locks
+		WHERE relation = 'hopper_job_history_failed'::regclass AND mode = 'AccessShareLock' AND granted AND pid <> pg_backend_pid()`) == "0"; {
+		if time.Now().After(deadline) {
+			t.Fatal("the reader did not lock the outcome table")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	slow := keep
+	slow.LockTimeout = 2 * time.Second
+	res, err := exec.HistoryMaintain(ctx, slow)
+	reader.Wait()
 	if err != nil || !slices.Contains(res.Dropped, old[0]) {
 		t.Fatalf("maintain = %+v, %v", res, err)
 	}
@@ -578,6 +599,10 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+// maintainWhileReading runs the history maintenance and indexing of three
+// overlapping leaders while eight readers list a key's jobs from history and
+// look for a unique key's duplicates there, and fails the test on any error
+// either side returns: no attach may deadlock with a reader.
 func maintainWhileReading(ctx context.Context, t *testing.T, exec driver.Executor) {
 	t.Helper()
 	var (

@@ -61,7 +61,8 @@
   with `UniqueOpts.Finished` reads that partition in full. Releases up to 0.7.0
   could leave an outcome table's index invalid, unused by the planner, when
   retention dropped the last partition without one; the leader repairs it on
-  Postgres releases from May 2026 (17.10) on, so update Postgres's minor
+  Postgres's minor releases from May 2026 on (17.10 on Postgres 17, and the
+  minor released with it on each other major), so update Postgres's minor
   version if `indisvalid` stays false for `hopper_job_history_*_ordering` or
   `_unique`.
 - **`UniqueOpts.Finished`.** Each such job is looked up in every history

@@ -29,10 +29,20 @@ type historyGroup struct {
 	format string
 }
 
-// HistoryLockKey is the pg_advisory_xact_lock key that serializes partition
-// creation between overlapping leaders. It is combined with the schema, so
-// installations sharing a database do not queue behind each other.
+// HistoryLockKey is the pg_advisory_xact_lock key that serializes changes to
+// the history partitions and their indexes: partition creation between
+// overlapping leaders, index attaches, and a retention drop that may complete
+// an outcome table's index. It is combined with the schema, so installations
+// sharing a database do not queue behind each other.
 const HistoryLockKey int32 = 0x686f7068 // "hoph"
+
+// lockHistoryMaintenance takes HistoryLockKey for the rest of tx.
+func lockHistoryMaintenance(ctx context.Context, tx Conn, schema string) error {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", schema, HistoryLockKey); err != nil {
+		return fmt.Errorf("hopper: lock history maintenance: %w", err)
+	}
+	return nil
+}
 
 var historyGroups = []historyGroup{
 	{root: "hopper_job_history", parent: "hopper_job_history_completed", timeColumn: "finalized_at", period: time.Hour, ahead: 3, format: "2006010215"},
@@ -171,8 +181,10 @@ func lockNotAvailable(err error) bool {
 // dropPartition drops a partition past retention. DROP takes a brief
 // ACCESS EXCLUSIVE lock on the parent for the catalog change, once per
 // period. (DETACH CONCURRENTLY would avoid it, but Postgres refuses it while
-// a DEFAULT partition exists.) The wait is bounded by lockTimeout: a drop
-// that cannot get the lock in time returns false.
+// a DEFAULT partition exists.) In the window after an upgrade declared a
+// history index, the drop may first complete that index (indexBeforeDrop).
+// Each lock wait is bounded by lockTimeout: a drop that cannot get a lock in
+// time returns false.
 func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lockTimeout string) (bool, error) {
 	err := e.withTx(ctx, func(tx Tx) error {
 		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+lockTimeout+"'"); err != nil {
@@ -201,39 +213,44 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name, lock
 // does not revalidate it. The partition is emptied first, since its rows go
 // with it, so the build is instant. It runs under HistoryLockKey, which
 // attachIndex takes too, so that an attach elsewhere does not count this
-// partition as unindexed and commit beside the drop.
+// partition as unindexed and commit beside the drop. The outcome table is
+// locked before the partition, the order in which queries and DROP lock
+// them: a reader holding the table while it waits for the partition would
+// otherwise deadlock with the drop.
 func (e *Executor) indexBeforeDrop(ctx context.Context, tx Tx, parent, name string) error {
-	if !slices.ContainsFunc(historyIndexes, func(x historyIndex) bool { return x.parent == parent }) {
+	if !hasHistoryIndexes(parent) {
 		return nil
 	}
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", e.Schema.Name, HistoryLockKey); err != nil {
+	// An outcome table's index, once valid, stays valid, so outside the
+	// window after an upgrade declared one, a drop stops here, unlocked.
+	invalid, err := scanStrings(tx.Query(ctx, `
+		SELECT c.relname FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
+		WHERE x.indrelid = to_regclass($1) AND NOT x.indisvalid`, e.Schema.Table(parent)))
+	if err != nil {
+		return fmt.Errorf("hopper: check indexes of %s: %w", parent, err)
+	}
+	if len(invalid) == 0 {
+		return nil
+	}
+	if err := lockHistoryMaintenance(ctx, tx, e.Schema.Name); err != nil {
 		return err
 	}
 	emptied := false
 	for _, x := range historyIndexes {
-		if x.parent != parent {
+		if x.parent != parent || !slices.Contains(invalid, x.name()) {
 			continue
 		}
-		var last bool
-		err := tx.QueryRow(ctx, `
-			SELECT to_regclass($2) IS NOT NULL AND NOT x.indisvalid AND NOT EXISTS (
-			  SELECT 1 FROM pg_inherits i
-			  WHERE i.inhparent = to_regclass($3)
-			    AND (i.inhrelid = to_regclass($2)) = EXISTS (
-			      SELECT 1 FROM pg_index ci JOIN pg_inherits xi ON xi.inhrelid = ci.indexrelid
-			      WHERE ci.indrelid = i.inhrelid AND xi.inhparent = x.indexrelid))
-			FROM pg_index x WHERE x.indexrelid = to_regclass($1)`,
-			e.Schema.Table(x.name()), e.Schema.Table(name), e.Schema.Table(parent)).Scan(&last)
-		if errors.Is(err, ErrNoRows) {
-			continue
-		}
+		unindexed, err := scanStrings(tx.Query(ctx, unindexedPartitions, e.Schema.Table(parent), e.Schema.Table(x.name())))
 		if err != nil {
 			return fmt.Errorf("hopper: check index %s: %w", x.name(), err)
 		}
-		if !last {
+		if len(unindexed) != 1 || unindexed[0] != name {
 			continue
 		}
 		if !emptied {
+			if _, err := tx.Exec(ctx, "LOCK TABLE ONLY "+e.Schema.Table(parent)+", "+e.Schema.Table(name)+" IN ACCESS EXCLUSIVE MODE"); err != nil {
+				return err
+			}
 			if _, err := tx.Exec(ctx, "TRUNCATE "+e.Schema.Table(name)); err != nil {
 				return err
 			}
@@ -269,6 +286,22 @@ var historyIndexes = []historyIndex{
 	{"hopper_job_history_completed", "_unique", "(kind, unique_key, finalized_at) WHERE unique_key IS NOT NULL"},
 	{"hopper_job_history_failed", "_unique", "(kind, unique_key, finalized_at) WHERE unique_key IS NOT NULL"},
 }
+
+// hasHistoryIndexes reports whether an upgrade declared history indexes on
+// the outcome table parent.
+func hasHistoryIndexes(parent string) bool {
+	return slices.ContainsFunc(historyIndexes, func(x historyIndex) bool { return x.parent == parent })
+}
+
+// unindexedPartitions lists the partitions of an outcome table ($1) that have
+// no index attached to its history index $2, or none if $2 does not exist.
+const unindexedPartitions = `
+	SELECT c.relname FROM pg_inherits i
+	JOIN pg_class c ON c.oid = i.inhrelid
+	WHERE i.inhparent = to_regclass($1) AND to_regclass($2) IS NOT NULL
+	  AND NOT EXISTS (
+	    SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
+	    WHERE x.indrelid = c.oid AND xi.inhparent = to_regclass($2))`
 
 // HistoryIndexLockKey is the pg_advisory_xact_lock key held while a history
 // partition is indexed, combined with the schema like HistoryLockKey. Two
@@ -314,14 +347,7 @@ func (e *Executor) HistoryIndex(ctx context.Context, params driver.HistoryIndexP
 	skip := slices.Clone(params.Skip)
 	for _, x := range historyIndexes {
 		parent, parentIndex := x.parent, x.name()
-		leaves, err := scanStrings(e.Conn.Query(ctx, `
-			SELECT c.relname FROM pg_inherits i
-			JOIN pg_class c ON c.oid = i.inhrelid
-			WHERE i.inhparent = to_regclass($1) AND to_regclass($2) IS NOT NULL
-			  AND NOT EXISTS (
-			    SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
-			    WHERE x.indrelid = c.oid AND xi.inhparent = to_regclass($2))`,
-			e.Schema.Table(parent), e.Schema.Table(parentIndex)))
+		leaves, err := scanStrings(e.Conn.Query(ctx, unindexedPartitions, e.Schema.Table(parent), e.Schema.Table(parentIndex)))
 		if err != nil {
 			return res, fmt.Errorf("hopper: list unindexed partitions of %s: %w", parent, err)
 		}
@@ -463,8 +489,8 @@ func (e *Executor) attachIndex(ctx context.Context, parentIndex, index string) (
 			_ = tx.Rollback(context.WithoutCancel(ctx))
 		}
 	}()
-	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", e.Schema.Name, HistoryLockKey); err != nil {
-		return fmt.Errorf("hopper: lock history maintenance: %w", err)
+	if err = lockHistoryMaintenance(ctx, tx, e.Schema.Name); err != nil {
+		return err
 	}
 	if _, err = tx.Exec(ctx, "ALTER INDEX "+e.Schema.Table(parentIndex)+" ATTACH PARTITION "+e.Schema.Table(index)); err != nil {
 		return fmt.Errorf("hopper: attach index %s: %w", index, err)
@@ -530,14 +556,14 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// Two leaders can overlap briefly; serialize them on an advisory lock
 	// held for this transaction, then check whether the other one has
 	// already created the partition.
-	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1), $2)", e.Schema.Name, HistoryLockKey); err != nil {
-		return false, false, fmt.Errorf("hopper: lock history maintenance: %w", err)
+	if err = lockHistoryMaintenance(ctx, tx, e.Schema.Name); err != nil {
+		return false, false, err
 	}
 	// An index being built concurrently on this table's DEFAULT partition
 	// (HistoryIndex) holds HistoryIndexLockKey combined with the table, and
 	// the attach below would deadlock with it. Partitions are created periods
 	// ahead, so this one is deferred to the next pass instead.
-	if slices.ContainsFunc(historyIndexes, func(x historyIndex) bool { return x.parent == g.parent }) {
+	if hasHistoryIndexes(g.parent) {
 		var free bool
 		if free, err = tryHistoryIndexLock(ctx, tx, e.Schema.Name+"."+g.parent); err != nil {
 			return false, false, fmt.Errorf("hopper: lock history indexing: %w", err)
