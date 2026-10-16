@@ -946,55 +946,17 @@ func lastUnindexedPartition(t *testing.T, h *harness) string {
 
 // TestLeaderWarnsAboutKeptPartition makes the last partition an outcome
 // table's index lacks pass retention while its build keeps running past the
-// session's statement_timeout. Retention keeps the partition on every pass,
-// and the leader warns from the fifth pass in a row on.
+// session's statement_timeout. Retention keeps the partition, logged at Info,
+// and its failing build is warned about by name.
 func TestLeaderWarnsAboutKeptPartition(t *testing.T) {
 	t.Parallel()
-	logs := &timeoutLog{counts: map[string]int{}, message: "kept until their index is built", key: "passes", level: slog.LevelWarn}
-	timedOutBuildsLogging(t, 100*time.Millisecond, logs, func(h *harness) {
-		lastUnindexedPartition(t, h)
+	var old string
+	kept := &timeoutLog{counts: map[string]int{}, message: "kept until their index is built", key: "kept"}
+	timedOut := &timeoutLog{counts: map[string]int{}, message: "statement_timeout", key: "partition", level: slog.LevelWarn}
+	timedOutBuildsLogging(t, 100*time.Millisecond, teeHandler{kept, timedOut}, func(h *harness) {
+		old = lastUnindexedPartition(t, h)
 	}, func(cfg *hopper.Config) { cfg.FailedRetention = 48 * time.Hour })
-	waitFor(t, func() bool { return logs.count("5") > 0 })
-	if n := logs.count("4"); n != 0 {
-		t.Errorf("warned after 4 passes")
-	}
-}
-
-// TestLeaderDoesNotWarnAboutPartitionKeptForBuild keeps the last partition
-// an outcome table's index lacks past retention while a build holds it, for
-// more passes than the warning waits for: a long build is reported at Info,
-// and does not count towards the warning.
-func TestLeaderDoesNotWarnAboutPartitionKeptForBuild(t *testing.T) {
-	t.Parallel()
-	h := newHarness(t)
-	ctx := context.Background()
-	old := lastUnindexedPartition(t, h)
-	// The partition's build lock (HistoryIndexLockKey), held as a build
-	// holds it.
-	build, err := h.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = build.Rollback(ctx) })
-	if _, err := build.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext(current_schema() || '.' || $1), 1752133737)", old); err != nil {
-		t.Fatal(err)
-	}
-	kept := &timeoutLog{counts: map[string]int{}, message: "kept while their index is built", key: "kept"}
-	counted := &timeoutLog{counts: map[string]int{}, message: "kept until their index is built", key: "passes"}
-	c := h.client(&hopper.Config{
-		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
-		Logger: slog.New(teeHandler{kept, counted}), FailedRetention: 48 * time.Hour,
-	})
-	tun := fastTuning
-	tun.Maintenance = 100 * time.Millisecond
-	c.SetTuning(tun)
-	if err := c.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, func() bool { return kept.count("["+old+"]") > 6 })
-	if n := counted.count("1"); n != 0 {
-		t.Errorf("a partition kept for a build under way counted towards the warning %d times", n)
-	}
+	waitFor(t, func() bool { return kept.count("["+old+"]") > 0 && timedOut.count(old) > 0 })
 }
 
 // teeHandler hands each record to every one of its handlers.
@@ -1026,7 +988,7 @@ func timedOutBuilds(t *testing.T, maintenance time.Duration) *timeoutLog {
 // timedOutBuildsLogging is timedOutBuilds with the leader logging to logs,
 // setup run on the harness before the snapshot is taken, and configure
 // applied to the client's configuration.
-func timedOutBuildsLogging(t *testing.T, maintenance time.Duration, logs *timeoutLog, setup func(*harness), configure func(*hopper.Config)) {
+func timedOutBuildsLogging(t *testing.T, maintenance time.Duration, logs slog.Handler, setup func(*harness), configure func(*hopper.Config)) {
 	t.Helper()
 	h := newHarness(t)
 	setup(h)

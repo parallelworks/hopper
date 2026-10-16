@@ -40,7 +40,6 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", c.clientID.Load())
 				c.emit(EventLeaderElected, nil, "")
 				lastMaintenance = time.Time{}
-				c.keptPasses = 0
 				term = c.startTerm(ctx)
 			}
 			c.rescue(ctx)
@@ -480,23 +479,11 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
 	}
-	// Kept partitions wait for the index loop, which runs every maintenance
-	// interval, so only those passes count towards the warning, and only
-	// while a partition waits for a build that is not under way: a long
-	// build is no failure. A pass that deferred drops may have left a
-	// kept partition among them, untried behind another drop or held off
-	// from its check, so it keeps the count rather than reset it.
-	switch {
-	case len(res.Kept) == 0 && len(res.Deferred) > 0:
-	case len(res.Kept) == len(res.Building):
-		c.keptPasses = 0
-		if len(res.Kept) > 0 && !retry {
-			c.logger.InfoContext(ctx, "hopper: history partitions past retention kept while their index is built", "kept", res.Kept)
-		}
-	case !retry:
-		c.keptPasses++
-		c.logger.Log(ctx, repeatLevel(c.keptPasses, slog.LevelInfo), "hopper: history partitions past retention kept until their index is built",
-			"kept", res.Kept, "building", res.Building, "passes", c.keptPasses)
+	// A kept partition waits for its build, whose failures the index loop
+	// warns about, so it is only logged, once per maintenance interval.
+	if len(res.Kept) > 0 && !retry {
+		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built",
+			"kept", res.Kept, "building", res.Building)
 	}
 	if len(res.Deferred) == 0 {
 		c.ddlDeferrals = 0

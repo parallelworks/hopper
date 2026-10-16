@@ -1175,13 +1175,11 @@ is not yet valid, a drop checks, under the history maintenance lock that attache
 take too, whether the partition is the last one the index lacks, and if it is keeps
 it until the build attaches its index: that one partition outlives retention by its
 build, once, after an upgrade. Once every index is valid, no partition is being built,
-and a drop skips the locks and the check. The leader logs kept partitions, and warns
-once it has kept one whose build is not under way (`HistoryMaintainResult.Building`
-lists those whose build lock is held) for five maintenance passes in a row (the retries
-of deferred work on the leader passes between them do not count, and a pass that
-deferred a drop, which may have left the kept partition untried, neither counts nor
-resets the run), which means their builds keep failing; a long build is no failure,
-and resets the count. An index an earlier release left
+and a drop skips the locks and the check. The leader logs kept partitions at Info once
+per maintenance interval (`HistoryMaintainResult.Building` names those whose build is
+under way): a kept partition only waits for its build, and every way a build fails
+already warns, a timeout each time, an error each pass, and a deferred attach from its
+fifth pass in a row. An index an earlier release left
 invalid is revalidated by attaching one of its partitions' indexes again, which
 releases from May 2026 on count anew. The pass first asks the server whether its
 attach counts anew, on temporary tables in a transaction it rolls back, rather than by
