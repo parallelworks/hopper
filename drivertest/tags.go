@@ -972,6 +972,7 @@ func testTagsPagePastFilteredHistory[TTx any](t *testing.T, f Fixture[TTx]) {
 			c.p.After = page[len(page)-1].ID
 		}
 		expected := slices.Clone(want)
+		slices.SortFunc(expected, func(a, b driver.JobID) int { return bytes.Compare(a[:], b[:]) })
 		if c.p.NewestFirst {
 			slices.Reverse(expected)
 		}
