@@ -729,6 +729,40 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("valid after the builds = %s", v)
 	}
 
+	// A pass builds the DEFAULT partition last, so that partitions that
+	// expire during a long pass are dropped, the DEFAULT partition lacking
+	// the index too, rather than kept for a build. A statement whose
+	// snapshot the first build waits for shows which partition that is.
+	ordered := redeclare("20000110")
+	snapshot := make(chan struct{})
+	go func() { defer close(snapshot); f.Exec(ctx, t, d, "SELECT pg_sleep(2)") }()
+	t.Cleanup(func() { <-snapshot })
+	for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
+		"SELECT count(*)::text FROM pg_stat_activity WHERE query = 'SELECT pg_sleep(2)' AND datname = current_database()") == "0"; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the snapshot holder did not start")
+		}
+	}
+	built := make(chan error, 1)
+	go func() { _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); built <- err }()
+	var first string
+	for deadline := time.Now().Add(10 * time.Second); first == ""; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("no build started")
+		}
+		first = f.QueryText(ctx, t, d, `SELECT coalesce(min(c.relname), '') FROM pg_stat_progress_create_index p
+			JOIN pg_class c ON c.oid = p.relid WHERE c.relnamespace = current_schema()::regnamespace`)
+	}
+	if strings.HasSuffix(first, "_default") {
+		t.Errorf("first build of a pass = %s, want a time partition", first)
+	}
+	if err := <-built; err != nil {
+		t.Fatal(err)
+	}
+	if res, err := exec.HistoryMaintain(ctx, keep); err != nil || !slices.Equal(failedOnly(res.Dropped), ordered) {
+		t.Errorf("maintain after the ordered pass = %+v, %v", res, err)
+	}
+
 	const (
 		buildLock       = "hashtext(current_schema() || '.' || $1), 1752133737" // HistoryIndexLockKey
 		maintenanceLock = "hashtext(current_schema()), 1752133736"              // HistoryLockKey

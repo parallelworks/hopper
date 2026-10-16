@@ -1161,7 +1161,9 @@ build. The `DEFAULT` partition's build waits for it, under the doubling lock tim
 of deferred partition work; one that times out, behind a transaction left open with
 the lock, is reported deferred (`HistoryIndexResult.Deferred`) rather than stall the
 pass, and every other leader's, behind the schema's build lock. A drop the deadlock
-detector picks over a build waiting for its snapshot is deferred. A build cut short by
+detector picks over a build waiting for its snapshot is deferred, and so is a build it
+picks over the drop, which has not committed when the build returns: the next pass
+finds the partition gone. A build cut short by
 the end of a term leaves an invalid index, which the next build drops and builds
 again. A build of a partition dropped since it was listed, or during the build, is
 skipped. Postgres marks an outcome table's index valid only in the attach that
@@ -1178,9 +1180,12 @@ a partition that lacks its index, so none is dropped under its build. A drop tha
 counts on the `DEFAULT` partition rechecks that it still lacks the index under the
 table's build lock, which the `DEFAULT` partition's build holds through its attach, at
 read committed whatever the session's default, so that it sees an attach that
-committed before the lock was free. The cost is building, once after an upgrade
-declared an index, the partitions past retention that the `DEFAULT` partition was
-indexed before. Once every index is valid, or no partition lacks an invalid one (an index
+committed before the lock was free. A pass builds the partitions newest first and the
+`DEFAULT` partition last, so that while any other partition lacks the index the
+`DEFAULT` partition does too, and partitions that expire before the pass reaches them
+are dropped rather than built. The cost is building, once after an upgrade declared
+an index, the partitions past retention that a pass left out (timed out or deferred)
+while it indexed the `DEFAULT` partition. Once every index is valid, or no partition lacks an invalid one (an index
 an earlier release left invalid, below), nothing is kept. The leader logs kept
 partitions at Info once per maintenance interval: a kept partition only
 waits for its build, and every way a build fails already warns, a timeout each time,
@@ -1213,8 +1218,12 @@ may have ended before the deferred work, so it does not end their run either. A 
 the next pass. An index the server cannot repair, or that the attach left invalid, is
 reported (`HistoryIndexResult.Invalid`), and the leader warns at doubling intervals,
 up to 8 maintenance intervals, that queries needing it read every partition, and that
-Postgres before its May 2026 releases cannot repair it: the update that repairs it
-arrives without a new term, and the next try after it repairs the index. A partition's
+Postgres before its May 2026 releases cannot repair it. On those releases hopper only
+reports it: building a replacement index and renaming it into place would double the
+index's storage and lock every partition for the swap, and declaring it again would
+leave every partition without it until the leader rebuilt them all, so updating the
+Postgres minor release is the repair. The update arrives without a new term, and the
+next try after it repairs the index. A partition's
 or index's backoff ends once a pass that tried it finishes without reporting it again,
 so that a later failure starts over at the shortest wait. A build that runs past the session's
 `statement_timeout` is canceled by it: its
@@ -1269,7 +1278,7 @@ consecutive deferral from 200 ms to at most 2 s, so that transactions that keep
 overlapping cannot hold retention, or the partitions ahead, off for good. Maintenance
 therefore holds up a group's finalizes for at most that timeout per kind of DDL each
 pass. A creation's wait for the history maintenance lock, which an overlapping leader's
-creation, retention or attach holds, runs under the same timeout, so a leader that
+creation or index attach holds, runs under the same timeout, so a leader that
 stalls holding it defers the partitions ahead rather than stall this leader's loop and
 its lease renewal. A session `statement_timeout` that runs out during one
 of these statements, which it can whatever its length since `lock_timeout` bounds each of
@@ -1277,7 +1286,10 @@ a statement's lock waits rather than their sum, defers the work the same way rat
 fail the pass. A creation takes its attach's locks first, in statements of their own,
 so a `statement_timeout` that ends the attach itself, scanning a DEFAULT partition grown
 large, fails the pass, an error each maintenance interval, rather than be retried as a
-wait on every leader pass. Deferrals are logged at debug level, and as a warning from the fifth pass in a
+wait on every leader pass. A group whose maintenance fails, retention's read of its
+partitions' indexes included, leaves the other groups to theirs, and a failed read of
+the indexes leaves the group's partitions past retention, not its `DEFAULT` prune, to
+the next pass; the errors are reported together. Deferrals are logged at debug level, and as a warning from the fifth pass in a
 row. Retention periods are set in `Config` and enforced by the leader, so the leader's
 settings apply cluster-wide.
 

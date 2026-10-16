@@ -90,95 +90,111 @@ func (e *Executor) HistoryMaintain(ctx context.Context, params driver.HistoryMai
 		"hopper_job_history_failed":    params.FailedRetention,
 		"hopper_stream_events":         params.StreamRetention,
 	}
+	// A group whose maintenance fails leaves the others to theirs: the
+	// partitions ahead of each, and its retention, are independent.
+	var errs []error
 	for _, g := range historyGroups {
-		existing, err := e.partitionsOf(ctx, g.parent)
-		if err != nil {
-			return res, err
+		if err := e.maintainGroup(ctx, g, now, retention[g.parent], lockTimeout, &res); err != nil {
+			errs = append(errs, err)
 		}
-		keep := retention[g.parent]
+	}
+	return res, errors.Join(errs...)
+}
 
-		// Create the periods ahead of the current one. Every attach waits
-		// for the same locks (the parent, and the DEFAULT partition it
-		// scans), so once one is deferred the rest are deferred untried:
-		// each attempt would hold the group's writers up for
-		// the lock timeout again.
-		start := now.UTC().Truncate(g.period)
+// maintainGroup creates g's partitions ahead and applies its retention, keep,
+// adding what it did to res.
+func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.Time, keep time.Duration, lockTimeout string, res *driver.HistoryMaintainResult) error {
+	existing, err := e.partitionsOf(ctx, g.parent)
+	if err != nil {
+		return err
+	}
+
+	// Create the periods ahead of the current one. Every attach waits
+	// for the same locks (the parent, and the DEFAULT partition it
+	// scans), so once one is deferred the rest are deferred untried:
+	// each attempt would hold the group's writers up for
+	// the lock timeout again.
+	start := now.UTC().Truncate(g.period)
+	blocked := false
+	for i := 1; i <= g.ahead; i++ {
+		from := start.Add(time.Duration(i) * g.period)
+		name := g.name(from)
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		if blocked {
+			res.Deferred = append(res.Deferred, name)
+			continue
+		}
+		created, deferred, err := e.createPartition(ctx, g, name, from, from.Add(g.period), lockTimeout)
+		if err != nil {
+			return err
+		}
+		if created {
+			res.Created = append(res.Created, name)
+		}
+		if deferred {
+			blocked = true
+			res.Deferred = append(res.Deferred, name)
+		}
+	}
+
+	// Drop partitions whose whole period is past retention. Every drop
+	// waits for the same lock on the parent, so as with the attaches,
+	// once one is deferred the rest are deferred untried.
+	if keep > 0 {
+		cutoff := now.Add(-keep)
+		// Read once, before the first drop, and only when a partition is
+		// past retention: most passes drop nothing.
+		lacking := sync.OnceValues(func() (map[string][]string, error) { return e.lackingInvalidIndexes(ctx, g.parent) })
 		blocked := false
-		for i := 1; i <= g.ahead; i++ {
-			from := start.Add(time.Duration(i) * g.period)
-			name := g.name(from)
-			if _, ok := existing[name]; ok {
+		// A failed read of the indexes leaves the group's partitions past
+		// retention to the next pass, not its DEFAULT partition's prune.
+		var lackErr error
+		for name := range existing {
+			from, ok := g.parse(name)
+			if !ok || !from.Add(g.period).Before(cutoff) {
+				continue
+			}
+			unindexed, err := lacking()
+			if err != nil {
+				lackErr = err
+				break
+			}
+			needs := unindexed[name]
+			if !lackedByDefault(needs, unindexed[g.parent+"_default"]) {
+				res.Kept = append(res.Kept, name)
 				continue
 			}
 			if blocked {
 				res.Deferred = append(res.Deferred, name)
 				continue
 			}
-			created, deferred, err := e.createPartition(ctx, g, name, from, from.Add(g.period), lockTimeout)
+			outcome, err := e.dropPartition(ctx, g, name, needs, lockTimeout)
 			if err != nil {
-				return res, err
+				return err
 			}
-			if created {
-				res.Created = append(res.Created, name)
-			}
-			if deferred {
+			switch outcome {
+			case partitionDropped:
+				res.Dropped = append(res.Dropped, name)
+			case partitionKept:
+				res.Kept = append(res.Kept, name)
+			case partitionDeferred:
 				blocked = true
 				res.Deferred = append(res.Deferred, name)
 			}
 		}
-
-		// Drop partitions whose whole period is past retention. Every drop
-		// waits for the same lock on the parent, so as with the attaches,
-		// once one is deferred the rest are deferred untried.
-		if keep > 0 {
-			cutoff := now.Add(-keep)
-			// Read once, before the first drop, and only when a partition is
-			// past retention: most passes drop nothing.
-			lacking := sync.OnceValues(func() (map[string][]string, error) { return e.lackingInvalidIndexes(ctx, g.parent) })
-			blocked := false
-			for name := range existing {
-				from, ok := g.parse(name)
-				if !ok || !from.Add(g.period).Before(cutoff) {
-					continue
-				}
-				unindexed, err := lacking()
-				if err != nil {
-					return res, err
-				}
-				needs := unindexed[name]
-				if !lackedByDefault(needs, unindexed[g.parent+"_default"]) {
-					res.Kept = append(res.Kept, name)
-					continue
-				}
-				if blocked {
-					res.Deferred = append(res.Deferred, name)
-					continue
-				}
-				outcome, err := e.dropPartition(ctx, g, name, needs, lockTimeout)
-				if err != nil {
-					return res, err
-				}
-				switch outcome {
-				case partitionDropped:
-					res.Dropped = append(res.Dropped, name)
-				case partitionKept:
-					res.Kept = append(res.Kept, name)
-				case partitionDeferred:
-					blocked = true
-					res.Deferred = append(res.Deferred, name)
-				}
-			}
-			// Rows in the DEFAULT partition cannot be dropped by period.
-			n, err := e.Conn.Exec(ctx,
-				fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", e.Schema.Table(g.parent+"_default"), g.timeColumn),
-				keep.Seconds())
-			if err != nil {
-				return res, fmt.Errorf("hopper: prune %s_default: %w", g.parent, err)
-			}
-			res.Pruned += n
+		// Rows in the DEFAULT partition cannot be dropped by period.
+		n, err := e.Conn.Exec(ctx,
+			fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", e.Schema.Table(g.parent+"_default"), g.timeColumn),
+			keep.Seconds())
+		if err != nil {
+			return errors.Join(lackErr, fmt.Errorf("hopper: prune %s_default: %w", g.parent, err))
 		}
+		res.Pruned += n
+		return lackErr
 	}
-	return res, nil
+	return nil
 }
 
 // defaultDDLLockTimeout bounds how long a partition's creation or drop, a
@@ -394,13 +410,19 @@ func hasHistoryIndexes(parent string) bool {
 
 // unindexedPartitions lists the partitions of an outcome table ($1) that have
 // no index attached to its history index $2, or none if $2 does not exist.
+// They come newest first and the DEFAULT partition last, the order
+// HistoryIndex builds them in: while any other partition still lacks the
+// index the DEFAULT one does too, so retention drops the partitions that
+// expire before the pass reaches them rather than keep them for a build
+// (lackingInvalidIndexes).
 const unindexedPartitions = `
 	SELECT c.relname FROM pg_inherits i
 	JOIN pg_class c ON c.oid = i.inhrelid
 	WHERE i.inhparent = to_regclass($1) AND to_regclass($2) IS NOT NULL
 	  AND NOT EXISTS (
 	    SELECT 1 FROM pg_index x JOIN pg_inherits xi ON xi.inhrelid = x.indexrelid
-	    WHERE x.indrelid = c.oid AND xi.inhparent = to_regclass($2))`
+	    WHERE x.indrelid = c.oid AND xi.inhparent = to_regclass($2))
+	ORDER BY pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT', c.relname DESC`
 
 // HistoryIndexLockKey is the pg_advisory_xact_lock key held while a history
 // partition is indexed, combined with the schema like HistoryLockKey. Two
@@ -537,9 +559,10 @@ var errStatementTimeout = errors.New("hopper: index build exceeded statement_tim
 // it without building it again.
 var errAttachDeferred = errors.New("hopper: index attach deferred")
 
-// errBuildDeferred marks a DEFAULT partition's build that could not get its
-// table's HistoryIndexLockKey within the lock timeout; a later pass builds
-// it.
+// errBuildDeferred marks a build that did not run: a DEFAULT partition's that
+// could not get its table's HistoryIndexLockKey within the lock timeout, or
+// one the deadlock detector canceled in favor of retention's drop of its
+// partition. A later pass builds it, if the partition is still there.
 var errBuildDeferred = errors.New("hopper: index build deferred")
 
 // indexHistoryPartitionLocked indexes one partition under
@@ -640,6 +663,13 @@ func (e *Executor) buildHistoryIndex(ctx context.Context, x historyIndex, leaf, 
 					return fmt.Errorf("hopper: drop invalid index %s: %w", index, derr)
 				}
 				return fmt.Errorf("%w: %s: %w", errStatementTimeout, leaf, err)
+			}
+			if sqlState(err) == "40P01" {
+				// The deadlock detector chose the build over retention's drop
+				// of the partition, which commits after this returns; a later
+				// pass finds the partition gone, or drops the invalid index
+				// the build left and builds it again.
+				return fmt.Errorf("%w: %s: %w", errBuildDeferred, leaf, err)
 			}
 			return fmt.Errorf("hopper: index partition %s: %w", leaf, err)
 		}

@@ -488,7 +488,7 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	// left out, without silencing a run of them that outlasts the interval.
 	if len(res.Kept) > 0 && time.Since(c.keptLogged) >= c.tuning.maintenanceInterval {
 		c.keptLogged = time.Now()
-		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built",
+		c.logger.InfoContext(ctx, "hopper: history partitions past retention kept until their index is built, or while their table's DEFAULT partition's is",
 			"kept", res.Kept)
 	}
 	if len(res.Deferred) == 0 {

@@ -70,9 +70,12 @@
   why. Releases
   up to 0.7.0 could instead drop it first and leave the outcome table's index
   invalid, unused by the planner. The leader repairs that on Postgres's May 2026
-  minor releases (18.4, 17.10, 16.14, 15.18, 14.23) and later; on earlier ones
-  it warns that the index stays invalid, and updating Postgres's minor version
-  lets it finish, within 8 maintenance intervals. Attaching a built index, and
+  minor releases (18.4, 17.10, 16.14, 15.18, 14.23) and later. On earlier ones
+  it only reports the index and warns that it stays invalid: hopper does not
+  build a replacement or declare the index again, either of which would take
+  locks on, or the index from, every partition. Update Postgres's minor
+  version to repair it; the leader does so within 8 maintenance intervals,
+  with no restart. Attaching a built index, and
   the repair, wait for transactions that read the partition they lock; a
   warning that history index work has been deferred for five passes in a row
   means such transactions keep overlapping, or that a transaction left open
