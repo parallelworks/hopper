@@ -79,6 +79,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"TagsFollowHistoryRetention", testTagsFollowHistoryRetention[TTx]},
 		{"TagsPartitionWaitsForHistory", testTagsPartitionWaitsForHistory[TTx]},
 		{"TagsLeaveWithTheirHour", testTagsLeaveWithTheirHour[TTx]},
+		{"TagsHourOutlastsItsDelete", testTagsHourOutlastsItsDelete[TTx]},
 		{"TagsFollowDirectUpdates", testTagsFollowDirectUpdates[TTx]},
 		{"TagsFollowTruncate", testTagsFollowTruncate[TTx]},
 		{"TagsPagePastFilteredHistory", testTagsPagePastFilteredHistory[TTx]},

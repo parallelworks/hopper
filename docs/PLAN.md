@@ -1479,7 +1479,10 @@ first deletes its jobs' tags rows, in the drop's transaction, by the tags index'
 left in the day's partition, they were the first rows a listing in ID order walked,
 and every page of them cost a walk and a lookup that found no job (20,000 of them
 took 2,001 round trips, 2.6 s, for a page of 10). A deferred drop rolls the delete back
-with it. A `failed` partition's period is its tags partition's, which goes in the same
+with it. A delete the server cancels, as a `statement_timeout` shorter than a busy hour's
+delete does, is rolled back to a savepoint and the hour dropped without it, as a previous
+release's leader drops one: its rows stay in the day's partition until it goes, rather
+than the hour, and every later one, staying for each pass to try again. A `failed` partition's period is its tags partition's, which goes in the same
 pass. A period that never had a history
 partition has its jobs in history's `DEFAULT` partition, so tags partitions are dropped
 only in a pass whose history outcome group has pruned its `DEFAULT` partition; while

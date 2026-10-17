@@ -447,6 +447,23 @@ func testTagsPartitionWaitsForHistory[TTx any](t *testing.T, f Fixture[TTx]) {
 // day's tags partition stays for the second hour: left there, a listing by
 // tag walked them before the day's jobs still in history.
 func testTagsLeaveWithTheirHour[TTx any](t *testing.T, f Fixture[TTx]) {
+	dropTaggedHour(t, f, false)
+}
+
+// testTagsHourOutlastsItsDelete drops an hourly history partition whose
+// tags rows' delete the server cancels, as a statement_timeout shorter than
+// a busy hour's delete does. The hour goes without deleting them, rather
+// than staying, with every later hour, for each pass to try again, and its
+// rows stay in the day's tags partition, which a listing by tag reads past.
+func testTagsHourOutlastsItsDelete[TTx any](t *testing.T, f Fixture[TTx]) {
+	dropTaggedHour(t, f, true)
+}
+
+// dropTaggedHour drops the first of a day's two hourly history partitions,
+// each holding a tagged job, by retention, its tags rows' delete canceled
+// if canceled, and checks what stays.
+func dropTaggedHour[TTx any](t *testing.T, f Fixture[TTx], canceled bool) {
+	t.Helper()
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -464,6 +481,13 @@ func testTagsLeaveWithTheirHour[TTx any](t *testing.T, f Fixture[TTx]) {
 			FROM (SELECT * FROM hopper_jobs LIMIT 1) j RETURNING id::text`, at)
 	}
 	gone, kept := finished("2020-01-01 00:30:00+00"), finished("2020-01-01 01:30:00+00")
+	left := "0"
+	if canceled {
+		f.Exec(ctx, t, d, `CREATE FUNCTION hopper_test_cancel() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN RAISE EXCEPTION 'canceling statement due to statement timeout' USING ERRCODE = 'query_canceled'; END $$`)
+		f.Exec(ctx, t, d, `CREATE TRIGGER hopper_test_cancel BEFORE DELETE ON `+day+` FOR EACH ROW EXECUTE FUNCTION hopper_test_cancel()`)
+		left = "1"
+	}
 	now, err := exec.Now(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -472,7 +496,7 @@ func testTagsLeaveWithTheirHour[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err != nil || !slices.Contains(res.Dropped, first) || slices.Contains(res.Dropped, second) || slices.Contains(res.Dropped, day) {
 		t.Fatalf("maintenance = %+v, %v; want %s dropped, and %s and %s kept", res, err, first, second, day)
 	}
-	for id, want := range map[string]string{gone: "0", kept: "1"} {
+	for id, want := range map[string]string{gone: left, kept: "1"} {
 		if n := f.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_job_history_tags WHERE id = $1::uuid", id); n != want {
 			t.Errorf("job %s has %s tags rows after its hour's drop, want %s", id, n, want)
 		}
