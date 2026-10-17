@@ -775,7 +775,10 @@ skew between pods cannot cause early or duplicate execution.
   takes twice the keys of the one before, up to 16 pages of them, so that a filter that
   keeps few of a tag's finished jobs, as `Metadata` beside a common tag can, costs a
   few round trips a page: with a page of keys each time, a page of 10 by a tag and a
-  kind that only 4 of the tag's 404 finished jobs had took 41 walks, and now takes 6. The walk counts the jobs it
+  kind that only 4 of the tag's 404 finished jobs had took 41 walks, and now takes 6.
+  The statement that reads a walk's jobs returns at most a page of them, the first in
+  listing order, however many of its keys the filter keeps: a walk of 160 keys whose
+  jobs all had the kind returned all 160 for a page of 10. The walk counts the jobs it
   found, so a job with two tags rows for one tag under different (state,
   `finalized_at`) counts once: only a direct SQL write can give it them, by reinserting
   into history at another time the rows of a partition a `TRUNCATE` emptied, whose

@@ -247,7 +247,7 @@ func (*statementTrace) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryE
 
 // tracedExecutor is an executor on pool's schema whose statements trace
 // records.
-func tracedExecutor(t *testing.T, pool *pgxpool.Pool, trace *statementTrace) driver.Executor {
+func tracedExecutor(t *testing.T, pool *pgxpool.Pool, trace pgx.QueryTracer) driver.Executor {
 	t.Helper()
 	cfg := *pool.Config().ConnConfig
 	cfg.Tracer = trace
@@ -333,5 +333,62 @@ func TestTagListingWalksOnFasterPastFilteredHistory(t *testing.T) {
 	}
 	if walks > 8 {
 		t.Errorf("the page took %d walks of history's tags rows, want at most 8", walks)
+	}
+}
+
+// fetchRows records the rows returned by each statement that reads a tag
+// listing's jobs from history by their keys.
+type fetchRows struct {
+	mu   sync.Mutex
+	rows []int64
+}
+
+type fetchSQL struct{}
+
+func (r *fetchRows) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, fetchSQL{}, d.SQL)
+}
+
+func (r *fetchRows) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryEndData) {
+	if sql, _ := ctx.Value(fetchSQL{}).(string); strings.Contains(sql, "finalized_at = ANY(") && d.Err == nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.rows = append(r.rows, d.CommandTag.RowsAffected())
+	}
+}
+
+// TestTagListingReadsAPageOfHistory lists finished jobs by tag and a kind
+// that the 300 after the first 150 of them have, in a page of 10. The walks
+// that double past the 150 end on one of 160 keys, all of that kind, but a
+// walk's read of the jobs returns no more than the page.
+func TestTagListingReadsAPageOfHistory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	x := hoppersql.NewWithConfig(open(t, pool), &hoppersql.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]}).Executor()
+	tagged(ctx, t, x, "skip", "f", 150, 150)
+	tagged(ctx, t, x, "want", "f", 300, 300)
+	read := &fetchRows{}
+	page, err := tracedExecutor(t, pool, read).JobList(ctx, driver.JobListParams{
+		Kinds: []string{"want"}, TagsAny: []string{"f"}, States: []driver.JobState{driver.JobStateCompleted}, Limit: 10,
+	})
+	if err != nil || len(page) != 10 {
+		t.Fatalf("listing = %d jobs, %v; want 10", len(page), err)
+	}
+	rows, err := pool.Query(ctx, "SELECT id FROM hopper_job_history WHERE kind = 'want' ORDER BY id LIMIT 10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := pgx.CollectRows(rows, pgx.RowTo[driver.JobID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, j := range page {
+		if j.ID != first[i] {
+			t.Fatalf("job %d of the page = %s, want %s", i, j.ID, first[i])
+		}
+	}
+	if len(read.rows) == 0 || slices.Max(read.rows) > 10 {
+		t.Errorf("the reads of history's jobs returned %v rows, want at most 10 each", read.rows)
 	}
 }

@@ -841,7 +841,7 @@ func (l *statementLog) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, _ pgx.Tra
 type statementSQL struct{}
 
 // tracedDriver is a driver on pool's schema whose statements log records.
-func tracedDriver(t *testing.T, pool *pgxpool.Pool, log *statementLog) *hopperpgx.Driver {
+func tracedDriver(t *testing.T, pool *pgxpool.Pool, log pgx.QueryTracer) *hopperpgx.Driver {
 	t.Helper()
 	cfg := pool.Config()
 	cfg.ConnConfig.Tracer = log
@@ -1047,29 +1047,8 @@ func TestTagListingWalksOnFasterPastFilteredHistory(t *testing.T) {
 	t.Parallel()
 	ctx, d, exec := setup(t)
 	clientID := register(t, ctx, exec)
-	finish := func(kind string, n int) {
-		t.Helper()
-		p := insertParams(kind, n)
-		for i := range p {
-			p[i].Queue, p[i].Tags = kind, []string{"f"}
-		}
-		if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
-			t.Fatal(err)
-		}
-		claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: kind, ClientID: clientID, Limit: n})
-		if err != nil || len(claimed.Jobs) != n {
-			t.Fatalf("claimed %d of %d, %v", len(claimed.Jobs), n, err)
-		}
-		fin := make([]driver.JobFinalize, n)
-		for i, j := range claimed.Jobs {
-			fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
-		}
-		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	finish("skip", 400)
-	finish("want", 4)
+	finishTagged(ctx, t, exec, clientID, "skip", 400)
+	finishTagged(ctx, t, exec, clientID, "want", 4)
 	log := &statementLog{}
 	page, err := tracedDriver(t, d.Pool(), log).Executor().JobList(ctx, driver.JobListParams{
 		Kinds: []string{"want"}, TagsAny: []string{"f"}, States: []driver.JobState{driver.JobStateCompleted}, Limit: 10,
@@ -1085,6 +1064,84 @@ func TestTagListingWalksOnFasterPastFilteredHistory(t *testing.T) {
 	}
 	if walks > 8 {
 		t.Errorf("the page took %d walks of history's tags rows, want at most 8", walks)
+	}
+}
+
+// TestTagListingReadsAPageOfHistory lists finished jobs by tag and a kind
+// that the 300 after the first 150 of them have, in a page of 10. The walks
+// that double past the 150 end on one of 160 keys, all of that kind, but a
+// walk's read of the jobs returns no more than the page.
+func TestTagListingReadsAPageOfHistory(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	clientID := register(t, ctx, exec)
+	finishTagged(ctx, t, exec, clientID, "skip", 150)
+	finishTagged(ctx, t, exec, clientID, "want", 300)
+	read := &fetchRows{}
+	page, err := tracedDriver(t, d.Pool(), read).Executor().JobList(ctx, driver.JobListParams{
+		Kinds: []string{"want"}, TagsAny: []string{"f"}, States: []driver.JobState{driver.JobStateCompleted}, Limit: 10,
+	})
+	if err != nil || len(page) != 10 {
+		t.Fatalf("listing = %d jobs, %v; want 10", len(page), err)
+	}
+	rows, err := d.Pool().Query(ctx, "SELECT id FROM hopper_job_history WHERE kind = 'want' ORDER BY id LIMIT 10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := pgx.CollectRows(rows, pgx.RowTo[driver.JobID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, j := range page {
+		if j.ID != first[i] {
+			t.Fatalf("job %d of the page = %s, want %s", i, j.ID, first[i])
+		}
+	}
+	if len(read.rows) == 0 || slices.Max(read.rows) > 10 {
+		t.Errorf("the reads of history's jobs returned %v rows, want at most 10 each", read.rows)
+	}
+}
+
+// fetchRows records the rows returned by each statement that reads a tag
+// listing's jobs from history by their keys.
+type fetchRows struct {
+	mu   sync.Mutex
+	rows []int64
+}
+
+func (r *fetchRows) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, statementSQL{}, d.SQL)
+}
+
+func (r *fetchRows) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryEndData) {
+	if sql, _ := ctx.Value(statementSQL{}).(string); strings.Contains(sql, "finalized_at = ANY(") && d.Err == nil {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.rows = append(r.rows, d.CommandTag.RowsAffected())
+	}
+}
+
+// finishTagged inserts n jobs of kind, in a queue of that name, tagged f,
+// and finalizes them into history as completed.
+func finishTagged(ctx context.Context, t *testing.T, exec driver.Executor, clientID int64, kind string, n int) {
+	t.Helper()
+	p := insertParams(kind, n)
+	for i := range p {
+		p[i].Queue, p[i].Tags = kind, []string{"f"}
+	}
+	if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: kind, ClientID: clientID, Limit: n})
+	if err != nil || len(claimed.Jobs) != n {
+		t.Fatalf("claimed %d of %d, %v", len(claimed.Jobs), n, err)
+	}
+	fin := make([]driver.JobFinalize, n)
+	for i, j := range claimed.Jobs {
+		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+	}
+	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin}); err != nil {
+		t.Fatal(err)
 	}
 }
 

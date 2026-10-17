@@ -1257,7 +1257,9 @@ type tagListing struct {
 // until the page is full or the tags' rows run out. Each walk after the first
 // takes twice the keys of the one before, up to maxWalkPages pages, so that a
 // filter that keeps few of a tag's finished jobs costs a few round trips a
-// page rather than one for each page of keys.
+// page rather than one for each page of keys. The second statement returns
+// at most a page of history's jobs, the first in listing order, however many
+// of the walk's keys the filter keeps.
 func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, args []any) (page []*driver.JobRow, err error) {
 	tx, err := c.Begin(ctx)
 	if err != nil {
@@ -1350,9 +1352,9 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 		if len(ids) > 0 {
 			slices.Sort(states)
 			fetchArgs = append(fetchArgs, timeArray(times), uuidArray(ids))
-			arms = append(arms, jobListHistorySQL+l.filter+fmt.Sprintf(
+			arms = append(arms, "SELECT * FROM ("+jobListHistorySQL+l.filter+fmt.Sprintf(
 				" AND state = ANY('{%s}'::{{schema}}.hopper_job_state[]) AND finalized_at = ANY($%d::timestamptz[]) AND id = ANY($%d::uuid[]) AND tags ?| $%d::text[]",
-				strings.Join(states, ","), len(fetchArgs)-1, len(fetchArgs), l.walked))
+				strings.Join(states, ","), len(fetchArgs)-1, len(fetchArgs), l.walked)+" OFFSET 0) h"+l.orderBy+" LIMIT "+strconv.Itoa(l.limit))
 		}
 		if len(arms) > 0 {
 			fetchSQL, fetchArgs := usedParams("("+strings.Join(arms, ") UNION ALL (")+")", fetchArgs)
