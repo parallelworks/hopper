@@ -810,14 +810,14 @@ skew between pods cannot cause early or duplicate execution.
   million finished jobs, under generic plans, a page of 20 took 0.3 ms for a tag on
   every job, 0.1 ms for one on 18, 0.4 ms for both with `TagsAny`, and 1.2 ms with
   `TagsAll` for the common tag and one on 2,000 jobs. With 300,000 jobs (200,000 in
-  history) tagged with one of 64 tags and 8 more, a page of 100 under generic plans,
-  both statements together, took 1.8 to 3.2 ms to plan at the default day of
-  `completed` partitions (29) for 1 to 64 tags of `TagsAny` and 2 or 8 of `TagsAll`. At
-  30 days (725) the walk of 33 daily tags partitions planned in 0.3 to 1.1 ms, and the
-  second statement in 0.5 to 0.7 ms when the page's jobs had finished in a few hours
-  of each other, as jobs listed in ID order mostly have; with `finalized_at` random
-  across the 30 days, each job of the page was in a partition of its own and it took
-  6.5 to 7.4 ms, a cost bounded by the page size.
+  history) tagged with one of 64 tags and 8 more, a page of 100, planned for its values
+  as the listing's transaction plans it, took 3.2 to 4.7 ms to plan, both statements
+  together, at the default day of `completed` partitions (29), for 1 to 64 tags of
+  `TagsAny` and 2 or 8 of `TagsAll`. At 30 days (725) it took 2.0 to 7.9 ms when the
+  page's jobs had finished within hours of each other, as jobs listed in ID order
+  mostly have, and 12 to 17 ms with `finalized_at` random across the 30 days, where
+  each job of the page was in a partition of its own: a cost bounded by the page size.
+  The walk of the 33 daily tags partitions is about a millisecond of that.
 - **Other filters:** `JobFilter.IDs` and `Priorities` match any of the given values,
   and `Metadata`, a JSON object, matches jobs whose metadata contains it (jsonb `@>`).
   Metadata has no index, since one would cost every insert; it narrows what the other
