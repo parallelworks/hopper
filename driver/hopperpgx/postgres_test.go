@@ -129,7 +129,7 @@ func TestHistoryMaintain(t *testing.T) {
 			}
 		}
 	}
-	next := "hopper_job_history_completed_" + time.Now().UTC().Add(time.Hour).Format("2006010215")
+	next := "hopper_job_history_completed_" + now.UTC().Add(time.Hour).Format("2006010215")
 	if !slices.Contains(res.Created, next) {
 		t.Errorf("created %v does not include the next hour %s", res.Created, next)
 	}
