@@ -439,6 +439,47 @@ func testTagsPartitionWaitsForHistory[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+// testTagsLeaveWithTheirHour drops, by retention, the first of a day's two
+// hourly history partitions. Its job's tags rows go with it, though the
+// day's tags partition stays for the second hour: left there, a listing by
+// tag walked them before the day's jobs still in history.
+func testTagsLeaveWithTheirHour[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	const first, second, day = "hopper_job_history_completed_2020010100", "hopper_job_history_completed_2020010101", "hopper_job_history_tags_completed_20200101"
+	f.Exec(ctx, t, d, `CREATE TABLE `+first+` PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`)
+	f.Exec(ctx, t, d, `CREATE TABLE `+second+` PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2020-01-01 01:00:00+00') TO ('2020-01-01 02:00:00+00')`)
+	f.Exec(ctx, t, d, `CREATE TABLE `+day+` PARTITION OF hopper_job_history_tags_completed FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-02 00:00:00+00')`)
+	insert(ctx, t, exec, params("template", 1))
+	finished := func(at string) string {
+		t.Helper()
+		return f.QueryText(ctx, t, d, `INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts,
+			  scheduled_at, args, metadata, errors, await, created_at, finalized_at, tags)
+			SELECT hopper_uuidv7(), j.seq, 'hourly', 'hourly', 'completed', j.priority, j.attempt, j.max_attempts,
+			  j.scheduled_at, j.args, j.metadata, j.errors, j.await, j.created_at, $1::timestamptz, '["hourly"]'
+			FROM (SELECT * FROM hopper_jobs LIMIT 1) j RETURNING id::text`, at)
+	}
+	gone, kept := finished("2020-01-01 00:30:00+00"), finished("2020-01-01 01:30:00+00")
+	now, err := exec.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: now.Sub(time.Date(2020, 1, 1, 1, 30, 0, 0, time.UTC))})
+	if err != nil || !slices.Contains(res.Dropped, first) || slices.Contains(res.Dropped, second) || slices.Contains(res.Dropped, day) {
+		t.Fatalf("maintenance = %+v, %v; want %s dropped, and %s and %s kept", res, err, first, second, day)
+	}
+	for id, want := range map[string]string{gone: "0", kept: "1"} {
+		if n := f.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_job_history_tags WHERE id = $1::uuid", id); n != want {
+			t.Errorf("job %s has %s tags rows after its hour's drop, want %s", id, n, want)
+		}
+	}
+	listed, err := exec.JobList(ctx, driver.JobListParams{TagsAny: []string{"hourly"}, States: []driver.JobState{driver.JobStateCompleted}, Limit: 10})
+	if err != nil || len(listed) != 1 || listed[0].ID.String() != kept {
+		t.Errorf("listing by tag after the hour's drop = %+v, %v; want the second hour's job", listed, err)
+	}
+}
+
 // testTagsRowsFollowJobs runs inserts (some replacing a unique job's tags),
 // claims, every kind of finalize, retries from history, cancels, deletes,
 // history maintenance (whose failed history's retention is short enough to
@@ -451,6 +492,22 @@ func testTagsRowsFollowJobs[TTx any](t *testing.T, f Fixture[TTx]) {
 	d := f.NewDriver(t)
 	exec := d.Executor()
 	tags := []string{"a", "b", "c", "d"}
+	f.Exec(ctx, t, d, `CREATE TABLE hopper_job_history_completed_2020010100 PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`)
+	f.Exec(ctx, t, d, `CREATE TABLE hopper_job_history_completed_2020010101 PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2020-01-01 01:00:00+00') TO ('2020-01-01 02:00:00+00')`)
+	f.Exec(ctx, t, d, `CREATE TABLE hopper_job_history_tags_completed_20200101 PARTITION OF hopper_job_history_tags_completed FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-02 00:00:00+00')`)
+	insert(ctx, t, exec, params("template", 1))
+	f.Exec(ctx, t, d, `INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts,
+		  scheduled_at, args, metadata, errors, await, created_at, finalized_at, tags)
+		SELECT hopper_uuidv7(), j.seq, 'old', 'default', 'completed', j.priority, j.attempt, j.max_attempts,
+		  j.scheduled_at, j.args, j.metadata, j.errors, j.await, j.created_at,
+		  '2020-01-01 00:00:00+00'::timestamptz + make_interval(mins => 3 * n), jsonb_build_array('a', 'b')
+		FROM (SELECT * FROM hopper_jobs LIMIT 1) j, generate_series(1, 30) n`)
+	f.Exec(ctx, t, d, "DELETE FROM hopper_jobs WHERE kind = 'template'")
+	now, err := exec.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maintain := driver.HistoryMaintainParams{CompletedRetention: now.Sub(time.Date(2020, 1, 1, 1, 30, 0, 0, time.UTC)), FailedRetention: 50 * time.Millisecond}
 	var (
 		wg   sync.WaitGroup
 		stop = make(chan struct{})
@@ -545,9 +602,11 @@ func testTagsRowsFollowJobs[TTx any](t *testing.T, f Fixture[TTx]) {
 	})
 	run(func(int) error {
 		// Completed history stays, so that tagged jobs are left there to
-		// check; the failed DEFAULT partitions' prune deletes jobs and their
-		// tags rows while finalizes, retries and deletes reach them.
-		_, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: 50 * time.Millisecond})
+		// check, but for the first of the old day's hours, whose drop deletes
+		// its jobs' tags rows; the failed DEFAULT partitions' prune deletes
+		// jobs and their tags rows while finalizes, retries and deletes reach
+		// them.
+		_, err := exec.HistoryMaintain(ctx, maintain)
 		return err
 	})
 	run(func(int) error {
@@ -560,6 +619,12 @@ func testTagsRowsFollowJobs[TTx any](t *testing.T, f Fixture[TTx]) {
 	close(errs)
 	for err := range errs {
 		t.Fatal(err)
+	}
+	if _, err := exec.HistoryMaintain(ctx, maintain); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.QueryText(ctx, t, d, "SELECT (to_regclass('hopper_job_history_completed_2020010100') IS NULL AND to_regclass('hopper_job_history_tags_completed_20200101') IS NOT NULL)::text"); n != "true" {
+		t.Fatal("the old day's first hour was not dropped apart from its tags partition")
 	}
 
 	if n := f.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_job_history_tags"); n == "0" {

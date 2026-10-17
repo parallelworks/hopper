@@ -407,6 +407,9 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name strin
 				return nil
 			}
 		}
+		if err := e.dropTagsRowsOf(ctx, tx, g, name); err != nil {
+			return err
+		}
 		_, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name))
 		return err
 	})
@@ -419,6 +422,27 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name strin
 		return partitionKept, nil
 	}
 	return partitionDropped, nil
+}
+
+func (e *Executor) dropTagsRowsOf(ctx context.Context, tx Tx, g historyGroup, name string) error {
+	i := slices.IndexFunc(historyGroups, func(t historyGroup) bool { return t.mirrors == g.parent })
+	if i < 0 || historyGroups[i].period <= g.period {
+		return nil
+	}
+	from, ok := g.parse(name)
+	if !ok {
+		return nil
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", e.Schema.Table(name)).Scan(&exists); err != nil || !exists {
+		return err
+	}
+	_, err := tx.Exec(ctx, fmt.Sprintf(`
+		DELETE FROM %s t USING %s h, %s.hopper_tags_of(h.tags) o(tag)
+		WHERE h.tags IS NOT NULL AND t.tag = o.tag AND t.id = h.id AND t.state = h.state AND t.finalized_at = h.finalized_at
+		  AND t.finalized_at >= $1 AND t.finalized_at < $2`,
+		e.Schema.Table(historyGroups[i].parent), e.Schema.Table(name), quoteIdent(e.Schema.Name)), from, from.Add(g.period))
+	return err
 }
 
 // lackingInvalidIndexes maps the partitions of the outcome table parent

@@ -736,9 +736,11 @@ skew between pods cannot cause early or duplicate execution.
   unique, as `hopper_job_tags`' are, so reinserting such a partition's rows fails
   (23505) rather than adding a second copy of each job's tags rows, which would list
   the job twice. A tagged job pays an index insert per tag when inserted and a
-  delete and an insert per tag when finalized. History's table is partitioned by
+  delete and an insert per tag when finalized, and a `completed` one a delete per tag
+  when retention drops its hour. History's table is partitioned by
   outcome as history is and then by day, and the leader creates and drops its
-  partitions with history's (§7.10), so retention stays a partition drop. A listing by
+  partitions with history's (§7.10), so retention of its rows is a partition drop,
+  less the hours of `completed` history that go before their day. A listing by
   tag has an arm per table (live and history): for each of its tags (`unnest`) a
   `LATERAL` subquery walks the tag's rows in ID order from the cursor and stops at the
   page size, and the arm keeps each job once, in ID order, up to the page. On the live
@@ -1460,15 +1462,21 @@ creates (two days ahead) and drops beside history's, each in a transaction of it
 Daily partitions keep a listing's walk, which reads every tags partition of its
 outcome, to one per day of retention rather than one per hour. A tags partition is
 dropped only once every history partition covering its day is gone, after them in the
-same pass or in a later one, so that a job in history always keeps its tags rows; a
-tags partition left without its history partitions indexes nothing a listing
-returns. A period that never had a history
+same pass or in a later one, so that a job in history always keeps its tags rows. An
+hour of `completed` history goes up to a day before its tags partition, so its drop
+first deletes its jobs' tags rows, in the drop's transaction, by the tags index's key:
+left in the day's partition, they were the first rows a listing in ID order walked,
+and every page of them cost a walk and a lookup that found no job (20,000 of them
+took 2,001 round trips, 2.6 s, for a page of 10). A deferred drop rolls the delete back
+with it. A `failed` partition's period is its tags partition's, which goes in the same
+pass. A period that never had a history
 partition has its jobs in history's `DEFAULT` partition, so tags partitions are dropped
 only in a pass whose history outcome group has pruned its `DEFAULT` partition; while
-that prune fails, they wait. Neither creation nor a drop locks both
-tables: a finalize locks history before its tags and a listing by tag the tags before
+that prune fails, they wait. Neither creation nor a drop takes an exclusive lock on
+both tables: a finalize locks history before its tags and a listing by tag the tags before
 history, so a statement that held one parent while it waited for the other could
-deadlock with either. A history partition that has no tags partition beside it, as one
+deadlock with either. The delete of an hour's tags rows takes only the row lock that
+finalizes take on the tags tables, which neither a finalize nor a listing waits for. A history partition that has no tags partition beside it, as one
 a previous release's leader creates, sends its jobs' tags rows to the tags table's
 `DEFAULT` partition, whose prune keeps the rows of jobs still in history. v17 gives
 each day that history's partitions for the current period and those ahead cover its
