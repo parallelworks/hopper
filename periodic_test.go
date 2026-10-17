@@ -177,28 +177,53 @@ func TestPeriodicJobsAtRuntime(t *testing.T) {
 	waitFor(t, func() bool { return jobs("3") >= 1 })
 }
 
+// minutesUntil has a slot at every minute up to end, and none after it, so
+// that a test of missed slots does not depend on the minute it spans.
+type minutesUntil struct{ end time.Time }
+
+func (s minutesUntil) Next(t time.Time) time.Time {
+	next := t.Truncate(time.Minute).Add(time.Minute)
+	if next.After(s.end) {
+		return time.Time{}
+	}
+	return next
+}
+
 // A job added mid-term whose last slot is old back-fills CatchUp slots, as
-// at the start of a term.
+// at the start of a term, and RunOnStart adds its job to them.
 func TestPeriodicJobsAddCatchesUp(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	ctx := context.Background()
 	c := h.started(noopWorkers(), 2)
 	waitFor(t, c.IsLeader)
-	if _, err := h.pool.Exec(ctx, "INSERT INTO hopper_periodic (name, last_slot) VALUES ('minutely', date_trunc('minute', now()) - interval '1 hour')"); err != nil {
+	var end time.Time
+	if err := h.pool.QueryRow(ctx, "SELECT now()").Scan(&end); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.PeriodicJobs().Add(hopper.Every(time.Minute, noop{N: 5}, &hopper.PeriodicOpts{Name: "minutely", CatchUp: 3})); err != nil {
+	for _, name := range []string{"minutely", "minutely-start"} {
+		if _, err := h.pool.Exec(ctx, "INSERT INTO hopper_periodic (name, last_slot) VALUES ($1, date_trunc('minute', now()) - interval '1 hour')", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := c.PeriodicJobs().AddMany([]hopper.PeriodicJob{
+		{Name: "minutely", Schedule: minutesUntil{end}, Args: noop{N: 5}, Opts: &hopper.PeriodicOpts{CatchUp: 3}},
+		{Name: "minutely-start", Schedule: minutesUntil{end}, Args: noop{N: 6}, Opts: &hopper.PeriodicOpts{CatchUp: 3, RunOnStart: true}},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	count := func() int {
-		return h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = '5'") +
-			h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = '5'")
+	count := func(n string) int {
+		return h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = $1", n) +
+			h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = $1", n)
 	}
-	waitFor(t, func() bool { return count() >= 3 })
+	waitFor(t, func() bool { return count("5") >= 3 && count("6") >= 4 })
 	time.Sleep(300 * time.Millisecond)
-	if n := count(); n != 3 {
+	if n := count("5"); n != 3 {
 		t.Errorf("caught up %d slots, want 3", n)
+	}
+	if n := count("6"); n != 4 {
+		t.Errorf("with RunOnStart, inserted %d jobs, want 3 caught up and 1 on start", n)
 	}
 }
 

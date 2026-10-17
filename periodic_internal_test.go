@@ -16,15 +16,29 @@ type tickArgs struct{}
 func (tickArgs) Kind() string { return "tick" }
 
 // periodicExec answers the periodic loop's reads and records its inserts.
-// Its first slotsFailures reads of the last slots fail.
+// Its first slotsFailures reads of the last slots fail, and its clock is
+// skew from the local one.
 type periodicExec struct {
 	driver.Executor
 	mu            sync.Mutex
 	slotsFailures int
+	skew          time.Duration
+	nowReads      int
 	inserts       []driver.PeriodicInsertParams
 }
 
-func (e *periodicExec) Now(context.Context) (time.Time, error) { return time.Now(), nil }
+func (e *periodicExec) Now(context.Context) (time.Time, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.nowReads++
+	return time.Now().Add(e.skew), nil
+}
+
+func (e *periodicExec) reads() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.nowReads
+}
 
 func (e *periodicExec) PeriodicLastSlots(context.Context) (map[string]time.Time, error) {
 	e.mu.Lock()
@@ -156,5 +170,41 @@ func TestInsertPeriodicSkipsRemoved(t *testing.T) {
 	c.insertPeriodic(context.Background(), r, time.Now())
 	if n := exec.inserted("tick"); n != 0 {
 		t.Errorf("removed job inserted %d times", n)
+	}
+}
+
+// A database clock behind the local one neither makes the loop spin on
+// clock reads nor delays the slots.
+func TestPeriodicLoopDatabaseClockBehind(t *testing.T) {
+	exec := &periodicExec{skew: -time.Minute}
+	c := newPeriodicTestClient(t, exec, Every(50*time.Millisecond, tickArgs{}, nil))
+	runPeriodicLoop(t, c)
+	time.Sleep(500 * time.Millisecond)
+	if n := exec.inserted("tick"); n < 5 {
+		t.Errorf("inserted %d slots in 500ms of 50ms slots", n)
+	}
+	if n := exec.reads(); n > 30 {
+		t.Errorf("read the clock %d times for about 10 slots", n)
+	}
+}
+
+// A job already scheduled keeps inserting its slots while the last slots
+// for a job added later cannot be read.
+func TestPeriodicLoopFailedReadKeepsOthers(t *testing.T) {
+	exec := &periodicExec{}
+	c := newPeriodicTestClient(t, exec, Every(20*time.Millisecond, tickArgs{}, nil))
+	c.tuning.leaderInterval = time.Hour
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool { return exec.inserted("tick") >= 1 })
+	exec.mu.Lock()
+	exec.slotsFailures = 1 << 30
+	exec.mu.Unlock()
+	if err := c.PeriodicJobs().Add(Every(time.Hour, tickArgs{}, &PeriodicOpts{Name: "added", RunOnStart: true})); err != nil {
+		t.Fatal(err)
+	}
+	n := exec.inserted("tick")
+	eventually(t, func() bool { return exec.inserted("tick") >= n+3 })
+	if got := exec.inserted("added"); got != 0 {
+		t.Errorf("a job whose slots could not be read inserted %d jobs", got)
 	}
 }

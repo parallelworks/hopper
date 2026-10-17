@@ -1458,7 +1458,8 @@ standard library. `Every` slots are aligned to the interval, so every leader com
 the same slots.
 
 The leader runs a periodic loop for the duration of its term. It sleeps until the
-soonest slot, reads the database clock, and for each slot that has come due upserts
+soonest slot, timed on the database clock, reads that clock, and for each slot that
+has come due upserts
 `hopper_periodic.last_slot` with `ON CONFLICT DO UPDATE … WHERE last_slot < $slot` and
 inserts the job in the same transaction only if that upsert returned a row. A slot
 therefore produces at most one job, even if two leaders overlap or leadership changes
@@ -1466,7 +1467,9 @@ mid-slot, and even after the first job has finished and left the live table.
 `RunOnStart` inserts a job when a leader starts scheduling. Missed slots are skipped by
 default, except slots due since the last recorded one within the last lease TTL, which
 covers a failover; `CatchUp: n` back-fills up to the n most recent missed slots
-instead. A schedule with no recorded slot starts from its next slot.
+instead. A schedule with no recorded slot starts from its next slot. `RunOnStart`'s
+slot is the database time, so it is inserted after the back-filled slots, which the
+upsert would otherwise reject as older than the last one.
 
 `Config.Periodic` is a client's initial set of periodic jobs. `Client.PeriodicJobs()`
 changes the set at runtime with `Add`, `AddMany`, `Remove` and `Clear`, and lists it with

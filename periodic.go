@@ -283,14 +283,12 @@ func (p *PeriodicJobs) notify() {
 	}
 }
 
-type periodicEntry struct {
-	next time.Time
-}
-
 // periodicLoop runs on the leader. It inserts each periodic job's slots as
 // they come due, sleeping until the soonest one or until the jobs change.
+// next holds the next slot of each job it has started scheduling, zero for
+// a job with no more slots.
 func (c *Client[TTx]) periodicLoop(ctx context.Context) {
-	entries := map[*registeredPeriodic]*periodicEntry{}
+	next := map[*registeredPeriodic]time.Time{}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -300,28 +298,35 @@ func (c *Client[TTx]) periodicLoop(ctx context.Context) {
 		case <-timer.C:
 		case <-c.periodic.changed:
 		}
-		timer.Reset(c.periodicPass(ctx, entries))
+		timer.Reset(c.periodicPass(ctx, next))
 	}
 }
 
 // periodicPass starts scheduling the jobs added since the last pass, stops
 // those removed, inserts the slots that have come due and returns how long
 // to sleep. A failed read of the clock or the last slots is retried after a
-// leader interval.
-func (c *Client[TTx]) periodicPass(ctx context.Context, entries map[*registeredPeriodic]*periodicEntry) time.Duration {
+// leader interval; while the slots cannot be read, the jobs already started
+// go on.
+func (c *Client[TTx]) periodicPass(ctx context.Context, next map[*registeredPeriodic]time.Time) time.Duration {
 	regs := c.periodic.snapshot()
-	live := make(map[*registeredPeriodic]struct{}, len(regs))
 	var added []*registeredPeriodic
 	for _, r := range regs {
-		live[r] = struct{}{}
-		if entries[r] == nil {
+		if _, ok := next[r]; !ok {
 			added = append(added, r)
 		}
 	}
-	maps.DeleteFunc(entries, func(r *registeredPeriodic, _ *periodicEntry) bool {
-		_, ok := live[r]
-		return !ok
-	})
+	// next holds a removed job only if it holds more than the started jobs
+	// still registered.
+	if len(next) > len(regs)-len(added) {
+		live := make(map[*registeredPeriodic]struct{}, len(regs))
+		for _, r := range regs {
+			live[r] = struct{}{}
+		}
+		maps.DeleteFunc(next, func(r *registeredPeriodic, _ time.Time) bool {
+			_, ok := live[r]
+			return !ok
+		})
+	}
 	if len(regs) == 0 {
 		return math.MaxInt64
 	}
@@ -333,58 +338,65 @@ func (c *Client[TTx]) periodicPass(ctx context.Context, entries map[*registeredP
 		}
 		return c.tuning.leaderInterval
 	}
+	read := time.Now()
+	sleep := time.Duration(math.MaxInt64)
 	if len(added) > 0 {
 		lastSlots, err := c.exec.PeriodicLastSlots(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: periodic: read slots", "error", err)
 			}
-			return c.tuning.leaderInterval
-		}
-		for _, r := range added {
-			entries[r] = c.startPeriodic(ctx, r, now, lastSlots)
+			sleep = c.tuning.leaderInterval
+		} else {
+			for _, r := range added {
+				next[r] = c.startPeriodic(ctx, r, now, lastSlots)
+			}
 		}
 	}
 
 	var soonest time.Time
 	for _, r := range regs {
-		e := entries[r]
-		for !e.next.IsZero() && !e.next.After(now) {
-			c.insertPeriodic(ctx, r, e.next)
-			e.next = r.job.Schedule.Next(e.next)
+		n, ok := next[r]
+		if !ok {
+			continue
 		}
-		if !e.next.IsZero() && (soonest.IsZero() || e.next.Before(soonest)) {
-			soonest = e.next
+		for !n.IsZero() && !n.After(now) {
+			c.insertPeriodic(ctx, r, n)
+			n = r.job.Schedule.Next(n)
+		}
+		next[r] = n
+		if !n.IsZero() && (soonest.IsZero() || n.Before(soonest)) {
+			soonest = n
 		}
 	}
-	if soonest.IsZero() {
-		return math.MaxInt64
+	if !soonest.IsZero() {
+		// Sleep until the slot comes due on the database clock, measured
+		// from the read, so that a local clock ahead of or behind the
+		// database's neither spins nor oversleeps.
+		sleep = min(sleep, soonest.Sub(now)-time.Since(read))
 	}
-	// Sleep on the local clock, then act on the database clock.
-	return time.Until(soonest)
+	return sleep
 }
 
-// startPeriodic starts scheduling a job at the database time now: it runs
-// RunOnStart and CatchUp, and returns the job's next slot.
-func (c *Client[TTx]) startPeriodic(ctx context.Context, r *registeredPeriodic, now time.Time, lastSlots map[string]time.Time) *periodicEntry {
+// startPeriodic starts scheduling a job at the database time now and
+// returns its next slot. It inserts the missed slots that CatchUp or a
+// failover back-fills, then RunOnStart's job. RunOnStart goes last because
+// its slot is now, and a slot older than the last one recorded is never
+// inserted.
+func (c *Client[TTx]) startPeriodic(ctx context.Context, r *registeredPeriodic, now time.Time, lastSlots map[string]time.Time) time.Time {
 	p := &r.job
 	var opts PeriodicOpts
 	if p.Opts != nil {
 		opts = *p.Opts
 	}
-	if opts.RunOnStart {
-		c.insertPeriodic(ctx, r, now)
-	}
 	// Slots missed while no leader ran are skipped, except those due since
 	// the last recorded slot within the last lease TTL, which covers a
 	// failover. CatchUp back-fills the most recent missed slots instead. A
 	// schedule with no recorded slot starts fresh.
-	e := &periodicEntry{next: p.Schedule.Next(now)}
+	next := p.Schedule.Next(now)
 	last, known := lastSlots[p.Name]
-	if known && last.Before(now) {
-		e.next = p.Schedule.Next(maxTime(last, now.Add(-c.tuning.leaderTTL)))
-	}
-	if known && opts.CatchUp > 0 {
+	switch {
+	case known && opts.CatchUp > 0:
 		var missed []time.Time
 		for slot := p.Schedule.Next(last); !slot.IsZero() && !slot.After(now) && len(missed) < 10000; slot = p.Schedule.Next(slot) {
 			missed = append(missed, slot)
@@ -395,9 +407,17 @@ func (c *Client[TTx]) startPeriodic(ctx context.Context, r *registeredPeriodic, 
 		for _, slot := range missed {
 			c.insertPeriodic(ctx, r, slot)
 		}
-		e.next = p.Schedule.Next(now)
+	case known && last.Before(now):
+		next = p.Schedule.Next(maxTime(last, now.Add(-c.tuning.leaderTTL)))
+		for !next.IsZero() && !next.After(now) {
+			c.insertPeriodic(ctx, r, next)
+			next = p.Schedule.Next(next)
+		}
 	}
-	return e
+	if opts.RunOnStart {
+		c.insertPeriodic(ctx, r, now)
+	}
+	return next
 }
 
 func maxTime(a, b time.Time) time.Time {
