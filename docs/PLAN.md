@@ -767,7 +767,12 @@ skew between pods cannot cause early or duplicate execution.
   return fewer jobs than the walk found. The page's jobs are known in full up to the
   end of each arm that came back full, the live arm's last job and the walk's last key;
   when the walk ends them short of a page, the listing walks history on from that key
-  in the same transaction, keeping the live jobs it has. Inside a caller's transaction (`JobsTx`) the listing cannot set the
+  in the same transaction, keeping the live jobs it has. The walk counts the jobs it
+  found, so a job with two tags rows for one tag under different (state,
+  `finalized_at`) counts once: only a direct SQL write can give it them, by reinserting
+  into history at another time the rows of a partition a `TRUNCATE` emptied, whose
+  stale tags rows stay. A walk cut off at the page size then reads as exhausted, the
+  page can come back short, and `Jobs` stops at it; the rows go at retention. Inside a caller's transaction (`JobsTx`) the listing cannot set the
   isolation level, so its history arm looks jobs up inline as the live one does; it is
   correct, and plans every partition. A statement leaves out a parameter it does not
   use, since the server cannot type one it never sees (42P18), and numbers the rest in
