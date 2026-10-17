@@ -364,6 +364,42 @@ func TestDownDropsUnattachedHistoryIndexes(t *testing.T) {
 	}
 }
 
+// TestTagsPartitionsOnInstall installs the schema, whose history has no time
+// partitions yet: today and tomorrow have tags partitions for both outcomes
+// all the same, so that the first day's tags rows are not left in the DEFAULT
+// partition, which the leader's attach of each later day scans.
+func TestTagsPartitionsOnInstall(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	today := func() time.Time {
+		t.Helper()
+		var now time.Time
+		if err := pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		return now.UTC().Truncate(24 * time.Hour)
+	}
+	before := today()
+	if _, err := hoppermigrate.Up(ctx, testdb.Driver(pool), &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}); err != nil {
+		t.Fatal(err)
+	}
+	after := today()
+	days := []time.Time{after}
+	if after.Equal(before) {
+		days = append(days, after.Add(24*time.Hour))
+	}
+	for _, outcome := range []string{"completed", "failed"} {
+		for _, day := range days {
+			name := "hopper_job_history_tags_" + outcome + "_" + day.Format("20060102")
+			var exists bool
+			if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", name).Scan(&exists); err != nil || !exists {
+				t.Errorf("%s exists = %t, %v; want it created on install", name, exists, err)
+			}
+		}
+	}
+}
+
 // TestTagsUpgrade upgrades a database with jobs, live and in history, to
 // v17: they have no tags, a tagged job's tags rows follow it from the live
 // table to history, and a downgrade then drops the tags tables, triggers

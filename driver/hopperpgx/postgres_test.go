@@ -100,14 +100,34 @@ func TestHistoryMaintain(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var now time.Time
+	if err := pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+		t.Fatal(err)
+	}
 	res, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, FailedRetention: 7 * 24 * time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 3 hourly and 2 daily periods ahead of the current ones for history, 2
-	// days ahead for each outcome's tags rows, and 2 daily stream partitions.
-	if len(res.Created) != 3+2+2*2+2 {
+	// 3 hourly and 2 daily periods ahead of the current ones for history,
+	// and 2 daily stream partitions. History's tags rows have the 2 days
+	// ahead too, tomorrow's from the migration.
+	tagsCreated := 0
+	for _, name := range res.Created {
+		if strings.HasPrefix(name, "hopper_job_history_tags_") {
+			tagsCreated++
+		}
+	}
+	if len(res.Created)-tagsCreated != 3+2+2 {
 		t.Errorf("created = %v", res.Created)
+	}
+	for _, outcome := range []string{"completed", "failed"} {
+		for days := 1; days <= 2; days++ {
+			name := "hopper_job_history_tags_" + outcome + "_" + now.UTC().Truncate(24*time.Hour).Add(time.Duration(days)*24*time.Hour).Format("20060102")
+			var exists bool
+			if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", name).Scan(&exists); err != nil || !exists {
+				t.Errorf("tags partition ahead %s exists = %t, %v", name, exists, err)
+			}
+		}
 	}
 	next := "hopper_job_history_completed_" + time.Now().UTC().Add(time.Hour).Format("2006010215")
 	if !slices.Contains(res.Created, next) {

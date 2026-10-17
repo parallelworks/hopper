@@ -62,7 +62,11 @@ CREATE UNIQUE INDEX hopper_job_history_tags_tag ON hopper_job_history_tags (tag,
 -- of the time partitions history already has for the current period and
 -- those ahead get their tags partitions here, so that a job's tags rows sit
 -- in a time partition from the start; the leader creates later ones beside
--- history's. A past period's partition gets none: a job is
+-- history's. Today and tomorrow get theirs whatever history has, as on a new
+-- installation, whose history has no time partitions yet: the leader creates
+-- only days ahead, and a day without one sends its tags rows to the DEFAULT
+-- partition, which the attach of every later day scans while it holds
+-- listings off. A past period's partition gets none: a job is
 -- finalized into history at now(), so only a direct SQL write could give it
 -- tags rows, which the tags' DEFAULT partition keeps instead, and a
 -- retention of months would otherwise create a table, with its index, for
@@ -84,6 +88,7 @@ DECLARE
   p record;
   day timestamptz;
   upto timestamptz;
+  outcome text;
   prior_datestyle constant text := current_setting('datestyle');
   prior_timezone constant text := current_setting('timezone');
 BEGIN
@@ -108,6 +113,15 @@ BEGIN
           'hopper_job_history_tags_' || substr(p.parent, length('hopper_job_history_') + 1), day, day + interval '1 day');
       END LOOP;
     END IF;
+  END LOOP;
+  FOR day IN SELECT generate_series(date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+      (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') + interval '1 day', interval '1 day')
+  LOOP
+    FOREACH outcome IN ARRAY ARRAY['completed', 'failed'] LOOP
+      EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF %I FOR VALUES FROM (%L) TO (%L)',
+        'hopper_job_history_tags_' || outcome || '_' || to_char(day AT TIME ZONE 'UTC', 'YYYYMMDD'),
+        'hopper_job_history_tags_' || outcome, day, day + interval '1 day');
+    END LOOP;
   END LOOP;
   PERFORM set_config('timezone', prior_timezone, true);
   PERFORM set_config('datestyle', prior_datestyle, true);

@@ -1485,7 +1485,11 @@ a previous release's leader creates, sends its jobs' tags rows to the tags table
 `DEFAULT` partition, whose prune keeps the rows of jobs still in history. v17 gives
 each day that history's partitions for the current period and those ahead cover its
 tags partition, so that a job's tags rows are in their day's partition from the upgrade
-on. It counts the days in UTC, as the leader does, whatever the session's time zone: a
+on, and today and tomorrow theirs for both outcomes whatever history has, as on a new
+installation, whose history has no time partitions yet: the leader creates only days
+ahead, and a first day without a tags partition left a day of tags rows in the
+`DEFAULT` partition, which the attach of each later day scans under an exclusive lock
+that holds listings by tag off. It counts the days in UTC, as the leader does, whatever the session's time zone: a
 day added in a zone whose clocks change that day is 23 or 25 hours, and the partition
 would leave a gap before the next day's or overlap it, failing the upgrade. A past
 period's partition

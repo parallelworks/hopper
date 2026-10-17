@@ -124,6 +124,9 @@ func testJobTags[TTx any](t *testing.T, f Fixture[TTx]) {
 		}
 		finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	}
+	if n := f.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_job_history_tags_completed_default"); n != "0" {
+		t.Errorf("%s tags rows of jobs finished on a new installation in the DEFAULT partition, want 0", n)
+	}
 	got, err := exec.JobGet(ctx, res[1].Job.ID)
 	if err != nil || got.State != driver.JobStateCompleted || !slices.Equal(got.Tags, p[1].Tags) {
 		t.Fatalf("job in history = %+v, %v", got, err)
@@ -776,7 +779,9 @@ func testTagsFollowHistoryRetention[TTx any](t *testing.T, f Fixture[TTx]) {
 	// History's DEFAULT partition holds the job, and a tags time partition
 	// its tags row.
 	pruned := hour.Add(-4 * time.Hour)
-	partition("hopper_job_history_tags_completed", "hopper_job_history_tags", pruned)
+	day := pruned.Truncate(24 * time.Hour)
+	f.Exec(ctx, t, d, "CREATE TABLE IF NOT EXISTS hopper_job_history_tags_completed_"+day.Format("20060102")+" PARTITION OF hopper_job_history_tags_completed FOR VALUES FROM ('"+
+		day.Format(time.RFC3339)+"') TO ('"+day.Add(24*time.Hour).Format(time.RFC3339)+"')")
 	id := finished("pruned", pruned)
 	if n := tagRows(id); n != "1" {
 		t.Fatalf("tags rows before retention = %s", n)
@@ -784,7 +789,7 @@ func testTagsFollowHistoryRetention[TTx any](t *testing.T, f Fixture[TTx]) {
 	// A tags row in the tags' DEFAULT partition whose job is gone, as one
 	// left by a dropped history partition, is pruned too, but Pruned counts
 	// jobs: only the one.
-	f.Exec(ctx, t, d, `INSERT INTO hopper_job_history_tags (state, finalized_at, tag, id) VALUES ('completed', $1, 'orphan', hopper_uuidv7())`, pruned.Add(-time.Hour))
+	f.Exec(ctx, t, d, `INSERT INTO hopper_job_history_tags (state, finalized_at, tag, id) VALUES ('completed', $1, 'orphan', hopper_uuidv7())`, hour.Add(-96*time.Hour))
 	if n := retain(pruned); n != 1 {
 		t.Errorf("Pruned = %d, want the one job", n)
 	}
@@ -800,7 +805,7 @@ func testTagsFollowHistoryRetention[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	// A history time partition holds the job, and the tags' DEFAULT partition
 	// its tags row.
-	kept := hour.Add(-2 * time.Hour)
+	kept := hour.Add(-72 * time.Hour)
 	partition("hopper_job_history_completed", "hopper_job_history", kept)
 	id = finished("kept", kept)
 	retain(kept)
