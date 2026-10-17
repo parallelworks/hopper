@@ -75,15 +75,20 @@ CREATE UNIQUE INDEX hopper_job_history_tags_tag ON hopper_job_history_tags (tag,
 -- through text, so it is written in ISO's form, with a numeric offset:
 -- another DateStyle writes the time zone's abbreviation, which Postgres
 -- before 18 reads by timezone_abbreviations alone (Asia/Shanghai's CST as US
--- Central's), and the copy would cover a period hours off its name's.
+-- Central's), and the copy would cover a period hours off its name's. Days
+-- are counted in UTC, as the leader names and bounds them: a day added in a
+-- zone that changes its clocks that day is 23 or 25 hours, and the partition
+-- would leave a gap before the next day's or overlap it, failing the upgrade.
 DO $$
 DECLARE
   p record;
   day timestamptz;
   upto timestamptz;
   prior_datestyle constant text := current_setting('datestyle');
+  prior_timezone constant text := current_setting('timezone');
 BEGIN
   PERFORM set_config('datestyle', 'ISO', true);
+  PERFORM set_config('timezone', 'UTC', true);
   FOR p IN
     SELECT c.relname AS name, pc.relname AS parent, pg_get_expr(c.relpartbound, 0) AS bound
     FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid JOIN pg_class pc ON pc.oid = i.inhparent
@@ -104,6 +109,7 @@ BEGIN
       END LOOP;
     END IF;
   END LOOP;
+  PERFORM set_config('timezone', prior_timezone, true);
   PERFORM set_config('datestyle', prior_datestyle, true);
 END
 $$;

@@ -1461,7 +1461,10 @@ a previous release's leader creates, sends its jobs' tags rows to the tags table
 `DEFAULT` partition, whose prune keeps the rows of jobs still in history. v17 gives
 each day that history's partitions for the current period and those ahead cover its
 tags partition, so that a job's tags rows are in their day's partition from the upgrade
-on. A past period's partition
+on. It counts the days in UTC, as the leader does, whatever the session's time zone: a
+day added in a zone whose clocks change that day is 23 or 25 hours, and the partition
+would leave a gap before the next day's or overlap it, failing the upgrade. A past
+period's partition
 gets none: jobs are finalized into history at `now()`, so only a direct SQL write
 could give one tags rows, which the `DEFAULT` partition keeps, and a long retention
 would otherwise create a table and index per period in the migration's transaction. The leader creates partitions several intervals ahead

@@ -994,3 +994,48 @@ func TestTagsUpgradeCopiesBoundsInAnyDateStyle(t *testing.T) {
 		}
 	}
 }
+
+// TestTagsUpgradeCutsDaysInUTC upgrades to v17 from a session in a time zone
+// whose clocks go back an hour on the first of the two days history has
+// failed partitions for (America/New_York, 2099-11-01). A day added in that
+// zone is 25 hours, which made the first day's tags partition overlap the
+// second's and failed the upgrade. Each tags partition covers its day in UTC.
+func TestTagsUpgradeCutsDaysInUTC(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, testdb.Driver(pool), &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
+		t.Fatal(err)
+	}
+	days := []time.Time{time.Date(2099, 11, 1, 0, 0, 0, 0, time.UTC), time.Date(2099, 11, 2, 0, 0, 0, 0, time.UTC)}
+	for _, day := range days {
+		if _, err := pool.Exec(ctx, fmt.Sprintf("CREATE TABLE hopper_job_history_failed_%s PARTITION OF hopper_job_history_failed FOR VALUES FROM ('%s') TO ('%s')",
+			day.Format("20060102"), day.Format(time.RFC3339), day.Add(24*time.Hour).Format(time.RFC3339))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := pool.Config().Copy()
+	cfg.ConnConfig.RuntimeParams["timezone"] = "America/New_York"
+	zoned, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zoned.Close()
+	if _, err := hoppermigrate.Up(ctx, testdb.Driver(zoned), &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
+	for _, day := range days {
+		var exact bool
+		if err := pool.QueryRow(ctx, `SELECT coalesce(
+			  (regexp_match(pg_get_expr(g.relpartbound, g.oid), 'FROM \(''([^'']+)''\)'))[1]::timestamptz = $2
+			    AND (regexp_match(pg_get_expr(g.relpartbound, g.oid), 'TO \(''([^'']+)''\)'))[1]::timestamptz = $3, false)
+			FROM (SELECT 1) one LEFT JOIN pg_class g ON g.relname = $1 AND g.relnamespace = current_schema()::regnamespace`,
+			"hopper_job_history_tags_failed_"+day.Format("20060102"), day, day.Add(24*time.Hour)).Scan(&exact); err != nil {
+			t.Fatal(err)
+		}
+		if !exact {
+			t.Errorf("tags partition of %s missing or not that day in UTC", day.Format("2006-01-02"))
+		}
+	}
+}
