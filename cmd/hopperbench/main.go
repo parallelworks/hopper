@@ -227,8 +227,9 @@ type bench struct {
 // over the last day into hourly partitions as a running system would have
 // them, so finalizes during the run land in the current hour's small
 // partition rather than in a large DEFAULT one. History's tags rows (schema
-// v17) get the same hourly partitions, as the leader keeps them beside
-// history's.
+// v17) get today's and yesterday's daily partitions, as the leader keeps them
+// beside history's. The days are 24 hours in UTC whatever the session's time
+// zone, as the leader's are.
 func (b *bench) reset(ctx context.Context) error {
 	// The tags tables (schema v17) are listed so that their truncate
 	// triggers find them empty, rather than truncating them one by one.
@@ -246,9 +247,9 @@ func (b *bench) reset(ctx context.Context) error {
 			      'hopper_job_history_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDDHH24'), start, start + interval '1 hour');
 			  END LOOP;
 			  FOR h IN 0..1 LOOP
-			    start := (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - make_interval(days => h);
+			    start := (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - make_interval(hours => 24 * h);
 			    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF hopper_job_history_tags_completed FOR VALUES FROM (%L) TO (%L)',
-			      'hopper_job_history_tags_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDD'), start, start + interval '1 day');
+			      'hopper_job_history_tags_completed_' || to_char(start AT TIME ZONE 'UTC', 'YYYYMMDD'), start, start + interval '24 hours');
 			  END LOOP;
 			END $$`); err != nil {
 			return fmt.Errorf("preload partitions: %w", err)
