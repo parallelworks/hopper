@@ -35,11 +35,16 @@
   default), so the leader vacuums the live table itself once a hundred
   thousand dead rows have accumulated, and re-analyzes it when the
   planner's row count is an order of magnitude off the live count, every
-  few seconds, skipping when autovacuum already holds the table. Nothing needs
+  few seconds, skipping when autovacuum already holds the table. It keeps
+  the live tags table, `hopper_job_tags`, the same way. Nothing needs
   configuring; the schema also sets the table's own autovacuum thresholds
   low with no cost delay, so the server's pass, when it comes, is quick.
-  History never needs vacuuming for retention: expired data is dropped by
-  partition.
+  History needs no vacuuming for retention, since expired jobs are dropped by
+  partition. The exceptions are the rows pruned from its DEFAULT partitions
+  and completed jobs' tags rows. Those are partitioned by day, and dropping
+  an hour of completed history deletes that hour's tags rows, which leaves
+  dead rows in the day's tags partition for autovacuum until the day is
+  dropped.
 - **`shared_buffers`.** Keep the live table, its indexes and the current
   history partition in shared buffers. With Postgres's 128 MB default, a
   burst of history writes evicts the live table and throughput drops by a
