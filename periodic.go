@@ -132,6 +132,25 @@ func (p PeriodicJob) clone() PeriodicJob {
 	return p
 }
 
+// resolvePeriodic returns copies of the jobs, validated and with their
+// names filled in. It fails if a job is invalid or two share a name.
+func resolvePeriodic(jobs []PeriodicJob) ([]PeriodicJob, error) {
+	out := make([]PeriodicJob, len(jobs))
+	names := make(map[string]struct{}, len(jobs))
+	for i, job := range jobs {
+		job = job.clone()
+		if err := job.resolve(); err != nil {
+			return nil, err
+		}
+		if _, dup := names[job.Name]; dup {
+			return nil, fmt.Errorf("hopper: periodic job %q is listed twice; set PeriodicOpts.Name to tell them apart", job.Name)
+		}
+		names[job.Name] = struct{}{}
+		out[i] = job
+	}
+	return out, nil
+}
+
 // PeriodicJobs is a client's set of periodic jobs, which starts as
 // Config.Periodic. Only the leader schedules, from its own set: a job added
 // on one client is not seen by the others, so a job that must keep running
@@ -183,17 +202,12 @@ func (p *PeriodicJobs) Add(job PeriodicJob) error {
 // AddMany registers every job, or none if any is invalid or its name is
 // taken, including by another of jobs.
 func (p *PeriodicJobs) AddMany(jobs []PeriodicJob) error {
-	regs := make([]*registeredPeriodic, len(jobs))
-	names := make(map[string]struct{}, len(jobs))
-	for i, job := range jobs {
-		job = job.clone()
-		if err := job.resolve(); err != nil {
-			return err
-		}
-		if _, dup := names[job.Name]; dup {
-			return fmt.Errorf("hopper: periodic job %q is listed twice; set PeriodicOpts.Name to tell them apart", job.Name)
-		}
-		names[job.Name] = struct{}{}
+	resolved, err := resolvePeriodic(jobs)
+	if err != nil {
+		return err
+	}
+	regs := make([]*registeredPeriodic, len(resolved))
+	for i, job := range resolved {
 		regs[i] = &registeredPeriodic{job: job}
 	}
 	p.mu.Lock()

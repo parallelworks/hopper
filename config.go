@@ -231,17 +231,8 @@ func (cfg *Config) withDefaults() (Config, error) {
 	if out.StrictKinds && out.Workers == nil {
 		return out, errors.New("hopper: Config.StrictKinds requires Workers")
 	}
-	out.Periodic = append([]PeriodicJob(nil), out.Periodic...)
-	names := map[string]struct{}{}
-	for i := range out.Periodic {
-		p := &out.Periodic[i]
-		if err := p.resolve(); err != nil {
-			return out, err
-		}
-		if _, dup := names[p.Name]; dup {
-			return out, fmt.Errorf("hopper: periodic job %q is listed twice; set PeriodicOpts.Name to tell them apart", p.Name)
-		}
-		names[p.Name] = struct{}{}
+	if out.Periodic, err = resolvePeriodic(out.Periodic); err != nil {
+		return out, err
 	}
 	for i, m := range out.Middleware {
 		if m == nil {
