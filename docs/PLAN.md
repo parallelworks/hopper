@@ -1483,7 +1483,9 @@ leader comes back with a leader that still has it. Overlapping leaders with diff
 sets still insert a slot at most once. A change wakes the leader's loop, which schedules
 an added job as if its term had just started: `RunOnStart` inserts a job, `CatchUp`
 back-fills, and otherwise slots since the last recorded one within the lease TTL are
-inserted. A removed job stops being inserted; a slot being inserted as it is removed may
+inserted. A `RunOnStart` added on every client inserts one job because only the leader
+schedules; its slot is the leader's database time, so two overlapping leaders each
+insert one, as at the start of a term. A removed job stops being inserted; a slot being inserted as it is removed may
 still be. Its `hopper_periodic` row is kept, because another client may still have the
 job and the row is what keeps a slot from being inserted twice. The loop retries a
 failed read of the clock or the last slots after a leader interval. A client that never

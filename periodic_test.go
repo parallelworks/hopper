@@ -106,10 +106,10 @@ func TestPeriodicJobsAddOnClientThatNeverLeads(t *testing.T) {
 	}
 }
 
-// Jobs added and removed on running clients: only the leader schedules, a
-// RunOnStart added on every client inserts one job, a removed job stops and
-// keeps its last slot, and a job added only on a follower is scheduled once
-// it leads.
+// Jobs added and removed on running clients: only the leader schedules, so
+// a RunOnStart added on every client inserts one job, a removed job stops
+// and keeps its last slot, and a job added only on a follower is scheduled
+// once it leads.
 func TestPeriodicJobsAtRuntime(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -141,7 +141,7 @@ func TestPeriodicJobsAtRuntime(t *testing.T) {
 	}
 	waitFor(t, func() bool { return jobs("1") >= 2 })
 	if n := jobs("2"); n != 1 {
-		t.Errorf("RunOnStart added on both clients inserted %d jobs, want 1", n)
+		t.Errorf("RunOnStart added on both clients inserted %d jobs, want 1, from the leader only", n)
 	}
 
 	for _, c := range []*hopper.Client[pgxTx]{a, b} {

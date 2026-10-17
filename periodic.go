@@ -33,13 +33,15 @@ type PeriodicJob struct {
 type PeriodicOpts struct {
 	// Name overrides the periodic job's name.
 	Name string
-	// RunOnStart inserts a job as soon as a leader starts scheduling, in
-	// addition to the regular slots.
+	// RunOnStart inserts a job as soon as a leader starts scheduling the
+	// periodic job, at the start of its term or when the job is added on
+	// it, in addition to the regular slots.
 	RunOnStart bool
 	// CatchUp inserts up to this many slots missed while no leader was
 	// running (for example during a full outage), oldest first. By default
-	// missed slots are skipped, except a slot due in the last few seconds,
-	// which covers a leader failover.
+	// missed slots are skipped, except those due since the last one inserted
+	// within the last lease TTL, which covers a leader failover and a job
+	// removed and added again.
 	CatchUp int
 	// Location evaluates a cron expression in this zone when the
 	// expression does not name one. Defaults to UTC.
@@ -49,7 +51,7 @@ type PeriodicOpts struct {
 }
 
 // Cron returns a periodic job on a cron expression (see ParseCron). An
-// invalid expression is reported by NewClient.
+// invalid expression is reported by NewClient or PeriodicJobs.Add.
 func Cron(spec string, args JobArgs, opts *PeriodicOpts) PeriodicJob {
 	p := PeriodicJob{Args: args, Opts: opts}
 	sched, err := ParseCron(spec)
