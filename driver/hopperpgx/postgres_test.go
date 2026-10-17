@@ -974,6 +974,56 @@ func TestTagListingRoundTrips(t *testing.T) {
 	}
 }
 
+// TestTagListingWalksOnFasterPastFilteredHistory lists finished jobs by tag
+// and a kind that only the last 4 of 404 have, in a page of 10. Each walk of
+// history's tags rows after the first takes twice the keys of the one
+// before: a walk of a page of keys each time took 41 walks, each with its own
+// round trips.
+func TestTagListingWalksOnFasterPastFilteredHistory(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	clientID := register(t, ctx, exec)
+	finish := func(kind string, n int) {
+		t.Helper()
+		p := insertParams(kind, n)
+		for i := range p {
+			p[i].Queue, p[i].Tags = kind, []string{"f"}
+		}
+		if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: kind, ClientID: clientID, Limit: n})
+		if err != nil || len(claimed.Jobs) != n {
+			t.Fatalf("claimed %d of %d, %v", len(claimed.Jobs), n, err)
+		}
+		fin := make([]driver.JobFinalize, n)
+		for i, j := range claimed.Jobs {
+			fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+		}
+		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish("skip", 400)
+	finish("want", 4)
+	log := &statementLog{}
+	page, err := tracedDriver(t, d.Pool(), log).Executor().JobList(ctx, driver.JobListParams{
+		Kinds: []string{"want"}, TagsAny: []string{"f"}, States: []driver.JobState{driver.JobStateCompleted}, Limit: 10,
+	})
+	if err != nil || len(page) != 4 {
+		t.Fatalf("listing = %d jobs, %v; want 4", len(page), err)
+	}
+	walks := 0
+	for _, q := range log.sql {
+		if strings.Contains(q, "LEFT JOIN LATERAL") {
+			walks++
+		}
+	}
+	if walks > 8 {
+		t.Errorf("the page took %d walks of history's tags rows, want at most 8", walks)
+	}
+}
+
 // TestTagListingSnapshotSpansStatements finalizes a tagged job into history
 // right after a listing by its tag has walked history's tags rows, before
 // the statement that reads the live table. The statements share one

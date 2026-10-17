@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -265,5 +266,35 @@ func TestTagListingRoundTrips(t *testing.T) {
 	}
 	if len(trace.sql) != 5 {
 		t.Errorf("a page by tag ran %d statements, want 5: %q", len(trace.sql), trace.sql)
+	}
+}
+
+// TestTagListingWalksOnFasterPastFilteredHistory lists finished jobs by tag
+// and a kind that only the last 4 of 404 have, in a page of 10. Each walk of
+// history's tags rows after the first takes twice the keys of the one
+// before: a walk of a page of keys each time took 41 walks, each with its own
+// round trips.
+func TestTagListingWalksOnFasterPastFilteredHistory(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	x := hoppersql.NewWithConfig(open(t, pool), &hoppersql.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]}).Executor()
+	tagged(ctx, t, x, "skip", "f", 400, 400)
+	tagged(ctx, t, x, "want", "f", 4, 4)
+	trace := &statementTrace{}
+	page, err := tracedExecutor(t, pool, trace).JobList(ctx, driver.JobListParams{
+		Kinds: []string{"want"}, TagsAny: []string{"f"}, States: []driver.JobState{driver.JobStateCompleted}, Limit: 10,
+	})
+	if err != nil || len(page) != 4 {
+		t.Fatalf("listing = %d jobs, %v; want 4", len(page), err)
+	}
+	walks := 0
+	for _, q := range trace.sql {
+		if strings.Contains(q, "LEFT JOIN LATERAL") {
+			walks++
+		}
+	}
+	if walks > 8 {
+		t.Errorf("the page took %d walks of history's tags rows, want at most 8", walks)
 	}
 }

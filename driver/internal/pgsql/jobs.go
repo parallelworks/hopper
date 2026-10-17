@@ -1072,10 +1072,11 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 	// compilation that take longer than the page itself.
 	args := []any{params.Queue, textArray(params.Kinds), textArray(states), uuidParam(after)}
 	limit := strconv.Itoa(max(params.Limit, 1))
-	filter, order := jobListFilterSQL+" AND id > $4::uuid", " ORDER BY id LIMIT "+limit
+	filter, orderBy := jobListFilterSQL+" AND id > $4::uuid", " ORDER BY id"
 	if params.NewestFirst {
-		filter, order = jobListFilterSQL+" AND id < $4::uuid", " ORDER BY id DESC LIMIT "+limit
+		filter, orderBy = jobListFilterSQL+" AND id < $4::uuid", " ORDER BY id DESC"
 	}
+	order := orderBy + " LIMIT " + limit
 	where := func(cond string, arg any) {
 		args = append(args, arg)
 		filter += fmt.Sprintf(" AND "+cond, len(args))
@@ -1149,7 +1150,7 @@ func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]
 		if source != "" && history && !e.InTx {
 			l := tagListing{
 				with: with, tagExpr: tagExpr, source: source, walked: walked, walk: historyWalk,
-				filter: filter, op: op, order: order, limit: max(params.Limit, 1), newestFirst: params.NewestFirst, after: after,
+				filter: filter, op: op, orderBy: orderBy, limit: max(params.Limit, 1), newestFirst: params.NewestFirst, after: after,
 			}
 			if live {
 				l.liveArm = func(source string) string { return tagJobsSQL(source, liveWalk, jobListLiveSQL+filter, op, order) }
@@ -1221,7 +1222,7 @@ type tagListing struct {
 	walked                int
 	liveArm               func(source string) string
 	walk                  tagWalk
-	filter, op, order     string
+	filter, op, orderBy   string
 	limit                 int
 	newestFirst           bool
 	after                 driver.JobID
@@ -1253,8 +1254,10 @@ type tagListing struct {
 // The second statement filters the walked jobs on what the tags rows do not
 // hold (the queue, kind, metadata and the rest), so a page can come up short
 // of the walk's; the walk then goes on from its last key, for history alone,
-// until the page is full or the tags' rows run out. A page whose jobs history
-// filters out more than it keeps takes a round trip for each page of them.
+// until the page is full or the tags' rows run out. Each walk after the first
+// takes twice the keys of the one before, up to maxWalkPages pages, so that a
+// filter that keeps few of a tag's finished jobs costs a few round trips a
+// page rather than one for each page of keys.
 func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, args []any) (page []*driver.JobRow, err error) {
 	tx, err := c.Begin(ctx)
 	if err != nil {
@@ -1275,13 +1278,14 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 		return bytes.Compare(a[:], b[:]) < 0
 	}
 	var (
-		jobs     []*driver.JobRow
-		liveFull bool
-		liveEnd  driver.JobID
-		source   = l.source
-		tagExpr  = cmp.Or(l.tagExpr, "NULL::text")
-		with     = l.with
-		cursor   = l.after
+		jobs      []*driver.JobRow
+		liveFull  bool
+		liveEnd   driver.JobID
+		source    = l.source
+		tagExpr   = cmp.Or(l.tagExpr, "NULL::text")
+		with      = l.with
+		cursor    = l.after
+		walkLimit = l.limit
 	)
 	for first := true; ; first = false {
 		// The walk's source is joined to the chosen tag, r.tag, which it
@@ -1293,7 +1297,7 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 		}
 		keyArgs := append(slices.Clip(args), uuidParam(cursor))
 		keySQL, keyArgs := usedParams(with+"SELECT r.tag, k.id, k.state, k.finalized_at FROM (SELECT "+tagExpr+") r(tag) LEFT JOIN LATERAL ("+
-			tagKeysSQL(walkSource, l.walk, l.op, fmt.Sprintf("$%d::uuid", len(keyArgs)), l.order)+") k ON true", keyArgs)
+			tagKeysSQL(walkSource, l.walk, l.op, fmt.Sprintf("$%d::uuid", len(keyArgs)), l.orderBy+" LIMIT "+strconv.Itoa(walkLimit))+") k ON true", keyArgs)
 		rows, err := tx.Query(ctx, e.Schema.expand(keySQL), keyArgs...)
 		if err != nil {
 			return nil, err
@@ -1331,7 +1335,7 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		walkFull := len(ids) == l.limit
+		walkFull := len(ids) == walkLimit
 		if first && l.tagExpr != "" {
 			args = append(slices.Clip(args), tag.String)
 			tagExpr, with = fmt.Sprintf("$%d::text", len(args)), ""
@@ -1396,9 +1400,11 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 		if len(known) >= l.limit || !byWalk {
 			return known[:min(len(known), l.limit)], tx.Commit(ctx)
 		}
-		cursor = walkEnd
+		cursor, walkLimit = walkEnd, min(2*walkLimit, maxWalkPages*l.limit)
 	}
 }
+
+const maxWalkPages = 16
 
 // usedParams numbers the parameters query refers to from $1, in the order
 // it first does, and returns their arguments of args: a parameter the
