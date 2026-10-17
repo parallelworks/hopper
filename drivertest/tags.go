@@ -507,6 +507,44 @@ func dropTaggedHour[TTx any](t *testing.T, f Fixture[TTx], canceled bool) {
 	}
 }
 
+// testTagsHourDroppedMeanwhile drops, by retention, an hourly history
+// partition that another session drops first, as an overlapping leader's
+// pass does, while this pass's delete of its tags rows waits for it. The
+// pass reports the hour dropped, as it does one gone before its DROP.
+func testTagsHourDroppedMeanwhile[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	p := driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, LockTimeout: 10 * time.Second}
+	if _, err := exec.HistoryMaintain(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	const hour = "hopper_job_history_completed_2020010100"
+	f.Exec(ctx, t, d, `CREATE TABLE `+hour+` PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-01 01:00:00+00')`)
+	dropped := make(chan struct{})
+	go func() {
+		defer close(dropped)
+		f.Exec(ctx, t, d, `DO $$ BEGIN
+			LOCK TABLE ONLY hopper_job_history_completed IN ACCESS EXCLUSIVE MODE;
+			LOCK TABLE `+hour+` IN ACCESS EXCLUSIVE MODE;
+			PERFORM pg_sleep(1);
+			DROP TABLE `+hour+`;
+		END $$`)
+	}()
+	for deadline := time.Now().Add(10 * time.Second); f.QueryText(ctx, t, d,
+		`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND mode = 'AccessExclusiveLock' AND granted`, hour) == "0"; {
+		if time.Now().After(deadline) {
+			t.Fatal("the other session's drop did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	res, err := exec.HistoryMaintain(ctx, p)
+	<-dropped
+	if err != nil || !slices.Contains(res.Dropped, hour) {
+		t.Errorf("maintenance while another session drops %s = %+v, %v; want it dropped", hour, res, err)
+	}
+}
+
 // testTagsRowsFollowJobs runs inserts (some replacing a unique job's tags),
 // claims, every kind of finalize, retries from history, cancels, deletes,
 // history maintenance (whose failed history's retention is short enough to

@@ -1482,7 +1482,10 @@ took 2,001 round trips, 2.6 s, for a page of 10). A deferred drop rolls the dele
 with it. A delete the server cancels, as a `statement_timeout` shorter than a busy hour's
 delete does, is rolled back to a savepoint and the hour dropped without it, as a previous
 release's leader drops one: its rows stay in the day's partition until it goes, rather
-than the hour, and every later one, staying for each pass to try again. A `failed` partition's period is its tags partition's, which goes in the same
+than the hour, and every later one, staying for each pass to try again. A delete that
+finds the hour gone, which an overlapping leader's pass dropped while it waited for the
+hour, is rolled back the same way, and the hour is reported dropped, as one gone before
+the drop's `DROP TABLE IF EXISTS` is, rather than fail the pass. A `failed` partition's period is its tags partition's, which goes in the same
 pass. A period that never had a history
 partition has its jobs in history's `DEFAULT` partition, so tags partitions are dropped
 only in a pass whose history outcome group has pruned its `DEFAULT` partition; while
