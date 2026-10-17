@@ -111,12 +111,20 @@ func (p *PeriodicJob) resolve() error {
 	return nil
 }
 
-// clone returns a copy of the job that shares no options with it.
+// clone returns a copy of the job that shares no options with it. The args
+// and schedule are shared.
 func (p PeriodicJob) clone() PeriodicJob {
 	if p.Opts != nil {
 		opts := *p.Opts
 		if opts.InsertOpts != nil {
 			insertOpts := *opts.InsertOpts
+			insertOpts.Metadata = slices.Clone(insertOpts.Metadata)
+			insertOpts.Tags = slices.Clone(insertOpts.Tags)
+			if insertOpts.Unique != nil {
+				unique := *insertOpts.Unique
+				unique.Finished = slices.Clone(unique.Finished)
+				insertOpts.Unique = &unique
+			}
 			opts.InsertOpts = &insertOpts
 		}
 		p.Opts = &opts

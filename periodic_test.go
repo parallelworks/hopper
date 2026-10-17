@@ -57,17 +57,22 @@ func TestPeriodicJobsRegistry(t *testing.T) {
 		t.Errorf("after failed adds, All = %v", got)
 	}
 
-	opts := &hopper.PeriodicOpts{Name: "later", InsertOpts: &hopper.InsertOpts{Queue: "q"}}
+	opts := &hopper.PeriodicOpts{Name: "later", InsertOpts: &hopper.InsertOpts{Queue: "q", Tags: []string{"t"}, Metadata: []byte(`{"a":1}`)}}
 	if err := jobs.AddMany([]hopper.PeriodicJob{hopper.Every(time.Second, noop{}, opts), hopper.Cron("@hourly", noop{}, &hopper.PeriodicOpts{Name: "hourly"})}); err != nil {
 		t.Fatal(err)
 	}
 	opts.Name, opts.InsertOpts.Queue = "changed", "changed"
+	opts.InsertOpts.Tags[0], opts.InsertOpts.Metadata[2] = "changed", 'X'
 	all := jobs.All()
 	if got := periodicNames(all); !slices.Equal(got, []string{"noop", "later", "hourly"}) {
 		t.Errorf("All = %v", got)
 	}
-	if q := all[1].Opts.InsertOpts.Queue; q != "q" {
-		t.Errorf("the caller's options changed a registered job's queue to %q", q)
+	if io := all[1].Opts.InsertOpts; io.Queue != "q" || io.Tags[0] != "t" || string(io.Metadata) != `{"a":1}` {
+		t.Errorf("the caller's options changed a registered job's options to %+v", io)
+	}
+	all[1].Opts.InsertOpts.Tags[0] = "changed"
+	if tag := jobs.All()[1].Opts.InsertOpts.Tags[0]; tag != "t" {
+		t.Errorf("a listed job's options changed a registered job's tag to %q", tag)
 	}
 
 	if err := jobs.Remove("missing"); !errors.Is(err, hopper.ErrNotFound) {
