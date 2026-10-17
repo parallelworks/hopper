@@ -1470,7 +1470,8 @@ instead. A schedule with no recorded slot starts from its next slot.
 ### 7.10 Retention
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.
 Retention is enforced by dropping whole partitions, so there is no `DELETE`, no dead
-tuples and no vacuum work. Their tags rows (schema v17, §7.2) live in `hopper_job_history_tags`,
+tuples and no vacuum work, but for the rows of the `DEFAULT` partitions, below, and the
+tags rows of `completed` history's hours, each deleted with its hour. Their tags rows (schema v17, §7.2) live in `hopper_job_history_tags`,
 partitioned by outcome and then by day for both outcomes, whose partitions the leader
 creates (two days ahead) and drops beside history's, each in a transaction of its own.
 Daily partitions keep a listing's walk, which reads every tags partition of its
@@ -1487,21 +1488,30 @@ pass catches up on is, deletes none: the same pass drops that partition after th
 hour. The delete names its hour's partition, so its bounds are written into it too, and
 it runs unprepared rather than leave a statement an hour in the connection's cache. A
 deferred drop rolls the delete back
-with it. A delete the server cancels, as a `statement_timeout` shorter than a busy hour's
+with it, and its retry, on the next leader pass, deletes again: an hour whose drop is
+deferred pass after pass pays its delete each time. A delete the server cancels, as a `statement_timeout` shorter than a busy hour's
 delete does, is rolled back to a savepoint and the hour dropped without it, as a previous
 release's leader drops one: its rows stay in the day's partition until it goes, rather
 than the hour, and every later one, staying for each pass to try again. A delete that
 finds the hour gone, which an overlapping leader's pass dropped while it waited for the
 hour, is rolled back the same way, and the hour is reported dropped, as one gone before
-the drop's `DROP TABLE IF EXISTS` is, rather than fail the pass. A `failed` partition's period is its tags partition's, which goes in the same
+the drop's `DROP TABLE IF EXISTS` is, rather than fail the pass. A `transaction_timeout`
+(Postgres 17 on) shorter than a busy hour's delete instead ends the drop's session,
+which no savepoint outlives: the pass fails, and the hour and every later one stay,
+for each pass to fail the same way, so a role that sets one sets it past that delete. A `failed` partition's period is its tags partition's, which goes in the same
 pass. A period that never had a history
 partition has its jobs in history's `DEFAULT` partition, so tags partitions are dropped
 only in a pass whose history outcome group has pruned its `DEFAULT` partition; while
 that prune fails, they wait. Neither creation nor a drop takes an exclusive lock on
 both tables: a finalize locks history before its tags and a listing by tag the tags before
 history, so a statement that held one parent while it waited for the other could
-deadlock with either. The delete of an hour's tags rows takes only the row lock that
-finalizes take on the tags tables, which neither a finalize nor a listing waits for. A history partition that has no tags partition beside it, as one
+deadlock with either. The delete of an hour's tags rows takes on the tags tables only
+the `ROW EXCLUSIVE` lock that finalizes take, which neither a finalize nor a listing
+waits for, and the row locks of the rows it deletes. A retry or a delete of one of the
+hour's jobs, past retention, that comes while the drop runs does wait for those, while
+the drop waits for that call's lock on history: the drop's lock timeout ends the drop,
+which is deferred, or the deadlock detector ends either of them, the call failing with
+`deadlock_detected` (40P01). A history partition that has no tags partition beside it, as one
 a previous release's leader creates, sends its jobs' tags rows to the tags table's
 `DEFAULT` partition, whose prune keeps the rows of jobs still in history. v17 gives
 each day that history's partitions for the current period and those ahead cover its
