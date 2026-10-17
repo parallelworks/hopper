@@ -10,9 +10,10 @@
 -- jobs and one for history, whose btree walks a tag's jobs in ID order from
 -- the listing's cursor: a page costs about its size, for a rare tag or a
 -- common one. Triggers keep them in step with the tags column on every
--- write, whoever makes it. The history table is
--- partitioned as hopper_job_history is, and the leader creates and drops
--- its time partitions with history's, so retention stays a partition drop.
+-- write, whoever makes it. The history table is partitioned by outcome, as
+-- hopper_job_history is, and then by day, and the leader creates and drops
+-- its time partitions beside history's, deleting the tags rows of an hour
+-- of completed history that goes before its day.
 --
 -- The column and the triggers are added like v15's progress: with a short
 -- lock_timeout per try, in a loop. The timeout is the loop's alone: the
