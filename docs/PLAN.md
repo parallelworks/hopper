@@ -737,7 +737,7 @@ skew between pods cannot cause early or duplicate execution.
   (23505) rather than adding a second copy of each job's tags rows, which would list
   the job twice. A tagged job pays an index insert per tag when inserted and a
   delete and an insert per tag when finalized, and a `completed` one a delete per tag
-  when retention drops its hour. History's table is partitioned by
+  when retention drops its hour before its day. History's table is partitioned by
   outcome as history is and then by day, and the leader creates and drops its
   partitions with history's (§7.10), so retention of its rows is a partition drop,
   less the hours of `completed` history that go before their day. A listing by
@@ -1478,7 +1478,10 @@ hour of `completed` history goes up to a day before its tags partition, so its d
 first deletes its jobs' tags rows, in the drop's transaction, by the tags index's key:
 left in the day's partition, they were the first rows a listing in ID order walked,
 and every page of them cost a walk and a lookup that found no job (20,000 of them
-took 2,001 round trips, 2.6 s, for a page of 10). A deferred drop rolls the delete back
+took 2,001 round trips, 2.6 s, for a page of 10). An hour whose tags partition is past
+retention too, as a day's last hour's always is, and as every hour's of a day that a
+pass catches up on is, deletes none: the same pass drops that partition after the
+hour. A deferred drop rolls the delete back
 with it. A delete the server cancels, as a `statement_timeout` shorter than a busy hour's
 delete does, is rolled back to a savepoint and the hour dropped without it, as a previous
 release's leader drops one: its rows stay in the day's partition until it goes, rather

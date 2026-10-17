@@ -507,6 +507,37 @@ func dropTaggedHour[TTx any](t *testing.T, f Fixture[TTx], canceled bool) {
 	}
 }
 
+// testTagsDayGoesWithItsLastHour drops, by retention, the last hourly
+// history partition of a day whose tags partition is past retention too.
+// The hour's tags rows go with that partition, which the same pass drops
+// after the hour, rather than be deleted first: a trigger fails any delete
+// from it.
+func testTagsDayGoesWithItsLastHour[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	const hour, day = "hopper_job_history_completed_2020010123", "hopper_job_history_tags_completed_20200101"
+	f.Exec(ctx, t, d, `CREATE TABLE `+hour+` PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2020-01-01 23:00:00+00') TO ('2020-01-02 00:00:00+00')`)
+	f.Exec(ctx, t, d, `CREATE TABLE `+day+` PARTITION OF hopper_job_history_tags_completed FOR VALUES FROM ('2020-01-01 00:00:00+00') TO ('2020-01-02 00:00:00+00')`)
+	insert(ctx, t, exec, params("template", 1))
+	f.Exec(ctx, t, d, `INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts,
+		  scheduled_at, args, metadata, errors, await, created_at, finalized_at, tags)
+		SELECT hopper_uuidv7(), j.seq, 'late', 'late', 'completed', j.priority, j.attempt, j.max_attempts,
+		  j.scheduled_at, j.args, j.metadata, j.errors, j.await, j.created_at, '2020-01-01 23:30:00+00', '["late"]'
+		FROM (SELECT * FROM hopper_jobs LIMIT 1) j`)
+	f.Exec(ctx, t, d, `CREATE FUNCTION hopper_test_refuse() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN RAISE EXCEPTION 'hopper test: a delete from the day''s tags partition'; END $$`)
+	f.Exec(ctx, t, d, `CREATE TRIGGER hopper_test_refuse BEFORE DELETE ON `+day+` FOR EACH ROW EXECUTE FUNCTION hopper_test_refuse()`)
+	now, err := exec.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: now.Sub(time.Date(2020, 1, 2, 1, 0, 0, 0, time.UTC))})
+	if err != nil || !slices.Contains(res.Dropped, hour) || !slices.Contains(res.Dropped, day) {
+		t.Errorf("maintenance = %+v, %v; want %s and %s dropped", res, err, hour, day)
+	}
+}
+
 // testTagsHourDroppedMeanwhile drops, by retention, an hourly history
 // partition that another session drops first, as an overlapping leader's
 // pass does, while this pass's delete of its tags rows waits for it. The

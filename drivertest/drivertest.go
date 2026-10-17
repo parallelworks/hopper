@@ -81,6 +81,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"TagsLeaveWithTheirHour", testTagsLeaveWithTheirHour[TTx]},
 		{"TagsHourOutlastsItsDelete", testTagsHourOutlastsItsDelete[TTx]},
 		{"TagsHourDroppedMeanwhile", testTagsHourDroppedMeanwhile[TTx]},
+		{"TagsDayGoesWithItsLastHour", testTagsDayGoesWithItsLastHour[TTx]},
 		{"TagsFollowDirectUpdates", testTagsFollowDirectUpdates[TTx]},
 		{"TagsFollowTruncate", testTagsFollowTruncate[TTx]},
 		{"TagsPagePastFilteredHistory", testTagsPagePastFilteredHistory[TTx]},

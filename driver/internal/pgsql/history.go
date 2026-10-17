@@ -177,8 +177,8 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 	// waits for the same lock on the parent, so as with the attaches,
 	// once one is deferred the rest are deferred untried.
 	var expired []string
+	cutoff := now.Add(-keep)
 	if keep > 0 {
-		cutoff := now.Add(-keep)
 		for name := range existing {
 			if from, ok := g.parse(name); ok && from.Add(g.period).Before(cutoff) {
 				expired = append(expired, name)
@@ -221,7 +221,7 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 				res.Deferred = append(res.Deferred, name)
 				continue
 			}
-			outcome, err := e.dropPartition(ctx, g, name, needs, lockTimeout)
+			outcome, err := e.dropPartition(ctx, g, name, needs, cutoff, lockTimeout)
 			if err != nil {
 				errs = append(errs, err)
 				dropsFailed = true
@@ -369,7 +369,7 @@ const (
 // under the key, holds until the drop commits. It is made at read committed,
 // whatever the session's default, so that it sees an attach that committed
 // before the key was free.
-func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name string, needs []string, lockTimeout string) (partitionOutcome, error) {
+func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name string, needs []string, cutoff time.Time, lockTimeout string) (partitionOutcome, error) {
 	var kept bool
 	err := e.withTx(ctx, func(tx Tx) error {
 		if len(needs) > 0 {
@@ -407,7 +407,7 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name strin
 				return nil
 			}
 		}
-		if err := e.dropTagsRowsOf(ctx, tx, g, name); err != nil {
+		if err := e.dropTagsRowsOf(ctx, tx, g, name, cutoff); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, "DROP TABLE IF EXISTS "+e.Schema.Table(name))
@@ -424,13 +424,13 @@ func (e *Executor) dropPartition(ctx context.Context, g historyGroup, name strin
 	return partitionDropped, nil
 }
 
-func (e *Executor) dropTagsRowsOf(ctx context.Context, tx Tx, g historyGroup, name string) error {
+func (e *Executor) dropTagsRowsOf(ctx context.Context, tx Tx, g historyGroup, name string, cutoff time.Time) error {
 	i := slices.IndexFunc(historyGroups, func(t historyGroup) bool { return t.mirrors == g.parent })
 	if i < 0 || historyGroups[i].period <= g.period {
 		return nil
 	}
 	from, ok := g.parse(name)
-	if !ok {
+	if !ok || from.Truncate(historyGroups[i].period).Add(historyGroups[i].period).Before(cutoff) {
 		return nil
 	}
 	if _, err := tx.Exec(ctx, "SAVEPOINT hopper_tags_rows"); err != nil {
