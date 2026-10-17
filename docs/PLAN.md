@@ -764,8 +764,10 @@ skew between pods cannot cause early or duplicate execution.
   that second statement, so a page is two statements. Both run in one `READ ONLY`
   `REPEATABLE READ` transaction: under read committed a job finalized between them is in neither
   the live table nor the keys the walk read, and a page would skip it; under one
-  snapshot a partition dropped or a job moved after the walk changes neither
-  statement's rows. The second statement applies the listing's other filters, so it can
+  snapshot a job moved after the walk is read where the walk found it, once. A
+  history partition that retention drops between the statements is no longer read,
+  since every snapshot sees a table's drop at once: its jobs, past retention, are left out
+  of the page, which the walk fills from later keys. The second statement applies the listing's other filters, so it can
   return fewer jobs than the walk found. The page's jobs are known in full up to the
   end of each arm that came back full, the live arm's last job and the walk's last key;
   when the walk ends them short of a page, the listing walks history on from that key
@@ -861,7 +863,12 @@ skew between pods cannot cause early or duplicate execution.
   retry from history brings the job back without them. A batch callback's stored tags
   read the same way, less any longer than `MaxTagBytes`: only a direct SQL write to the
   batch row stores one, and one past the tags index's largest row would fail the
-  finalize that completes the batch.
+  finalize that completes the batch. A job's own tags are not filtered so: a direct
+  SQL write of a tag longer than the live tags index takes fails that write, and one
+  of 2,666 to 2,676 incompressible bytes, which the live index takes, fails the
+  finalize that moves the job to history, whose tags index also holds the state and
+  `finalized_at`, with every job of that finalize. A direct SQL write keeps to
+  `MaxTagBytes`, as `hopper_tags` checks.
 - **Wake-up:** an insert inside a caller's transaction sends
   `pg_notify('hopper_insert', queue)` in the same pipelined batch as the insert, once
   per queue. Postgres delivers notifications only on commit and collapses identical
