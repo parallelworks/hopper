@@ -939,6 +939,41 @@ func TestTagListingPreparesOnce(t *testing.T) {
 	}
 }
 
+// TestTagListingRoundTrips lists live and finished jobs by tag in one page:
+// the transaction's begin, its settings, the walk of history's tags rows, the
+// read of the jobs and the commit, five round trips.
+func TestTagListingRoundTrips(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	p := insertParams("trips", 4)
+	for i := range p {
+		p[i].Tags = []string{"trip"}
+	}
+	if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	clientID := register(t, ctx, exec)
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range claimed.Jobs {
+		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+			{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log := &statementLog{}
+	page, err := tracedDriver(t, d.Pool(), log).Executor().JobList(ctx, driver.JobListParams{TagsAny: []string{"trip"}, Limit: 10})
+	if err != nil || len(page) != 4 {
+		t.Fatalf("listing = %d jobs, %v; want 4", len(page), err)
+	}
+	if len(log.sql) != 5 {
+		t.Errorf("a page by tag ran %d statements, want 5: %q", len(log.sql), log.sql)
+	}
+}
+
 // TestTagListingSnapshotSpansStatements finalizes a tagged job into history
 // right after a listing by its tag has walked history's tags rows, before
 // the statement that reads the live table. The statements share one

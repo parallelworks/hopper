@@ -1265,10 +1265,7 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 			err = errors.Join(err, tx.Rollback(context.WithoutCancel(ctx)))
 		}
 	}()
-	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx, "SET LOCAL plan_cache_mode = force_custom_plan"); err != nil {
+	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY; SET LOCAL plan_cache_mode = force_custom_plan"); err != nil {
 		return nil, err
 	}
 	before := func(a, b driver.JobID) bool {

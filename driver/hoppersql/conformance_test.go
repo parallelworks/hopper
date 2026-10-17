@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 
@@ -187,5 +189,81 @@ func TestTagListingPreparesOnce(t *testing.T) {
 	}
 	if statements != 1 || generic != 0 {
 		t.Errorf("12 pages prepared %d statements reading history's jobs, which ran %d generic plans; want 1 and 0", statements, generic)
+	}
+}
+
+// statementTrace records the statements a database/sql handle runs.
+type statementTrace struct {
+	mu  sync.Mutex
+	sql []string
+}
+
+func (s *statementTrace) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sql = append(s.sql, d.SQL)
+	return ctx
+}
+
+func (*statementTrace) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// tracedExecutor is an executor on pool's schema whose statements trace
+// records.
+func tracedExecutor(t *testing.T, pool *pgxpool.Pool, trace *statementTrace) driver.Executor {
+	t.Helper()
+	cfg := *pool.Config().ConnConfig
+	cfg.Tracer = trace
+	db := stdlib.OpenDB(cfg)
+	t.Cleanup(func() { _ = db.Close() })
+	return hoppersql.NewWithConfig(db, &hoppersql.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]}).Executor()
+}
+
+// tagged inserts n jobs of kind with tag, and finalizes the first finished
+// of them into history as completed.
+func tagged(ctx context.Context, t *testing.T, x driver.Executor, kind, tag string, n, finished int) {
+	t.Helper()
+	p := make([]driver.JobInsertParams, n)
+	for i := range p {
+		p[i] = driver.JobInsertParams{Kind: kind, Queue: kind, Priority: 2, MaxAttempts: 3, Tags: []string{tag}}
+	}
+	if _, err := x.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if finished == 0 {
+		return
+	}
+	clientID, err := x.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := x.JobClaim(ctx, driver.JobClaimParams{Queue: kind, ClientID: clientID, Limit: finished})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fin := make([]driver.JobFinalize, len(claimed.Jobs))
+	for i, j := range claimed.Jobs {
+		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+	}
+	if _, err := x.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTagListingRoundTrips lists live and finished jobs by tag in one page:
+// the transaction's begin, its settings, the walk of history's tags rows, the
+// read of the jobs and the commit, five round trips.
+func TestTagListingRoundTrips(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	x := hoppersql.NewWithConfig(open(t, pool), &hoppersql.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]}).Executor()
+	tagged(ctx, t, x, "trips", "trip", 4, 2)
+	trace := &statementTrace{}
+	page, err := tracedExecutor(t, pool, trace).JobList(ctx, driver.JobListParams{TagsAny: []string{"trip"}, Limit: 10})
+	if err != nil || len(page) != 4 {
+		t.Fatalf("listing = %d jobs, %v; want 4", len(page), err)
+	}
+	if len(trace.sql) != 5 {
+		t.Errorf("a page by tag ran %d statements, want 5: %q", len(trace.sql), trace.sql)
 	}
 }
