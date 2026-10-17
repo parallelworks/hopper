@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -190,6 +191,42 @@ func TestTagListingPreparesOnce(t *testing.T) {
 	}
 	if statements != 1 || generic != 0 {
 		t.Errorf("12 pages prepared %d statements reading history's jobs, which ran %d generic plans; want 1 and 0", statements, generic)
+	}
+}
+
+// TestRetentionPreparesNoTagsDelete drops two hours of history, whose tags
+// rows' deletes each name their hour's partition. They run unprepared: a
+// prepared one stayed in the connection's statement cache, on the server
+// too, never to run again.
+func TestRetentionPreparesNoTagsDelete(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	for h := range 2 {
+		from := time.Date(2020, 1, 1, h, 0, 0, 0, time.UTC)
+		if _, err := pool.Exec(ctx, `CREATE TABLE hopper_job_history_completed_`+from.Format("2006010215")+` PARTITION OF hopper_job_history_completed FOR VALUES FROM ('`+
+			from.Format(time.RFC3339)+`') TO ('`+from.Add(time.Hour).Format(time.RFC3339)+`')`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db := open(t, pool)
+	db.SetMaxOpenConns(1)
+	exec := hoppersql.NewWithConfig(db, &hoppersql.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]}).Executor()
+	now, err := exec.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: now.Sub(time.Date(2020, 1, 1, 12, 0, 0, 0, time.UTC))})
+	if err != nil || !slices.Contains(res.Dropped, "hopper_job_history_completed_2020010100") || !slices.Contains(res.Dropped, "hopper_job_history_completed_2020010101") {
+		t.Fatalf("maintenance = %+v, %v; want both hours dropped", res, err)
+	}
+	var prepared int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_prepared_statements
+		WHERE statement LIKE '%hopper_tags_of(h.tags)%' AND statement NOT LIKE '%pg_prepared_statements%'`).Scan(&prepared); err != nil {
+		t.Fatal(err)
+	}
+	if prepared != 0 {
+		t.Errorf("dropping 2 hours prepared %d deletes of their tags rows, want 0", prepared)
 	}
 }
 

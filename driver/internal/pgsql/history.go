@@ -439,8 +439,8 @@ func (e *Executor) dropTagsRowsOf(ctx context.Context, tx Tx, g historyGroup, na
 	_, err := tx.Exec(ctx, fmt.Sprintf(`
 		DELETE FROM %s t USING %s h, %s.hopper_tags_of(h.tags) o(tag)
 		WHERE h.tags IS NOT NULL AND t.tag = o.tag AND t.id = h.id AND t.state = h.state AND t.finalized_at = h.finalized_at
-		  AND t.finalized_at >= $1 AND t.finalized_at < $2`,
-		e.Schema.Table(historyGroups[i].parent), e.Schema.Table(name), quoteIdent(e.Schema.Name)), from, from.Add(g.period))
+		  AND t.finalized_at >= %s AND t.finalized_at < %s`,
+		e.Schema.Table(historyGroups[i].parent), e.Schema.Table(name), quoteIdent(e.Schema.Name), literal(from), literal(from.Add(g.period))))
 	if statementTimedOut(ctx, err) || undefinedTable(err) {
 		_, err = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT hopper_tags_rows")
 	}

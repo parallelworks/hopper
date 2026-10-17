@@ -636,6 +636,46 @@ func (c *statementCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ p
 
 func (*statementCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
+// TestRetentionPreparesNoTagsDelete drops two hours of history, whose tags
+// rows' deletes each name their hour's partition. They run unprepared: a
+// prepared one stayed in the connection's statement cache, on the server
+// too, never to run again.
+func TestRetentionPreparesNoTagsDelete(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	for h := range 2 {
+		from := time.Date(2020, 1, 1, h, 0, 0, 0, time.UTC)
+		if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE hopper_job_history_completed_%s PARTITION OF hopper_job_history_completed FOR VALUES FROM ('%s') TO ('%s')`,
+			from.Format("2006010215"), from.Format(time.RFC3339), from.Add(time.Hour).Format(time.RFC3339))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := pool.Config()
+	cfg.MaxConns = 1
+	one, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer one.Close()
+	now, err := exec.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := testdb.Driver(one).Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: now.Sub(time.Date(2020, 1, 1, 12, 0, 0, 0, time.UTC))})
+	if err != nil || !slices.Contains(res.Dropped, "hopper_job_history_completed_2020010100") || !slices.Contains(res.Dropped, "hopper_job_history_completed_2020010101") {
+		t.Fatalf("maintenance = %+v, %v; want both hours dropped", res, err)
+	}
+	var prepared int
+	if err := one.QueryRow(ctx, `SELECT count(*) FROM pg_prepared_statements
+		WHERE statement LIKE '%hopper_tags_of(h.tags)%' AND statement NOT LIKE '%pg_prepared_statements%'`).Scan(&prepared); err != nil {
+		t.Fatal(err)
+	}
+	if prepared != 0 {
+		t.Errorf("dropping 2 hours prepared %d deletes of their tags rows, want 0", prepared)
+	}
+}
+
 // TestRetentionChecksTagsPartitionsTogether checks that retention finds which
 // expired tags partitions still have their history partition in one
 // statement for the group, not one for each: with history's drops deferred,

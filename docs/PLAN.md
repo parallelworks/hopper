@@ -1481,7 +1481,9 @@ and every page of them cost a walk and a lookup that found no job (20,000 of the
 took 2,001 round trips, 2.6 s, for a page of 10). An hour whose tags partition is past
 retention too, as a day's last hour's always is, and as every hour's of a day that a
 pass catches up on is, deletes none: the same pass drops that partition after the
-hour. A deferred drop rolls the delete back
+hour. The delete names its hour's partition, so its bounds are written into it too, and
+it runs unprepared rather than leave a statement an hour in the connection's cache. A
+deferred drop rolls the delete back
 with it. A delete the server cancels, as a `statement_timeout` shorter than a busy hour's
 delete does, is rolled back to a savepoint and the hour dropped without it, as a previous
 release's leader drops one: its rows stay in the day's partition until it goes, rather
