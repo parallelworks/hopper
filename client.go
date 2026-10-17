@@ -30,6 +30,7 @@ type Client[TTx any] struct {
 	logger   *slog.Logger
 	workers  *Workers
 	notifier *notifier
+	periodic *PeriodicJobs
 
 	// clientID is the lease row ID while running. It changes if the lease is
 	// lost and re-registered.
@@ -109,6 +110,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		workers:     resolved.Workers,
 		leaderPoke:  make(chan struct{}, 1),
 		streamPoke:  make(chan struct{}, 1),
+		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, resolved.NeverLead || len(resolved.Queues) == 0),
 		events:      newEventBus(),
 		running:     map[JobID]context.CancelCauseFunc{},
 		doneWaiters: map[JobID][]chan struct{}{},

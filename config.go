@@ -23,7 +23,8 @@ type Config struct {
 	// Workers is the registry of workers. Required when Queues is set.
 	Workers *Workers
 	// Periodic lists jobs inserted on a schedule by the leader. See Cron
-	// and Every.
+	// and Every. It is the initial set, which Client.PeriodicJobs changes
+	// at runtime.
 	Periodic []PeriodicJob
 	// Middleware wraps job execution and inserts, outermost first.
 	Middleware []Middleware

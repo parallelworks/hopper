@@ -281,6 +281,7 @@ for job, err := range client.Jobs(ctx, hopper.JobFilter{
 
 client.Queues().Pause(ctx, "email")
 client.Queues().Add(ctx, "tenant_42", hopper.QueueConfig{MaxWorkers: 5}) // runtime, multi-tenant
+client.PeriodicJobs().Add(hopper.Cron("0 * * * *", TenantReport{ID: 42}, &hopper.PeriodicOpts{Name: "report:42"})) // on every client that can lead
 
 for ev := range client.Events(ctx, hopper.EventJobFailed, hopper.EventJobDiscarded) { ... }
 
@@ -1466,6 +1467,24 @@ mid-slot, and even after the first job has finished and left the live table.
 default, except slots due since the last recorded one within the last lease TTL, which
 covers a failover; `CatchUp: n` back-fills up to the n most recent missed slots
 instead. A schedule with no recorded slot starts from its next slot.
+
+`Config.Periodic` is a client's initial set of periodic jobs. `Client.PeriodicJobs()`
+changes the set at runtime with `Add`, `AddMany`, `Remove` and `Clear`, and lists it with
+`All`. A job is identified by its name, the key of `hopper_periodic`; adding a name that
+is already registered fails, so a job is changed by removing it and adding it again. The
+set is held in memory, per client, and is not persisted or shared: the leader schedules
+only its own set, so **every client that can lead must register the job**, as with
+`Config.Periodic`. A job added only on the leader stops when leadership moves, a job
+added only on a follower starts when that client leads, and a job removed only on the
+leader comes back with a leader that still has it. Overlapping leaders with different
+sets still insert a slot at most once. A change wakes the leader's loop, which schedules
+an added job as if its term had just started: `RunOnStart` inserts a job, `CatchUp`
+back-fills, and otherwise slots since the last recorded one within the lease TTL are
+inserted. A removed job stops being inserted; a slot being inserted as it is removed may
+still be. Its `hopper_periodic` row is kept, because another client may still have the
+job and the row is what keeps a slot from being inserted twice. The loop retries a
+failed read of the clock or the last slots after a leader interval. A client that never
+leads (`NeverLead`, or one with no queues) accepts the jobs but never schedules them.
 
 ### 7.10 Retention
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.

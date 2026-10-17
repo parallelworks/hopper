@@ -271,6 +271,17 @@ Periodic: []hopper.PeriodicJob{
 
 The leader inserts each slot exactly once, whichever replica is leader.
 
+`client.PeriodicJobs()` adds and removes periodic jobs at runtime:
+
+```go
+err := client.PeriodicJobs().Add(hopper.Cron("0 * * * *", TenantReport{ID: 42}, &hopper.PeriodicOpts{Name: "report:42"}))
+err = client.PeriodicJobs().Remove("report:42")
+```
+
+The set is per client and kept in memory, and only the leader's set is
+scheduled. Make the same change on every replica that can lead, or the job
+stops or starts when leadership moves.
+
 ## Batches and workflows
 
 ```go

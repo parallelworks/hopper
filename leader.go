@@ -87,11 +87,7 @@ func (c *Client[TTx]) startTerm(ctx context.Context) *leaderTerm {
 	termCtx, cancel := context.WithCancel(ctx)
 	t := &leaderTerm{cancel: cancel, done: make(chan struct{}), maintained: make(chan struct{})}
 	var wg sync.WaitGroup
-	wg.Go(func() {
-		if len(c.cfg.Periodic) > 0 {
-			c.periodicLoop(termCtx)
-		}
-	})
+	wg.Go(func() { c.periodicLoop(termCtx) })
 	wg.Go(func() { c.streamLoop(termCtx) })
 	wg.Go(func() { c.liveLoop(termCtx) })
 	wg.Go(func() { c.indexLoop(termCtx, t.maintained) })
