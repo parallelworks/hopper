@@ -546,7 +546,11 @@ func testTagsHourDroppedMeanwhile[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
-	p := driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, LockTimeout: 10 * time.Second}
+	now, err := exec.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := driver.HistoryMaintainParams{CompletedRetention: now.Sub(time.Date(2020, 1, 1, 1, 30, 0, 0, time.UTC)), LockTimeout: 10 * time.Second}
 	if _, err := exec.HistoryMaintain(ctx, p); err != nil {
 		t.Fatal(err)
 	}
