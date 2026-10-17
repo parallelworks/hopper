@@ -116,12 +116,13 @@ func TestUI(t *testing.T) {
 	if strings.Contains(body, wres.Jobs[0].Job.ID.String()) || strings.Contains(body, "ping") {
 		t.Error("state filter ignored")
 	}
-	tagged, err := client.Insert(ctx, ping{N: 2}, &hopper.InsertOpts{Queue: "emails", Tags: []string{"tenant:acme", "a&b"}})
+	tagged, err := client.Insert(ctx, ping{N: 2}, &hopper.InsertOpts{Queue: "emails", Tags: []string{"tenant:acme", "a&b", "evil\u202ename"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	code, body = get(readOnly, "/jobs?tag=tenant:acme")
-	want(200, body, code, tagged.Job.ID.String(), `value="tenant:acme"`, `<a class="tag" href="/hopper/jobs?tag=a%26b">a&amp;b</a>`)
+	want(200, body, code, tagged.Job.ID.String(), `value="tenant:acme"`, `<a class="tag" dir="auto" href="/hopper/jobs?tag=a%26b">a&amp;b</a>`,
+		`<a class="tag" dir="auto" href="/hopper/jobs?tag=evil%e2%80%aename">evil`+"\u202e"+`name</a>`)
 	if strings.Contains(body, job.Job.ID.String()) {
 		t.Error("tag filter ignored")
 	}
