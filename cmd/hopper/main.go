@@ -1,7 +1,8 @@
 // Command hopper administers a hopper installation from the shell.
 //
 //	hopper migrate up|down|version [-target N]
-//	hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
+//	hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-priority P]
+//	                 [-tag T]... [-any-tag T]... [-metadata JSON] [-id ID]... [-newest] [-limit N]
 //	hopper jobs get|retry|cancel|delete <id>
 //	hopper jobs retry -from-start <id>
 //	hopper queues list|pause|resume [name]
@@ -28,6 +29,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -54,7 +56,8 @@ const usage = `usage: hopper [-database-url URL] [-schema NAME] [-json] <command
 
 commands:
   migrate up|down|version [-target N]
-  jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
+  jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-priority P]
+            [-tag T]... [-any-tag T]... [-metadata JSON] [-id ID]... [-newest] [-limit N]
   jobs get|retry|cancel|delete <id>
   jobs retry -from-start <id>
   queues list
@@ -189,10 +192,32 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		orderingKey := fs.String("ordering-key", "", "ordering key (with -queue)")
 		newest := fs.Bool("newest", false, "newest first")
 		limit := fs.Int("limit", 50, "maximum jobs to print")
+		priority := fs.Int("priority", 0, "priority (1 to 4)")
+		metadata := fs.String("metadata", "", `a JSON object the jobs' metadata contains, such as '{"tenant":"acme"}'`)
+		var filter hopper.JobFilter
+		fs.Func("tag", "a tag the jobs have; repeat for jobs with all of them", func(s string) error {
+			filter.TagsAll = append(filter.TagsAll, s)
+			return nil
+		})
+		fs.Func("any-tag", "a tag the jobs may have; repeat for jobs with any of them", func(s string) error {
+			filter.TagsAny = append(filter.TagsAny, s)
+			return nil
+		})
+		fs.Func("id", "a job ID; repeat for several", func(s string) error {
+			id, err := hopper.ParseJobID(s)
+			filter.IDs = append(filter.IDs, id)
+			return err
+		})
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		filter := hopper.JobFilter{Queue: *queue, OrderingKey: *orderingKey, NewestFirst: *newest}
+		filter.Queue, filter.OrderingKey, filter.NewestFirst = *queue, *orderingKey, *newest
+		if *priority != 0 {
+			filter.Priorities = []hopper.Priority{hopper.Priority(*priority)}
+		}
+		if *metadata != "" {
+			filter.Metadata = json.RawMessage(*metadata)
+		}
 		if *kind != "" {
 			filter.Kinds = []string{*kind}
 		}
@@ -211,10 +236,10 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		}
 		return c.print(jobs, func(w io.Writer) {
 			tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(tw, "ID\tKIND\tQUEUE\tSTATE\tATTEMPT\tSCHEDULED\tCREATED")
+			fmt.Fprintln(tw, "ID\tKIND\tQUEUE\tSTATE\tATTEMPT\tSCHEDULED\tCREATED\tTAGS")
 			for _, j := range jobs {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d/%d\t%s\t%s\n", j.ID, j.Kind, j.Queue, j.State, j.Attempt, j.MaxAttempts,
-					j.ScheduledAt.Local().Format(time.RFC3339), j.CreatedAt.Local().Format(time.RFC3339))
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d/%d\t%s\t%s\t%s\n", j.ID, j.Kind, j.Queue, j.State, j.Attempt, j.MaxAttempts,
+					j.ScheduledAt.Local().Format(time.RFC3339), j.CreatedAt.Local().Format(time.RFC3339), tagsColumn(j.Tags))
 			}
 			tw.Flush()
 		})
@@ -285,6 +310,21 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 	}
 }
 
+// tagsColumn joins a job's tags for the list's TAGS column. A tag with a
+// comma, a quote or a character that does not print, such as a
+// bidirectional override, is quoted, so that the column reads back as the
+// tags it lists and cannot rearrange the terminal's text.
+func tagsColumn(tags []string) string {
+	out := make([]string, len(tags))
+	for i, t := range tags {
+		if strings.ContainsAny(t, `,"`) || strings.ContainsFunc(t, func(r rune) bool { return !unicode.IsPrint(r) }) {
+			t = strconv.Quote(t)
+		}
+		out[i] = t
+	}
+	return strings.Join(out, ",")
+}
+
 func printJob(w io.Writer, j *hopper.JobRow, logs []hopper.AttemptLog, logsErr string) {
 	fmt.Fprintf(w, "id:            %s\nkind:          %s\nqueue:         %s\nstate:         %s\npriority:      %d\nattempt:       %d/%d\n",
 		j.ID, j.Kind, j.Queue, j.State, j.Priority, j.Attempt, j.MaxAttempts)
@@ -303,6 +343,9 @@ func printJob(w io.Writer, j *hopper.JobRow, logs []hopper.AttemptLog, logsErr s
 	}
 	if j.UniqueKey != "" {
 		fmt.Fprintf(w, "unique_key:    %q\n", j.UniqueKey)
+	}
+	if len(j.Tags) > 0 {
+		fmt.Fprintf(w, "tags:          %q\n", j.Tags)
 	}
 	if p := j.Progress; p != nil {
 		fmt.Fprintf(w, "progress:      step %q", p.Step)

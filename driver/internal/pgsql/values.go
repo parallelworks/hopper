@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/internal/jobtags"
 )
 
 // Array parameters cross the transport as plain slices, which pgx encodes
@@ -199,6 +200,16 @@ func nullableFloat(v float64) *float64 {
 	return &v
 }
 
+// TagsJSON encodes a job's tags for its tags column: a JSON array, or nil
+// for none, which is stored as NULL.
+func TagsJSON(tags []string) []byte {
+	if len(tags) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(tags)
+	return b
+}
+
 func jsonOrEmptyObject(b []byte) string {
 	if len(b) == 0 {
 		return "{}"
@@ -255,6 +266,36 @@ func (a *attemptErrors) Scan(src any) error {
 		return nil
 	}
 	return json.Unmarshal([]byte(text), (*[]driver.AttemptError)(a))
+}
+
+// tagList scans a tags column, a JSON array of strings or NULL. hopper
+// writes only those, but a direct SQL write can store anything: a value
+// that is not an array reads as no tags, and elements that are not strings
+// are skipped, as are empty strings and repeats (storedTagsSQL), so that
+// one such row fails neither the claim that takes it (whose update has
+// committed by the time it is read) nor a listing or the rescuer.
+type tagList []string
+
+func (l *tagList) Scan(src any) error {
+	var text jsonText
+	if err := text.Scan(src); err != nil {
+		return err
+	}
+	*l = nil
+	if text == "" {
+		return nil
+	}
+	var elems []json.RawMessage
+	_ = json.Unmarshal([]byte(text), &elems) // anything but an array reads as no tags
+	var tags []string
+	for _, e := range elems {
+		var s string
+		if len(e) > 0 && e[0] == '"' && json.Unmarshal(e, &s) == nil && s != "" {
+			tags = append(tags, s)
+		}
+	}
+	*l = jobtags.Distinct(tags)
+	return nil
 }
 
 // nullUUID scans a nullable uuid column.

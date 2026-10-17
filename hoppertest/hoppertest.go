@@ -22,12 +22,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/parallelworks/hopper"
+	"github.com/parallelworks/hopper/internal/jobtags"
 )
 
 // RequireOpts narrows which jobs a Require helper considers. Zero fields
@@ -37,6 +39,8 @@ type RequireOpts struct {
 	Priority    hopper.Priority
 	MaxAttempts int
 	State       hopper.JobState
+	// Tags matches jobs that have every one of them.
+	Tags []string
 }
 
 func (o *RequireOpts) matches(job *hopper.JobRow) bool {
@@ -54,6 +58,11 @@ func (o *RequireOpts) matches(job *hopper.JobRow) bool {
 	}
 	if o.State != "" && job.State != o.State {
 		return false
+	}
+	for _, t := range o.Tags {
+		if !slices.Contains(job.Tags, t) {
+			return false
+		}
 	}
 	return true
 }
@@ -75,6 +84,9 @@ func (o *RequireOpts) String() string {
 	if o.State != "" {
 		parts = append(parts, "state="+string(o.State))
 	}
+	if len(o.Tags) > 0 {
+		parts = append(parts, "tags="+strings.Join(o.Tags, ","))
+	}
 	if len(parts) == 0 {
 		return ""
 	}
@@ -88,14 +100,14 @@ var liveStates = []hopper.JobState{hopper.JobStateAvailable, hopper.JobStateSche
 // RequireManyInserted when several are expected.
 func RequireInserted[T hopper.JobArgs, TTx any](ctx context.Context, tb testing.TB, client *hopper.Client[TTx], opts *RequireOpts) *hopper.Job[T] {
 	tb.Helper()
-	jobs := requireMany[T](tb, client.Jobs(ctx, filter[T]()), opts, 1)
+	jobs := requireMany[T](tb, client.Jobs(ctx, filter[T](opts)), opts, 1)
 	return jobs[0]
 }
 
 // RequireInsertedTx is RequireInserted inside the caller's transaction.
 func RequireInsertedTx[T hopper.JobArgs, TTx any](ctx context.Context, tb testing.TB, client *hopper.Client[TTx], tx TTx, opts *RequireOpts) *hopper.Job[T] {
 	tb.Helper()
-	jobs := requireMany[T](tb, client.JobsTx(ctx, tx, filter[T]()), opts, 1)
+	jobs := requireMany[T](tb, client.JobsTx(ctx, tx, filter[T](opts)), opts, 1)
 	return jobs[0]
 }
 
@@ -103,33 +115,41 @@ func RequireInsertedTx[T hopper.JobArgs, TTx any](ctx context.Context, tb testin
 // matching opts exist, and returns them in insertion order.
 func RequireManyInserted[T hopper.JobArgs, TTx any](ctx context.Context, tb testing.TB, client *hopper.Client[TTx], n int, opts *RequireOpts) []*hopper.Job[T] {
 	tb.Helper()
-	return requireMany[T](tb, client.Jobs(ctx, filter[T]()), opts, n)
+	return requireMany[T](tb, client.Jobs(ctx, filter[T](opts)), opts, n)
 }
 
 // RequireManyInsertedTx is RequireManyInserted inside the caller's
 // transaction.
 func RequireManyInsertedTx[T hopper.JobArgs, TTx any](ctx context.Context, tb testing.TB, client *hopper.Client[TTx], tx TTx, n int, opts *RequireOpts) []*hopper.Job[T] {
 	tb.Helper()
-	return requireMany[T](tb, client.JobsTx(ctx, tx, filter[T]()), opts, n)
+	return requireMany[T](tb, client.JobsTx(ctx, tx, filter[T](opts)), opts, n)
 }
 
 // RequireNotInserted fails the test if any live job of kind T matching opts
 // exists.
 func RequireNotInserted[T hopper.JobArgs, TTx any](ctx context.Context, tb testing.TB, client *hopper.Client[TTx], opts *RequireOpts) {
 	tb.Helper()
-	requireMany[T](tb, client.Jobs(ctx, filter[T]()), opts, 0)
+	requireMany[T](tb, client.Jobs(ctx, filter[T](opts)), opts, 0)
 }
 
 // RequireNotInsertedTx is RequireNotInserted inside the caller's
 // transaction.
 func RequireNotInsertedTx[T hopper.JobArgs, TTx any](ctx context.Context, tb testing.TB, client *hopper.Client[TTx], tx TTx, opts *RequireOpts) {
 	tb.Helper()
-	requireMany[T](tb, client.JobsTx(ctx, tx, filter[T]()), opts, 0)
+	requireMany[T](tb, client.JobsTx(ctx, tx, filter[T](opts)), opts, 0)
 }
 
-func filter[T hopper.JobArgs]() hopper.JobFilter {
+func filter[T hopper.JobArgs](opts *RequireOpts) hopper.JobFilter {
 	var zero T
-	return hopper.JobFilter{Kinds: []string{zero.Kind()}, States: liveStates}
+	f := hopper.JobFilter{Kinds: []string{zero.Kind()}, States: liveStates}
+	// The listing finds tagged jobs through its index. Tags no job could
+	// have would fail it, and match nothing anyway.
+	if opts != nil {
+		if _, err := jobtags.Check(opts.Tags); err == nil {
+			f.TagsAll = opts.Tags
+		}
+	}
+	return f
 }
 
 func requireMany[T hopper.JobArgs](tb testing.TB, jobs func(func(*hopper.JobRow, error) bool), opts *RequireOpts, want int) []*hopper.Job[T] {
@@ -161,6 +181,9 @@ type WorkOpts struct {
 	Attempt  int // defaults to 1
 	Priority hopper.Priority
 	Metadata json.RawMessage
+	// Tags are the job's tags, checked and with repeats dropped as an
+	// insert does: a tag an insert would reject fails the test.
+	Tags []string
 	// Progress is the job's progress from an earlier attempt, to test
 	// resuming. Work runs the job with a copy, which RecordStep and
 	// RecordCursor update in memory; Progress itself is left as it is.
@@ -216,6 +239,9 @@ func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.
 	}
 	if len(opts.Metadata) > 0 {
 		row.Metadata = opts.Metadata
+	}
+	if row.Tags, err = jobtags.Check(opts.Tags); err != nil {
+		tb.Fatalf("hoppertest: %v", err)
 	}
 	if opts.Progress != nil {
 		p := *opts.Progress

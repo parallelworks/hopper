@@ -35,11 +35,16 @@
   default), so the leader vacuums the live table itself once a hundred
   thousand dead rows have accumulated, and re-analyzes it when the
   planner's row count is an order of magnitude off the live count, every
-  few seconds, skipping when autovacuum already holds the table. Nothing needs
+  few seconds, skipping when autovacuum already holds the table. It keeps
+  the live tags table, `hopper_job_tags`, the same way. Nothing needs
   configuring; the schema also sets the table's own autovacuum thresholds
   low with no cost delay, so the server's pass, when it comes, is quick.
-  History never needs vacuuming for retention: expired data is dropped by
-  partition.
+  History needs no vacuuming for retention, since expired jobs are dropped by
+  partition. The exceptions are the rows pruned from its DEFAULT partitions
+  and completed jobs' tags rows. Those are partitioned by day, and dropping
+  an hour of completed history deletes that hour's tags rows, which leaves
+  dead rows in the day's tags partition for autovacuum until the day is
+  dropped.
 - **`shared_buffers`.** Keep the live table, its indexes and the current
   history partition in shared buffers. With Postgres's 128 MB default, a
   burst of history writes evicts the live table and throughput drops by a
@@ -55,9 +60,21 @@
 - **`statement_timeout`.** After the v13 and v14 upgrades the leader builds
   indexes on each existing history partition with `CREATE INDEX CONCURRENTLY`, which
   runs under the pool's `statement_timeout` and waits for every older
-  transaction in the database. A build that runs past the timeout is retried
-  at doubling intervals with a warning; raise the timeout for hopper's role
-  until the warnings stop. A timeout that ends a partition's creation or drop, or an
+  transaction in the database. A migration run meanwhile cancels the build
+  rather than wait for it, and the leader builds it again later. A leader of
+  a release before v17's, which is the one running while `migrate up` applies
+  v17, cannot tell that cancel from a timeout: it logs the timeout warning
+  below once for the partition and retries it later, and the warning can be
+  ignored. A build that runs past the timeout, or that an operator cancels, is
+  retried at doubling intervals with a warning; if nobody canceled it, raise
+  the timeout for hopper's role until the warnings stop. From v17, dropping an
+  hour of completed history first deletes that hour's tags rows. If
+  `statement_timeout` cancels that delete, the hour is still dropped, but its
+  tags rows stay in their day's partition until the day is dropped, and tag
+  listings walk past them in the meantime. A `transaction_timeout` (Postgres
+  17 and later) that ends the delete ends the session too, so every pass
+  fails and that hour and every later one stay. Set either timeout for
+  hopper's role above a busy hour's delete. A timeout that ends a partition's creation or drop, or an
   index's attach, while it waits for its locks defers that work like a lock timeout;
   one that ends a partition's attach while it scans the DEFAULT partition, grown
   large during a long leader outage, is logged as an error each maintenance
@@ -191,7 +208,8 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
 
 ```sh
 hopper [-schema NAME] migrate up|down|version
-hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-newest] [-limit N]
+hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-priority P] \
+  [-tag T]... [-any-tag T]... [-metadata JSON] [-id ID]... [-newest] [-limit N]
 hopper jobs get|retry|cancel|delete <id>
 hopper jobs retry -from-start <id>
 hopper queues list|pause|resume [name]

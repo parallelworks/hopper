@@ -237,6 +237,28 @@ Unique: &hopper.UniqueOpts{
 A finished job counts while history keeps it (`CompletedRetention`,
 `FailedRetention`), and is reported as the duplicate, never replaced.
 
+## Tags and finding jobs
+
+Tags label a job so you can find it later, for example by tenant:
+
+```go
+client.Insert(ctx, SyncAccount{AccountID: 7}, &hopper.InsertOpts{
+    Tags: []string{"tenant:acme", "backfill"},
+})
+
+for job, err := range client.Jobs(ctx, hopper.JobFilter{TagsAll: []string{"tenant:acme"}}) {
+    ...
+}
+```
+
+`TagsAny` finds jobs with any of the tags and `TagsAll` jobs with all of
+them. Both read an index of each tag's jobs in ID order, live and in
+history, so a page costs about the same for a rare tag or a common one.
+`JobFilter` also takes job `IDs`, `Priorities`, and `Metadata`, a JSON
+object the job's metadata must contain (`{"region": "eu"}`). Metadata
+has no index, so combine it with filters that do. `hopper jobs list -tag
+tenant:acme` and the web UI filter by tag too.
+
 ## Periodic jobs
 
 ```go

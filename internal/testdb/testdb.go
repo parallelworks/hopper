@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net/url"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -42,7 +43,13 @@ func URL(t testing.TB) string {
 // with hopper's schema installed. The schema is dropped when the test ends.
 func Pool(t testing.TB) *pgxpool.Pool {
 	t.Helper()
-	pool := EmptyPool(t, 0)
+	return PoolIn(t, URL(t))
+}
+
+// PoolIn is like Pool, in the database at dbURL.
+func PoolIn(t testing.TB, dbURL string) *pgxpool.Pool {
+	t.Helper()
+	pool := emptyPool(t, dbURL, 0)
 	opts := &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}
 	if _, err := hoppermigrate.Up(context.Background(), Driver(pool), opts); err != nil {
 		t.Fatalf("migrate: %v", err)
@@ -54,11 +61,15 @@ func Pool(t testing.TB) *pgxpool.Pool {
 // maxConns of 0 uses the pgxpool default.
 func EmptyPool(t testing.TB, maxConns int32) *pgxpool.Pool {
 	t.Helper()
+	return emptyPool(t, URL(t), maxConns)
+}
+
+func emptyPool(t testing.TB, dbURL string, maxConns int32) *pgxpool.Pool {
+	t.Helper()
 	ctx := context.Background()
-	url := URL(t)
 	schema := fmt.Sprintf("hopper_test_%d_%08x_%d", os.Getpid(), run, counter.Add(1))
 
-	admin, err := pgx.Connect(ctx, url)
+	admin, err := pgx.Connect(ctx, dbURL)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -72,7 +83,7 @@ func EmptyPool(t testing.TB, maxConns int32) *pgxpool.Pool {
 		admin.Close(ctx) //nolint:errcheck // test cleanup
 	})
 
-	cfg, err := pgxpool.ParseConfig(url)
+	cfg, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
 		t.Fatalf("parse url: %v", err)
 	}
@@ -86,6 +97,40 @@ func EmptyPool(t testing.TB, maxConns int32) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 	return pool
+}
+
+// Database creates a database for this test, with the CREATE DATABASE
+// options given, and returns its URL. It is dropped when the test ends.
+func Database(t testing.TB, options string) string {
+	t.Helper()
+	ctx := context.Background()
+	base := URL(t)
+	name := fmt.Sprintf("hopper_test_%d_%08x_%d", os.Getpid(), run, counter.Add(1))
+	admin, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer admin.Close(ctx) //nolint:errcheck // test setup
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" "+options); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	t.Cleanup(func() {
+		admin, err := pgx.Connect(ctx, base)
+		if err != nil {
+			t.Errorf("connect: %v", err)
+			return
+		}
+		defer admin.Close(ctx) //nolint:errcheck // test cleanup
+		if _, err := admin.Exec(ctx, "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop database: %v", err)
+		}
+	})
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	u.Path = "/" + name
+	return u.String()
 }
 
 // Driver binds the driver to the isolated schema created by EmptyPool.

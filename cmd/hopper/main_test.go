@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -86,6 +87,36 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "list", "-newest", "-limit", "1"); !strings.Contains(got, newer) || strings.Contains(got, older) {
 		t.Errorf("newest jobs list = %q", got)
 	}
+	tagged, err := client.Insert(ctx, ping{}, &hopper.InsertOpts{
+		Queue: "q2", Priority: hopper.PriorityLow, Tags: []string{"nightly", "tenant:acme"},
+		Metadata: json.RawMessage(`{"tenant": "acme", "region": "eu"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taggedID := tagged.Job.ID.String()
+	for _, args := range [][]string{
+		{"-tag", "nightly", "-tag", "tenant:acme"},
+		{"-any-tag", "other", "-any-tag", "nightly"},
+		{"-metadata", `{"tenant": "acme"}`},
+		{"-priority", "3"},
+		{"-id", taggedID, "-id", keyed.Job.ID.String()},
+	} {
+		got := hopperCmd(append([]string{"jobs", "list"}, args...)...)
+		if !strings.Contains(got, taggedID) || !strings.Contains(got, "nightly,tenant:acme") || strings.Contains(got, id) {
+			t.Errorf("jobs list %s = %q", strings.Join(args, " "), got)
+		}
+	}
+	if got := hopperCmd("jobs", "list", "-tag", "nightly", "-tag", "other"); strings.Contains(got, taggedID) {
+		t.Errorf("jobs list with a tag it lacks = %q", got)
+	}
+	if got := hopperCmd("jobs", "get", taggedID); !strings.Contains(got, `tags:          ["nightly" "tenant:acme"]`) {
+		t.Errorf("jobs get of a tagged job = %q", got)
+	}
+	var badOut bytes.Buffer
+	if err := run(ctx, []string{"-schema", schema, "jobs", "list", "-metadata", "[1]"}, &badOut); err == nil || !strings.Contains(err.Error(), "JSON object") {
+		t.Errorf("jobs list with metadata that is not an object: %v", err)
+	}
 	if _, err := client.JobCancel(ctx, keyed.Job.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -105,15 +136,19 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "log #1:\n  level=INFO msg=one\n  level=WARN msg=two\nlog #2:\n  no newline\n") {
 		t.Errorf("jobs get with logs = %q", got)
 	}
-	// A job whose logs cannot be read, here from a schema before v16, is
-	// still shown, with why its logs are missing, and the command fails.
-	hopperCmd("migrate", "down", "-target", "15")
+	// A job whose logs cannot be read, here without a logs column, is still
+	// shown, with why its logs are missing, and the command fails.
+	if _, err := pool.Exec(ctx, "ALTER TABLE hopper_jobs RENAME COLUMN logs TO hidden_logs"); err != nil {
+		t.Fatal(err)
+	}
 	var getOut bytes.Buffer
 	err = run(ctx, []string{"-schema", schema, "jobs", "get", id}, &getOut)
 	if got := getOut.String(); err == nil || !strings.Contains(got, "state:         available") || !strings.Contains(got, "logs:          unavailable: ") {
 		t.Errorf("jobs get without a logs column = %v, %q", err, got)
 	}
-	hopperCmd("migrate", "up")
+	if _, err := pool.Exec(ctx, "ALTER TABLE hopper_jobs RENAME COLUMN hidden_logs TO logs"); err != nil {
+		t.Fatal(err)
+	}
 	if got := hopperCmd("jobs", "retry", id); !strings.Contains(got, "progress:") {
 		t.Errorf("jobs retry dropped the progress: %q", got)
 	}
@@ -127,7 +162,7 @@ func TestCLI(t *testing.T) {
 		t.Errorf("jobs retry = %q", got)
 	}
 	var jobs []*hopper.JobRow
-	if err := json.Unmarshal([]byte(hopperCmd("-json", "jobs", "list", "-state", "available")), &jobs); err != nil || len(jobs) != 1 {
+	if err := json.Unmarshal([]byte(hopperCmd("-json", "jobs", "list", "-queue", "q1", "-state", "available")), &jobs); err != nil || len(jobs) != 1 {
 		t.Errorf("json jobs = %v, %v", jobs, err)
 	}
 	if got := hopperCmd("jobs", "delete", keyed.Job.ID.String()); !strings.Contains(got, "state:         canceled") {
@@ -179,6 +214,14 @@ func TestCLI(t *testing.T) {
 		!strings.Contains(got, "0 of 2 finished") || !strings.Contains(got, "pending") || !strings.Contains(got, wres.Jobs[0].Job.ID.String()) {
 		t.Errorf("workflows get = %q", got)
 	}
+	// A downgrade stops at its target, and an upgrade applies the rest.
+	previous := fmt.Sprintf("schema version %d", hoppermigrate.Latest()-1)
+	if got := hopperCmd("migrate", "down", "-target", strconv.Itoa(hoppermigrate.Latest()-1)); !strings.Contains(got, previous) {
+		t.Errorf("migrate down -target = %q, want %q", got, previous)
+	}
+	if got := hopperCmd("migrate", "up"); !strings.Contains(got, latest) {
+		t.Errorf("migrate up after a partial downgrade = %q", got)
+	}
 	if got := hopperCmd("migrate", "down"); !strings.Contains(got, "schema version 0") {
 		t.Errorf("migrate down = %q", got)
 	}
@@ -189,5 +232,22 @@ func TestCLI(t *testing.T) {
 	}
 	if err := run(ctx, []string{"jobs", "get", "not-an-id"}, &out); err == nil {
 		t.Error("bad job ID succeeded")
+	}
+}
+
+func TestTagsColumn(t *testing.T) {
+	for _, c := range []struct {
+		tags []string
+		want string
+	}{
+		{nil, ""},
+		{[]string{"nightly", "tenant:acme", "with space"}, "nightly,tenant:acme,with space"},
+		{[]string{"a,b", "c"}, `"a,b",c`},
+		{[]string{`say "hi"`}, `"say \"hi\""`},
+		{[]string{"evil\u202ename"}, `"evil\u202ename"`},
+	} {
+		if got := tagsColumn(c.tags); got != c.want {
+			t.Errorf("tagsColumn(%q) = %s, want %s", c.tags, got, c.want)
+		}
 	}
 }

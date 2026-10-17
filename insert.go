@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/internal/jobtags"
 )
 
 // Insert inserts one job. It can be called before Start and on an
@@ -207,7 +208,7 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 	if opts.Priority == 0 {
 		opts.Priority = PriorityNormal
 	}
-	if opts.Priority < PriorityHigh || opts.Priority > PriorityLowest {
+	if !opts.Priority.valid() {
 		return driver.JobInsertParams{}, 0, fmt.Errorf("hopper: priority %d is out of range 1..4", opts.Priority)
 	}
 	if opts.MaxAttempts == 0 {
@@ -222,6 +223,10 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 	if opts.TTL < 0 {
 		return driver.JobInsertParams{}, 0, fmt.Errorf("hopper: TTL %s must not be negative", opts.TTL)
 	}
+	tags, err := jobtags.Check(opts.Tags)
+	if err != nil {
+		return driver.JobInsertParams{}, 0, err
+	}
 
 	args, err := c.cfg.Codec.Marshal(p.Args)
 	if err != nil {
@@ -235,6 +240,7 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 		ScheduledAt:  opts.ScheduledAt,
 		Args:         args,
 		Metadata:     opts.Metadata,
+		Tags:         tags,
 		TTL:          opts.TTL,
 		Await:        opts.Await,
 		OrderingKey:  opts.OrderingKey,

@@ -401,7 +401,7 @@ func (c *Client[TTx]) indexLoop(ctx context.Context, maintained <-chan struct{})
 			c.logger.WarnContext(ctx, "hopper: index history", "error", err)
 		}
 		for _, name := range res.TimedOut {
-			c.logger.WarnContext(ctx, "hopper: a history partition's index build ran past statement_timeout; raise it for this role to let the build finish",
+			c.logger.WarnContext(ctx, "hopper: a history partition's index build was canceled, by statement_timeout or an operator; if by the timeout, raise it for this role to let the build finish",
 				"partition", name, "retry_in", retryIn(builds, name, maxIndexBackoffShift))
 		}
 		for _, name := range res.Invalid {
@@ -479,6 +479,9 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	if err != nil && ctx.Err() == nil {
 		c.logger.ErrorContext(ctx, "hopper: maintain history", "error", err, "deferred", res.Deferred)
 	}
+	// A group's failure leaves the others maintained (HistoryMaintain goes
+	// on past it), so what they did and what they deferred is in res
+	// either way.
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
 	}

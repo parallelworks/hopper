@@ -3,6 +3,7 @@ package hopper_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -356,6 +357,28 @@ func TestPublishAwaitAndSQLContract(t *testing.T) {
 	inserted, err := c.JobGet(ctx, mustID(t, jobID))
 	if err != nil || inserted.Queue != "q" || inserted.Priority != 3 || inserted.ExpiresAt.IsZero() || string(inserted.Args) != `{"n": 7}` {
 		t.Errorf("hopper_insert job = %+v, %v", inserted, err)
+	}
+
+	var taggedID string
+	if err := h.pool.QueryRow(ctx, `SELECT hopper_insert('noop', '{}', '{"tags": ["b", "a", "b"]}')::text`).Scan(&taggedID); err != nil {
+		t.Fatal(err)
+	}
+	if tagged, err := c.JobGet(ctx, mustID(t, taggedID)); err != nil || !slices.Equal(tagged.Tags, []string{"b", "a"}) {
+		t.Errorf("hopper_insert tagged job = %+v, %v", tagged, err)
+	}
+	for _, opts := range []string{`{"tags": "a"}`, `{"tags": [1]}`, `{"tags": [""]}`, `{"tags": ["a\nb"]}`, `{"tags": ["a\u0085b"]}`, `{"tags": ["` + strings.Repeat("x", 256) + `"]}`} {
+		if _, err := h.pool.Exec(ctx, `SELECT hopper_insert('noop', '{}', $1::jsonb)`, opts); err == nil {
+			t.Errorf("hopper_insert with %s succeeded", opts)
+		}
+	}
+	for _, opts := range []string{`{}`, `{"tags": null}`, `{"tags": []}`} {
+		var id string
+		if err := h.pool.QueryRow(ctx, `SELECT hopper_insert('noop', '{}', $1::jsonb)::text`, opts).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if j, err := c.JobGet(ctx, mustID(t, id)); err != nil || j.Tags != nil {
+			t.Errorf("hopper_insert with %s = %+v, %v", opts, j, err)
+		}
 	}
 }
 

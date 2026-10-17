@@ -518,6 +518,71 @@ func TestLeaderRetriesDeferredPartitions(t *testing.T) {
 	})
 }
 
+// TestLeaderWaitsOutFailingGroup has a partition group failing on every
+// pass, the stream log's DEFAULT partition holding a row of each of the two
+// days ahead so that the first day's partition cannot be attached, even if
+// the leader's pass runs after midnight, while history's partition ahead is
+// deferred. The leader retries a pass that failed only at the next
+// maintenance interval, not on every leader pass, which would run the
+// failing group again each time.
+func TestLeaderWaitsOutFailingGroup(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_stream_events (topic, created_at)
+		SELECT 't', date_trunc('day', now(), 'UTC') + make_interval(days => d, hours => 1) FROM generate_series(1, 2) d`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "LOCK TABLE hopper_job_history_completed_default IN ROW EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	logs := &messageLog{}
+	c := h.client(&hopper.Config{
+		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers(),
+		Logger: slog.New(logs),
+	})
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A failed pass logs what it deferred with its error.
+	waitFor(t, func() bool { return logs.count("hopper: maintain history") > 0 })
+	time.Sleep(5 * fastTuning.LeaderInterval)
+	if n := logs.count("hopper: maintain history"); n != 1 {
+		t.Errorf("failing maintenance ran %d times within one maintenance interval, want 1", n)
+	}
+}
+
+// messageLog counts the records logged per message.
+type messageLog struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (l *messageLog) Enabled(context.Context, slog.Level) bool { return true }
+func (l *messageLog) WithAttrs([]slog.Attr) slog.Handler       { return l }
+func (l *messageLog) WithGroup(string) slog.Handler            { return l }
+
+func (l *messageLog) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.counts == nil {
+		l.counts = map[string]int{}
+	}
+	l.counts[r.Message]++
+	return nil
+}
+
+func (l *messageLog) count(message string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.counts[message]
+}
+
 func TestNotificationsWakeOtherClients(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)

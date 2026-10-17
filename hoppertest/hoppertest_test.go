@@ -61,7 +61,7 @@ func TestRequireInserted(t *testing.T) {
 	hoppertest.RequireNotInserted[sendEmail](ctx, t, client, nil)
 	expectFailure(t, func(tb testing.TB) { hoppertest.RequireInserted[sendEmail](ctx, tb, client, nil) })
 
-	if _, err := client.Insert(ctx, sendEmail{UserID: 42}, &hopper.InsertOpts{Queue: "email", Priority: hopper.PriorityHigh}); err != nil {
+	if _, err := client.Insert(ctx, sendEmail{UserID: 42}, &hopper.InsertOpts{Queue: "email", Priority: hopper.PriorityHigh, Tags: []string{"welcome", "tenant:acme"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Insert(ctx, other{}, nil); err != nil {
@@ -72,6 +72,11 @@ func TestRequireInserted(t *testing.T) {
 		t.Errorf("job = %+v args %+v", job.JobRow, job.Args)
 	}
 	hoppertest.RequireInserted[sendEmail](ctx, t, client, &hoppertest.RequireOpts{Queue: "email", Priority: hopper.PriorityHigh, State: hopper.JobStateAvailable})
+	hoppertest.RequireInserted[sendEmail](ctx, t, client, &hoppertest.RequireOpts{Tags: []string{"tenant:acme", "welcome"}})
+	expectFailure(t, func(tb testing.TB) {
+		hoppertest.RequireInserted[sendEmail](ctx, tb, client, &hoppertest.RequireOpts{Tags: []string{"welcome", "other"}})
+	})
+	hoppertest.RequireNotInserted[sendEmail](ctx, t, client, &hoppertest.RequireOpts{Tags: []string{""}})
 	expectFailure(t, func(tb testing.TB) {
 		hoppertest.RequireInserted[sendEmail](ctx, tb, client, &hoppertest.RequireOpts{Queue: "default"})
 	})
@@ -118,12 +123,16 @@ func TestWork(t *testing.T) {
 	slow := hopper.NewWorkers()
 	hopper.AddWorker(slow, &slowWorker{})
 
-	if err := hoppertest.Work(ctx, t, workers, sendEmail{UserID: 1}, &hoppertest.WorkOpts{Queue: "email", Attempt: 3}); err == nil {
+	if err := hoppertest.Work(ctx, t, workers, sendEmail{UserID: 1}, &hoppertest.WorkOpts{Queue: "email", Attempt: 3, Tags: []string{"t", "t"}}); err == nil {
 		t.Fatal("expected the no-deadline error: Work applies only the worker's timeout")
 	}
-	if got == nil || got.Args.UserID != 1 || got.Queue != "email" || got.Attempt != 3 || got.ID.IsZero() || got.State != hopper.JobStateRunning {
+	if got == nil || got.Args.UserID != 1 || got.Queue != "email" || got.Attempt != 3 || got.ID.IsZero() || got.State != hopper.JobStateRunning || len(got.Tags) != 1 {
 		t.Errorf("job seen by worker = %+v", got.JobRow)
 	}
+	// A tag an insert would reject fails the test, as the insert would.
+	expectFailure(t, func(tb testing.TB) {
+		_ = hoppertest.Work(ctx, tb, workers, sendEmail{UserID: 1}, &hoppertest.WorkOpts{Tags: []string{"line\nbreak"}})
+	})
 	var cancel *hopper.CancelError
 	if err := hoppertest.Work(ctx, t, workers, sendEmail{UserID: -1}, nil); !errors.As(err, &cancel) {
 		t.Errorf("err = %v, want CancelError", err)

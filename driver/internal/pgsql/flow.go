@@ -116,10 +116,14 @@ func callbackJSON(p *driver.JobInsertParams) (*string, error) {
 	if _, err := smallint(p.MaxAttempts, "callback max_attempts"); err != nil {
 		return nil, err
 	}
-	b, err := json.Marshal(map[string]any{
+	cb := map[string]any{
 		"kind": p.Kind, "queue": p.Queue, "priority": p.Priority, "max_attempts": p.MaxAttempts,
 		"args": json.RawMessage(jsonOrEmptyObject(p.Args)), "metadata": json.RawMessage(jsonOrEmptyObject(p.Metadata)),
-	})
+	}
+	if len(p.Tags) > 0 {
+		cb["tags"] = p.Tags
+	}
+	b, err := json.Marshal(cb)
 	if err != nil {
 		return nil, err
 	}

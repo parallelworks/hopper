@@ -39,6 +39,9 @@ const (
 	PriorityLowest Priority = 4
 )
 
+// valid reports whether p is one of the four levels.
+func (p Priority) valid() bool { return p >= PriorityHigh && p <= PriorityLowest }
+
 // InsertOpts customizes one insert. A nil *InsertOpts means the defaults,
 // which come from the args' InsertOpts method if it has one, then from the
 // client's Config.
@@ -72,6 +75,13 @@ type InsertOpts struct {
 	// PartitionKey groups the job for the queue's PartitionLimit, for
 	// example a customer ID.
 	PartitionKey string
+	// Tags label the job, for finding it with JobFilter.TagsAny and
+	// TagsAll, for example a tenant or a release. Each is a non-empty
+	// string of valid UTF-8, at most MaxTagBytes, without control
+	// characters. Repeats are dropped, keeping the first; more than MaxTags
+	// distinct tags fail the insert. They replace, not add to, the tags of
+	// the JobArgs' own InsertOpts.
+	Tags []string
 }
 
 // merge returns opts with the non-zero fields of over applied on top.
@@ -105,6 +115,9 @@ func (opts InsertOpts) merge(over InsertOpts) InsertOpts {
 	}
 	if over.PartitionKey != "" {
 		opts.PartitionKey = over.PartitionKey
+	}
+	if len(over.Tags) > 0 {
+		opts.Tags = over.Tags
 	}
 	return opts
 }
