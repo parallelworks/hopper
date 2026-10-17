@@ -425,7 +425,7 @@ func TestTagsUpgrade(t *testing.T) {
 		  args, metadata, errors, await, created_at, now()%[1]s FROM hopper_jobs WHERE %[2]s`
 	// A time partition the leader made before the upgrade, named for the
 	// current hour, and wide enough that the test does not leave it.
-	hour := time.Now().UTC().Truncate(time.Hour)
+	hour := dbHour(ctx, t, pool)
 	partition := "hopper_job_history_completed_" + hour.Format("2006010215")
 	exec(fmt.Sprintf("CREATE TABLE %s PARTITION OF hopper_job_history_completed FOR VALUES FROM ('%s') TO ('%s')",
 		partition, hour.Add(-time.Hour).Format(time.RFC3339), hour.Add(2*time.Hour).Format(time.RFC3339)))
@@ -520,7 +520,7 @@ func TestTagsUpgradeLocksOnlyInItsRetryLoop(t *testing.T) {
 	if _, err := hoppermigrate.Up(ctx, testdb.Driver(pool), &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
 		t.Fatal(err)
 	}
-	hour := time.Now().UTC().Truncate(time.Hour)
+	hour := dbHour(ctx, t, pool)
 	partition := "hopper_job_history_completed_" + hour.Format("2006010215")
 	// Two hours wide, so that the period has not ended by the time the
 	// upgrade copies it, should the test straddle the hour.
@@ -994,7 +994,7 @@ func TestTagsUpgradeCopiesBoundsInAnyDateStyle(t *testing.T) {
 	if _, err := hoppermigrate.Up(ctx, testdb.Driver(pool), &hoppermigrate.Options{Logger: logger, Target: 16}); err != nil {
 		t.Fatal(err)
 	}
-	hour := time.Now().UTC().Truncate(time.Hour)
+	hour := dbHour(ctx, t, pool)
 	partition := "hopper_job_history_completed_" + hour.Format("2006010215")
 	// Two hours wide, so that the period has not ended by the time the
 	// upgrade copies it, should the test straddle the hour.
@@ -1074,4 +1074,14 @@ func TestTagsUpgradeCutsDaysInUTC(t *testing.T) {
 			t.Errorf("tags partition of %s missing or not that day in UTC", day.Format("2006-01-02"))
 		}
 	}
+}
+
+// dbHour is the database's current hour, in UTC.
+func dbHour(ctx context.Context, t *testing.T, pool *pgxpool.Pool) time.Time {
+	t.Helper()
+	var now time.Time
+	if err := pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	return now.UTC().Truncate(time.Hour)
 }

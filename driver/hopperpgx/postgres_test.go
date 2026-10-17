@@ -823,7 +823,11 @@ func TestTagListingPlansWhatItReads(t *testing.T) {
 	t.Parallel()
 	ctx, d, exec := setup(t)
 	pool := d.Pool()
-	start := time.Now().UTC().Truncate(time.Hour)
+	var now time.Time
+	if err := pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+		t.Fatal(err)
+	}
+	start := now.UTC().Truncate(time.Hour)
 	for h := 3; h < 33; h++ {
 		from := start.Add(-time.Duration(h) * time.Hour)
 		if _, err := pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE hopper_job_history_completed_%s PARTITION OF hopper_job_history_completed
