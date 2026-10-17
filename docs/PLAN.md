@@ -1485,7 +1485,12 @@ and every page of them cost a walk and a lookup that found no job (20,000 of the
 took 2,001 round trips, 2.6 s, for a page of 10). An hour whose tags partition is past
 retention too, as a day's last hour's always is, and as every hour's of a day that a
 pass catches up on is, deletes none: the same pass drops that partition after the
-hour. The delete names its hour's partition, so its bounds are written into it too, and
+hour. When that partition has to wait instead, for another hour of its day that is
+kept or deferred, for its own deferred drop, or while history's retention fails (as a
+`DEFAULT` prune that outlasts `statement_timeout` does on every pass), the hour's rows
+stay in it until it goes, and listings walk past them. After a leader outage, a pass
+that catches up on whole days while that prune fails leaves the rows of every hour it
+drops. The delete names its hour's partition, so its bounds are written into it too, and
 it runs unprepared rather than leave a statement an hour in the connection's cache. A
 deferred drop rolls the delete back
 with it, and its retry, on the next leader pass, deletes again: an hour whose drop is
