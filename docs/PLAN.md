@@ -748,12 +748,19 @@ skew between pods cannot cause early or duplicate execution.
   at 30 days of hourly `completed` partitions (725) a page by 8 tags took 830 ms to plan
   and one by 64 tags 8.5 s, against 15 ms and 81 ms at the default day. So outside a
   transaction the listing reads history in two statements: the walk returns the page's
-  keys (ID, state and `finalized_at`), and a second statement reads the jobs with those
-  values as constants (`state = ANY('{...}') AND finalized_at = ANY('{...}') AND id =
-  ANY($n)`), which the planner prunes to the partitions the page's jobs are in, or the
-  `DEFAULT` partition for a period that has none. The live arm goes in that second
-  statement, so a page is two round trips. Both run in one `READ ONLY` `REPEATABLE
-  READ` transaction: under read committed a job finalized between them is in neither
+  keys (ID, state and `finalized_at`), and a second statement reads the jobs by those
+  values (`state = ANY('{...}') AND finalized_at = ANY($m) AND id = ANY($n)`), which the
+  planner prunes to the partitions the page's jobs are in, or the `DEFAULT` partition
+  for a period that has none. The times are a parameter, so that the statement's text
+  is the same from page to page: pgx and its database/sql adapter prepare each text
+  they run and keep up to 512 a connection on the server, and with the times written
+  in, each page prepared another. The listing's transaction sets `plan_cache_mode` to
+  `force_custom_plan`, so that each statement is planned for its values and the times
+  prune as constants would; a generic plan would plan every partition. The states are
+  written in, sorted, since a cast parameter of their type would not prune (its input
+  function is not immutable), and there are few sets of them. The live arm goes in
+  that second statement, so a page is two statements. Both run in one `READ ONLY`
+  `REPEATABLE READ` transaction: under read committed a job finalized between them is in neither
   the live table nor the keys the walk read, and a page would skip it; under one
   snapshot a partition dropped or a job moved after the walk changes neither
   statement's rows. The second statement applies the listing's other filters, so it can

@@ -1037,7 +1037,7 @@ var errOrderingKeyNeedsQueue = fmt.Errorf("%w: an ordering key is listed within 
 // JobList implements driver.Executor. The ordering key, IDs, priorities
 // and metadata are matched only when set, each as a plain condition, so that
 // the indexes on them serve it: the ordering-key indexes and the primary
-// keys. Tags are found through the tags tables (tagArms).
+// keys. Tags are found through the tags tables (tagJobsSQL, listTagsHistory).
 func (e *Executor) JobList(ctx context.Context, params driver.JobListParams) ([]*driver.JobRow, error) {
 	if params.OrderingKey != "" && params.Queue == "" {
 		return nil, errOrderingKeyNeedsQueue
@@ -1234,11 +1234,21 @@ type tagListing struct {
 // month), whatever the page reads. The walk of history's tags rows
 // (tagKeysSQL), partitioned by day, returns each job's key (id, state,
 // finalized_at) instead, and a second statement reads the live table's arm
-// and those jobs, whose states and times it is given as constants, from
-// which the planner keeps only the partitions they are in. The statements
-// run in one read-only transaction at repeatable read, whose snapshot they
-// share: a job moved between the live table and history in between would
-// otherwise be missed by both or listed from both.
+// and those jobs, by their states and times, from which the planner keeps
+// only the partitions they are in. The statements run in one read-only
+// transaction at repeatable read, whose snapshot they share: a job moved
+// between the live table and history in between would otherwise be missed by
+// both or listed from both.
+//
+// The times are a parameter, so that the second statement's text is the
+// same from page to page: a transport may prepare each text it runs and keep
+// it on the server (pgx keeps 512 a connection), and with the times written
+// in, each page prepared another. The transaction plans each statement for
+// its values (plan_cache_mode), never generically, so that the times prune
+// history's partitions as constants would; a generic plan would plan every
+// partition. The states are written in, sorted, since their type's input is
+// not immutable and a parameter's cast would not prune; there are few sets
+// of them.
 //
 // The second statement filters the walked jobs on what the tags rows do not
 // hold (the queue, kind, metadata and the rest), so a page can come up short
@@ -1256,6 +1266,9 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 		}
 	}()
 	if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, "SET LOCAL plan_cache_mode = force_custom_plan"); err != nil {
 		return nil, err
 	}
 	before := func(a, b driver.JobID) bool {
@@ -1289,10 +1302,11 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 			return nil, err
 		}
 		var (
-			tag           sql.NullString
-			ids           []driver.JobID
-			states, times []string
-			walkEnd       driver.JobID
+			tag     sql.NullString
+			ids     []driver.JobID
+			states  []string
+			times   []time.Time
+			walkEnd driver.JobID
 		)
 		for rows.Next() {
 			var (
@@ -1311,7 +1325,7 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 			if !slices.Contains(states, state.String) {
 				states = append(states, state.String)
 			}
-			times = append(times, `"`+at.Time.UTC().Format("2006-01-02T15:04:05.999999Z")+`"`)
+			times = append(times, at.Time)
 			if len(ids) == 1 || before(walkEnd, id.ID) {
 				walkEnd = id.ID
 			}
@@ -1333,12 +1347,11 @@ func (e *Executor) listTagsHistory(ctx context.Context, c Conn, l tagListing, ar
 			arms = append(arms, l.liveArm(source))
 		}
 		if len(ids) > 0 {
-			fetchArgs = append(fetchArgs, uuidArray(ids))
-			// The states and times are constants, not parameters, so that the
-			// planner keeps only their partitions under a generic plan too.
+			slices.Sort(states)
+			fetchArgs = append(fetchArgs, timeArray(times), uuidArray(ids))
 			arms = append(arms, jobListHistorySQL+l.filter+fmt.Sprintf(
-				" AND state = ANY('{%s}'::{{schema}}.hopper_job_state[]) AND finalized_at = ANY('{%s}'::timestamptz[]) AND id = ANY($%d::uuid[]) AND tags ?| $%d::text[]",
-				strings.Join(states, ","), strings.Join(times, ","), len(fetchArgs), l.walked))
+				" AND state = ANY('{%s}'::{{schema}}.hopper_job_state[]) AND finalized_at = ANY($%d::timestamptz[]) AND id = ANY($%d::uuid[]) AND tags ?| $%d::text[]",
+				strings.Join(states, ","), len(fetchArgs)-1, len(fetchArgs), l.walked))
 		}
 		if len(arms) > 0 {
 			fetchSQL, fetchArgs := usedParams("("+strings.Join(arms, ") UNION ALL (")+")", fetchArgs)

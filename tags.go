@@ -37,8 +37,8 @@ func checkJobFilter(f JobFilter) error {
 			return fmt.Errorf("%w: %w; no job has such a tag", ErrInvalidFilter, err)
 		}
 	}
-	// Each of TagsAny's tags is an arm of the listing's statement, so their
-	// number is bounded as a job's are.
+	// Each of TagsAny's tags is walked on every page, so their number is
+	// bounded as a job's are.
 	if _, ok := jobtags.DistinctAtMost(f.TagsAny, MaxTags); !ok {
 		return fmt.Errorf("%w: more distinct TagsAny than MaxTags (%d)", ErrInvalidFilter, MaxTags)
 	}

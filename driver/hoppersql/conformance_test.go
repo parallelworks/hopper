@@ -129,3 +129,63 @@ func TestMigrate(t *testing.T) {
 		t.Fatalf("version after down = %d, %v; want 0", v, err)
 	}
 }
+
+// TestTagListingPreparesOnce pages through finished jobs by tag, a job a
+// page, on one connection. pgx's database/sql adapter prepares each
+// statement text it runs and keeps it on the server, so the listing's texts
+// are the same from page to page, and the statement that reads the page's
+// jobs is planned for each page's values, never generically.
+func TestTagListingPreparesOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.Pool(t)
+	db := open(t, pool)
+	db.SetMaxOpenConns(1)
+	exec := hoppersql.NewWithConfig(db, &hoppersql.Config{Schema: pool.Config().ConnConfig.RuntimeParams["search_path"]}).Executor()
+	p := make([]driver.JobInsertParams, 12)
+	for i := range p {
+		p[i] = driver.JobInsertParams{Kind: "paged", Queue: "default", Priority: 2, MaxAttempts: 3, Tags: []string{"paged"}}
+	}
+	if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	clientID, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range claimed.Jobs {
+		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+			{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	params := driver.JobListParams{TagsAny: []string{"paged"}, States: []driver.JobState{driver.JobStateCompleted}, Limit: 1}
+	listed := 0
+	for {
+		page, err := exec.JobList(ctx, params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		listed += len(page)
+		params.After = page[0].ID
+	}
+	if listed != 12 {
+		t.Fatalf("listed %d jobs, want 12", listed)
+	}
+	var statements, generic int
+	if err := db.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(generic_plans), 0) FROM pg_prepared_statements
+		WHERE statement LIKE '%finalized_at = ANY(%' AND statement NOT LIKE '%pg_prepared_statements%'`).Scan(&statements, &generic); err != nil {
+		t.Fatal(err)
+	}
+	if statements != 1 || generic != 0 {
+		t.Errorf("12 pages prepared %d statements reading history's jobs, which ran %d generic plans; want 1 and 0", statements, generic)
+	}
+}

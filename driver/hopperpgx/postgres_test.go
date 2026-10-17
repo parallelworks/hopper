@@ -876,6 +876,69 @@ func TestTagListingPlansWhatItReads(t *testing.T) {
 	}
 }
 
+// TestTagListingPreparesOnce pages through finished jobs by tag, a job a
+// page, on one connection. pgx prepares each statement text it runs and
+// keeps up to 512 a connection, so the listing's texts are the same from
+// page to page: with the page's finish times written into the statement,
+// each page prepared another, which the server kept until pgx evicted it.
+// The statement that reads the page's jobs is planned for each page's
+// values, never generically, so that it reads only their partitions.
+func TestTagListingPreparesOnce(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	p := insertParams("paged", 12)
+	for i := range p {
+		p[i].Tags = []string{"paged"}
+	}
+	if _, err := exec.JobInsertMany(ctx, p, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	clientID := register(t, ctx, exec)
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range claimed.Jobs {
+		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+			{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := d.Pool().Config()
+	cfg.MaxConns = 1
+	one, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer one.Close()
+	listing := testdb.Driver(one).Executor()
+	params := driver.JobListParams{TagsAny: []string{"paged"}, States: []driver.JobState{driver.JobStateCompleted}, Limit: 1}
+	listed := 0
+	for {
+		page, err := listing.JobList(ctx, params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		listed += len(page)
+		params.After = page[0].ID
+	}
+	if listed != 12 {
+		t.Fatalf("listed %d jobs, want 12", listed)
+	}
+	var statements, generic int
+	if err := one.QueryRow(ctx, `SELECT count(*), coalesce(sum(generic_plans), 0) FROM pg_prepared_statements
+		WHERE statement LIKE '%finalized_at = ANY(%' AND statement NOT LIKE '%pg_prepared_statements%'`).Scan(&statements, &generic); err != nil {
+		t.Fatal(err)
+	}
+	if statements != 1 || generic != 0 {
+		t.Errorf("12 pages prepared %d statements reading history's jobs, which ran %d generic plans; want 1 and 0", statements, generic)
+	}
+}
+
 // TestTagListingSnapshotSpansStatements finalizes a tagged job into history
 // right after a listing by its tag has walked history's tags rows, before
 // the statement that reads the live table. The statements share one
