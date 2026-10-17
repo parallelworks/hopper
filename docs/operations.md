@@ -67,7 +67,14 @@
   below once for the partition and retries it later, and the warning can be
   ignored. A build that runs past the timeout, or that an operator cancels, is
   retried at doubling intervals with a warning; if nobody canceled it, raise
-  the timeout for hopper's role until the warnings stop. A timeout that ends a partition's creation or drop, or an
+  the timeout for hopper's role until the warnings stop. From v17, dropping an
+  hour of completed history first deletes that hour's tags rows. If
+  `statement_timeout` cancels that delete, the hour is still dropped, but its
+  tags rows stay in their day's partition until the day is dropped, and tag
+  listings walk past them in the meantime. A `transaction_timeout` (Postgres
+  17 and later) that ends the delete ends the session too, so every pass
+  fails and that hour and every later one stay. Set either timeout for
+  hopper's role above a busy hour's delete. A timeout that ends a partition's creation or drop, or an
   index's attach, while it waits for its locks defers that work like a lock timeout;
   one that ends a partition's attach while it scans the DEFAULT partition, grown
   large during a long leader outage, is logged as an error each maintenance
