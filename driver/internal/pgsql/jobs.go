@@ -761,7 +761,7 @@ SET progress = jsonb_build_object(
       'step', CASE WHEN $5 THEN coalesce(progress->>'step', '') ELSE $4::text END,
       'at', statement_timestamp())
     || CASE WHEN $6::jsonb IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('cursor', $6::jsonb) END
-WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND fence = $3%s
+WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND fence = $3 AND attempt = $7%s
 RETURNING progress::text`
 
 var (
@@ -769,7 +769,7 @@ var (
 	jobRecordProgressNoWaitQuery = fmt.Sprintf(jobRecordProgressSQL, `
 WITH locked AS (
   SELECT id FROM {{schema}}.hopper_jobs
-  WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND fence = $3
+  WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND fence = $3 AND attempt = $7
   FOR UPDATE NOWAIT
 )`, " AND id IN (SELECT id FROM locked)")
 )
@@ -787,7 +787,7 @@ func (e *Executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 	}
 	var stored string
 	err := e.Conn.QueryRow(ctx, query, uuidParam(params.ID), params.AttemptedBy, params.Fence,
-		params.Step, params.KeepStep, cursor).Scan(&stored)
+		params.Step, params.KeepStep, cursor, params.Attempt).Scan(&stored)
 	if errors.Is(err, ErrNoRows) {
 		return nil, nil
 	}

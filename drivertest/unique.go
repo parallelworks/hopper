@@ -27,7 +27,7 @@ func runTo(ctx context.Context, t *testing.T, exec driver.Executor, clientID int
 	if state != driver.JobStateCompleted {
 		fin.Error = &driver.AttemptError{Attempt: 1, Error: "x"}
 	}
-	if applied := finalize(ctx, t, exec, fin); len(applied) != 1 {
+	if applied := finalizeCurrent(ctx, t, exec, fin); len(applied) != 1 {
 		t.Fatalf("finalize %s applied %v", key, applied)
 	}
 	return job
@@ -154,7 +154,7 @@ func testInsertUniqueFinishedRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]
 		// Rolled back on exit too, so a failed check cannot leave it open
 		// with the insert waiting on it.
 		defer rollback() //nolint:errcheck // already ended on the happy path
-		finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+		finalizeCurrent(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 
 		// The insert's transaction begins here, since Begin may call
 		// t.Fatal, which only the test's goroutine may.

@@ -149,7 +149,7 @@ type Executor interface {
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
 	// JobRecordProgress stores a running job's progress, fenced like a
 	// finalize: only while the job is running in the given claim, by the
-	// given client at the given fence. It returns the progress as stored, or nil if the attempt
+	// given client at the given fence and attempt. It returns the progress as stored, or nil if the attempt
 	// no longer owns the job.
 	JobRecordProgress(ctx context.Context, params JobRecordProgressParams) (*Progress, error)
 	// JobGet returns a job by ID, live or from history.
@@ -410,7 +410,9 @@ type JobRow struct {
 	AttemptedBy int64
 	// Fence numbers the job's claims: each claim increments it. Snoozes,
 	// retries, the archive and JobRetry keep it, so for a given job it
-	// never repeats. Zero means the job was never claimed.
+	// never repeats. Zero means the job was never claimed, or only by
+	// clients of the previous release (schema v17), which claim without
+	// incrementing it, and whose archive and JobRetry from history drop it.
 	Fence        int64
 	Args         json.RawMessage
 	Metadata     json.RawMessage
@@ -477,10 +479,14 @@ type JobRetryParams struct {
 // JobRecordProgressParams is a running job's new progress.
 type JobRecordProgressParams struct {
 	ID JobID
-	// AttemptedBy and Fence identify the attempt's claim, which must
-	// still own the job.
+	// AttemptedBy, Fence and Attempt identify the attempt's claim, which
+	// must still own the job. The attempt number is checked with the fence,
+	// as the finalize checks the client with it: a client of the previous
+	// release drops the fence when it archives a job or retries it from
+	// history, and a later claim can repeat it.
 	AttemptedBy int64
 	Fence       int64
+	Attempt     int
 	// Step is the last step finished. With KeepStep the stored step is
 	// kept and Step is ignored.
 	Step     string

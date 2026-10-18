@@ -1130,7 +1130,9 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   when `tx` commits.
 - After the worker returns, the client reads the job (one primary-key read of the
   live table and history), because a fenced result cannot tell a commit from a rescue
-  that applied once `tx` rolled back.
+  that applied once `tx` rolled back. The read matches the job to this attempt by its
+  client, fence and attempt number: a `JobRetry` from history by a client of the
+  previous release drops the fence, and the claim after it can repeat this one's.
   - **Committed.** If the job is in history as this attempt completed it, or gone (a
     completed job on a `DeleteCompleted` queue), `tx` committed, whatever the worker
     returned: the client emits `job.completed`, settles the job's batch and promotes
@@ -1164,8 +1166,9 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   the commit.
 - **Progress.** `RecordStep` and `RecordCursor` write the job's `progress` column
   (`{"step", "cursor", "at"}`, the time `statement_timestamp()`) with one `UPDATE`
-  fenced like a finalize: `state = 'running'`, the attempt's client and its claim's
-  fence. A fenced write changes nothing and returns `ErrJobFenced`. They run on the
+  fenced like a finalize: `state = 'running'`, the attempt's client, its claim's
+  fence and its attempt number, which guards a fence that a client of the previous
+  release reset. A fenced write changes nothing and returns `ErrJobFenced`. They run on the
   pool and are not batched: a step is long next to its write, and the write must be
   durable before the worker goes on. `RecordStepTx` and `RecordCursorTx` run the same
   statement through `Driver.UnwrapTx(tx)`, so the progress commits with the step's

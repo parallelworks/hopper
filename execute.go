@@ -103,7 +103,10 @@ const readTxTimeout = 5 * time.Second
 
 // readTx reads the job a worker completed with CompleteTx. A fenced result
 // cannot tell a commit from a rescue that applied once the transaction
-// rolled back, since both fence it; the job's row can.
+// rolled back, since both fence it; the job's row can. The attempt number
+// is checked with the fence, as the finalize checks the client with it: a
+// JobRetry from history by a client of the previous release drops the
+// fence, and the claim after it can repeat this one's.
 func readTx(ctx context.Context, exec interface {
 	JobGet(context.Context, driver.JobID) (*driver.JobRow, error)
 }, row *driver.JobRow,
@@ -116,7 +119,7 @@ func readTx(ctx context.Context, exec interface {
 		return txCommitted
 	case err != nil:
 		return txUnknown
-	case job.AttemptedBy != row.AttemptedBy || job.Fence != row.Fence:
+	case job.AttemptedBy != row.AttemptedBy || job.Fence != row.Fence || job.Attempt != row.Attempt:
 		return txLost
 	case job.State == driver.JobStateCompleted:
 		return txCommitted

@@ -19,7 +19,8 @@ type attemptKey struct{}
 type attempt struct {
 	codec Codec
 	// exec is the client's pool, and attempt the job's attempt number, for
-	// recording progress. progressMu serializes the attempt's progress
+	// recording progress, fenced with completion's client and fence, and for
+	// the attempt's logger. progressMu serializes the attempt's progress
 	// writes, so that job.Progress ends as the last one stored.
 	exec       driver.Executor
 	attempt    int

@@ -33,7 +33,7 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 		for i, j := range jobs {
 			fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
 		}
-		if applied := finalize(ctx, t, exec, fin...); len(applied) != len(jobs) {
+		if applied := finalizeCurrent(ctx, t, exec, fin...); len(applied) != len(jobs) {
 			t.Fatalf("applied %d of %d", len(applied), len(jobs))
 		}
 	}
@@ -141,7 +141,7 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 	if len(running) != 1 || running[0].ID != e.ID {
 		t.Fatalf("claimed %v, want e", running)
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: e.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: e.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}})
 	if state(ff.ID) != driver.JobStateCanceled || state(g.ID) != driver.JobStateCanceled {
 		t.Errorf("after e failed: f %s g %s, want canceled", state(ff.ID), state(g.ID))
 	}
@@ -243,7 +243,7 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
-	if applied := finalize(ctx, t, d.UnwrapTx(tx), completed(x)); len(applied) != 1 {
+	if applied := finalizeCurrent(ctx, t, d.UnwrapTx(tx), completed(x)); len(applied) != 1 {
 		t.Fatalf("finalize in tx applied %v", applied)
 	}
 	// The other dependency's finalize does not wait for the transaction.
@@ -281,7 +281,7 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if jobs := claim(ctx, t, exec, clientID, 1); len(jobs) != 1 || jobs[0].ID != dep {
 		t.Fatalf("claimed %+v, want the fan-in dependent", jobs)
 	}
-	finalize(ctx, t, exec, completed(dep))
+	finalizeCurrent(ctx, t, exec, completed(dep))
 	var steps []driver.JobID
 	for range 2 {
 		wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
@@ -294,7 +294,7 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		if len(jobs) != 1 || jobs[0].ID != wf.Jobs[0].Job.ID {
 			t.Fatalf("claimed %+v", jobs)
 		}
-		finalize(ctx, t, exec, completed(jobs[0].ID))
+		finalizeCurrent(ctx, t, exec, completed(jobs[0].ID))
 		f.Exec(ctx, t, d, `UPDATE hopper_jobs SET state = 'pending' WHERE id = $1::uuid`, wf.Jobs[1].Job.ID.String())
 		steps = append(steps, wf.Jobs[1].Job.ID)
 	}

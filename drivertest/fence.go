@@ -179,11 +179,11 @@ func testRecordProgressFencesSnooze[TTx any](t *testing.T, f Fixture[TTx]) {
 	if second.Attempt != first.Attempt || second.Fence == first.Fence {
 		t.Fatalf("claims: attempt %d fence %d, then attempt %d fence %d", first.Attempt, first.Fence, second.Attempt, second.Fence)
 	}
-	p, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Fence: first.Fence, Step: "stale"})
+	p, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Fence: first.Fence, Attempt: first.Attempt, Step: "stale"})
 	if err != nil || p != nil {
 		t.Fatalf("the first claim's progress write = %+v, %v; want it fenced", p, err)
 	}
-	p, err = exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Fence: second.Fence, Step: "current"})
+	p, err = exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Fence: second.Fence, Attempt: second.Attempt, Step: "current"})
 	if err != nil || p == nil || p.Step != "current" {
 		t.Fatalf("the second claim's progress write = %+v, %v", p, err)
 	}

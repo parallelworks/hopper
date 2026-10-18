@@ -58,7 +58,7 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	snooze := func(reason string) {
 		t.Helper()
 		claimIt()
-		if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: reason}); len(applied) != 1 {
+		if applied := finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: reason}); len(applied) != 1 {
 			t.Fatal("snooze not applied")
 		}
 		if j := get(); j.State != driver.JobStateScheduled || j.SnoozeReason != reason {
@@ -78,14 +78,14 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	// Text PostgreSQL cannot store is repaired, not refused: a refused
 	// result would fail every result finalized in the same statement.
 	claimIt()
-	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "bad \xff\x00 reason"}); len(applied) != 1 {
+	if applied := finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "bad \xff\x00 reason"}); len(applied) != 1 {
 		t.Fatal("snooze with unstorable reason not applied")
 	}
 	if j := get(); j.SnoozeReason != "bad �� reason" {
 		t.Errorf("unstorable reason stored as %q", j.SnoozeReason)
 	}
 	claimIt()
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "bad \x00 error", Trace: "bad \x00 trace"}})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "bad \x00 error", Trace: "bad \x00 trace"}})
 	if j := get(); j.Errors[len(j.Errors)-1].Error != "bad � error" || j.Errors[len(j.Errors)-1].Trace != "bad � trace" {
 		t.Errorf("unstorable error stored as %+v", j.Errors[len(j.Errors)-1])
 	}
@@ -98,7 +98,7 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		t.Errorf("running job = %+v", j)
 	}
 	// A retry clears the reason, even one the claim did not.
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}})
 	if r := storedReason(ctx, t, f, d, id); r != "" {
 		t.Errorf("retry kept reason %q", r)
 	}
@@ -111,14 +111,14 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 	// A reason given with a result that is not a snooze is not stored.
 	claimIt()
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, SnoozeReason: "ignored"})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, SnoozeReason: "ignored"})
 	if r := storedReason(ctx, t, f, d, id); r != "" {
 		t.Errorf("retryable job kept reason %q", r)
 	}
 
 	// A fenced result does not touch the reason.
 	snooze("second")
-	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateScheduled, Snooze: true, SnoozeReason: "stale"}); len(applied) != 0 {
+	if applied := finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateScheduled, Snooze: true, SnoozeReason: "stale"}); len(applied) != 0 {
 		t.Fatal("finalize of a waiting job applied")
 	}
 	if j := get(); j.SnoozeReason != "second" {
