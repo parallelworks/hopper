@@ -95,6 +95,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeSkipLocked", func(t *testing.T, f Fixture[TTx]) { testFinalizeSkipLocked(t, f, false) }},
 		{"FinalizeSkipLockedNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeSkipLocked(t, f, true) }},
 		{"ClaimFence", testClaimFence[TTx]},
+		{"FinalizeFencesReclaim", testFinalizeFencesReclaim[TTx]},
+		{"RescueRacesReclaim", testRescueRacesReclaim[TTx]},
 		{"FinalizeTx", testFinalizeTx[TTx]},
 		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},

@@ -116,7 +116,7 @@ func readTx(ctx context.Context, exec interface {
 		return txCommitted
 	case err != nil:
 		return txUnknown
-	case job.AttemptedBy != row.AttemptedBy || job.Attempt != row.Attempt:
+	case job.AttemptedBy != row.AttemptedBy || job.Fence != row.Fence:
 		return txLost
 	case job.State == driver.JobStateCompleted:
 		return txCommitted

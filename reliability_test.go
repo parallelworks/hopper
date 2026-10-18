@@ -2,6 +2,7 @@ package hopper_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -715,6 +716,81 @@ func TestRescueStuckAfter(t *testing.T) {
 		t.Errorf("stuck job = %+v", job)
 	}
 	close(w.release)
+}
+
+type reclaimed struct{}
+
+func (reclaimed) Kind() string { return "reclaimed" }
+
+// TestRescuedAttemptsResultSkipsTheNextClaim rescues a stuck attempt whose
+// client is alive, so that the same client claims the job again while the
+// first attempt still runs. The first attempt's late result, from the same
+// client, must not finalize the second claim: the job's output is that of
+// the attempt it completed in.
+func TestRescuedAttemptsResultSkipsTheNextClaim(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	started := make(chan int, 10)
+	first, second := make(chan struct{}), make(chan struct{})
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[reclaimed]) error {
+		started <- job.Attempt
+		switch job.Attempt {
+		case 1:
+			<-first // ignores its context
+		case 2:
+			<-second
+		}
+		return hopper.SetOutput(ctx, job.Attempt)
+	})
+	c := h.client(&hopper.Config{
+		Queues:           map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers:          workers,
+		RescueStuckAfter: time.Second,
+		JobTimeout:       time.Hour,
+	})
+	releaseFirst, releaseSecond := sync.OnceFunc(func() { close(first) }), sync.OnceFunc(func() { close(second) })
+	t.Cleanup(releaseFirst)
+	t.Cleanup(releaseSecond)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, reclaimed{}, &hopper.InsertOpts{MaxAttempts: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAttempt(t, started, 1)
+	waitAttempt(t, started, 2)
+	releaseFirst()
+	// Long enough for the first attempt's result to be flushed, short of
+	// RescueStuckAfter for the second.
+	time.Sleep(300 * time.Millisecond)
+	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State != hopper.JobStateRunning || job.Attempt < 2 {
+		t.Fatalf("after the rescued attempt returned, job = %+v, %v; want it running in a later claim", job, err)
+	}
+	releaseSecond()
+	job := waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted)
+	var out int
+	if err := json.Unmarshal(job.Output, &out); err != nil || out != job.Attempt || out < 2 {
+		t.Errorf("completed at attempt %d with output %s (%v): another attempt's result", job.Attempt, job.Output, err)
+	}
+}
+
+// waitAttempt waits for the worker to start attempt n.
+func waitAttempt(t *testing.T, started <-chan int, n int) {
+	t.Helper()
+	timeout := time.After(15 * time.Second)
+	for {
+		select {
+		case a := <-started:
+			if a == n {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("attempt %d did not start", n)
+		}
+	}
 }
 
 func TestInsertOnlyClientNotifiesWorkers(t *testing.T) {

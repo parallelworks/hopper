@@ -596,14 +596,14 @@ retry AS (
                            THEN r.snooze_reason END,
       wake_requested_at = NULL
   FROM r
-  WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by
+  WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
     AND r.state IN ('retryable', 'scheduled')
   RETURNING j.id
 ),
 finished AS (
   DELETE FROM {{schema}}.hopper_jobs j
   USING r
-  WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by
+  WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
     AND r.state IN ('completed', 'canceled', 'discarded')
   RETURNING ` + finishedColumns(`CASE WHEN r.error IS NULL THEN j.errors
          ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END`, appendLogSQL, "r.output", "r.archive", "r.state", "$9") + `

@@ -143,9 +143,9 @@ type Executor interface {
 	// for longer than after, one level per call, and returns how many.
 	JobAge(ctx context.Context, queue string, after time.Duration) (int64, error)
 	// JobFinalizeMany applies a batch of results in one statement. A result is
-	// applied only if its job is still running and owned by the client that
-	// produced it; the IDs that were applied are returned, and the caller
-	// treats the rest as fenced.
+	// applied only if its job is still running in the claim that produced
+	// it, by the same client at the same fence; the IDs that were applied are
+	// returned, and the caller treats the rest as fenced.
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
 	// JobRecordProgress stores a running job's progress, fenced like a
 	// finalize: only while the job is running in the given attempt of the
@@ -826,11 +826,11 @@ type WorkflowPromoteResult struct {
 // JobFinalize is the result of one attempt.
 type JobFinalize struct {
 	ID JobID
-	// AttemptedBy is the client that claimed the attempt. The engine applies
-	// the result only if the job is still running and owned by this client.
+	// AttemptedBy and Fence identify the claim of the attempt. The engine
+	// applies the result only if the job is still running in that claim:
+	// owned by this client, at this fence.
 	AttemptedBy int64
-	// Fence is the fence of the attempt's claim.
-	Fence int64
+	Fence       int64
 	// State is the state to move to: completed, canceled or discarded (the
 	// job moves to history) or retryable or scheduled (it stays live).
 	State JobState

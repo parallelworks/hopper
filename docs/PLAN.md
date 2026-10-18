@@ -1047,21 +1047,22 @@ retry AS (
          snooze_reason = CASE WHEN r.snooze AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false) THEN r.snooze_reason END,
          wake_requested_at = NULL
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
-    AND j.state = 'running' AND j.attempted_by = r.attempted_by
+    AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
   RETURNING j.id),
 done AS (
   DELETE FROM hopper_jobs j USING r
   WHERE j.id = r.id AND r.state IN ('completed','canceled','discarded')
-    AND j.state = 'running' AND j.attempted_by = r.attempted_by
+    AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
   RETURNING j.*, r.state AS final_state, r.error, r.output, r.archive),
 archived AS (INSERT INTO hopper_job_history SELECT … , now() FROM done WHERE archive)
 SELECT id FROM retry UNION ALL SELECT id FROM done;
 ```
 
-- The `state = 'running' AND attempted_by = r.attempted_by` condition fences out
-  stale results. Each result carries the client ID that claimed its attempt, so a
-  client that re-registered under a new ID still finalizes the attempts it claimed
-  under the old one. If the job was rescued and reclaimed, the result is dropped and
+- The `state = 'running' AND attempted_by = r.attempted_by AND fence = r.fence`
+  condition fences out stale results. Each result carries the client ID and the fence
+  of the claim it ran in, so a client that re-registered under a new ID still
+  finalizes the attempts it claimed under the old one. If the job was rescued and
+  claimed again, by another client or by the same one, the result is dropped and
   logged, so a finalize can never overwrite a newer attempt. The statement returns
   the IDs it applied; the client logs the rest.
 - Retry delays are sent as durations and applied to database `now()`; error
@@ -1303,7 +1304,9 @@ the largest source of write amplification in heartbeat-based designs.
 - **Rescue.** The leader's rescuer finds `running` jobs whose `attempted_by` has no
   unexpired lease and moves them to `retryable` with the error `client lost` (or to
   `discarded` if they are out of attempts). A crashed pod's jobs run again within about
-  20s. The rescue's finalize skips rows another transaction holds (a `CompleteTx` that
+  20s. The rescue reads its candidates and then finalizes them, fenced to the claim
+  each was found in, so a job its client finalized and claimed again in between is
+  left to that claim. The rescue's finalize skips rows another transaction holds (a `CompleteTx` that
   has not ended, §7.5) and retries them on the next pass, so one such row cannot hold
   up the leader's loop and its lease renewal.
 - **Fencing.** If a renewal matches zero rows (after a long GC pause or a partition),
@@ -2168,7 +2171,7 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease, backdate an attempt, count rows). Engine internals such as partition management stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |

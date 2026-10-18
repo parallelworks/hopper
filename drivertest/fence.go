@@ -89,3 +89,76 @@ func testClaimFence[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatalf("JobRetry of a waiting job = %+v, %v", retried, err)
 	}
 }
+
+// testFinalizeFencesReclaim rescues a job while its client is alive, as
+// RescueStuckAfter does, and has the same client claim it again. A result of
+// the first claim, from the same client, must not finalize the second.
+func testFinalizeFencesReclaim[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+	clientID := register(ctx, t, exec)
+	first := claimOne(ctx, t, exec, clientID, id)
+	rescue := driver.JobFinalize{
+		ID: id, AttemptedBy: clientID, Fence: first.Fence, State: driver.JobStateRetryable,
+		Error: &driver.AttemptError{Attempt: 1, Fence: first.Fence, Error: "hopper: job ran longer than RescueStuckAfter"},
+	}
+	if applied := finalize(ctx, t, exec, rescue); len(applied) != 1 {
+		t.Fatal("rescue not applied")
+	}
+	second := claimOne(ctx, t, exec, clientID, id)
+	if second.AttemptedBy != first.AttemptedBy || second.Fence == first.Fence {
+		t.Fatalf("second claim: client %d, fence %d; first: client %d, fence %d", second.AttemptedBy, second.Fence, first.AttemptedBy, first.Fence)
+	}
+	for _, state := range []driver.JobState{driver.JobStateCompleted, driver.JobStateRetryable, driver.JobStateScheduled} {
+		late := driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: first.Fence, State: state, Archive: true, Snooze: state == driver.JobStateScheduled}
+		if applied := finalize(ctx, t, exec, late); len(applied) != 0 {
+			t.Fatalf("the first claim's %s result finalized the second claim", state)
+		}
+	}
+	if j := get(ctx, t, exec, id); j.State != driver.JobStateRunning || j.Fence != second.Fence || j.Attempt != 2 {
+		t.Fatalf("after the late results: %+v", j)
+	}
+	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: second.Fence, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
+		t.Fatal("the second claim's result was not applied")
+	}
+}
+
+// testRescueRacesReclaim finds a stuck job, then lets its client finalize it
+// and claim it again before the rescue applies: the rescue, fenced to the
+// claim it found, must leave the new claim alone.
+func testRescueRacesReclaim[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+	clientID := register(ctx, t, exec)
+	claimOne(ctx, t, exec, clientID, id)
+	f.AgeAttempt(ctx, t, d, id, 10*time.Minute)
+	candidates, err := exec.JobRescueCandidates(ctx, driver.JobRescueParams{StuckAfter: 5 * time.Minute, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].ID != id {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+	found := candidates[0]
+
+	finalize(ctx, t, exec, driver.JobFinalize{
+		ID: id, AttemptedBy: clientID, Fence: found.Fence, State: driver.JobStateRetryable,
+		Error: &driver.AttemptError{Attempt: 1, Fence: found.Fence, Error: "x"},
+	})
+	again := claimOne(ctx, t, exec, clientID, id)
+
+	rescue := driver.JobFinalize{
+		ID: id, AttemptedBy: found.AttemptedBy, Fence: found.Fence, State: driver.JobStateRetryable,
+		Error: &driver.AttemptError{Attempt: found.Attempt, Fence: found.Fence, Error: "hopper: job ran longer than RescueStuckAfter"},
+	}
+	if applied := finalize(ctx, t, exec, rescue); len(applied) != 0 {
+		t.Fatal("the rescue of the claim it found applied to the claim after it")
+	}
+	if j := get(ctx, t, exec, id); j.State != driver.JobStateRunning || j.Fence != again.Fence || len(j.Errors) != 1 {
+		t.Fatalf("after the rescue: %+v", j)
+	}
+}
