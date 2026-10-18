@@ -44,7 +44,8 @@ type PeriodicOpts struct {
 	// 10000. By default missed slots are skipped, except those due since the
 	// last one inserted within the last lease TTL, which covers a leader
 	// failover and a job removed and added again; CatchUp never inserts
-	// fewer than those.
+	// fewer than those. Either way at most the 10000 most recent missed
+	// slots are inserted.
 	CatchUp int
 	// Location evaluates a cron expression in this zone when the
 	// expression does not name one. Defaults to UTC.

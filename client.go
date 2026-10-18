@@ -123,7 +123,8 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		return err
 	}
 	// Workers may be added after NewClient, so StrictKinds is left to Add
-	// and to each insert. Nothing else holds c yet.
+	// and to each insert. c is returned only once StrictKinds is restored,
+	// so an error or a panic here cannot leave a client without it.
 	strict := c.cfg.StrictKinds
 	c.cfg.StrictKinds = false
 	for _, r := range c.periodic.jobs {

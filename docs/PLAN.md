@@ -1467,8 +1467,10 @@ first job has finished and left the live table.
 `RunOnStart` inserts a job when a leader starts scheduling. Missed slots are skipped by
 default, except slots due since the last recorded one within the last lease TTL, which
 covers a failover; `CatchUp: n` back-fills up to the n most recent missed slots
-(at most 10,000, the most recent), and never fewer than that window holds. A schedule with no recorded slot starts from its next slot. `RunOnStart`'s
-slot is the database time, so it is inserted after the back-filled slots, which the
+instead, and never fewer than that window holds. Either way at most the 10,000 most
+recent missed slots are inserted, so a failover window of a dense schedule is cut to
+its most recent 10,000. A schedule with no recorded slot starts from its next slot.
+`RunOnStart`'s slot is the database time, so it is inserted after the back-filled slots, which the
 upsert would otherwise reject as older than the last one.
 
 `Config.Periodic` is a client's initial set of periodic jobs. `Client.PeriodicJobs()`
@@ -1484,7 +1486,9 @@ sets still insert a slot at most once. A change wakes the leader's loop, which s
 an added job as if its term had just started: `RunOnStart` inserts a job, `CatchUp`
 back-fills, and otherwise slots since the last recorded one within the lease TTL are
 inserted, so a job removed and added again within the lease TTL inserts the slots it
-missed. A `RunOnStart` added on every client inserts one job because only the leader
+missed. Rows are kept, so a name whose recorded slot is older, however long ago it was
+removed, inserts the slots of the last lease TTL, or back-fills up to `CatchUp`, as a
+term start after an outage does. A `RunOnStart` added on every client inserts one job because only the leader
 schedules; its slot is the leader's database time, so two overlapping leaders each
 insert one, as at the start of a term. `Remove` applies only to the client it is called
 on, so a job is removed on every client that can lead, or a failover to a client that
