@@ -23,7 +23,9 @@ type Config struct {
 	// Workers is the registry of workers. Required when Queues is set.
 	Workers *Workers
 	// Periodic lists jobs inserted on a schedule by the leader. See Cron
-	// and Every.
+	// and Every. It is the initial set, which Client.PeriodicJobs changes
+	// at runtime. NewClient builds each job's insert and fails if it cannot
+	// be built; with StrictKinds, register their workers before NewClient.
 	Periodic []PeriodicJob
 	// Middleware wraps job execution and inserts, outermost first.
 	Middleware []Middleware
@@ -156,6 +158,12 @@ const (
 	DefaultStreamRetention    = 7 * 24 * time.Hour
 )
 
+// leads reports whether a client with this config competes for leadership:
+// one with no queues holds no lease, and so never leads.
+func (cfg *Config) leads() bool {
+	return !cfg.NeverLead && len(cfg.Queues) > 0
+}
+
 // withDefaults validates cfg and fills in defaults. It does not modify cfg.
 func (cfg *Config) withDefaults() (Config, error) {
 	var out Config
@@ -230,17 +238,8 @@ func (cfg *Config) withDefaults() (Config, error) {
 	if out.StrictKinds && out.Workers == nil {
 		return out, errors.New("hopper: Config.StrictKinds requires Workers")
 	}
-	out.Periodic = append([]PeriodicJob(nil), out.Periodic...)
-	names := map[string]struct{}{}
-	for i := range out.Periodic {
-		p := &out.Periodic[i]
-		if err := p.resolve(); err != nil {
-			return out, err
-		}
-		if _, dup := names[p.Name]; dup {
-			return out, fmt.Errorf("hopper: periodic job %q is listed twice; set PeriodicOpts.Name to tell them apart", p.Name)
-		}
-		names[p.Name] = struct{}{}
+	if out.Periodic, err = resolvePeriodic(out.Periodic); err != nil {
+		return out, err
 	}
 	for i, m := range out.Middleware {
 		if m == nil {

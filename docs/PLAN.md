@@ -281,6 +281,7 @@ for job, err := range client.Jobs(ctx, hopper.JobFilter{
 
 client.Queues().Pause(ctx, "email")
 client.Queues().Add(ctx, "tenant_42", hopper.QueueConfig{MaxWorkers: 5}) // runtime, multi-tenant
+client.PeriodicJobs().Add(hopper.Cron("0 * * * *", TenantReport{ID: 42}, &hopper.PeriodicOpts{Name: "report:42"})) // on every client that can lead
 
 for ev := range client.Events(ctx, hopper.EventJobFailed, hopper.EventJobDiscarded) { ... }
 
@@ -1457,15 +1458,62 @@ standard library. `Every` slots are aligned to the interval, so every leader com
 the same slots.
 
 The leader runs a periodic loop for the duration of its term. It sleeps until the
-soonest slot, reads the database clock, and for each slot that has come due upserts
-`hopper_periodic.last_slot` with `ON CONFLICT DO UPDATE … WHERE last_slot < $slot` and
-inserts the job in the same transaction only if that upsert returned a row. A slot
-therefore produces at most one job, even if two leaders overlap or leadership changes
-mid-slot, and even after the first job has finished and left the live table.
+soonest slot, timed on the database clock, reads that clock, and for each slot that
+has come due upserts `hopper_periodic.last_slot` with
+`ON CONFLICT DO UPDATE … WHERE last_slot < $slot` and inserts the job in the same
+transaction only if that upsert returned a row. A slot therefore produces at most one
+job, even if two leaders overlap or leadership changes mid-slot, and even after the
+first job has finished and left the live table.
 `RunOnStart` inserts a job when a leader starts scheduling. Missed slots are skipped by
 default, except slots due since the last recorded one within the last lease TTL, which
 covers a failover; `CatchUp: n` back-fills up to the n most recent missed slots
-instead. A schedule with no recorded slot starts from its next slot.
+(at most 10,000), and never fewer than that window holds. A schedule with no recorded slot starts from its next slot. `RunOnStart`'s
+slot is the database time, so it is inserted after the back-filled slots, which the
+upsert would otherwise reject as older than the last one.
+
+`Config.Periodic` is a client's initial set of periodic jobs. `Client.PeriodicJobs()`
+changes the set at runtime with `Add`, `AddMany`, `Remove` and `Clear`, and lists it with
+`All`. A job is identified by its name, the key of `hopper_periodic`; adding a name that
+is already registered fails, so a job is changed by removing it and adding it again. The
+set is held in memory, per client, and is not persisted or shared: the leader schedules
+only its own set, so **every client that can lead must register the job**, as with
+`Config.Periodic`. A job added only on the leader stops when leadership moves, a job
+added only on a follower starts when that client leads, and a job removed only on the
+leader comes back with a leader that still has it. Overlapping leaders with different
+sets still insert a slot at most once. A change wakes the leader's loop, which schedules
+an added job as if its term had just started: `RunOnStart` inserts a job, `CatchUp`
+back-fills, and otherwise slots since the last recorded one within the lease TTL are
+inserted, so a job removed and added again within the lease TTL inserts the slots it
+missed. A `RunOnStart` added on every client inserts one job because only the leader
+schedules; its slot is the leader's database time, so two overlapping leaders each
+insert one, as at the start of a term. `Remove` applies only to the client it is called
+on, so a job is removed on every client that can lead, or a failover to a client that
+still has it brings it back. A removed job stops being inserted; a slot being inserted as
+it is removed may still be. Its `hopper_periodic` row is kept, because another client may
+still have the job and the row is what keeps a slot from being inserted twice, so the
+table holds a row for every name ever scheduled. Starting added jobs reads the whole
+table, once per loop pass that has jobs to start, as the start of a term does. The loop
+retries a failed read of the clock or the last slots after a leader interval. It also
+retries a failed insert after a leader interval, from the same slot, so a transient
+error does not lose a slot; a job that fails to start is started again from the slots
+then recorded, `RunOnStart` included. A job that keeps failing waits a leader interval
+between tries, whatever else wakes the loop. A slot that falls more than a lease TTL
+behind because the database failed, as while it cannot be reached, or because the loop
+did not run, as while the process was suspended, is treated on recovery as missed slots
+are at the start of a term: skipped beyond the lease TTL window, or back-filled up to
+`CatchUp`, rather than inserted all at once. A slot behind only because a
+pass was slow, such as one that started a job with many slots to back-fill, is still
+inserted, and the jobs already scheduled insert their due slots before added jobs
+start. `NewClient`, for
+`Config.Periodic`, and `Add` build each job's insert as `Insert` would and fail if it
+cannot be built, such as for invalid `InsertOpts` or, with `StrictKinds`, a kind with no
+worker, so with `StrictKinds` a `Config.Periodic` job's worker is registered before
+`NewClient`. A job's `UniqueOpts.ByPeriod` key is computed from its slot, so each
+back-filled or retried slot keys its own period. A `RunOnStart` insert whose reply is
+lost after it committed is inserted again when retried, since its slot is the database
+time of the try. A client
+that never leads (`NeverLead`, or one with no queues) accepts the jobs but never
+schedules them.
 
 ### 7.10 Retention
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.
