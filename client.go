@@ -110,7 +110,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		workers:     resolved.Workers,
 		leaderPoke:  make(chan struct{}, 1),
 		streamPoke:  make(chan struct{}, 1),
-		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, resolved.NeverLead || len(resolved.Queues) == 0),
+		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, !resolved.leads()),
 		events:      newEventBus(),
 		running:     map[JobID]context.CancelCauseFunc{},
 		doneWaiters: map[JobID][]chan struct{}{},
@@ -190,7 +190,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	if c.caps.Listen {
 		c.listenWG.Go(func() { c.listenLoop(c.bgCtx) })
 	}
-	if !c.cfg.NeverLead {
+	if c.cfg.leads() {
 		c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
 	}
 	c.leaseWG.Go(func() { c.leaseLoop(c.bgCtx) })

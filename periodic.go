@@ -177,10 +177,12 @@ type registeredPeriodic struct {
 	removed atomic.Bool
 }
 
+// newPeriodicJobs returns a set that starts as jobs, which resolvePeriodic
+// has already validated and copied.
 func newPeriodicJobs(jobs []PeriodicJob, logger *slog.Logger, neverLeads bool) *PeriodicJobs {
 	p := &PeriodicJobs{logger: logger, neverLeads: neverLeads, byName: map[string]*registeredPeriodic{}, changed: make(chan struct{}, 1)}
 	for _, job := range jobs {
-		r := &registeredPeriodic{job: job.clone()}
+		r := &registeredPeriodic{job: job}
 		p.jobs = append(p.jobs, r)
 		p.byName[job.Name] = r
 	}

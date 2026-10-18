@@ -158,6 +158,12 @@ const (
 )
 
 // withDefaults validates cfg and fills in defaults. It does not modify cfg.
+// leads reports whether a client with this config competes for leadership:
+// one with no queues holds no lease, and so never leads.
+func (cfg *Config) leads() bool {
+	return !cfg.NeverLead && len(cfg.Queues) > 0
+}
+
 func (cfg *Config) withDefaults() (Config, error) {
 	var out Config
 	if cfg != nil {
