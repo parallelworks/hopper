@@ -196,7 +196,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		for _, f := range fin {
 			byID[f.ID] = f
 		}
+		rescued := make(map[JobID]struct{}, len(applied))
 		for _, id := range applied {
+			rescued[id] = struct{}{}
 			if byID[id].State == driver.JobStateDiscarded {
 				discarded++
 				continue
@@ -206,8 +208,8 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		}
 		c.logger.WarnContext(ctx, "hopper: rescued jobs from lost clients", "retried", retried, "discarded", discarded, "dropped", len(candidates)-len(applied))
 		for _, cand := range candidates {
-			if f, was := byID[cand.Job.ID]; was && slices.Contains(applied, cand.Job.ID) {
-				c.emit(EventJobRescued, cand.Job, f.Error.Error)
+			if _, was := rescued[cand.Job.ID]; was {
+				c.emit(EventJobRescued, cand.Job, byID[cand.Job.ID].Error.Error)
 			}
 		}
 		for q := range queues {

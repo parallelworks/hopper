@@ -58,6 +58,8 @@ type finalizer struct {
 	// applied is called for each result that was applied, for events and
 	// local waiters.
 	applied func(job *driver.JobRow, result driver.JobFinalize)
+	// seen is repeatedJob's set, used only by the goroutine that runs run.
+	seen map[driver.JobID]struct{}
 
 	in   chan pending
 	done chan struct{} // closed when run returns
@@ -426,7 +428,7 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 	if len(batch) == 0 {
 		return
 	}
-	if n := repeatedJob(batch); n > 0 {
+	if n := f.repeatedJob(batch); n > 0 {
 		f.write(ctx, batch[:n], skipLocked)
 		f.write(ctx, batch[n:], skipLocked)
 		return
@@ -477,17 +479,21 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 }
 
 // repeatedJob returns the index of the first result in batch whose job an
-// earlier one has, or 0 if every job is there once.
-func repeatedJob(batch []pending) int {
+// earlier one has, or 0 if every job is there once. Every write checks, so
+// the set is kept between writes rather than allocated for each.
+func (f *finalizer) repeatedJob(batch []pending) int {
 	if len(batch) < 2 {
 		return 0
 	}
-	seen := make(map[driver.JobID]struct{}, len(batch))
+	if f.seen == nil {
+		f.seen = make(map[driver.JobID]struct{}, len(batch))
+	}
+	defer clear(f.seen)
 	for i, p := range batch {
-		if _, was := seen[p.result.ID]; was {
+		if _, was := f.seen[p.result.ID]; was {
 			return i
 		}
-		seen[p.result.ID] = struct{}{}
+		f.seen[p.result.ID] = struct{}{}
 	}
 	return 0
 }
