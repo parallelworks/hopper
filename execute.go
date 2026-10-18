@@ -41,8 +41,8 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	defer func() { a.closeLog(c.logCloseTimeout(ctx)) }()
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
-	c.trackRunning(row.ID, row.Fence, cancel)
-	defer c.untrackRunning(row.ID, row.Fence)
+	claim := c.trackRunning(row.ID, cancel)
+	defer c.untrackRunning(row.ID, claim)
 
 	unit, err := c.runWorker(jobCtx, row)
 	completed := a.completedTx()

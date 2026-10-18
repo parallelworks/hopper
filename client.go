@@ -73,10 +73,9 @@ type Client[TTx any] struct {
 
 	events *eventBus
 
-	// running maps jobs running on this client to the fence of their
-	// latest claim here and its cancel function.
+	// running maps jobs running on this client to their latest claim here.
 	runningMu sync.Mutex
-	running   map[JobID]runningJob
+	running   map[JobID]*runningJob
 
 	// doneWaiters are Await callers by job.
 	doneMu      sync.Mutex
@@ -113,7 +112,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		streamPoke:  make(chan struct{}, 1),
 		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, !resolved.leads()),
 		events:      newEventBus(),
-		running:     map[JobID]runningJob{},
+		running:     map[JobID]*runningJob{},
 		doneWaiters: map[JobID][]chan struct{}{},
 	}
 	if c.workers == nil {

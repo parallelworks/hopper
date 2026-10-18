@@ -787,28 +787,32 @@ func TestRescuedAttemptsResultSkipsTheNextClaim(t *testing.T) {
 }
 
 // TestCancelReachesAReclaimedAttempt rescues a stuck attempt and lets the
-// same client claim the job again. Once the first attempt returns, a
-// JobCancel must still reach the second.
+// same client claim the job again. The second claim cancels the first
+// attempt, and once that returns, a JobCancel must still reach the second.
 func TestCancelReachesAReclaimedAttempt(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	ctx := context.Background()
 	started := make(chan int, 10)
 	first := make(chan struct{})
-	causes := make(chan error, 1)
+	causes, firstCause := make(chan error, 1), make(chan error, 1)
 	workers := hopper.NewWorkers()
 	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[reclaimed]) error {
 		started <- job.Attempt
-		switch job.Attempt {
-		case 1:
+		if job.Attempt == 1 {
 			<-first // ignores its context
+			firstCause <- context.Cause(ctx)
 			return nil
-		case 2:
-			<-ctx.Done()
-			causes <- context.Cause(ctx)
-			return ctx.Err()
 		}
-		return nil
+		// The second attempt, and any after it should a slow host let the
+		// second be rescued too: the cancel reaches the latest claim. One
+		// rescued meanwhile ends at the stop, once the test has its cause.
+		<-ctx.Done()
+		select {
+		case causes <- context.Cause(ctx):
+		default:
+		}
+		return ctx.Err()
 	})
 	logs := &messageLog{}
 	c := h.client(&hopper.Config{
@@ -830,6 +834,9 @@ func TestCancelReachesAReclaimedAttempt(t *testing.T) {
 	waitAttempt(t, started, 1)
 	waitAttempt(t, started, 2)
 	releaseFirst()
+	if cause := <-firstCause; !errors.Is(cause, hopper.ErrJobFenced) {
+		t.Errorf("rescued attempt's cause = %v once claimed again, want ErrJobFenced", cause)
+	}
 	// The first attempt's result is dropped once the attempt has returned
 	// and let go of its claim, so the cancel comes after that.
 	waitFor(t, func() bool { return logs.count(droppedResult) > 0 })

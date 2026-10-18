@@ -1073,9 +1073,11 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   the IDs it applied; the client logs the rest. A flush can hold two results of one
   job, a rescued attempt's late one and that of the claim after it, and the statement
   would return the job's ID once whichever applied, so the finalizer writes the second
-  in a statement of its own, and the late result emits no event. The client keeps its running jobs'
-  cancel functions by claim too, so that the return of a rescued attempt does not
-  take away the cancel of the claim after it.
+  in a statement of its own, and the late result emits no event. The client keeps the
+  cancel function of each running job's latest claim, and an attempt that returns
+  removes only its own claim's, so that the return of a rescued attempt does not take
+  away the cancel of the claim after it. A claim that replaces another cancels the
+  earlier attempt with `ErrJobFenced`, since its result can no longer apply.
 - Retry delays are sent as durations and applied to database `now()`; error
   timestamps are set by the database too (§7.1).
 - Queues with `DeleteCompleted: true` delete completed jobs without writing history.
