@@ -120,8 +120,13 @@ func TestPeriodicJobsAtRuntime(t *testing.T) {
 	cfg := func() *hopper.Config {
 		return &hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}}, Workers: workers}
 	}
+	// Leases long enough that leadership moves only when the test stops the
+	// leader: a new term would run RunOnStart again.
+	tun := fastTuning
+	tun.LeaseTTL, tun.LeaseRenew, tun.LeaderTTL = 30*time.Second, time.Second, 30*time.Second
 	a, b := h.client(cfg()), h.client(cfg())
 	for _, c := range []*hopper.Client[pgxTx]{a, b} {
+		c.SetTuning(tun)
 		if err := c.Start(ctx); err != nil {
 			t.Fatal(err)
 		}
