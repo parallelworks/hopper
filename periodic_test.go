@@ -228,8 +228,10 @@ func TestPeriodicJobsAddCatchesUp(t *testing.T) {
 }
 
 // Jobs added, removed and cleared from many goroutines on two clients that
-// compete for leadership insert each slot at most once: no job has more jobs
-// than it had slots.
+// compete for leadership stay free of races and insert no more jobs than
+// there were slots. Jobs do not record their slot, so this cannot see a
+// slot inserted twice; the slot guard is tested by drivertest's periodic
+// test and TestPeriodicJobsRunOnceAcrossLeaders.
 func TestPeriodicJobsConcurrentChanges(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
