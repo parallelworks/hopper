@@ -1496,12 +1496,22 @@ table, once per loop pass that has jobs to start, as the start of a term does. T
 retries a failed read of the clock or the last slots after a leader interval. It also
 retries a failed insert after a leader interval, from the same slot, so a transient
 error does not lose a slot; a job that fails to start is started again from the slots
-then recorded, `RunOnStart` included. A slot that falls more than a lease TTL behind,
-as while the database cannot be reached, is skipped rather than inserted at once on
-recovery, as missed slots are at the start of a term. `NewClient`, for
+then recorded, `RunOnStart` included. A job that keeps failing waits a leader interval
+between tries, whatever else wakes the loop. A slot that falls more than a lease TTL
+behind because the database failed, as while it cannot be reached, or because the loop
+did not run, as while the process was suspended, is treated on recovery as missed slots
+are at the start of a term: skipped beyond the lease TTL window, or back-filled up to
+`CatchUp`, rather than inserted all at once. A slot behind only because a
+pass was slow, such as one that started a job with many slots to back-fill, is still
+inserted, and the jobs already scheduled insert their due slots before added jobs
+start. `NewClient`, for
 `Config.Periodic`, and `Add` build each job's insert as `Insert` would and fail if it
 cannot be built, such as for invalid `InsertOpts` or, with `StrictKinds`, a kind with no
-worker. A client
+worker, so with `StrictKinds` a `Config.Periodic` job's worker is registered before
+`NewClient`. A job's `UniqueOpts.ByPeriod` key is computed from its slot, so each
+back-filled or retried slot keys its own period. A `RunOnStart` insert whose reply is
+lost after it committed is inserted again when retried, since its slot is the database
+time of the try. A client
 that never leads (`NeverLead`, or one with no queues) accepts the jobs but never
 schedules them.
 

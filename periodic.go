@@ -313,10 +313,8 @@ func (p *PeriodicJobs) notify() {
 
 // periodicLoop runs on the leader. It inserts each periodic job's slots as
 // they come due, sleeping until the soonest one or until the jobs change.
-// next holds the next slot of each job it has started scheduling, zero for
-// a job with no more slots.
 func (c *Client[TTx]) periodicLoop(ctx context.Context) {
-	next := map[*registeredPeriodic]time.Time{}
+	st := &periodicState{next: map[*registeredPeriodic]time.Time{}, retryAt: map[*registeredPeriodic]time.Time{}}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -326,36 +324,65 @@ func (c *Client[TTx]) periodicLoop(ctx context.Context) {
 		case <-timer.C:
 		case <-c.periodic.changed:
 		}
-		timer.Reset(c.periodicPass(ctx, next))
+		sleep := c.periodicPass(ctx, st)
+		st.wakeAt = time.Time{}
+		if sleep < math.MaxInt64 {
+			st.wakeAt = time.Now().Add(max(sleep, 0))
+		}
+		timer.Reset(sleep)
 	}
 }
 
-// periodicPass starts scheduling the jobs added since the last pass, stops
-// those removed, inserts the slots that have come due and returns how long
+// periodicState is what the periodic loop keeps between its passes in a
+// term.
+type periodicState struct {
+	// next holds the next slot of each job the loop has started scheduling,
+	// zero for a job with no more slots.
+	next map[*registeredPeriodic]time.Time
+	// retryAt holds, on the local clock, when a job whose start or insert
+	// failed is tried again. Until then the job waits, so that a failure is
+	// retried after a leader interval rather than on every pass that another
+	// job's slot or a change wakes.
+	retryAt map[*registeredPeriodic]time.Time
+	// clockFailed is set when the last pass could not read the clock.
+	clockFailed bool
+	// wakeAt is when, on the local clock, the last pass expected the next
+	// one, zero if it expected none. A pass that starts more than a lease
+	// TTL after it, as when the process was suspended, skips slots as after
+	// a failure.
+	wakeAt time.Time
+}
+
+// periodicPass inserts the slots that have come due, starts scheduling the
+// jobs added since the last pass, stops those removed and returns how long
 // to sleep. A failed read of the clock or the last slots, and a failed
 // insert, is retried after a leader interval; while the slots cannot be
 // read, the jobs already started go on. A slot that falls more than a lease
-// TTL behind, as while the database cannot be reached, is skipped, as
-// missed slots are at the start of a term.
-func (c *Client[TTx]) periodicPass(ctx context.Context, next map[*registeredPeriodic]time.Time) time.Duration {
+// TTL behind because the database failed, as while it cannot be reached, or
+// while the loop does not run, as while the process is suspended, is
+// treated as missed slots are at the start of a term (see missedSlots). A job behind only because a pass was slow, such as one that
+// started another job with many missed slots, inserts every slot.
+func (c *Client[TTx]) periodicPass(ctx context.Context, st *periodicState) time.Duration {
 	regs := c.periodic.snapshot()
 	var added []*registeredPeriodic
 	for _, r := range regs {
-		if _, ok := next[r]; !ok {
+		if _, ok := st.next[r]; !ok {
 			added = append(added, r)
 		}
 	}
 	// next holds a removed job only if it holds more than the started jobs
-	// still registered.
-	if len(next) > len(regs)-len(added) {
+	// still registered. retryAt is checked whenever something is failing.
+	if len(st.next) > len(regs)-len(added) || len(st.retryAt) > 0 {
 		live := make(map[*registeredPeriodic]struct{}, len(regs))
 		for _, r := range regs {
 			live[r] = struct{}{}
 		}
-		maps.DeleteFunc(next, func(r *registeredPeriodic, _ time.Time) bool {
+		removed := func(r *registeredPeriodic, _ time.Time) bool {
 			_, ok := live[r]
 			return !ok
-		})
+		}
+		maps.DeleteFunc(st.next, removed)
+		maps.DeleteFunc(st.retryAt, removed)
 	}
 	if len(regs) == 0 {
 		return math.MaxInt64
@@ -366,57 +393,104 @@ func (c *Client[TTx]) periodicPass(ctx context.Context, next map[*registeredPeri
 		if ctx.Err() == nil {
 			c.logger.ErrorContext(ctx, "hopper: periodic: read clock", "error", err)
 		}
+		st.clockFailed = true
 		return c.tuning.leaderInterval
 	}
 	read := time.Now()
-	sleep := time.Duration(math.MaxInt64)
-	if len(added) > 0 {
+	stale := st.clockFailed || (!st.wakeAt.IsZero() && read.Sub(st.wakeAt) > c.tuning.leaderTTL)
+	st.clockFailed = false
+	// waiting reports whether a job that failed is not yet due to be tried
+	// again.
+	waiting := func(r *registeredPeriodic) bool {
+		at, ok := st.retryAt[r]
+		return ok && read.Before(at)
+	}
+	retry := func(r *registeredPeriodic) {
+		st.retryAt[r] = time.Now().Add(c.tuning.leaderInterval)
+	}
+
+	// The jobs already started go first, so that starting an added job with
+	// many slots to back-fill does not hold up their slots.
+	var soonest time.Time
+	floor := now.Add(-c.tuning.leaderTTL)
+	for _, r := range regs {
+		n, ok := st.next[r]
+		if !ok || waiting(r) {
+			continue
+		}
+		// A job held up past the lease TTL by a failing database, or by a
+		// loop that did not run, inserts the slots it missed as it would at
+		// the start of a term, rather than all of them at once.
+		inserted := true
+		if _, failed := st.retryAt[r]; (stale || failed) && !n.IsZero() && n.Before(floor) {
+			missed := c.missedSlots(&r.job, n.Add(-time.Nanosecond), now)
+			n = r.job.Schedule.Next(floor)
+			for _, slot := range missed {
+				if !c.insertPeriodic(ctx, r, slot) {
+					n, inserted = slot, false
+					break
+				}
+				n = r.job.Schedule.Next(slot)
+			}
+		}
+		for inserted && !n.IsZero() && !n.After(now) {
+			if !c.insertPeriodic(ctx, r, n) {
+				inserted = false
+				break
+			}
+			n = r.job.Schedule.Next(n)
+		}
+		st.next[r] = n
+		if !inserted {
+			retry(r)
+			continue
+		}
+		delete(st.retryAt, r)
+		if n.After(now) && (soonest.IsZero() || n.Before(soonest)) {
+			soonest = n
+		}
+	}
+
+	var starting []*registeredPeriodic
+	for _, r := range added {
+		if !waiting(r) {
+			starting = append(starting, r)
+		}
+	}
+	if len(starting) > 0 {
 		lastSlots, err := c.exec.PeriodicLastSlots(ctx)
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: periodic: read slots", "error", err)
 			}
-			sleep = c.tuning.leaderInterval
+			for _, r := range starting {
+				retry(r)
+			}
 		} else {
-			for _, r := range added {
-				if n, ok := c.startPeriodic(ctx, r, now, lastSlots); ok {
-					next[r] = n
-				} else {
-					sleep = c.tuning.leaderInterval
+			for _, r := range starting {
+				n, ok := c.startPeriodic(ctx, r, now, lastSlots)
+				if !ok {
+					retry(r)
+					continue
+				}
+				delete(st.retryAt, r)
+				st.next[r] = n
+				if n.After(now) && (soonest.IsZero() || n.Before(soonest)) {
+					soonest = n
 				}
 			}
 		}
 	}
 
-	var soonest time.Time
-	floor := now.Add(-c.tuning.leaderTTL)
-	for _, r := range regs {
-		n, ok := next[r]
-		if !ok {
-			continue
-		}
-		// A pass held up past the lease TTL, by a failing database, skips
-		// the slots due before it rather than inserting them all at once.
-		if !n.IsZero() && n.Before(floor) {
-			n = r.job.Schedule.Next(floor)
-		}
-		for !n.IsZero() && !n.After(now) {
-			if !c.insertPeriodic(ctx, r, n) {
-				sleep = c.tuning.leaderInterval
-				break
-			}
-			n = r.job.Schedule.Next(n)
-		}
-		next[r] = n
-		if n.After(now) && (soonest.IsZero() || n.Before(soonest)) {
-			soonest = n
-		}
-	}
+	sleep := time.Duration(math.MaxInt64)
 	if !soonest.IsZero() {
 		// Sleep until the slot comes due on the database clock, measured
 		// from the read, so that a local clock ahead of or behind the
 		// database's neither spins nor oversleeps.
-		sleep = min(sleep, soonest.Sub(now)-time.Since(read))
+		sleep = soonest.Sub(now) - time.Since(read)
+	}
+	for _, at := range st.retryAt {
+		sleep = min(sleep, time.Until(at))
 	}
 	return sleep
 }
@@ -433,38 +507,39 @@ func (c *Client[TTx]) startPeriodic(ctx context.Context, r *registeredPeriodic, 
 	if p.Opts != nil {
 		opts = *p.Opts
 	}
-	// Slots missed while no leader ran are skipped, except those due since
-	// the last recorded slot within the last lease TTL, which covers a
-	// failover. CatchUp back-fills the most recent missed slots instead. A
-	// schedule with no recorded slot starts fresh.
+	// A schedule with no recorded slot starts fresh.
 	next := p.Schedule.Next(now)
-	last, known := lastSlots[p.Name]
-	switch {
-	case known && opts.CatchUp > 0:
-		// CatchUp adds to the failover window's slots, which are the most
-		// recent ones, rather than replacing them.
-		window := 0
-		for slot := p.Schedule.Next(maxTime(last, now.Add(-c.tuning.leaderTTL))); !slot.IsZero() && !slot.After(now) && window < maxCatchUp; slot = p.Schedule.Next(slot) {
-			window++
-		}
-		for _, slot := range recentSlots(p.Schedule, last, now, min(max(opts.CatchUp, window), maxCatchUp)) {
+	if last, known := lastSlots[p.Name]; known {
+		missed := c.missedSlots(p, last, now)
+		for _, slot := range missed {
 			if !c.insertPeriodic(ctx, r, slot) {
 				return time.Time{}, false
 			}
 		}
-	case known && last.Before(now):
-		next = p.Schedule.Next(maxTime(last, now.Add(-c.tuning.leaderTTL)))
-		for !next.IsZero() && !next.After(now) {
-			if !c.insertPeriodic(ctx, r, next) {
-				return time.Time{}, false
-			}
-			next = p.Schedule.Next(next)
+		if len(missed) > 0 {
+			next = p.Schedule.Next(missed[len(missed)-1])
 		}
 	}
 	if opts.RunOnStart && !c.insertPeriodic(ctx, r, now) {
 		return time.Time{}, false
 	}
 	return next, true
+}
+
+// missedSlots returns the slots of a job after last and not after now that
+// it inserts when it starts, oldest first. Missed slots are skipped, except
+// those within the last lease TTL, which covers a failover; CatchUp
+// back-fills the most recent missed slots instead, never fewer than that
+// window holds.
+func (c *Client[TTx]) missedSlots(p *PeriodicJob, last, now time.Time) []time.Time {
+	var window []time.Time
+	for slot := p.Schedule.Next(maxTime(last, now.Add(-c.tuning.leaderTTL))); !slot.IsZero() && !slot.After(now) && len(window) < maxCatchUp; slot = p.Schedule.Next(slot) {
+		window = append(window, slot)
+	}
+	if p.Opts == nil || p.Opts.CatchUp <= len(window) {
+		return window
+	}
+	return recentSlots(p.Schedule, last, now, min(p.Opts.CatchUp, maxCatchUp))
 }
 
 // maxCatchUp bounds the missed slots a job back-fills when it starts.
@@ -515,7 +590,7 @@ func (c *Client[TTx]) insertPeriodic(ctx context.Context, r *registeredPeriodic,
 		return true
 	}
 	p := &r.job
-	params, err := c.periodicParams(p)
+	params, err := c.periodicParams(p, slot)
 	if err != nil {
 		c.logger.ErrorContext(ctx, "hopper: periodic: build job", "periodic", p.Name, "error", err)
 		return true
@@ -534,12 +609,14 @@ func (c *Client[TTx]) insertPeriodic(ctx context.Context, r *registeredPeriodic,
 	return true
 }
 
-// periodicParams builds the job a periodic job inserts.
-func (c *Client[TTx]) periodicParams(p *PeriodicJob) (driver.JobInsertParams, error) {
+// periodicParams builds the job a periodic job inserts for a slot. The slot
+// is the time a UniqueOpts.ByPeriod key is computed from, so that each slot
+// back-filled or retried keys its own period.
+func (c *Client[TTx]) periodicParams(p *PeriodicJob, slot time.Time) (driver.JobInsertParams, error) {
 	var insertOpts *InsertOpts
 	if p.Opts != nil {
 		insertOpts = p.Opts.InsertOpts
 	}
-	params, _, err := c.buildInsertParams(InsertParams{Args: p.Args, Opts: insertOpts}, time.Now())
+	params, _, err := c.buildInsertParams(InsertParams{Args: p.Args, Opts: insertOpts}, slot)
 	return params, err
 }

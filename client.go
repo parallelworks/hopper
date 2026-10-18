@@ -119,7 +119,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		c.workers = NewWorkers()
 	}
 	c.periodic.validate = func(p *PeriodicJob) error {
-		_, err := c.periodicParams(p)
+		_, err := c.periodicParams(p, time.Now())
 		return err
 	}
 	for _, r := range c.periodic.jobs {

@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -290,6 +292,93 @@ func TestPeriodicLoopSkipsSlotsPastTTL(t *testing.T) {
 	}
 }
 
+// slowInserts delays every insert of one periodic job.
+type slowInserts struct {
+	*periodicExec
+	name  string
+	delay time.Duration
+}
+
+func (e slowInserts) PeriodicInsert(ctx context.Context, p driver.PeriodicInsertParams) (*driver.JobRow, bool, error) {
+	if p.Name == e.name {
+		time.Sleep(e.delay)
+	}
+	return e.periodicExec.PeriodicInsert(ctx, p)
+}
+
+// millisUntil has a slot every millisecond up to end, and none after it.
+type millisUntil struct{ end time.Time }
+
+func (s millisUntil) Next(t time.Time) time.Time {
+	next := t.Truncate(time.Millisecond).Add(time.Millisecond)
+	if next.After(s.end) {
+		return time.Time{}
+	}
+	return next
+}
+
+// A pass held up past the lease TTL by starting another job, rather than by
+// a failing database, skips none of a running job's slots.
+func TestPeriodicLoopSlowPassKeepsSlots(t *testing.T) {
+	const interval = 10 * time.Millisecond
+	exec := &periodicExec{last: map[string]time.Time{"slow": time.Now().Add(-time.Hour)}}
+	c := newPeriodicTestClient(t, slowInserts{exec, "slow", 2 * time.Millisecond}, Every(interval, tickArgs{}, nil))
+	c.tuning.leaderTTL = 100 * time.Millisecond
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool { return exec.inserted("tick") >= 1 })
+	// The failover window of the added job holds a slot every millisecond
+	// of the lease TTL, which take about twice the TTL to insert.
+	if err := c.PeriodicJobs().Add(PeriodicJob{Name: "slow", Schedule: millisUntil{time.Now()}, Args: tickArgs{}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := exec.inserted("slow"); n < 60 {
+		t.Fatalf("the added job inserted %d slots, too few to hold the loop up past the lease TTL", n)
+	}
+	slots := exec.slots("tick")
+	for i := 1; i < len(slots); i++ {
+		if d := slots[i].Sub(slots[i-1]); d != interval {
+			t.Errorf("slot %d is %s after the one before, want %s", i, d, interval)
+		}
+	}
+}
+
+// failingInserts fails every insert of the periodic jobs whose name starts
+// with "fail", and counts the tries.
+type failingInserts struct {
+	*periodicExec
+	tries atomic.Int64
+}
+
+func (e *failingInserts) PeriodicInsert(ctx context.Context, p driver.PeriodicInsertParams) (*driver.JobRow, bool, error) {
+	if strings.HasPrefix(p.Name, "fail") {
+		e.tries.Add(1)
+		return nil, false, errors.New("connection reset")
+	}
+	return e.periodicExec.PeriodicInsert(ctx, p)
+}
+
+// A job whose start or slot keeps failing is tried again after a leader
+// interval, rather than on every pass that another job's slots wake.
+func TestPeriodicLoopPacesRetries(t *testing.T) {
+	exec := &periodicExec{}
+	f := &failingInserts{periodicExec: exec}
+	c := newPeriodicTestClient(t, f,
+		Every(5*time.Millisecond, tickArgs{}, nil),
+		Every(time.Hour, tickArgs{}, &PeriodicOpts{Name: "fail-start", RunOnStart: true}),
+		Every(10*time.Millisecond, tickArgs{}, &PeriodicOpts{Name: "fail-slot"}))
+	c.tuning.leaderInterval = 100 * time.Millisecond
+	runPeriodicLoop(t, c)
+	time.Sleep(500 * time.Millisecond)
+	if n := exec.inserted("tick"); n < 20 {
+		t.Errorf("the healthy job inserted %d slots in 500ms of 5ms slots", n)
+	}
+	// Each failing job is tried about once a leader interval: 5 times each.
+	if n := f.tries.Load(); n > 20 {
+		t.Errorf("the failing jobs were tried %d times in 5 leader intervals", n)
+	}
+}
+
 func TestRecentSlots(t *testing.T) {
 	s := IntervalSchedule{Interval: time.Second}
 	now := time.Date(2026, 1, 1, 12, 0, 0, 500_000_000, time.UTC)
@@ -334,4 +423,45 @@ func TestPeriodicCatchUpKeepsFailoverWindow(t *testing.T) {
 		}
 		return missed >= 5
 	})
+}
+
+// After a database outage in the middle of a term, CatchUp back-fills the
+// slots missed beyond the lease TTL, as it would at the start of a term.
+func TestPeriodicLoopCatchesUpAfterOutage(t *testing.T) {
+	const interval = 10 * time.Millisecond
+	exec := &periodicExec{}
+	c := newPeriodicTestClient(t, exec, Every(interval, tickArgs{}, &PeriodicOpts{CatchUp: 30}))
+	c.tuning.leaderTTL = 100 * time.Millisecond
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool { return exec.inserted("tick") >= 1 })
+	exec.set(func(e *periodicExec) { e.failNow = true })
+	time.Sleep(500 * time.Millisecond)
+	recovered := time.Now()
+	exec.set(func(e *periodicExec) { e.failNow = false })
+	eventually(t, func() bool {
+		old := 0
+		for _, slot := range exec.slots("tick") {
+			if slot.Before(recovered.Add(-2*c.tuning.leaderTTL)) && slot.After(recovered.Add(-400*time.Millisecond)) {
+				old++
+			}
+		}
+		return old >= 5
+	})
+}
+
+// A UniqueOpts.ByPeriod key is computed from the slot, so back-filled slots
+// in different periods get different keys.
+func TestPeriodicUniqueByPeriodKeysSlot(t *testing.T) {
+	exec := &periodicExec{last: map[string]time.Time{"tick": time.Now().Add(-3 * time.Hour)}}
+	c := newPeriodicTestClient(t, exec, Every(time.Hour, tickArgs{}, &PeriodicOpts{
+		CatchUp:    2,
+		InsertOpts: &InsertOpts{Unique: &UniqueOpts{ByPeriod: time.Hour}},
+	}))
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool { return exec.inserted("tick") >= 2 })
+	exec.mu.Lock()
+	defer exec.mu.Unlock()
+	if a, b := exec.inserts[0].Job.UniqueKey, exec.inserts[1].Job.UniqueKey; a == "" || a == b {
+		t.Errorf("unique keys of two hours' slots = %q, %q, want distinct", a, b)
+	}
 }
