@@ -22,6 +22,16 @@ type JobArgsWithInsertOpts interface {
 	InsertOpts() InsertOpts
 }
 
+// JobArgsWithKindAliases is implemented by args whose kind was renamed.
+// KindAliases returns the earlier kinds, and the worker registered for the
+// args also works jobs stored under them. A job keeps the kind it was
+// inserted with, and unique keys, periodic job names and job filters match
+// that stored kind. An alias must not be another registered kind or alias.
+type JobArgsWithKindAliases interface {
+	JobArgs
+	KindAliases() []string
+}
+
 // Job is a claimed job with its decoded args.
 type Job[T JobArgs] struct {
 	*JobRow

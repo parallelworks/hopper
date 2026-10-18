@@ -131,6 +131,20 @@ hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[ResizeImag
 `http.Handle`. Calling `Insert` with an args type that has no registered worker on this
 client is allowed (another service may work it), but `Config.StrictKinds` rejects it.
 
+A kind is renamed with aliases: args that implement `KindAliases() []string`
+(`JobArgsWithKindAliases`) register their worker under each earlier kind too, so jobs
+stored under the old kind still run while the new one is inserted. The alias lives on
+the args, beside `Kind`, and is resolved only in the registry, when a job is worked
+(and by `StrictKinds`, which accepts an aliased kind). Claiming selects by queue, never
+by kind, so nothing in the database changes: a job keeps its stored kind through
+retries and snoozes, and that is `job.Kind`. An alias that is empty, repeated, or
+another registered kind or alias panics, and a rejected registration adds none of its
+names. Everything that keys on the stored kind keeps doing so: a unique key does not
+match across the old and new kinds, so a duplicate can be inserted during the rename;
+`JobFilter.Kinds` and the UI list each kind by its own name; and a periodic job's
+default name is its kind, so one renamed without a `Name` starts a new schedule.
+Ordering keys and limits are per queue and do not see kinds.
+
 A worker whose work is in the same database can complete its job in the same
 transaction, so the job runs exactly once even if the process dies right after:
 

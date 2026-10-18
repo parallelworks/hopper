@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -58,11 +59,12 @@ type workUnit interface {
 
 type workerInfo struct {
 	kind    string
+	aliases []string
 	newUnit func(row *JobRow, codec Codec) (workUnit, error)
 }
 
-// AddWorker registers worker for the kind of T. It panics if the kind is
-// already registered, like http.Handle.
+// AddWorker registers worker for the kind of T and for its KindAliases. It
+// panics if one of them is already registered, like http.Handle.
 func AddWorker[T JobArgs](workers *Workers, worker Worker[T]) {
 	if worker == nil {
 		panic("hopper: AddWorker called with a nil worker")
@@ -72,8 +74,16 @@ func AddWorker[T JobArgs](workers *Workers, worker Worker[T]) {
 	if kind == "" {
 		panic(fmt.Sprintf("hopper: %T has an empty kind", zero))
 	}
+	var aliases []string
+	if a, ok := any(zero).(JobArgsWithKindAliases); ok {
+		aliases = a.KindAliases()
+		if slices.Contains(aliases, "") {
+			panic(fmt.Sprintf("hopper: %T has an empty kind alias", zero))
+		}
+	}
 	workers.add(&workerInfo{
-		kind: kind,
+		kind:    kind,
+		aliases: aliases,
 		newUnit: func(row *JobRow, codec Codec) (workUnit, error) {
 			var args T
 			if err := codec.Unmarshal(row.Args, &args); err != nil {
@@ -96,10 +106,15 @@ func AddWorkFunc[T JobArgs](workers *Workers, fn func(ctx context.Context, job *
 func (w *Workers) add(info *workerInfo) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if _, dup := w.kinds[info.kind]; dup {
-		panic(fmt.Sprintf("hopper: worker for kind %q registered twice", info.kind))
+	kinds := append([]string{info.kind}, info.aliases...)
+	for i, kind := range kinds {
+		if _, dup := w.kinds[kind]; dup || slices.Contains(kinds[:i], kind) {
+			panic(fmt.Sprintf("hopper: worker for kind %q registered twice", kind))
+		}
 	}
-	w.kinds[info.kind] = info
+	for _, kind := range kinds {
+		w.kinds[kind] = info
+	}
 }
 
 // Work runs the registered worker for job.Kind inline, decoding job.Args

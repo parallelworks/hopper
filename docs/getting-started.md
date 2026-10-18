@@ -154,6 +154,20 @@ hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[ResizeImag
 })
 ```
 
+To rename a kind, keep its old name as an alias until no job of it is left.
+The worker for the args then also works jobs stored under the old kind, and
+`job.Kind` is the kind the job was stored with:
+
+```go
+func (SendEmail) Kind() string          { return "send_email" }
+func (SendEmail) KindAliases() []string { return []string{"send_mail"} }
+```
+
+A job keeps its stored kind, so during the rename a unique key does not match
+across the two kinds, and filtering jobs by kind needs both names. A periodic
+job is named after its kind unless it has a `Name`; give it the old kind as
+its name to keep its schedule.
+
 ## Start a client
 
 ```go
