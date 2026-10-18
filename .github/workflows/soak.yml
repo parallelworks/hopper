@@ -47,7 +47,7 @@ jobs:
         run: |
           for round in 1 2 3; do
             go run ./cmd/hopperbench -database-url "$DATABASE_URL" \
-              -scenarios throughput,mixed,scheduled,retry,insert,copy,latency \
+              -scenarios throughput,mixed,scheduled,retry,workflow,insert,copy,latency \
               -jobs 200000 -history 5000000 -schema "soak_$round"
           done | tee soak.jsonl
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

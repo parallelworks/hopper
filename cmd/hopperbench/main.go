@@ -22,6 +22,8 @@
 //	scheduled   as throughput, with jobs scheduled up to 500ms in the future
 //	tagged      as throughput, with two tags on every job
 //	retry       as throughput, with every job failing its first attempt
+//	workflow    as throughput, in workflows of ten steps (one, then eight after it, then one after those),
+//	            each step recording a small output
 //	insert      InsertMany in batches of 100 (the unnest statement)
 //	copy        InsertMany in batches of 5000 (the COPY path)
 //	latency     commit-to-Work on an idle queue, local wake-up
@@ -163,6 +165,8 @@ func run(ctx context.Context, url, schema string, scenarios []string, opts optio
 			}), noopWorker)
 		case "retry":
 			r, err = b.drain(ctx, "retry", b.params(opts.jobs, nil), failOnceWorker)
+		case "workflow":
+			r, err = b.workflows(ctx, opts.jobs)
 		case "insert":
 			r, err = b.insert(ctx, opts.jobs, 100)
 		case "copy":
@@ -233,7 +237,7 @@ type bench struct {
 func (b *bench) reset(ctx context.Context) error {
 	// The tags tables (schema v17) are listed so that their truncate
 	// triggers find them empty, rather than truncating them one by one.
-	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic"); err != nil {
+	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic, hopper_batches, hopper_batch_progress, hopper_job_deps"); err != nil {
 		return err
 	}
 	if b.opts.history > 0 {
@@ -307,6 +311,67 @@ func (immediateRetry) NextRetry(*hopper.Job[benchArgs]) time.Time { return time.
 // drain preloads jobs, then measures how long -clients clients take to
 // empty the queue.
 func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertParams, work func(context.Context, *hopper.Job[benchArgs]) error) (result, error) {
+	return b.drainLoaded(ctx, name, len(params), func(inserter *hopper.Client[pgx.Tx]) error {
+		for i := 0; i < len(params); i += 10000 {
+			if _, err := inserter.InsertMany(ctx, params[i:min(i+10000, len(params))]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, work)
+}
+
+const workflowSteps = 10
+
+func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
+	n := jobs / workflowSteps
+	if n == 0 {
+		return result{}, fmt.Errorf("-jobs must be at least %d", workflowSteps)
+	}
+	load := func(inserter *hopper.Client[pgx.Tx]) error {
+		const inserters, perTx = 8, 100
+		var wg sync.WaitGroup
+		errs := make([]error, inserters)
+		for w := range inserters {
+			wg.Go(func() {
+				for first := w * perTx; first < n; first += inserters * perTx {
+					errs[w] = pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
+						for i := first; i < min(first+perTx, n); i++ {
+							if _, err := inserter.InsertWorkflowTx(ctx, tx, benchWorkflow(i)); err != nil {
+								return err
+							}
+						}
+						return nil
+					})
+					if errs[w] != nil {
+						return
+					}
+				}
+			})
+		}
+		wg.Wait()
+		return errors.Join(errs...)
+	}
+	return b.drainLoaded(ctx, "workflow", n*workflowSteps, load, outputWorker)
+}
+
+func benchWorkflow(i int) *hopper.Workflow {
+	wf := hopper.NewWorkflow("bench-"+strconv.Itoa(i), nil)
+	n := i * workflowSteps
+	root := wf.Add(benchArgs{N: n}, nil)
+	middle := make([]hopper.Step, workflowSteps-2)
+	for j := range middle {
+		middle[j] = wf.Add(benchArgs{N: n + 1 + j}, hopper.After(root))
+	}
+	wf.Add(benchArgs{N: n + workflowSteps - 1}, hopper.After(middle...))
+	return wf
+}
+
+func outputWorker(ctx context.Context, job *hopper.Job[benchArgs]) error {
+	return hopper.SetOutput(ctx, map[string]any{"n": job.Args.N, "artifact": "bench/" + strconv.Itoa(job.Args.N)})
+}
+
+func (b *bench) drainLoaded(ctx context.Context, name string, jobs int, load func(*hopper.Client[pgx.Tx]) error, work func(context.Context, *hopper.Job[benchArgs]) error) (result, error) {
 	if err := b.reset(ctx); err != nil {
 		return result{}, err
 	}
@@ -315,10 +380,8 @@ func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertPa
 		return result{}, err
 	}
 	defer inserter.Stop(ctx) //nolint:errcheck // flushes pending notifications
-	for i := 0; i < len(params); i += 10000 {
-		if _, err := inserter.InsertMany(ctx, params[i:min(i+10000, len(params))]); err != nil {
-			return result{}, err
-		}
+	if err := load(inserter); err != nil {
+		return result{}, err
 	}
 
 	ws := hopper.NewWorkers()
@@ -361,12 +424,12 @@ func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertPa
 	if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_job_history WHERE state = 'completed' AND kind = 'bench'").Scan(&done); err != nil {
 		return result{}, err
 	}
-	if done != len(params) {
-		return result{}, fmt.Errorf("%d of %d jobs completed", done, len(params))
+	if done != jobs {
+		return result{}, fmt.Errorf("%d of %d jobs completed", done, jobs)
 	}
 	return result{
-		Scenario: name, Jobs: len(params), Clients: b.opts.clients, Workers: b.opts.workers,
-		Seconds: elapsed.Seconds(), JobsPerSec: float64(len(params)) / elapsed.Seconds(),
+		Scenario: name, Jobs: jobs, Clients: b.opts.clients, Workers: b.opts.workers,
+		Seconds: elapsed.Seconds(), JobsPerSec: float64(jobs) / elapsed.Seconds(),
 	}, nil
 }
 
