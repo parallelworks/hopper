@@ -216,7 +216,10 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			c.wakeQueue(q)
 			c.notifier.mark(q)
 		}
-		if len(candidates) < c.tuning.rescueBatch {
+		// A full batch that rescued nothing would be read again as it is:
+		// rows that transactions hold, which the finalize skips, or that it
+		// cannot apply to. The next pass tries them again.
+		if len(candidates) < c.tuning.rescueBatch || len(applied) == 0 {
 			return
 		}
 	}

@@ -1325,7 +1325,8 @@ the largest source of write amplification in heartbeat-based designs.
   each was found in, so a job its client finalized and claimed again in between is
   left to that claim. The rescue's finalize skips rows another transaction holds (a `CompleteTx` that
   has not ended, §7.5) and retries them on the next pass, so one such row cannot hold
-  up the leader's loop and its lease renewal.
+  up the leader's loop and its lease renewal; a full batch that rescues nothing ends
+  the pass rather than read the same rows again.
 - **Fencing.** If a renewal matches zero rows (after a long GC pause or a partition),
   the client has lost its lease. It cancels the context of every in-flight job that has
   attempts left and re-registers under a new ID. A job on its last attempt keeps
