@@ -128,8 +128,6 @@ type InsertParams struct {
 	Opts *InsertOpts
 
 	batchID JobID
-	// anyKind skips Config.StrictKinds.
-	anyKind bool
 }
 
 // InsertResult is the outcome of inserting one job.

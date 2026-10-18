@@ -123,14 +123,15 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		return err
 	}
 	// Workers may be added after NewClient, so StrictKinds is left to Add
-	// and to each insert.
+	// and to each insert. Nothing else holds c yet.
+	strict := c.cfg.StrictKinds
+	c.cfg.StrictKinds = false
 	for _, r := range c.periodic.jobs {
-		params := r.job.insertParams()
-		params.anyKind = true
-		if _, _, err := c.buildInsertParams(params, time.Now()); err != nil {
+		if _, err := c.periodicParams(&r.job, time.Now()); err != nil {
 			return nil, fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
 		}
 	}
+	c.cfg.StrictKinds = strict
 	c.notifier = newNotifier(c.exec, c.logger, c.tuning.notifyInterval)
 	return c, nil
 }
