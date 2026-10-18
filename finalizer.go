@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -418,8 +417,18 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 // every other result of the batch. Past heldWait the batch is written again
 // skipping held rows, and a held job's result is tried again later
 // (notWritten), so that the transaction holds up only its own job.
+//
+// A batch can hold two results of one job: a rescued attempt's late one and
+// that of the claim after it, on this client. The statement applies at most
+// one and returns the job's ID once, which would not say which, so the
+// results from the second of them on go in a statement of their own.
 func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool) {
 	if len(batch) == 0 {
+		return
+	}
+	if n := repeatedJob(batch); n > 0 {
+		f.write(ctx, batch[:n], skipLocked)
+		f.write(ctx, batch[n:], skipLocked)
 		return
 	}
 	jobs := make([]driver.JobFinalize, len(batch))
@@ -467,6 +476,22 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 	}
 }
 
+// repeatedJob returns the index of the first result in batch whose job an
+// earlier one has, or 0 if every job is there once.
+func repeatedJob(batch []pending) int {
+	if len(batch) < 2 {
+		return 0
+	}
+	seen := make(map[driver.JobID]struct{}, len(batch))
+	for i, p := range batch {
+		if _, was := seen[p.result.ID]; was {
+			return i
+		}
+		seen[p.result.ID] = struct{}{}
+	}
+	return 0
+}
+
 // followUp settles the batches of jobs that have finished and promotes
 // their dependents, once the statements that finished them have committed:
 // of two clients that finalized a batch's or a dependent's last jobs at the
@@ -503,29 +528,20 @@ func (f *finalizer) followUp(ctx context.Context, finished []pending) {
 // not apply was fenced, or, for a job completed with CompleteTx, skipped
 // because the worker's transaction still held its row; the job's row tells
 // which.
-//
-// The statement returns the IDs it applied, and a batch can hold two
-// results of one job: a rescued attempt's late one and that of the claim
-// after it, on this client. At most one of them applied, and only the later
-// claim's can have, since a job's fence only increases: an applied ID counts
-// for its result with the greatest fence alone.
+// The statement returns the IDs it applied, which name the results only
+// because write never puts two results of one job in one statement.
 func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []driver.JobID) []pending {
-	var ok map[driver.JobID]int64
+	var ok map[driver.JobID]struct{}
 	if len(applied) != len(batch) {
-		ok = make(map[driver.JobID]int64, len(applied))
+		ok = make(map[driver.JobID]struct{}, len(applied))
 		for _, id := range applied {
-			ok[id] = math.MinInt64
-		}
-		for _, p := range batch {
-			if fence, was := ok[p.result.ID]; was && p.result.Fence > fence {
-				ok[p.result.ID] = p.result.Fence
-			}
+			ok[id] = struct{}{}
 		}
 	}
 	var finished []pending
 	for _, p := range batch {
 		if ok != nil {
-			if fence, was := ok[p.result.ID]; !was || p.result.Fence != fence {
+			if _, was := ok[p.result.ID]; !was {
 				if p, done := f.notWritten(ctx, p); done {
 					finished = append(finished, p)
 				}

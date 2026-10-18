@@ -1065,9 +1065,9 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   claimed again, by another client or by the same one, the result is dropped and
   logged, so a finalize can never overwrite a newer attempt. The statement returns
   the IDs it applied; the client logs the rest. A flush can hold two results of one
-  job, a rescued attempt's late one and that of the claim after it, and an applied ID
-  counts for the one with the greater fence alone, the only one that can have
-  applied, so the late result emits no event. The client keeps its running jobs'
+  job, a rescued attempt's late one and that of the claim after it, and the statement
+  would return the job's ID once whichever applied, so the finalizer writes the second
+  in a statement of its own, and the late result emits no event. The client keeps its running jobs'
   cancel functions by claim too, so that the return of a rescued attempt does not
   take away the cancel of the claim after it.
 - Retry delays are sent as durations and applied to database `now()`; error
