@@ -1498,8 +1498,10 @@ retries a failed insert after a leader interval, from the same slot, so a transi
 error does not lose a slot; a job that fails to start is started again from the slots
 then recorded, `RunOnStart` included. A slot that falls more than a lease TTL behind,
 as while the database cannot be reached, is skipped rather than inserted at once on
-recovery, as missed slots are at the start of a term. `Add` builds the job's insert as
-`Insert` would and fails if it cannot be built, such as for invalid `InsertOpts`. A client
+recovery, as missed slots are at the start of a term. `NewClient`, for
+`Config.Periodic`, and `Add` build each job's insert as `Insert` would and fail if it
+cannot be built, such as for invalid `InsertOpts` or, with `StrictKinds`, a kind with no
+worker. A client
 that never leads (`NeverLead`, or one with no queues) accepts the jobs but never
 schedules them.
 

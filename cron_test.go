@@ -137,6 +137,8 @@ func TestPeriodicJobValidation(t *testing.T) {
 		"nil args":       {Workers: workers, Periodic: []hopper.PeriodicJob{hopper.Every(time.Second, nil, nil)}},
 		"duplicate name": {Workers: workers, Periodic: []hopper.PeriodicJob{hopper.Every(time.Second, noop{}, nil), hopper.Every(time.Minute, noop{}, nil)}},
 		"nil middleware": {Workers: workers, Middleware: []hopper.Middleware{nil}},
+		"bad insert":     {Workers: workers, Periodic: []hopper.PeriodicJob{hopper.Every(time.Second, noop{}, &hopper.PeriodicOpts{InsertOpts: &hopper.InsertOpts{Metadata: []byte("{")}})}},
+		"unknown kind":   {Workers: workers, StrictKinds: true, Periodic: []hopper.PeriodicJob{hopper.Every(time.Second, noop{}, nil)}},
 	} {
 		if _, err := hopper.NewClient(h.d, cfg); err == nil {
 			t.Errorf("%s: NewClient succeeded", name)

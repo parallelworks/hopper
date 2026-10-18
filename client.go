@@ -122,6 +122,11 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		_, err := c.periodicParams(p)
 		return err
 	}
+	for _, r := range c.periodic.jobs {
+		if err := c.periodic.check(&r.job); err != nil {
+			return nil, err
+		}
+	}
 	c.notifier = newNotifier(c.exec, c.logger, c.tuning.notifyInterval)
 	return c, nil
 }

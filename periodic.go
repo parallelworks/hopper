@@ -218,10 +218,8 @@ func (p *PeriodicJobs) AddMany(jobs []PeriodicJob) error {
 	}
 	regs := make([]*registeredPeriodic, len(resolved))
 	for i, job := range resolved {
-		if p.validate != nil {
-			if err := p.validate(&job); err != nil {
-				return fmt.Errorf("hopper: periodic job %q: %w", job.Name, err)
-			}
+		if err := p.check(&job); err != nil {
+			return err
 		}
 		regs[i] = &registeredPeriodic{job: job}
 	}
@@ -285,6 +283,17 @@ func (p *PeriodicJobs) All() []PeriodicJob {
 		out[i] = r.job.clone()
 	}
 	return out
+}
+
+// check reports whether the job's insert can be built.
+func (p *PeriodicJobs) check(job *PeriodicJob) error {
+	if p.validate == nil {
+		return nil
+	}
+	if err := p.validate(job); err != nil {
+		return fmt.Errorf("hopper: periodic job %q: %w", job.Name, err)
+	}
+	return nil
 }
 
 func (p *PeriodicJobs) snapshot() []*registeredPeriodic {
