@@ -411,8 +411,9 @@ type JobRow struct {
 	// Fence numbers the job's claims: each claim increments it. Snoozes,
 	// retries, the archive and JobRetry keep it, so for a given job it
 	// never repeats. Zero means the job was never claimed, or only by
-	// clients of the previous release (schema v17), which claim without
-	// incrementing it, and whose archive and JobRetry from history drop it.
+	// clients of earlier releases (built for schema v17 or before), which
+	// claim without incrementing it, and whose archive and JobRetry from
+	// history drop it.
 	Fence        int64
 	Args         json.RawMessage
 	Metadata     json.RawMessage

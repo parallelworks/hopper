@@ -1339,7 +1339,9 @@ the largest source of write amplification in heartbeat-based designs.
 - **Hung jobs.** A live client with a stuck goroutine is handled by timeouts. An
   optional `RescueStuckAfter` also rescues jobs that are still running past an absolute
   age, measured by database time: the candidate query reports which jobs it found as
-  stuck, and the rescue's error says so.
+  stuck, and the rescue's error says so. The rescue does not reach the stuck attempt:
+  it runs on until it returns, and its result is dropped, unless its own client claims
+  the job again, which cancels it (§7.5).
 - **Graceful stop** deletes the lease after the finalizer flushes, so nothing needs
   rescuing.
 
