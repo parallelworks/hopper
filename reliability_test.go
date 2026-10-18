@@ -777,6 +777,63 @@ func TestRescuedAttemptsResultSkipsTheNextClaim(t *testing.T) {
 	}
 }
 
+// TestCancelReachesAReclaimedAttempt rescues a stuck attempt and lets the
+// same client claim the job again. Once the first attempt returns, a
+// JobCancel must still reach the second.
+func TestCancelReachesAReclaimedAttempt(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	started := make(chan int, 10)
+	first := make(chan struct{})
+	causes := make(chan error, 1)
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[reclaimed]) error {
+		started <- job.Attempt
+		switch job.Attempt {
+		case 1:
+			<-first // ignores its context
+			return nil
+		case 2:
+			<-ctx.Done()
+			causes <- context.Cause(ctx)
+			return ctx.Err()
+		}
+		return nil
+	})
+	c := h.client(&hopper.Config{
+		Queues:           map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers:          workers,
+		RescueStuckAfter: 2 * time.Second,
+		JobTimeout:       time.Hour,
+	})
+	releaseFirst := sync.OnceFunc(func() { close(first) })
+	t.Cleanup(releaseFirst)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, reclaimed{}, &hopper.InsertOpts{MaxAttempts: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAttempt(t, started, 1)
+	waitAttempt(t, started, 2)
+	releaseFirst()
+	time.Sleep(200 * time.Millisecond)
+	if _, err := c.JobCancel(ctx, res.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case cause := <-causes:
+		if !errors.Is(cause, hopper.ErrJobCanceled) {
+			t.Errorf("second attempt's cause = %v, want ErrJobCanceled", cause)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("JobCancel did not reach the second attempt")
+	}
+	waitForJob(t, c, res.Job.ID, hopper.JobStateCanceled)
+}
+
 // waitAttempt waits for the worker to start attempt n.
 func waitAttempt(t *testing.T, started <-chan int, n int) {
 	t.Helper()

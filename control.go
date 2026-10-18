@@ -486,23 +486,35 @@ func (c *Client[TTx]) emit(kind EventKind, job *JobRow, errText string) {
 	c.events.emit(Event{Kind: kind, At: time.Now(), Job: job, Error: errText, ClientID: c.clientID.Load()})
 }
 
-// trackRunning registers a running job's cancel function.
-func (c *Client[TTx]) trackRunning(id JobID, cancel context.CancelCauseFunc) {
+// runningJob is the claim of a job running on this client and its cancel
+// function.
+type runningJob struct {
+	fence  int64
+	cancel context.CancelCauseFunc
+}
+
+// trackRunning registers a running job's claim and cancel function. A job
+// rescued while its attempt still runs here can be claimed here again: the
+// later claim replaces the earlier.
+func (c *Client[TTx]) trackRunning(id JobID, fence int64, cancel context.CancelCauseFunc) {
 	c.runningMu.Lock()
-	c.running[id] = cancel
+	c.running[id] = runningJob{fence: fence, cancel: cancel}
 	c.runningMu.Unlock()
 }
 
-func (c *Client[TTx]) untrackRunning(id JobID) {
+// untrackRunning removes a job's claim, unless a later claim replaced it.
+func (c *Client[TTx]) untrackRunning(id JobID, fence int64) {
 	c.runningMu.Lock()
-	delete(c.running, id)
+	if c.running[id].fence == fence {
+		delete(c.running, id)
+	}
 	c.runningMu.Unlock()
 }
 
 // cancelLocal cancels a job running on this client, if it is.
 func (c *Client[TTx]) cancelLocal(id JobID) {
 	c.runningMu.Lock()
-	cancel := c.running[id]
+	cancel := c.running[id].cancel
 	c.runningMu.Unlock()
 	if cancel != nil {
 		cancel(ErrJobCanceled)
