@@ -326,12 +326,7 @@ func (c *Client[TTx]) periodicLoop(ctx context.Context) {
 		case <-timer.C:
 		case <-c.periodic.changed:
 		}
-		sleep := c.periodicPass(ctx, st)
-		st.wakeAt = time.Time{}
-		if sleep < math.MaxInt64 {
-			st.wakeAt = time.Now().Add(max(sleep, 0))
-		}
-		timer.Reset(sleep)
+		timer.Reset(c.periodicPass(ctx, st))
 	}
 }
 
@@ -348,10 +343,11 @@ type periodicState struct {
 	retryAt map[*registeredPeriodic]time.Time
 	// clockFailed is set when the last pass could not read the clock.
 	clockFailed bool
-	// wakeAt is when, on the local clock, the last pass expected the next
-	// one, zero if it expected none. A pass that starts more than a lease
-	// TTL after it, as when the process was suspended, skips slots as after
-	// a failure.
+	// wakeAt is when, on the database clock, the last pass expected the
+	// next one, zero if it expected none. A pass that starts more than a
+	// lease TTL after it, as when the process was suspended, skips slots as
+	// after a failure. It is not on the local clock, whose monotonic reading
+	// stops on some systems while they sleep.
 	wakeAt time.Time
 }
 
@@ -372,21 +368,12 @@ func (c *Client[TTx]) periodicPass(ctx context.Context, st *periodicState) time.
 			added = append(added, r)
 		}
 	}
-	// next holds a removed job only if it holds more than the started jobs
-	// still registered. retryAt is checked whenever something is failing.
-	if len(st.next) > len(regs)-len(added) || len(st.retryAt) > 0 {
-		live := make(map[*registeredPeriodic]struct{}, len(regs))
-		for _, r := range regs {
-			live[r] = struct{}{}
-		}
-		removed := func(r *registeredPeriodic, _ time.Time) bool {
-			_, ok := live[r]
-			return !ok
-		}
-		maps.DeleteFunc(st.next, removed)
-		maps.DeleteFunc(st.retryAt, removed)
-	}
+	// Remove and Clear mark every registration they drop.
+	removed := func(r *registeredPeriodic, _ time.Time) bool { return r.removed.Load() }
+	maps.DeleteFunc(st.next, removed)
+	maps.DeleteFunc(st.retryAt, removed)
 	if len(regs) == 0 {
+		st.wakeAt = time.Time{}
 		return math.MaxInt64
 	}
 
@@ -399,7 +386,7 @@ func (c *Client[TTx]) periodicPass(ctx context.Context, st *periodicState) time.
 		return c.tuning.leaderInterval
 	}
 	read := time.Now()
-	stale := st.clockFailed || (!st.wakeAt.IsZero() && read.Sub(st.wakeAt) > c.tuning.leaderTTL)
+	stale := st.clockFailed || (!st.wakeAt.IsZero() && now.Sub(st.wakeAt) > c.tuning.leaderTTL)
 	st.clockFailed = false
 	// waiting reports whether a job that failed is not yet due to be tried
 	// again.
@@ -494,6 +481,10 @@ func (c *Client[TTx]) periodicPass(ctx context.Context, st *periodicState) time.
 	for _, at := range st.retryAt {
 		sleep = min(sleep, time.Until(at))
 	}
+	st.wakeAt = time.Time{}
+	if sleep < math.MaxInt64 {
+		st.wakeAt = now.Add(time.Since(read)).Add(max(sleep, 0))
+	}
 	return sleep
 }
 
@@ -532,19 +523,18 @@ func (c *Client[TTx]) startPeriodic(ctx context.Context, r *registeredPeriodic, 
 // it inserts when it starts, oldest first. Missed slots are skipped, except
 // those within the last lease TTL, which covers a failover; CatchUp
 // back-fills the most recent missed slots instead, never fewer than that
-// window holds.
+// window holds. Either way they are the most recent, up to maxCatchUp, so
+// the job's next slot is after now.
 func (c *Client[TTx]) missedSlots(p *PeriodicJob, last, now time.Time) []time.Time {
-	var window []time.Time
-	for slot := p.Schedule.Next(maxTime(last, now.Add(-c.tuning.leaderTTL))); !slot.IsZero() && !slot.After(now) && len(window) < maxCatchUp; slot = p.Schedule.Next(slot) {
-		window = append(window, slot)
-	}
+	window := recentSlots(p.Schedule, maxTime(last, now.Add(-c.tuning.leaderTTL)), now, maxCatchUp)
 	if p.Opts == nil || p.Opts.CatchUp <= len(window) {
 		return window
 	}
 	return recentSlots(p.Schedule, last, now, min(p.Opts.CatchUp, maxCatchUp))
 }
 
-// maxCatchUp bounds the missed slots a job back-fills when it starts.
+// maxCatchUp bounds the missed slots a job back-fills when it starts: the
+// most recent are kept.
 const maxCatchUp = 10000
 
 // recentSlots returns the up to n most recent slots of s after last and not

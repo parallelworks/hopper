@@ -292,6 +292,25 @@ func TestPeriodicLoopSkipsSlotsPastTTL(t *testing.T) {
 	}
 }
 
+// A database clock that jumps ahead of the local one, as after the host
+// slept while its monotonic clock stood still, skips the slots past the
+// lease TTL rather than inserting every one at once.
+func TestPeriodicLoopSkipsSlotsAfterSleep(t *testing.T) {
+	const interval = 10 * time.Millisecond
+	exec := &periodicExec{}
+	c := newPeriodicTestClient(t, exec, Every(interval, tickArgs{}, nil))
+	c.tuning.leaderTTL = 100 * time.Millisecond
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool { return exec.inserted("tick") >= 1 })
+	exec.set(func(e *periodicExec) { e.skew = time.Hour })
+	woke := time.Now().Add(time.Hour)
+	n := exec.inserted("tick")
+	eventually(t, func() bool { return exec.inserted("tick") > n })
+	if first := exec.slots("tick")[n]; first.Before(woke.Add(-c.tuning.leaderTTL - 5*interval)) {
+		t.Errorf("after the clock jumped, inserted slot %s, %s before it", first, woke.Sub(first))
+	}
+}
+
 // slowInserts delays every insert of one periodic job.
 type slowInserts struct {
 	*periodicExec
@@ -463,5 +482,22 @@ func TestPeriodicUniqueByPeriodKeysSlot(t *testing.T) {
 	defer exec.mu.Unlock()
 	if a, b := exec.inserts[0].Job.UniqueKey, exec.inserts[1].Job.UniqueKey; a == "" || a == b {
 		t.Errorf("unique keys of two hours' slots = %q, %q, want distinct", a, b)
+	}
+}
+
+// A failover window holding more slots than maxCatchUp back-fills its most
+// recent ones, and the job goes on from there.
+func TestPeriodicStartKeepsMostRecentWindow(t *testing.T) {
+	start := time.Now()
+	exec := &periodicExec{last: map[string]time.Time{"tick": start.Add(-20 * time.Second)}}
+	c := newPeriodicTestClient(t, exec, Every(time.Millisecond, tickArgs{}, nil))
+	c.tuning.leaderTTL = 20 * time.Second
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool {
+		slots := exec.slots("tick")
+		return len(slots) > 0 && slots[len(slots)-1].After(start.Add(100*time.Millisecond))
+	})
+	if first := exec.slots("tick")[0]; first.Before(start.Add(-11 * time.Second)) {
+		t.Errorf("back-filled from %s before the start, want the most recent %d slots", start.Sub(first), maxCatchUp)
 	}
 }

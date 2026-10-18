@@ -1467,7 +1467,7 @@ first job has finished and left the live table.
 `RunOnStart` inserts a job when a leader starts scheduling. Missed slots are skipped by
 default, except slots due since the last recorded one within the last lease TTL, which
 covers a failover; `CatchUp: n` back-fills up to the n most recent missed slots
-(at most 10,000), and never fewer than that window holds. A schedule with no recorded slot starts from its next slot. `RunOnStart`'s
+(at most 10,000, the most recent), and never fewer than that window holds. A schedule with no recorded slot starts from its next slot. `RunOnStart`'s
 slot is the database time, so it is inserted after the back-filled slots, which the
 upsert would otherwise reject as older than the last one.
 
