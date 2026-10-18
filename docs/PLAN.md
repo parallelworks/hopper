@@ -1459,15 +1459,15 @@ the same slots.
 
 The leader runs a periodic loop for the duration of its term. It sleeps until the
 soonest slot, timed on the database clock, reads that clock, and for each slot that
-has come due upserts
-`hopper_periodic.last_slot` with `ON CONFLICT DO UPDATE … WHERE last_slot < $slot` and
-inserts the job in the same transaction only if that upsert returned a row. A slot
-therefore produces at most one job, even if two leaders overlap or leadership changes
-mid-slot, and even after the first job has finished and left the live table.
+has come due upserts `hopper_periodic.last_slot` with
+`ON CONFLICT DO UPDATE … WHERE last_slot < $slot` and inserts the job in the same
+transaction only if that upsert returned a row. A slot therefore produces at most one
+job, even if two leaders overlap or leadership changes mid-slot, and even after the
+first job has finished and left the live table.
 `RunOnStart` inserts a job when a leader starts scheduling. Missed slots are skipped by
 default, except slots due since the last recorded one within the last lease TTL, which
 covers a failover; `CatchUp: n` back-fills up to the n most recent missed slots
-instead. A schedule with no recorded slot starts from its next slot. `RunOnStart`'s
+(at most 10,000), and never fewer than that window holds. A schedule with no recorded slot starts from its next slot. `RunOnStart`'s
 slot is the database time, so it is inserted after the back-filled slots, which the
 upsert would otherwise reject as older than the last one.
 
@@ -1491,10 +1491,17 @@ on, so a job is removed on every client that can lead, or a failover to a client
 still has it brings it back. A removed job stops being inserted; a slot being inserted as
 it is removed may still be. Its `hopper_periodic` row is kept, because another client may
 still have the job and the row is what keeps a slot from being inserted twice, so the
-table holds a row for every name ever scheduled. Starting an added job reads the whole
-table, once per `Add` or `AddMany` on the leader, as the start of a term does. The loop retries a
-failed read of the clock or the last slots after a leader interval. A client that never
-leads (`NeverLead`, or one with no queues) accepts the jobs but never schedules them.
+table holds a row for every name ever scheduled. Starting added jobs reads the whole
+table, once per loop pass that has jobs to start, as the start of a term does. The loop
+retries a failed read of the clock or the last slots after a leader interval. It also
+retries a failed insert after a leader interval, from the same slot, so a transient
+error does not lose a slot; a job that fails to start is started again from the slots
+then recorded, `RunOnStart` included. A slot that falls more than a lease TTL behind,
+as while the database cannot be reached, is skipped rather than inserted at once on
+recovery, as missed slots are at the start of a term. `Add` builds the job's insert as
+`Insert` would and fails if it cannot be built, such as for invalid `InsertOpts`. A client
+that never leads (`NeverLead`, or one with no queues) accepts the jobs but never
+schedules them.
 
 ### 7.10 Retention
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.

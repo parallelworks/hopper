@@ -41,6 +41,8 @@ func TestPeriodicJobsRegistry(t *testing.T) {
 		"bad interval": hopper.Every(0, noop{}, &hopper.PeriodicOpts{Name: "b"}),
 		"nil args":     hopper.Every(time.Second, nil, nil),
 		"taken name":   hopper.Every(time.Second, noop{}, nil),
+		"bad metadata": hopper.Every(time.Second, noop{}, &hopper.PeriodicOpts{Name: "c", InsertOpts: &hopper.InsertOpts{Metadata: []byte("{")}}),
+		"bad priority": hopper.Every(time.Second, noop{}, &hopper.PeriodicOpts{Name: "d", InsertOpts: &hopper.InsertOpts{Priority: 9}}),
 	} {
 		if err := jobs.Add(job); err == nil {
 			t.Errorf("%s: Add succeeded", name)

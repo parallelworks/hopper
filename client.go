@@ -118,6 +118,10 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 	if c.workers == nil {
 		c.workers = NewWorkers()
 	}
+	c.periodic.validate = func(p *PeriodicJob) error {
+		_, err := c.periodicParams(p)
+		return err
+	}
 	c.notifier = newNotifier(c.exec, c.logger, c.tuning.notifyInterval)
 	return c, nil
 }
