@@ -22,6 +22,8 @@
 //	scheduled   as throughput, with jobs scheduled up to 500ms in the future
 //	tagged      as throughput, with two tags on every job
 //	retry       as throughput, with every job failing its first attempt
+//	workflow    as throughput, in workflows of ten steps (one, then eight after it, then one after those),
+//	            each step recording a small output; -jobs is rounded down to a multiple of ten
 //	insert      InsertMany in batches of 100 (the unnest statement)
 //	copy        InsertMany in batches of 5000 (the COPY path)
 //	latency     commit-to-Work on an idle queue, local wake-up
@@ -163,6 +165,8 @@ func run(ctx context.Context, url, schema string, scenarios []string, opts optio
 			}), noopWorker)
 		case "retry":
 			r, err = b.drain(ctx, "retry", b.params(opts.jobs, nil), failOnceWorker)
+		case "workflow":
+			r, err = b.workflows(ctx, opts.jobs)
 		case "insert":
 			r, err = b.insert(ctx, opts.jobs, 100)
 		case "copy":
@@ -233,7 +237,7 @@ type bench struct {
 func (b *bench) reset(ctx context.Context) error {
 	// The tags tables (schema v17) are listed so that their truncate
 	// triggers find them empty, rather than truncating them one by one.
-	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic"); err != nil {
+	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic, hopper_batches, hopper_batch_progress, hopper_job_deps"); err != nil {
 		return err
 	}
 	if b.opts.history > 0 {
@@ -307,6 +311,135 @@ func (immediateRetry) NextRetry(*hopper.Job[benchArgs]) time.Time { return time.
 // drain preloads jobs, then measures how long -clients clients take to
 // empty the queue.
 func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertParams, work func(context.Context, *hopper.Job[benchArgs]) error) (result, error) {
+	return b.drainLoaded(ctx, name, len(params), func(inserter *hopper.Client[pgx.Tx]) error {
+		for i := 0; i < len(params); i += 10000 {
+			if _, err := inserter.InsertMany(ctx, params[i:min(i+10000, len(params))]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, work)
+}
+
+const workflowSteps = 10
+
+const (
+	drainStall       = 2 * time.Minute
+	drainStopTimeout = 30 * time.Second
+)
+
+func stopAll(ctx context.Context, cs []*hopper.Client[pgx.Tx]) {
+	ctx, cancel := context.WithTimeout(ctx, drainStopTimeout)
+	defer cancel()
+	for _, c := range cs {
+		if c != nil {
+			_ = c.Stop(ctx)
+		}
+	}
+}
+
+func (b *bench) waitDrained(ctx context.Context) error {
+	last, changed := -1, time.Now()
+	for {
+		var live int
+		if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_jobs").Scan(&live); err != nil {
+			return err
+		}
+		if live == 0 {
+			return nil
+		}
+		if live != last {
+			last, changed = live, time.Now()
+		} else if time.Since(changed) > drainStall {
+			var states string
+			if err := b.pool.QueryRow(ctx, "SELECT coalesce(string_agg(state || ' ' || n, ', '), 'none') FROM (SELECT state::text, count(*) AS n FROM hopper_jobs GROUP BY state) s").Scan(&states); err != nil {
+				return err
+			}
+			return fmt.Errorf("no progress for %s with %d jobs left: %s", drainStall, live, states)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
+	n := jobs / workflowSteps
+	if n < 1 {
+		return result{}, fmt.Errorf("-jobs must be at least %d", workflowSteps)
+	}
+	load := func(inserter *hopper.Client[pgx.Tx]) error {
+		return fanOut(ctx, n, 100, func(ctx context.Context, lo, hi int) error {
+			return pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
+				for i := lo; i < hi; i++ {
+					if _, err := inserter.InsertWorkflowTx(ctx, tx, benchWorkflow(i)); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		})
+	}
+	r, err := b.drainLoaded(ctx, "workflow", n*workflowSteps, load, outputWorker)
+	if err != nil {
+		return result{}, err
+	}
+	var outputs, open int
+	if err := b.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM hopper_job_history WHERE batch_id IS NOT NULL AND kind = 'bench' AND output IS NOT NULL),
+		(SELECT count(*) FROM hopper_batches WHERE completed_at IS NULL)`).Scan(&outputs, &open); err != nil {
+		return result{}, err
+	}
+	if outputs != r.Jobs {
+		return result{}, fmt.Errorf("%d of %d jobs stored an output", outputs, r.Jobs)
+	}
+	if open != 0 {
+		return result{}, fmt.Errorf("%d of %d workflows not completed", open, n)
+	}
+	return r, nil
+}
+
+func benchWorkflow(i int) *hopper.Workflow {
+	wf := hopper.NewWorkflow("bench-"+strconv.Itoa(i), nil)
+	n := i * workflowSteps
+	root := wf.Add(benchArgs{N: n}, nil)
+	middle := make([]hopper.Step, workflowSteps-2)
+	for j := range middle {
+		middle[j] = wf.Add(benchArgs{N: n + 1 + j}, hopper.After(root))
+	}
+	wf.Add(benchArgs{N: n + workflowSteps - 1}, hopper.After(middle...))
+	return wf
+}
+
+type benchOutput struct {
+	N        int    `json:"n"`
+	Artifact string `json:"artifact"`
+}
+
+func outputWorker(ctx context.Context, job *hopper.Job[benchArgs]) error {
+	return hopper.SetOutput(ctx, benchOutput{N: job.Args.N, Artifact: "bench/" + strconv.Itoa(job.Args.N)})
+}
+
+// fanOut runs fn over [0, n) in chunks from eight inserters, as an application
+// with several replicas would; the first error cancels the rest.
+func fanOut(ctx context.Context, n, chunk int, fn func(ctx context.Context, lo, hi int) error) error {
+	const inserters = 8
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var wg sync.WaitGroup
+	for w := range inserters {
+		wg.Go(func() {
+			for lo := w * chunk; lo < n && ctx.Err() == nil; lo += inserters * chunk {
+				if err := fn(ctx, lo, min(lo+chunk, n)); err != nil {
+					cancel(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	return context.Cause(ctx)
+}
+
+func (b *bench) drainLoaded(ctx context.Context, name string, jobs int, load func(*hopper.Client[pgx.Tx]) error, work func(context.Context, *hopper.Job[benchArgs]) error) (result, error) {
 	if err := b.reset(ctx); err != nil {
 		return result{}, err
 	}
@@ -315,10 +448,8 @@ func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertPa
 		return result{}, err
 	}
 	defer inserter.Stop(ctx) //nolint:errcheck // flushes pending notifications
-	for i := 0; i < len(params); i += 10000 {
-		if _, err := inserter.InsertMany(ctx, params[i:min(i+10000, len(params))]); err != nil {
-			return result{}, err
-		}
+	if err := load(inserter); err != nil {
+		return result{}, err
 	}
 
 	ws := hopper.NewWorkers()
@@ -335,21 +466,15 @@ func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertPa
 		}
 		cs[i] = c
 	}
+	defer stopAll(ctx, cs)
 	start := time.Now()
 	for _, c := range cs {
 		if err := c.Start(ctx); err != nil {
 			return result{}, err
 		}
 	}
-	for {
-		var live int
-		if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_jobs").Scan(&live); err != nil {
-			return result{}, err
-		}
-		if live == 0 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	if err := b.waitDrained(ctx); err != nil {
+		return result{}, err
 	}
 	elapsed := time.Since(start)
 	for _, c := range cs {
@@ -361,12 +486,12 @@ func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertPa
 	if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_job_history WHERE state = 'completed' AND kind = 'bench'").Scan(&done); err != nil {
 		return result{}, err
 	}
-	if done != len(params) {
-		return result{}, fmt.Errorf("%d of %d jobs completed", done, len(params))
+	if done != jobs {
+		return result{}, fmt.Errorf("%d of %d jobs completed", done, jobs)
 	}
 	return result{
-		Scenario: name, Jobs: len(params), Clients: b.opts.clients, Workers: b.opts.workers,
-		Seconds: elapsed.Seconds(), JobsPerSec: float64(len(params)) / elapsed.Seconds(),
+		Scenario: name, Jobs: jobs, Clients: b.opts.clients, Workers: b.opts.workers,
+		Seconds: elapsed.Seconds(), JobsPerSec: float64(jobs) / elapsed.Seconds(),
 	}, nil
 }
 
@@ -382,27 +507,14 @@ func (b *bench) insert(ctx context.Context, jobs, batch int) (result, error) {
 	}
 	defer c.Stop(ctx) //nolint:errcheck // flushes pending notifications
 	params := b.params(jobs, nil)
-	// Eight concurrent inserters, as an application with several replicas would have.
-	const inserters = 8
-	var wg sync.WaitGroup
-	errs := make([]error, inserters)
 	start := time.Now()
-	for w := range inserters {
-		wg.Go(func() {
-			for i := w * batch; i < len(params); i += inserters * batch {
-				if _, err := c.InsertMany(ctx, params[i:min(i+batch, len(params))]); err != nil {
-					errs[w] = err
-					return
-				}
-			}
-		})
-	}
-	wg.Wait()
+	err = fanOut(ctx, len(params), batch, func(ctx context.Context, lo, hi int) error {
+		_, err := c.InsertMany(ctx, params[lo:hi])
+		return err
+	})
 	elapsed := time.Since(start)
-	for _, err := range errs {
-		if err != nil {
-			return result{}, err
-		}
+	if err != nil {
+		return result{}, err
 	}
 	name := "insert"
 	if batch >= 256 {
@@ -490,6 +602,7 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 		return nil
 	})
 	cs := make([]*hopper.Client[pgx.Tx], b.opts.clients)
+	defer stopAll(ctx, cs)
 	for i := range cs {
 		c, err := hopper.NewClient(b.d, &hopper.Config{
 			Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: b.opts.workers}},
@@ -499,11 +612,10 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 		if err != nil {
 			return result{}, err
 		}
+		cs[i] = c
 		if err := c.Start(ctx); err != nil {
 			return result{}, err
 		}
-		defer c.Stop(ctx) //nolint:errcheck // best effort
-		cs[i] = c
 	}
 	inserter, err := hopper.NewClient(b.d, &hopper.Config{Logger: b.logger})
 	if err != nil {
@@ -593,15 +705,8 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 		}
 	}
 	// Let the backlog drain before reading the samples.
-	for {
-		var live int
-		if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_jobs").Scan(&live); err != nil {
-			return result{}, err
-		}
-		if live == 0 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	if err := b.waitDrained(ctx); err != nil {
+		return result{}, err
 	}
 	elapsed := time.Since(start)
 	mu.Lock()
