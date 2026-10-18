@@ -744,11 +744,13 @@ func TestRescuedAttemptsResultSkipsTheNextClaim(t *testing.T) {
 		}
 		return hopper.SetOutput(ctx, job.Attempt)
 	})
+	logs := &messageLog{}
 	c := h.client(&hopper.Config{
 		Queues:           map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
 		Workers:          workers,
 		RescueStuckAfter: time.Second,
 		JobTimeout:       time.Hour,
+		Logger:           slog.New(logs),
 	})
 	releaseFirst, releaseSecond := sync.OnceFunc(func() { close(first) }), sync.OnceFunc(func() { close(second) })
 	t.Cleanup(releaseFirst)
@@ -763,11 +765,15 @@ func TestRescuedAttemptsResultSkipsTheNextClaim(t *testing.T) {
 	waitAttempt(t, started, 1)
 	waitAttempt(t, started, 2)
 	releaseFirst()
-	// Long enough for the first attempt's result to be flushed, short of
-	// RescueStuckAfter for the second.
-	time.Sleep(300 * time.Millisecond)
-	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State != hopper.JobStateRunning || job.Attempt < 2 {
-		t.Fatalf("after the rescued attempt returned, job = %+v, %v; want it running in a later claim", job, err)
+	// The first attempt's result is written and dropped, or, unfenced,
+	// finalizes the job.
+	const dropped = "hopper: result dropped: job no longer owned by this attempt"
+	waitFor(t, func() bool {
+		job, err := c.JobGet(ctx, res.Job.ID)
+		return logs.count(dropped) > 0 || err == nil && job.State == hopper.JobStateCompleted
+	})
+	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State == hopper.JobStateCompleted {
+		t.Fatalf("after the rescued attempt returned, job = %+v, %v; want it left to a later claim", job, err)
 	}
 	releaseSecond()
 	job := waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted)
