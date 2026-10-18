@@ -82,9 +82,6 @@ func AddWorker[T JobArgs](workers *Workers, worker Worker[T]) {
 	}
 	if ok {
 		aliases = a.KindAliases()
-		if slices.Contains(aliases, "") {
-			panic(fmt.Sprintf("hopper: %T has an empty kind alias", zero))
-		}
 	}
 	workers.add(&workerInfo{
 		kind: kind,
@@ -112,13 +109,22 @@ func AddWorkFunc[T JobArgs](workers *Workers, fn func(ctx context.Context, job *
 func (w *Workers) add(info *workerInfo, aliases ...string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if slices.Contains(aliases, "") {
+		panic(fmt.Sprintf("hopper: kind %q has an empty kind alias", info.kind))
+	}
 	kinds := append([]string{info.kind}, aliases...)
 	for i, kind := range kinds {
-		if _, dup := w.kinds[kind]; dup || slices.Contains(kinds[:i], kind) {
-			if i == 0 {
-				panic(fmt.Sprintf("hopper: worker for kind %q registered twice", kind))
+		if prior, dup := w.kinds[kind]; dup || slices.Contains(kinds[:i], kind) {
+			msg := fmt.Sprintf("hopper: worker for kind %q registered twice", kind)
+			if i > 0 {
+				msg += fmt.Sprintf(" (as a kind alias of %q)", info.kind)
 			}
-			panic(fmt.Sprintf("hopper: worker for kind %q registered twice (as a kind alias of %q)", kind, info.kind))
+			// No args type has the kind when it is another's alias: name
+			// that one, so the collision can be found.
+			if dup && prior.kind != kind {
+				msg += fmt.Sprintf(" (already a kind alias of %q)", prior.kind)
+			}
+			panic(msg)
 		}
 	}
 	for _, kind := range kinds {

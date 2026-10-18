@@ -3,6 +3,8 @@ package hopper_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/parallelworks/hopper"
@@ -59,11 +61,18 @@ func TestWorkersRejectKindAliasCollisions(t *testing.T) {
 	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[noop]) error { return nil })
 	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[sendEmail]) error { return nil })
 
-	panics := func(name string, add func()) {
+	panics := func(name string, add func(), want ...string) {
 		t.Helper()
 		defer func() {
-			if recover() == nil {
+			r := recover()
+			if r == nil {
 				t.Errorf("%s: registering did not panic", name)
+				return
+			}
+			for _, w := range want {
+				if !strings.Contains(fmt.Sprint(r), w) {
+					t.Errorf("%s: panic %q does not say %q", name, r, w)
+				}
 			}
 		}()
 		add()
@@ -74,9 +83,10 @@ func TestWorkersRejectKindAliasCollisions(t *testing.T) {
 	panics("alias of a registered alias", func() {
 		hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[aliasesMail]) error { return nil })
 	})
+	// No args type has the kind "mail", so the panic names its owner.
 	panics("kind of a registered alias", func() {
 		hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[kindIsMail]) error { return nil })
-	})
+	}, `already a kind alias of "send_email"`)
 	panics("alias of its own kind", func() {
 		hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[aliasesItself]) error { return nil })
 	})
@@ -85,7 +95,7 @@ func TestWorkersRejectKindAliasCollisions(t *testing.T) {
 	})
 	panics("empty alias", func() {
 		hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[aliasesEmpty]) error { return nil })
-	})
+	}, `kind "e" has an empty kind alias`)
 	// KindAliases with a pointer receiver is read too, not dropped.
 	panics("alias with a pointer receiver", func() {
 		hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[ptrAliases]) error { return nil })
@@ -130,9 +140,11 @@ func TestKindAliasWorksJobsOfTheOldKind(t *testing.T) {
 	}
 	want := map[seen]bool{{"send_mail", "old@example.com"}: true, {"send_email", "new@example.com"}: true}
 	for range 2 {
-		if s := <-got; !want[s] {
+		s := <-got
+		if !want[s] {
 			t.Errorf("worker saw %+v", s)
 		}
+		delete(want, s) // each job is seen once
 	}
 
 	// StrictKinds accepts the old kind, since a worker here works it. The

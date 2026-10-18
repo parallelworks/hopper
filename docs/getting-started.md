@@ -154,9 +154,11 @@ hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[ResizeImag
 })
 ```
 
-To rename a kind, keep its old name as an alias until no job of it is left.
-The worker for the args then also works jobs stored under the old kind, and
-`job.Kind` is the kind the job was stored with:
+To rename a kind, keep its old name as an alias until no job of it is left,
+and no open batch has a callback of it. The worker for the args then also
+works jobs stored under the old kind, decoding their args into the renamed
+args, so keep the fields' encoded names. `job.Kind` is the kind the job was
+stored with:
 
 ```go
 func (SendEmail) Kind() string          { return "send_email" }
