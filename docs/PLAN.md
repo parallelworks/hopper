@@ -1485,9 +1485,13 @@ an added job as if its term had just started: `RunOnStart` inserts a job, `Catch
 back-fills, and otherwise slots since the last recorded one within the lease TTL are
 inserted. A `RunOnStart` added on every client inserts one job because only the leader
 schedules; its slot is the leader's database time, so two overlapping leaders each
-insert one, as at the start of a term. A removed job stops being inserted; a slot being inserted as it is removed may
-still be. Its `hopper_periodic` row is kept, because another client may still have the
-job and the row is what keeps a slot from being inserted twice. The loop retries a
+insert one, as at the start of a term. `Remove` applies only to the client it is called
+on, so a job is removed on every client that can lead, or a failover to a client that
+still has it brings it back. A removed job stops being inserted; a slot being inserted as
+it is removed may still be. Its `hopper_periodic` row is kept, because another client may
+still have the job and the row is what keeps a slot from being inserted twice, so the
+table holds a row for every name ever scheduled. Starting an added job reads the whole
+table, once per `Add` or `AddMany` on the leader, as the start of a term does. The loop retries a
 failed read of the clock or the last slots after a leader interval. A client that never
 leads (`NeverLead`, or one with no queues) accepts the jobs but never schedules them.
 

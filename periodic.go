@@ -231,9 +231,11 @@ func (p *PeriodicJobs) AddMany(jobs []PeriodicJob) error {
 	return nil
 }
 
-// Remove unregisters the job with this name. A slot being inserted as it is
-// removed may still be inserted. The job's last slot stays in the database,
-// so a leader that still has the job does not insert a slot twice.
+// Remove unregisters the job with this name on this client only: remove it
+// on every client that can lead, or a leader change to a client that still
+// has it brings it back. A slot being inserted as it is removed may still be
+// inserted. The job's last slot stays in the database, so a leader that
+// still has the job does not insert a slot twice.
 func (p *PeriodicJobs) Remove(name string) error {
 	p.mu.Lock()
 	r := p.byName[name]
