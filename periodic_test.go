@@ -30,6 +30,12 @@ func periodicNames(jobs []hopper.PeriodicJob) []string {
 	return names
 }
 
+// countN counts the jobs, live and finished, whose args' N is n.
+func (h *harness) countN(n string) int {
+	return h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = $1", n) +
+		h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = $1", n)
+}
+
 func TestPeriodicJobsRegistry(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -132,10 +138,7 @@ func TestPeriodicJobsAtRuntime(t *testing.T) {
 		}
 	}
 	waitFor(t, func() bool { return a.IsLeader() || b.IsLeader() })
-	jobs := func(n string) int {
-		return h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = $1", n) +
-			h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = $1", n)
-	}
+	jobs := h.countN
 
 	for _, c := range []*hopper.Client[pgxTx]{a, b} {
 		err := c.PeriodicJobs().AddMany([]hopper.PeriodicJob{
@@ -220,10 +223,7 @@ func TestPeriodicJobsAddCatchesUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	count := func(n string) int {
-		return h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = $1", n) +
-			h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = $1", n)
-	}
+	count := h.countN
 	waitFor(t, func() bool { return count("5") >= 3 && count("6") >= 4 })
 	time.Sleep(300 * time.Millisecond)
 	if n := count("5"); n != 3 {
@@ -277,8 +277,7 @@ func TestPeriodicJobsConcurrentChanges(t *testing.T) {
 
 	var total int
 	for n := 10; n < 13; n++ {
-		got := h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = $1", strconv.Itoa(n)) +
-			h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = $1", strconv.Itoa(n))
+		got := h.countN(strconv.Itoa(n))
 		if got > slots {
 			t.Errorf("p%d inserted %d jobs in %d slots", n-10, got, slots)
 		}

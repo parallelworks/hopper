@@ -97,6 +97,12 @@ func (e *periodicExec) slots(name string) []time.Time {
 	return out
 }
 
+// onStartOnly has no slots, for a job that only RunOnStart inserts, so that
+// a test's count of it does not depend on the hour the test runs in.
+type onStartOnly struct{}
+
+func (onStartOnly) Next(time.Time) time.Time { return time.Time{} }
+
 func newPeriodicTestClient(t *testing.T, exec driver.Executor, jobs ...PeriodicJob) *Client[struct{}] {
 	t.Helper()
 	cfg, err := (&Config{Periodic: jobs, Logger: slog.New(slog.DiscardHandler)}).withDefaults()
@@ -138,7 +144,7 @@ func eventually(t *testing.T, cond func() bool) {
 // leaving the term without periodic jobs.
 func TestPeriodicLoopRetriesFailedRead(t *testing.T) {
 	exec := &periodicExec{slotsFailures: 2}
-	c := newPeriodicTestClient(t, exec, Every(time.Hour, tickArgs{}, &PeriodicOpts{RunOnStart: true}))
+	c := newPeriodicTestClient(t, exec, PeriodicJob{Schedule: onStartOnly{}, Args: tickArgs{}, Opts: &PeriodicOpts{RunOnStart: true}})
 	runPeriodicLoop(t, c)
 	eventually(t, func() bool { return exec.inserted("tick") == 1 })
 }
@@ -149,10 +155,10 @@ func TestPeriodicLoopAddAndRemove(t *testing.T) {
 	exec := &periodicExec{}
 	c := newPeriodicTestClient(t, exec)
 	runPeriodicLoop(t, c)
-	if err := c.PeriodicJobs().Add(Every(time.Hour, tickArgs{}, &PeriodicOpts{Name: "hourly", RunOnStart: true})); err != nil {
+	if err := c.PeriodicJobs().Add(PeriodicJob{Schedule: onStartOnly{}, Args: tickArgs{}, Opts: &PeriodicOpts{Name: "on-start", RunOnStart: true}}); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, func() bool { return exec.inserted("hourly") == 1 })
+	eventually(t, func() bool { return exec.inserted("on-start") == 1 })
 
 	if err := c.PeriodicJobs().Add(Every(10*time.Millisecond, tickArgs{}, nil)); err != nil {
 		t.Fatal(err)
@@ -167,8 +173,8 @@ func TestPeriodicLoopAddAndRemove(t *testing.T) {
 	if got := exec.inserted("tick"); got != n {
 		t.Errorf("removed job inserted %d more slots", got-n)
 	}
-	if got := exec.inserted("hourly"); got != 1 {
-		t.Errorf("hourly job inserted %d times, want 1", got)
+	if got := exec.inserted("on-start"); got != 1 {
+		t.Errorf("RunOnStart job inserted %d times, want 1", got)
 	}
 }
 
@@ -176,7 +182,7 @@ func TestPeriodicLoopAddAndRemove(t *testing.T) {
 // and RunOnStart fires again.
 func TestPeriodicLoopReplace(t *testing.T) {
 	exec := &periodicExec{}
-	c := newPeriodicTestClient(t, exec, Every(time.Hour, tickArgs{}, &PeriodicOpts{RunOnStart: true}))
+	c := newPeriodicTestClient(t, exec, PeriodicJob{Schedule: onStartOnly{}, Args: tickArgs{}, Opts: &PeriodicOpts{RunOnStart: true}})
 	runPeriodicLoop(t, c)
 	eventually(t, func() bool { return exec.inserted("tick") == 1 })
 	jobs := c.PeriodicJobs()
@@ -240,7 +246,7 @@ func TestPeriodicLoopFailedReadKeepsOthers(t *testing.T) {
 // A failed insert of RunOnStart's job is retried, rather than lost.
 func TestPeriodicLoopRetriesFailedStart(t *testing.T) {
 	exec := &periodicExec{insertFailures: 2}
-	c := newPeriodicTestClient(t, exec, Every(time.Hour, tickArgs{}, &PeriodicOpts{RunOnStart: true}))
+	c := newPeriodicTestClient(t, exec, PeriodicJob{Schedule: onStartOnly{}, Args: tickArgs{}, Opts: &PeriodicOpts{RunOnStart: true}})
 	runPeriodicLoop(t, c)
 	eventually(t, func() bool { return exec.inserted("tick") == 1 })
 }
