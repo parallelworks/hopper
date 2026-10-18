@@ -1077,7 +1077,8 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   cancel function of each running job's latest claim, and an attempt that returns
   removes only its own claim's, so that the return of a rescued attempt does not take
   away the cancel of the claim after it. A claim that replaces another cancels the
-  earlier attempt with `ErrJobFenced`, since its result can no longer apply.
+  earlier attempt with `ErrJobFenced`, since its result can no longer apply; that
+  attempt's failure, like a rescued job's, goes to neither `Config.OnError` nor the log.
 - Retry delays are sent as durations and applied to database `now()`; error
   timestamps are set by the database too (§7.1).
 - Queues with `DeleteCompleted: true` delete completed jobs without writing history.

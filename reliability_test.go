@@ -856,6 +856,70 @@ func TestCancelReachesAReclaimedAttempt(t *testing.T) {
 	waitForJob(t, c, res.Job.ID, hopper.JobStateCanceled)
 }
 
+// TestReplacedAttemptsFailureIsNotTheJobs rescues a stuck attempt and lets
+// the same client claim the job again, which cancels the first attempt with
+// ErrJobFenced. The first attempt's failure, from that cancel, is not the
+// job's: Config.OnError is not called for it, as for any rescued job, and it
+// is not logged as a failed job.
+func TestReplacedAttemptsFailureIsNotTheJobs(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	started := make(chan int, 10)
+	first, second := make(chan struct{}), make(chan struct{})
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[reclaimed]) error {
+		started <- job.Attempt
+		if job.Attempt == 1 {
+			<-first // ignores its context
+			return context.Cause(ctx)
+		}
+		<-second
+		return nil
+	})
+	var onErrorMu sync.Mutex
+	var onError []error
+	logs := &messageLog{}
+	c := h.client(&hopper.Config{
+		Queues:           map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers:          workers,
+		RescueStuckAfter: time.Second,
+		JobTimeout:       time.Hour,
+		Logger:           slog.New(logs),
+		OnError: func(_ context.Context, _ *hopper.JobRow, err error) hopper.ErrorOutcome {
+			onErrorMu.Lock()
+			onError = append(onError, err)
+			onErrorMu.Unlock()
+			return hopper.ErrorOutcome{}
+		},
+	})
+	releaseFirst, releaseSecond := sync.OnceFunc(func() { close(first) }), sync.OnceFunc(func() { close(second) })
+	t.Cleanup(releaseFirst)
+	t.Cleanup(releaseSecond)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, reclaimed{}, &hopper.InsertOpts{MaxAttempts: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAttempt(t, started, 1)
+	waitAttempt(t, started, 2)
+	releaseFirst()
+	waitFor(t, func() bool { return logs.count(droppedResult) > 0 })
+	onErrorMu.Lock()
+	calls := slices.Clone(onError)
+	onErrorMu.Unlock()
+	if len(calls) != 0 {
+		t.Errorf("Config.OnError called for the replaced attempt with %v", calls)
+	}
+	if n := logs.count("hopper: job failed"); n != 0 {
+		t.Errorf("the replaced attempt was logged as a failed job %d times", n)
+	}
+	releaseSecond()
+	waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted)
+}
+
 // waitAttempt waits for the worker to start attempt n.
 func waitAttempt(t *testing.T, started <-chan int, n int) {
 	t.Helper()
