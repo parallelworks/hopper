@@ -192,9 +192,9 @@ type Executor interface {
 	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)
 	// JobRescueCandidates returns running jobs whose owning client has no
 	// unexpired lease, plus, if StuckAfter is positive, running jobs claimed
-	// longer ago than that. The caller finalizes them, fenced to the claim
-	// each was found in.
-	JobRescueCandidates(ctx context.Context, params JobRescueParams) ([]*JobRow, error)
+	// longer ago than that by database time. The caller finalizes them,
+	// fenced to the claim each was found in.
+	JobRescueCandidates(ctx context.Context, params JobRescueParams) ([]RescueCandidate, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
 	ClientRegister(ctx context.Context, params ClientRegisterParams) (int64, error)
@@ -875,6 +875,14 @@ type JobRescueParams struct {
 	// than this, whatever the state of their client's lease.
 	StuckAfter time.Duration
 	Limit      int
+}
+
+// RescueCandidate is a running job to rescue. Stuck reports that it was
+// claimed longer ago than StuckAfter, by database time; otherwise its client
+// has lost its lease.
+type RescueCandidate struct {
+	Job   *JobRow
+	Stuck bool
 }
 
 // LeaderParams describes a leadership attempt.

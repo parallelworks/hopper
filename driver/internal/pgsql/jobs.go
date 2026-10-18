@@ -1769,19 +1769,29 @@ func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 }
 
 // jobRescueSQL finds running jobs whose client has no live lease, plus jobs
-// running longer than a stuck threshold. It walks the running index, which is
-// bounded by total concurrency.
+// running longer than a stuck threshold, which it reports as stuck by
+// database time. It walks the running index, which is bounded by total
+// concurrency.
 var jobRescueQuery = fmt.Sprintf(`
-SELECT %s FROM {{schema}}.hopper_jobs j
-WHERE j.state = 'running'
-  AND (NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_clients c WHERE c.id = j.attempted_by AND c.expires_at > now())
-       OR ($1::float8 > 0 AND j.attempted_at < now() - make_interval(secs => $1::float8)))
+SELECT * FROM (
+  SELECT %s, ($1::float8 > 0 AND j.attempted_at < now() - make_interval(secs => $1::float8)) AS stuck
+  FROM {{schema}}.hopper_jobs j
+  WHERE j.state = 'running'
+) j
+WHERE stuck OR NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_clients c WHERE c.id = j.attempted_by AND c.expires_at > now())
 ORDER BY j.attempted_at
 LIMIT $2`, JobColumns("j."))
 
+var scanRescueCandidates = collect(func(r Row) (driver.RescueCandidate, error) {
+	var c driver.RescueCandidate
+	var err error
+	c.Job, err = scanJob(r, false, &c.Stuck)
+	return c, err
+})
+
 // JobRescueCandidates implements driver.Executor.
-func (e *Executor) JobRescueCandidates(ctx context.Context, params driver.JobRescueParams) ([]*driver.JobRow, error) {
-	jobs, err := liveJobs(e.Conn.Query(ctx, jobRescueQuery, max(params.StuckAfter, 0).Seconds(), params.Limit))
+func (e *Executor) JobRescueCandidates(ctx context.Context, params driver.JobRescueParams) ([]driver.RescueCandidate, error) {
+	jobs, err := scanRescueCandidates(e.Conn.Query(ctx, jobRescueQuery, max(params.StuckAfter, 0).Seconds(), params.Limit))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: rescue candidates: %w", err)
 	}

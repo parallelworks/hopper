@@ -103,7 +103,7 @@ func testRescue[TTx any](t *testing.T, f Fixture[TTx]) {
 	if len(liveJobs) != 2 || len(deadJobs) != 1 {
 		t.Fatal("claims")
 	}
-	candidates := func(stuck time.Duration) []*driver.JobRow {
+	candidates := func(stuck time.Duration) []driver.RescueCandidate {
 		t.Helper()
 		got, err := exec.JobRescueCandidates(ctx, driver.JobRescueParams{StuckAfter: stuck, Limit: 10})
 		if err != nil {
@@ -115,7 +115,8 @@ func testRescue[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatalf("candidates with live leases = %v", got)
 	}
 	f.ExpireLease(ctx, t, d, dead)
-	if got := candidates(0); len(got) != 1 || got[0].ID != deadJobs[0].ID || got[0].AttemptedBy != dead {
+	if got := candidates(0); len(got) != 1 || got[0].Job.ID != deadJobs[0].ID || got[0].Job.AttemptedBy != dead ||
+		got[0].Job.Fence != deadJobs[0].Fence || got[0].Stuck {
 		t.Fatalf("candidates = %v", got)
 	}
 	if _, err := exec.ClientPruneExpired(ctx); err != nil {
@@ -124,9 +125,14 @@ func testRescue[TTx any](t *testing.T, f Fixture[TTx]) {
 	if got := candidates(0); len(got) != 1 {
 		t.Fatalf("candidates after prune = %v", got)
 	}
+	// A job is stuck by database time: its attempt began StuckAfter ago by
+	// the database's clock, whatever the caller's.
 	f.AgeAttempt(ctx, t, d, liveJobs[0].ID, 10*time.Minute)
-	if got := candidates(5 * time.Minute); len(got) != 2 || got[0].ID != liveJobs[0].ID {
-		t.Fatalf("candidates with StuckAfter = %v (oldest first)", got)
+	if got := candidates(5 * time.Minute); len(got) != 2 || got[0].Job.ID != liveJobs[0].ID || !got[0].Stuck || got[1].Stuck {
+		t.Fatalf("candidates with StuckAfter = %v (oldest first, the first stuck)", got)
+	}
+	if got := candidates(15 * time.Minute); len(got) != 1 || got[0].Stuck {
+		t.Fatalf("candidates with a longer StuckAfter = %v", got)
 	}
 	// The rescue itself is the fenced finalize.
 	applied := finalize(ctx, t, exec, driver.JobFinalize{ID: deadJobs[0].ID, AttemptedBy: dead, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}})

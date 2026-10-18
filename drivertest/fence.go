@@ -140,10 +140,10 @@ func testRescueRacesReclaim[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 1 || candidates[0].ID != id {
+	if len(candidates) != 1 || candidates[0].Job.ID != id || !candidates[0].Stuck {
 		t.Fatalf("candidates = %+v", candidates)
 	}
-	found := candidates[0]
+	found := candidates[0].Job
 
 	finalize(ctx, t, exec, driver.JobFinalize{
 		ID: id, AttemptedBy: clientID, Fence: found.Fence, State: driver.JobStateRetryable,
