@@ -720,6 +720,10 @@ func TestRescueStuckAfter(t *testing.T) {
 
 type reclaimed struct{}
 
+// droppedResult is what the finalizer logs for a result whose attempt no
+// longer owns its job.
+const droppedResult = "hopper: result dropped: job no longer owned by this attempt"
+
 func (reclaimed) Kind() string { return "reclaimed" }
 
 // TestRescuedAttemptsResultSkipsTheNextClaim rescues a stuck attempt whose
@@ -767,10 +771,9 @@ func TestRescuedAttemptsResultSkipsTheNextClaim(t *testing.T) {
 	releaseFirst()
 	// The first attempt's result is written and dropped, or, unfenced,
 	// finalizes the job.
-	const dropped = "hopper: result dropped: job no longer owned by this attempt"
 	waitFor(t, func() bool {
 		job, err := c.JobGet(ctx, res.Job.ID)
-		return logs.count(dropped) > 0 || err == nil && job.State == hopper.JobStateCompleted
+		return logs.count(droppedResult) > 0 || err == nil && job.State == hopper.JobStateCompleted
 	})
 	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State == hopper.JobStateCompleted {
 		t.Fatalf("after the rescued attempt returned, job = %+v, %v; want it left to a later claim", job, err)
@@ -807,11 +810,13 @@ func TestCancelReachesAReclaimedAttempt(t *testing.T) {
 		}
 		return nil
 	})
+	logs := &messageLog{}
 	c := h.client(&hopper.Config{
 		Queues:           map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
 		Workers:          workers,
 		RescueStuckAfter: 2 * time.Second,
 		JobTimeout:       time.Hour,
+		Logger:           slog.New(logs),
 	})
 	releaseFirst := sync.OnceFunc(func() { close(first) })
 	t.Cleanup(releaseFirst)
@@ -825,7 +830,9 @@ func TestCancelReachesAReclaimedAttempt(t *testing.T) {
 	waitAttempt(t, started, 1)
 	waitAttempt(t, started, 2)
 	releaseFirst()
-	time.Sleep(200 * time.Millisecond)
+	// The first attempt's result is dropped once the attempt has returned
+	// and let go of its claim, so the cancel comes after that.
+	waitFor(t, func() bool { return logs.count(droppedResult) > 0 })
 	if _, err := c.JobCancel(ctx, res.Job.ID); err != nil {
 		t.Fatal(err)
 	}

@@ -1089,9 +1089,8 @@ func dbHour(ctx context.Context, t *testing.T, pool *pgxpool.Pool) time.Time {
 // TestFenceUpgrade upgrades to v18 with jobs the previous release left: a
 // waiting job, a running one, and one in history, which read fence 0. The
 // running job's result, fenced to fence 0, still applies; the others' first
-// claim is fence 1, also after a JobRetry from history. A claim waits at
-// most one short try of the migration's loop, which locks hopper_jobs and
-// then history, while a transaction that wrote both stays open.
+// claim is fence 1, also after a JobRetry from history. The migration's
+// locking under traffic is TestUpgradeUnderTraffic's, from v17.
 func TestFenceUpgrade(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1124,63 +1123,8 @@ func TestFenceUpgrade(t *testing.T) {
 	     args, metadata, errors, await, created_at, finalized_at)
 	   SELECT id, seq, kind, queue, 'discarded', priority, 1, max_attempts, scheduled_at, args, metadata, errors, await, created_at, now() FROM j`, archived)
 
-	held, err := pool.Begin(ctx)
-	if err != nil {
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
 		t.Fatal(err)
-	}
-	defer held.Rollback(ctx) //nolint:errcheck // committed below
-	if _, err := held.Exec(ctx, `UPDATE hopper_jobs SET priority = 2 WHERE id = $1`, waiting); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := held.Exec(ctx, `UPDATE hopper_job_history SET priority = 2 WHERE id = $1`, archived); err != nil {
-		t.Fatal(err)
-	}
-	// As long as TestUpgradeUnderTraffic holds its transaction, with the same
-	// bound on a claim's wait: a successful try holds hopper_jobs while it
-	// alters every history partition, which a loaded CI host can stretch.
-	const holdFor = 2 * time.Second
-	var (
-		wg      sync.WaitGroup
-		stop    = make(chan struct{})
-		slowest time.Duration
-	)
-	wg.Go(func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case <-time.After(2 * time.Millisecond):
-			}
-			start := time.Now()
-			if _, err := pool.Exec(ctx, `SELECT id FROM hopper_jobs WHERE state IN ('available', 'scheduled', 'retryable')
-			                             ORDER BY priority, scheduled_at, seq LIMIT 8 FOR UPDATE SKIP LOCKED`); err != nil {
-				t.Errorf("claim during the migration: %v", err)
-				return
-			}
-			slowest = max(slowest, time.Since(start))
-		}
-	})
-	wg.Go(func() {
-		time.Sleep(holdFor)
-		if err := held.Commit(ctx); err != nil {
-			t.Errorf("commit the held transaction: %v", err)
-		}
-	})
-	uctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-	start := time.Now()
-	_, err = hoppermigrate.Up(uctx, d, &hoppermigrate.Options{Logger: logger})
-	took := time.Since(start)
-	close(stop)
-	wg.Wait()
-	if err != nil {
-		t.Fatalf("Up while a transaction held both tables: %v", err)
-	}
-	if took < holdFor*9/10 {
-		t.Errorf("Up took %s, less than the held transaction: it did not wait for its locks", took)
-	}
-	if slowest > holdFor/2 {
-		t.Errorf("a claim waited %s during the migration", slowest)
 	}
 
 	for _, id := range []driver.JobID{waiting, running, archived} {

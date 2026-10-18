@@ -61,12 +61,18 @@ func testJobRecordProgress[TTx any](t *testing.T, f Fixture[TTx]) {
 	if got := record(exec, driver.JobRecordProgressParams{Fence: 1, Attempt: 1, KeepStep: true}); got == nil || got.Step != "download" || got.Cursor != nil {
 		t.Errorf("cursor cleared: %+v", got)
 	}
-	// Fenced: another client, another attempt.
+	// Fenced: another client, another claim, and another attempt at the same
+	// fence, which a client of the previous release can repeat.
 	if got := record(exec, driver.JobRecordProgressParams{AttemptedBy: clientID + 1, Fence: 1, Attempt: 1, Step: "x"}); got != nil {
 		t.Errorf("another client recorded %+v", got)
 	}
-	if got := record(exec, driver.JobRecordProgressParams{Fence: 2, Attempt: 2, Step: "x"}); got != nil {
-		t.Errorf("another attempt recorded %+v", got)
+	if got := record(exec, driver.JobRecordProgressParams{Fence: 2, Attempt: 1, Step: "x"}); got != nil {
+		t.Errorf("another claim recorded %+v", got)
+	}
+	for _, noWait := range []bool{false, true} {
+		if got := record(exec, driver.JobRecordProgressParams{Fence: 1, Attempt: 2, Step: "x", NoWait: noWait}); got != nil {
+			t.Errorf("another attempt at the same fence recorded %+v (NoWait %t)", got, noWait)
+		}
 	}
 
 	// In a caller's transaction: kept only if it commits.

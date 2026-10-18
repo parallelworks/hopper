@@ -939,11 +939,17 @@ RETURNING j.*;
   the archive keep the fence, and `JobRetry` carries it back from history, so for a
   given job it never repeats; the error recorded for a failed attempt carries it too.
   It is a counter on the row rather than a sequence, which would be a hotspot shared
-  by every claim and, cached per session, would not increase per job. `fence` has no
-  index, so the claim's update stays HOT. A client of the previous release claims
+  by every claim and, cached per session, would not increase per job. `fence` is in no
+  index, so incrementing it adds no index write to the claim. A client of the previous release claims
   without incrementing it, archives a job with `fence` 0 and drops it in `JobRetry` from
-  history; the finalize fence still holds then, since it checks the client too, but a
-  fence passed outside hopper only increases once every client runs this release.
+  history; the finalize fence still holds then against other clients, since it checks
+  the client too, and progress writes check the attempt number as well. A fence reset
+  that way can come round to the same value for the same client, and a late result of
+  that client's earlier claim at that value, still running all that while, would
+  finalize the later one: this needs the reset and a stuck attempt that outlives as
+  many claims of its job, and is accepted rather than adding the attempt number to the
+  finalize. A fence passed outside hopper only increases once every client runs this
+  release.
 - **Plan stability.** Drivers cache prepared statements, and Postgres keeps a
   statement's generic plan until something invalidates it. A plan made while
   `hopper_jobs` was empty (an idle queue, drained and vacuumed to zero pages) costs every
