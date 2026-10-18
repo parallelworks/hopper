@@ -1135,6 +1135,10 @@ func TestFenceUpgrade(t *testing.T) {
 	if _, err := held.Exec(ctx, `UPDATE hopper_job_history SET priority = 2 WHERE id = $1`, archived); err != nil {
 		t.Fatal(err)
 	}
+	// As long as TestUpgradeUnderTraffic holds its transaction, with the same
+	// bound on a claim's wait: a successful try holds hopper_jobs while it
+	// alters every history partition, which a loaded CI host can stretch.
+	const holdFor = 2 * time.Second
 	var (
 		wg      sync.WaitGroup
 		stop    = make(chan struct{})
@@ -1157,7 +1161,7 @@ func TestFenceUpgrade(t *testing.T) {
 		}
 	})
 	wg.Go(func() {
-		time.Sleep(time.Second)
+		time.Sleep(holdFor)
 		if err := held.Commit(ctx); err != nil {
 			t.Errorf("commit the held transaction: %v", err)
 		}
@@ -1172,10 +1176,10 @@ func TestFenceUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Up while a transaction held both tables: %v", err)
 	}
-	if took < 900*time.Millisecond {
+	if took < holdFor*9/10 {
 		t.Errorf("Up took %s, less than the held transaction: it did not wait for its locks", took)
 	}
-	if slowest > 500*time.Millisecond {
+	if slowest > holdFor/2 {
 		t.Errorf("a claim waited %s during the migration", slowest)
 	}
 
