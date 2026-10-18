@@ -743,7 +743,9 @@ func TestRescuedAttemptsResultSkipsTheNextClaim(t *testing.T) {
 		switch job.Attempt {
 		case 1:
 			<-first // ignores its context
-		case 2:
+		default:
+			// The second attempt, and any after it should a slow host let
+			// the second be rescued too: none completes before the check.
 			<-second
 		}
 		return hopper.SetOutput(ctx, job.Attempt)
