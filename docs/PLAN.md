@@ -1159,8 +1159,8 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   the commit.
 - **Progress.** `RecordStep` and `RecordCursor` write the job's `progress` column
   (`{"step", "cursor", "at"}`, the time `statement_timestamp()`) with one `UPDATE`
-  fenced like a finalize: `state = 'running'`, the attempt's client and its attempt
-  number. A fenced write changes nothing and returns `ErrJobFenced`. They run on the
+  fenced like a finalize: `state = 'running'`, the attempt's client and its claim's
+  fence. A fenced write changes nothing and returns `ErrJobFenced`. They run on the
   pool and are not batched: a step is long next to its write, and the write must be
   durable before the worker goes on. `RecordStepTx` and `RecordCursorTx` run the same
   statement through `Driver.UnwrapTx(tx)`, so the progress commits with the step's

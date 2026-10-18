@@ -162,3 +162,29 @@ func testRescueRacesReclaim[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatalf("after the rescue: %+v", j)
 	}
 }
+
+// testRecordProgressFencesSnooze snoozes a job and has the same client claim
+// it again, at the same attempt number. A progress write of the first claim
+// must not land on the second.
+func testRecordProgressFencesSnooze[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+	clientID := register(ctx, t, exec)
+	first := claimOne(ctx, t, exec, clientID, id)
+	finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: first.Fence, State: driver.JobStateScheduled, Snooze: true, Delay: time.Hour})
+	f.MakeClaimable(ctx, t, d, id)
+	second := claimOne(ctx, t, exec, clientID, id)
+	if second.Attempt != first.Attempt || second.Fence == first.Fence {
+		t.Fatalf("claims: attempt %d fence %d, then attempt %d fence %d", first.Attempt, first.Fence, second.Attempt, second.Fence)
+	}
+	p, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Fence: first.Fence, Step: "stale"})
+	if err != nil || p != nil {
+		t.Fatalf("the first claim's progress write = %+v, %v; want it fenced", p, err)
+	}
+	p, err = exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Fence: second.Fence, Step: "current"})
+	if err != nil || p == nil || p.Step != "current" {
+		t.Fatalf("the second claim's progress write = %+v, %v", p, err)
+	}
+}

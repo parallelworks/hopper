@@ -206,7 +206,7 @@ func record[T JobArgs](ctx context.Context, job *Job[T], txExec func() (driver.E
 	// and a write on the pool would wait for the worker itself.
 	noWait := txExec == nil && a.txHeld()
 	p, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{
-		ID: job.ID, AttemptedBy: a.completion.AttemptedBy, Attempt: a.attempt,
+		ID: job.ID, AttemptedBy: a.completion.AttemptedBy, Fence: a.completion.Fence,
 		Step: step, KeepStep: keepStep, Cursor: raw, NoWait: noWait,
 	})
 	if errors.Is(err, driver.ErrJobLocked) {

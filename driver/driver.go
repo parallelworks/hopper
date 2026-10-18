@@ -148,8 +148,8 @@ type Executor interface {
 	// returned, and the caller treats the rest as fenced.
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
 	// JobRecordProgress stores a running job's progress, fenced like a
-	// finalize: only while the job is running in the given attempt of the
-	// given client. It returns the progress as stored, or nil if the attempt
+	// finalize: only while the job is running in the given claim, by the
+	// given client at the given fence. It returns the progress as stored, or nil if the attempt
 	// no longer owns the job.
 	JobRecordProgress(ctx context.Context, params JobRecordProgressParams) (*Progress, error)
 	// JobGet returns a job by ID, live or from history.
@@ -477,10 +477,10 @@ type JobRetryParams struct {
 // JobRecordProgressParams is a running job's new progress.
 type JobRecordProgressParams struct {
 	ID JobID
-	// AttemptedBy and Attempt identify the attempt, which must still own
-	// the job.
+	// AttemptedBy and Fence identify the attempt's claim, which must
+	// still own the job.
 	AttemptedBy int64
-	Attempt     int
+	Fence       int64
 	// Step is the last step finished. With KeepStep the stored step is
 	// kept and Step is ignored.
 	Step     string

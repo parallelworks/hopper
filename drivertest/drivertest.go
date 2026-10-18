@@ -97,6 +97,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"ClaimFence", testClaimFence[TTx]},
 		{"FinalizeFencesReclaim", testFinalizeFencesReclaim[TTx]},
 		{"RescueRacesReclaim", testRescueRacesReclaim[TTx]},
+		{"RecordProgressFencesSnooze", testRecordProgressFencesSnooze[TTx]},
 		{"FinalizeTx", testFinalizeTx[TTx]},
 		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},

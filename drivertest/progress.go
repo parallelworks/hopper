@@ -47,7 +47,7 @@ func testJobRecordProgress[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("progress before any = %+v", p)
 	}
 	// A cursor is stored as given, a null within it included.
-	got := record(exec, driver.JobRecordProgressParams{Attempt: 1, Step: "download", Cursor: json.RawMessage(`{"page": 2, "etag": null}`)})
+	got := record(exec, driver.JobRecordProgressParams{Fence: 1, Step: "download", Cursor: json.RawMessage(`{"page": 2, "etag": null}`)})
 	if got == nil || got.Step != "download" || string(got.Cursor) != `{"etag": null, "page": 2}` || got.RecordedAt.IsZero() {
 		t.Fatalf("recorded = %+v", got)
 	}
@@ -55,24 +55,24 @@ func testJobRecordProgress[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("JobGet progress = %+v, want %+v", p, got)
 	}
 	// A cursor alone keeps the step, and no cursor clears it.
-	if got := record(exec, driver.JobRecordProgressParams{Attempt: 1, KeepStep: true, Step: "ignored", Cursor: json.RawMessage(`3`)}); got == nil || got.Step != "download" || string(got.Cursor) != "3" {
+	if got := record(exec, driver.JobRecordProgressParams{Fence: 1, KeepStep: true, Step: "ignored", Cursor: json.RawMessage(`3`)}); got == nil || got.Step != "download" || string(got.Cursor) != "3" {
 		t.Errorf("cursor kept the step: %+v", got)
 	}
-	if got := record(exec, driver.JobRecordProgressParams{Attempt: 1, KeepStep: true}); got == nil || got.Step != "download" || got.Cursor != nil {
+	if got := record(exec, driver.JobRecordProgressParams{Fence: 1, KeepStep: true}); got == nil || got.Step != "download" || got.Cursor != nil {
 		t.Errorf("cursor cleared: %+v", got)
 	}
 	// Fenced: another client, another attempt.
-	if got := record(exec, driver.JobRecordProgressParams{AttemptedBy: clientID + 1, Attempt: 1, Step: "x"}); got != nil {
+	if got := record(exec, driver.JobRecordProgressParams{AttemptedBy: clientID + 1, Fence: 1, Step: "x"}); got != nil {
 		t.Errorf("another client recorded %+v", got)
 	}
-	if got := record(exec, driver.JobRecordProgressParams{Attempt: 2, Step: "x"}); got != nil {
+	if got := record(exec, driver.JobRecordProgressParams{Fence: 2, Step: "x"}); got != nil {
 		t.Errorf("another attempt recorded %+v", got)
 	}
 
 	// In a caller's transaction: kept only if it commits.
 	for _, commitTx := range []bool{false, true} {
 		tx, commit, rollback := f.Begin(ctx, t, d)
-		record(d.UnwrapTx(tx), driver.JobRecordProgressParams{Attempt: 1, Step: "load"})
+		record(d.UnwrapTx(tx), driver.JobRecordProgressParams{Fence: 1, Step: "load"})
 		end := rollback
 		if commitTx {
 			end = commit
@@ -88,14 +88,14 @@ func testJobRecordProgress[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	// A retry keeps it, and the next attempt can record.
 	finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
-	if got := record(exec, driver.JobRecordProgressParams{Attempt: 1, Step: "x"}); got != nil {
+	if got := record(exec, driver.JobRecordProgressParams{Fence: 1, Step: "x"}); got != nil {
 		t.Errorf("recorded on a job that is not running: %+v", got)
 	}
 	jobs := claim(ctx, t, exec, clientID, 1)
 	if len(jobs) != 1 || jobs[0].Progress == nil || jobs[0].Progress.Step != "load" {
 		t.Fatalf("claimed after retry: %+v", jobs)
 	}
-	record(exec, driver.JobRecordProgressParams{Attempt: 2, Step: "notify", Cursor: json.RawMessage(`"c"`)})
+	record(exec, driver.JobRecordProgressParams{Fence: 2, Step: "notify", Cursor: json.RawMessage(`"c"`)})
 
 	// History keeps it, and a JobRetry brings it back.
 	finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true, Error: &driver.AttemptError{Attempt: 2, Error: "x"}})
@@ -131,7 +131,7 @@ func testJobRecordProgressRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 	id := inserted[0].Job.ID
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already ended on the happy path
-	if p, err := d.UnwrapTx(tx).JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Attempt: 1, Step: "a"}); err != nil || p == nil {
+	if p, err := d.UnwrapTx(tx).JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Fence: 1, Step: "a"}); err != nil || p == nil {
 		t.Fatalf("record in tx = %+v, %v", p, err)
 	}
 	done := make(chan []driver.JobID, 1)
@@ -166,7 +166,7 @@ func testJobRecordProgressRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	recorded := make(chan *driver.Progress, 1)
 	go func() {
-		p, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Attempt: 1, Step: "b"})
+		p, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, AttemptedBy: clientID, Fence: 1, Step: "b"})
 		if err != nil {
 			t.Error(err)
 		}
@@ -198,7 +198,7 @@ func testJobProgressReset[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal("claim")
 	}
 	for _, r := range inserted {
-		if got, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: r.Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "a"}); err != nil || got == nil {
+		if got, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: r.Job.ID, AttemptedBy: clientID, Fence: 1, Step: "a"}); err != nil || got == nil {
 			t.Fatalf("record = %+v, %v", got, err)
 		}
 	}
@@ -214,17 +214,17 @@ func testJobProgressReset[TTx any](t *testing.T, f Fixture[TTx]) {
 	// NoWait fails at once on a row another transaction holds.
 	tx, _, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already ended on the happy path
-	if got, err := d.UnwrapTx(tx).JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "b"}); err != nil || got == nil {
+	if got, err := d.UnwrapTx(tx).JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Fence: 1, Step: "b"}); err != nil || got == nil {
 		t.Fatalf("record in tx = %+v, %v", got, err)
 	}
 	start := time.Now()
-	if _, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "c", NoWait: true}); !errors.Is(err, driver.ErrJobLocked) || time.Since(start) > 5*time.Second {
+	if _, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Fence: 1, Step: "c", NoWait: true}); !errors.Is(err, driver.ErrJobLocked) || time.Since(start) > 5*time.Second {
 		t.Errorf("NoWait on a held row = %v after %s, want ErrJobLocked at once", err, time.Since(start))
 	}
 	if err := rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "c", NoWait: true}); err != nil || got == nil || got.Step != "c" {
+	if got, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Fence: 1, Step: "c", NoWait: true}); err != nil || got == nil || got.Step != "c" {
 		t.Errorf("NoWait on a free row = %+v, %v", got, err)
 	}
 
@@ -241,7 +241,7 @@ func testJobProgressReset[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 
 	// JobRetry keeps progress; FromStart clears it, live and from history.
-	if _, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Attempt: 1, Step: "d"}); err != nil {
+	if _, err := exec.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: inserted[1].Job.ID, AttemptedBy: clientID, Fence: 1, Step: "d"}); err != nil {
 		t.Fatal(err)
 	}
 	finalize(ctx, t, exec, driver.JobFinalize{ID: inserted[1].Job.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
