@@ -323,7 +323,43 @@ func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertPa
 
 const workflowSteps = 10
 
-const drainStall = 2 * time.Minute
+const (
+	drainStall       = 2 * time.Minute
+	drainStopTimeout = 30 * time.Second
+)
+
+func stopAll(ctx context.Context, cs []*hopper.Client[pgx.Tx]) {
+	ctx, cancel := context.WithTimeout(ctx, drainStopTimeout)
+	defer cancel()
+	for _, c := range cs {
+		if c != nil {
+			_ = c.Stop(ctx)
+		}
+	}
+}
+
+func (b *bench) waitDrained(ctx context.Context) error {
+	last, changed := -1, time.Now()
+	for {
+		var live int
+		if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_jobs").Scan(&live); err != nil {
+			return err
+		}
+		if live == 0 {
+			return nil
+		}
+		if live != last {
+			last, changed = live, time.Now()
+		} else if time.Since(changed) > drainStall {
+			var states string
+			if err := b.pool.QueryRow(ctx, "SELECT coalesce(string_agg(state || ' ' || n, ', '), 'none') FROM (SELECT state::text, count(*) AS n FROM hopper_jobs GROUP BY state) s").Scan(&states); err != nil {
+				return err
+			}
+			return fmt.Errorf("no progress for %s with %d jobs left: %s", drainStall, live, states)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
 
 func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
 	n := jobs / workflowSteps
@@ -348,7 +384,7 @@ func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
 	}
 	var outputs, open int
 	if err := b.pool.QueryRow(ctx, `SELECT
-		(SELECT count(*) FROM hopper_job_history WHERE kind = 'bench' AND output IS NOT NULL),
+		(SELECT count(*) FROM hopper_job_history WHERE batch_id IS NOT NULL AND kind = 'bench' AND output IS NOT NULL),
 		(SELECT count(*) FROM hopper_batches WHERE completed_at IS NULL)`).Scan(&outputs, &open); err != nil {
 		return result{}, err
 	}
@@ -382,6 +418,8 @@ func outputWorker(ctx context.Context, job *hopper.Job[benchArgs]) error {
 	return hopper.SetOutput(ctx, benchOutput{N: job.Args.N, Artifact: "bench/" + strconv.Itoa(job.Args.N)})
 }
 
+// fanOut runs fn over [0, n) in chunks from eight inserters, as an application
+// with several replicas would; the first error cancels the rest.
 func fanOut(ctx context.Context, n, chunk int, fn func(ctx context.Context, lo, hi int) error) error {
 	const inserters = 8
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -428,43 +466,18 @@ func (b *bench) drainLoaded(ctx context.Context, name string, jobs int, load fun
 		}
 		cs[i] = c
 	}
-	var started []*hopper.Client[pgx.Tx]
-	defer func() {
-		for _, c := range started {
-			_ = c.Stop(ctx)
-		}
-	}()
+	defer stopAll(ctx, cs)
 	start := time.Now()
 	for _, c := range cs {
 		if err := c.Start(ctx); err != nil {
 			return result{}, err
 		}
-		started = append(started, c)
 	}
-	last, changed := -1, time.Now()
-	for {
-		var live int
-		if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_jobs").Scan(&live); err != nil {
-			return result{}, err
-		}
-		if live == 0 {
-			break
-		}
-		if live != last {
-			last, changed = live, time.Now()
-		} else if time.Since(changed) > drainStall {
-			var states string
-			if err := b.pool.QueryRow(ctx, "SELECT string_agg(state || ' ' || n, ', ') FROM (SELECT state::text, count(*) AS n FROM hopper_jobs GROUP BY state) s").Scan(&states); err != nil {
-				return result{}, err
-			}
-			return result{}, fmt.Errorf("no progress for %s with %d jobs left: %s", drainStall, live, states)
-		}
-		time.Sleep(20 * time.Millisecond)
+	if err := b.waitDrained(ctx); err != nil {
+		return result{}, err
 	}
 	elapsed := time.Since(start)
-	stopping := started
-	started = nil
-	for _, c := range stopping {
+	for _, c := range cs {
 		if err := c.Stop(ctx); err != nil {
 			return result{}, err
 		}
@@ -589,6 +602,7 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 		return nil
 	})
 	cs := make([]*hopper.Client[pgx.Tx], b.opts.clients)
+	defer stopAll(ctx, cs)
 	for i := range cs {
 		c, err := hopper.NewClient(b.d, &hopper.Config{
 			Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: b.opts.workers}},
@@ -598,11 +612,10 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 		if err != nil {
 			return result{}, err
 		}
+		cs[i] = c
 		if err := c.Start(ctx); err != nil {
 			return result{}, err
 		}
-		defer c.Stop(ctx) //nolint:errcheck // best effort
-		cs[i] = c
 	}
 	inserter, err := hopper.NewClient(b.d, &hopper.Config{Logger: b.logger})
 	if err != nil {
@@ -692,15 +705,8 @@ func (b *bench) loaded(ctx context.Context, rate int, duration time.Duration) (r
 		}
 	}
 	// Let the backlog drain before reading the samples.
-	for {
-		var live int
-		if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_jobs").Scan(&live); err != nil {
-			return result{}, err
-		}
-		if live == 0 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	if err := b.waitDrained(ctx); err != nil {
+		return result{}, err
 	}
 	elapsed := time.Since(start)
 	mu.Lock()
