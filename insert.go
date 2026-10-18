@@ -186,7 +186,7 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 	if kind == "" {
 		return driver.JobInsertParams{}, 0, fmt.Errorf("hopper: %T has an empty kind", p.Args)
 	}
-	if c.cfg.StrictKinds {
+	if c.cfg.StrictKinds && !p.anyKind {
 		if _, ok := c.workers.lookup(kind); !ok {
 			return driver.JobInsertParams{}, 0, &UnknownKindError{Kind: kind}
 		}

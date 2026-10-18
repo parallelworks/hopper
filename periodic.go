@@ -613,10 +613,14 @@ func (c *Client[TTx]) insertPeriodic(ctx context.Context, r *registeredPeriodic,
 // is the time a UniqueOpts.ByPeriod key is computed from, so that each slot
 // back-filled or retried keys its own period.
 func (c *Client[TTx]) periodicParams(p *PeriodicJob, slot time.Time) (driver.JobInsertParams, error) {
+	params, _, err := c.buildInsertParams(p.insertParams(), slot)
+	return params, err
+}
+
+func (p *PeriodicJob) insertParams() InsertParams {
 	var insertOpts *InsertOpts
 	if p.Opts != nil {
 		insertOpts = p.Opts.InsertOpts
 	}
-	params, _, err := c.buildInsertParams(InsertParams{Args: p.Args, Opts: insertOpts}, slot)
-	return params, err
+	return InsertParams{Args: p.Args, Opts: insertOpts}
 }

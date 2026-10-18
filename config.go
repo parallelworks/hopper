@@ -25,7 +25,7 @@ type Config struct {
 	// Periodic lists jobs inserted on a schedule by the leader. See Cron
 	// and Every. It is the initial set, which Client.PeriodicJobs changes
 	// at runtime. NewClient builds each job's insert and fails if it cannot
-	// be built; with StrictKinds, register their workers before NewClient.
+	// be built, apart from StrictKinds, which applies when each is inserted.
 	Periodic []PeriodicJob
 	// Middleware wraps job execution and inserts, outermost first.
 	Middleware []Middleware
