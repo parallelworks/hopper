@@ -151,10 +151,6 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		if len(candidates) == 0 {
 			return
 		}
-		jobs := make([]*driver.JobRow, len(candidates))
-		for i, cand := range candidates {
-			jobs[i] = cand.Job
-		}
 		// Finding our own jobs among the candidates, other than as stuck,
 		// means our lease has lapsed and the lease loop has not noticed
 		// yet. Fence first, so the jobs stop before they are handed back.
@@ -162,8 +158,8 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			c.fence(ctx, me)
 		}
 
-		fin := make([]driver.JobFinalize, len(jobs))
-		queueOf := make(map[JobID]string, len(jobs))
+		fin := make([]driver.JobFinalize, len(candidates))
+		queueOf := make(map[JobID]string, len(candidates))
 		noBatches := true
 		for i, cand := range candidates {
 			j := cand.Job
@@ -208,17 +204,17 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			retried++
 			queues[queueOf[id]] = struct{}{}
 		}
-		c.logger.WarnContext(ctx, "hopper: rescued jobs from lost clients", "retried", retried, "discarded", discarded, "dropped", len(jobs)-len(applied))
-		for _, j := range jobs {
-			if f, was := byID[j.ID]; was && slices.Contains(applied, j.ID) {
-				c.emit(EventJobRescued, j, f.Error.Error)
+		c.logger.WarnContext(ctx, "hopper: rescued jobs from lost clients", "retried", retried, "discarded", discarded, "dropped", len(candidates)-len(applied))
+		for _, cand := range candidates {
+			if f, was := byID[cand.Job.ID]; was && slices.Contains(applied, cand.Job.ID) {
+				c.emit(EventJobRescued, cand.Job, f.Error.Error)
 			}
 		}
 		for q := range queues {
 			c.wakeQueue(q)
 			c.notifier.mark(q)
 		}
-		if len(jobs) < c.tuning.rescueBatch {
+		if len(candidates) < c.tuning.rescueBatch {
 			return
 		}
 	}

@@ -1182,3 +1182,22 @@ func TestTagListingSnapshotSpansStatements(t *testing.T) {
 		t.Error("the job was not finalized during the listing")
 	}
 }
+
+// TestRescueCandidatesWithoutAttemptTime has a direct SQL write leave a
+// running row with no attempted_at and no live client. With StuckAfter the
+// rescuer still reads its batch, the row in it, reported as not stuck,
+// rather than failing the scan of a NULL stuck flag on every pass.
+func TestRescueCandidatesWithoutAttemptTime(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	if _, err := exec.JobInsertMany(ctx, insertParams("k", 1), driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool().Exec(ctx, `UPDATE hopper_jobs SET state = 'running', attempt = 1`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := exec.JobRescueCandidates(ctx, driver.JobRescueParams{StuckAfter: time.Minute, Limit: 10})
+	if err != nil || len(got) != 1 || got[0].Stuck {
+		t.Fatalf("candidates = %+v, %v; want the row, not stuck", got, err)
+	}
+}

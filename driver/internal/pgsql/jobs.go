@@ -1771,10 +1771,11 @@ func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 // jobRescueSQL finds running jobs whose client has no live lease, plus jobs
 // running longer than a stuck threshold, which it reports as stuck by
 // database time. It walks the running index, which is bounded by total
-// concurrency.
+// concurrency. A running row without attempted_at, which only a direct SQL
+// write leaves, is not stuck: a NULL flag would fail the scan of the batch.
 var jobRescueQuery = fmt.Sprintf(`
 SELECT * FROM (
-  SELECT %s, ($1::float8 > 0 AND j.attempted_at < now() - make_interval(secs => $1::float8)) AS stuck
+  SELECT %s, coalesce($1::float8 > 0 AND j.attempted_at < now() - make_interval(secs => $1::float8), false) AS stuck
   FROM {{schema}}.hopper_jobs j
   WHERE j.state = 'running'
 ) j
