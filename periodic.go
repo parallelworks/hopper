@@ -500,23 +500,20 @@ func (c *Client[TTx]) startPeriodic(ctx context.Context, r *registeredPeriodic, 
 	if p.Opts != nil {
 		opts = *p.Opts
 	}
-	// A schedule with no recorded slot starts fresh.
-	next := p.Schedule.Next(now)
+	// A schedule with no recorded slot starts fresh. The missed slots end at
+	// the latest one not after now, so either way the next slot is the one
+	// after now.
 	if last, known := lastSlots[p.Name]; known {
-		missed := c.missedSlots(p, last, now)
-		for _, slot := range missed {
+		for _, slot := range c.missedSlots(p, last, now) {
 			if !c.insertPeriodic(ctx, r, slot) {
 				return time.Time{}, false
 			}
-		}
-		if len(missed) > 0 {
-			next = p.Schedule.Next(missed[len(missed)-1])
 		}
 	}
 	if opts.RunOnStart && !c.insertPeriodic(ctx, r, now) {
 		return time.Time{}, false
 	}
-	return next, true
+	return p.Schedule.Next(now), true
 }
 
 // missedSlots returns the slots of a job after last and not after now that
