@@ -220,6 +220,7 @@ func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.
 		State:       hopper.JobStateRunning,
 		Priority:    int(hopper.PriorityNormal),
 		Attempt:     1,
+		Fence:       1,
 		MaxAttempts: hopper.DefaultMaxAttempts,
 		ScheduledAt: now,
 		AttemptedAt: now,
