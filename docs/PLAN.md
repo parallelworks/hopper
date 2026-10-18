@@ -137,13 +137,22 @@ stored under the old kind still run while the new one is inserted. The alias liv
 the args, beside `Kind`, and is resolved only in the registry, when a job is worked
 (and by `StrictKinds`, which accepts an aliased kind). Claiming selects by queue, never
 by kind, so nothing in the database changes: a job keeps its stored kind through
-retries and snoozes, and that is `job.Kind`. An alias that is empty, repeated, or
-another registered kind or alias panics, and a rejected registration adds none of its
-names. Everything that keys on the stored kind keeps doing so: a unique key does not
-match across the old and new kinds, so a duplicate can be inserted during the rename;
-`JobFilter.Kinds` and the UI list each kind by its own name; and a periodic job's
-default name is its kind, so one renamed without a `Name` starts a new schedule.
-Ordering keys and limits are per queue and do not see kinds.
+retries and snoozes, and that is `job.Kind`. An alias that is empty, repeated, the
+args' own kind, or another registered kind or alias panics, and a rejected
+registration adds none of its names. Everything that keys on the stored kind keeps
+doing so: a unique key does not match across the old and new kinds, so a duplicate can
+be inserted during the rename; `JobFilter.Kinds` and the UI list each kind by its own
+name; middleware, `OnError` and `hopperotel` see the stored kind, so spans and metrics
+carry both names until the old jobs are gone; and a periodic job's default name is its
+kind, so one renamed without a `Name` starts a new schedule. Ordering keys and limits
+are per queue and do not see kinds.
+
+In a rolling deploy, a client of the previous release has no worker for the new kind,
+so a job of it that client claims fails with `UnknownKindError` and uses an attempt (a
+job on its last attempt is discarded). A rename that must not spend attempts takes two
+releases: the first keeps the old `Kind` and adds the new kind as its alias, and the
+second, once no client runs an older release, swaps them. A job of the old kind kept in
+history fails the same way if `JobRetry` re-drives it after the alias is removed.
 
 A worker whose work is in the same database can complete its job in the same
 transaction, so the job runs exactly once even if the process dies right after:

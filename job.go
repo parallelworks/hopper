@@ -26,7 +26,8 @@ type JobArgsWithInsertOpts interface {
 // KindAliases returns the earlier kinds, and the worker registered for the
 // args also works jobs stored under them. A job keeps the kind it was
 // inserted with, and unique keys, periodic job names and job filters match
-// that stored kind. An alias must not be another registered kind or alias.
+// that stored kind. An alias must not be empty, repeated, the args' own kind,
+// or another registered kind or alias.
 type JobArgsWithKindAliases interface {
 	JobArgs
 	KindAliases() []string

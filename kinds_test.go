@@ -31,6 +31,7 @@ type (
 	aliasesItself struct{}
 	aliasesTwice  struct{}
 	aliasesEmpty  struct{}
+	ptrAliases    struct{}
 	fresh         struct{}
 )
 
@@ -45,7 +46,12 @@ func (aliasesTwice) Kind() string           { return "d" }
 func (aliasesTwice) KindAliases() []string  { return []string{"x", "x"} }
 func (aliasesEmpty) Kind() string           { return "e" }
 func (aliasesEmpty) KindAliases() []string  { return []string{""} }
+func (ptrAliases) Kind() string             { return "p" }
+func (*ptrAliases) KindAliases() []string   { return []string{"noop"} }
 func (fresh) Kind() string                  { return "fresh" }
+func (fresh) KindAliases() []string {
+	return []string{"a", "b", "c", "d", "e", "p", "x"}
+}
 
 func TestWorkersRejectKindAliasCollisions(t *testing.T) {
 	t.Parallel()
@@ -80,8 +86,17 @@ func TestWorkersRejectKindAliasCollisions(t *testing.T) {
 	panics("empty alias", func() {
 		hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[aliasesEmpty]) error { return nil })
 	})
+	// KindAliases with a pointer receiver is read too, not dropped.
+	panics("alias with a pointer receiver", func() {
+		hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[ptrAliases]) error { return nil })
+	})
 
 	// A rejected registration leaves none of its names behind.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("a rejected registration left a name behind: %v", r)
+		}
+	}()
 	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[fresh]) error { return nil })
 }
 
@@ -120,9 +135,11 @@ func TestKindAliasWorksJobsOfTheOldKind(t *testing.T) {
 		}
 	}
 
-	// StrictKinds accepts the old kind, since a worker here works it.
+	// StrictKinds accepts the old kind, since a worker here works it. The
+	// job goes to a queue c does not work, so c cannot send it to got
+	// ahead of the inline Work below.
 	strict := h.client(&hopper.Config{Workers: workers, StrictKinds: true})
-	if _, err := strict.Insert(ctx, sendMail{}, nil); err != nil {
+	if _, err := strict.Insert(ctx, sendMail{}, &hopper.InsertOpts{Queue: "unworked"}); err != nil {
 		t.Errorf("StrictKinds rejected an aliased kind: %v", err)
 	}
 	var unknown *hopper.UnknownKindError
@@ -130,7 +147,8 @@ func TestKindAliasWorksJobsOfTheOldKind(t *testing.T) {
 		t.Errorf("StrictKinds: err = %v", err)
 	}
 
-	// hoppertest's inline Work resolves aliases as the client does.
+	// Workers.Work, which hoppertest.Work calls, resolves aliases as the
+	// client does.
 	row := &hopper.JobRow{Kind: "mail", Args: []byte(`{"to":"inline@example.com"}`)}
 	if err := workers.Work(ctx, row, nil); err != nil {
 		t.Fatal(err)

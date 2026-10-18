@@ -168,6 +168,12 @@ across the two kinds, and filtering jobs by kind needs both names. A periodic
 job is named after its kind unless it has a `Name`; give it the old kind as
 its name to keep its schedule.
 
+In a rolling deploy, a process still on the previous release cannot work the
+new kind: a job of it that process claims fails and uses an attempt. To avoid
+that, rename in two releases: first keep `Kind` as `"send_mail"` and return
+`"send_email"` from `KindAliases`, then, once every process runs that release,
+swap them as above.
+
 ## Start a client
 
 ```go

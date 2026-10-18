@@ -59,7 +59,6 @@ type workUnit interface {
 
 type workerInfo struct {
 	kind    string
-	aliases []string
 	newUnit func(row *JobRow, codec Codec) (workUnit, error)
 }
 
@@ -75,15 +74,20 @@ func AddWorker[T JobArgs](workers *Workers, worker Worker[T]) {
 		panic(fmt.Sprintf("hopper: %T has an empty kind", zero))
 	}
 	var aliases []string
-	if a, ok := any(zero).(JobArgsWithKindAliases); ok {
+	a, ok := any(zero).(JobArgsWithKindAliases)
+	if !ok {
+		// A KindAliases with a pointer receiver is in the method set of *T
+		// only; without this its aliases would be dropped silently.
+		a, ok = any(&zero).(JobArgsWithKindAliases)
+	}
+	if ok {
 		aliases = a.KindAliases()
 		if slices.Contains(aliases, "") {
 			panic(fmt.Sprintf("hopper: %T has an empty kind alias", zero))
 		}
 	}
 	workers.add(&workerInfo{
-		kind:    kind,
-		aliases: aliases,
+		kind: kind,
 		newUnit: func(row *JobRow, codec Codec) (workUnit, error) {
 			var args T
 			if err := codec.Unmarshal(row.Args, &args); err != nil {
@@ -91,7 +95,7 @@ func AddWorker[T JobArgs](workers *Workers, worker Worker[T]) {
 			}
 			return &typedUnit[T]{worker: worker, job: &Job[T]{JobRow: row, Args: args}}, nil
 		},
-	})
+	}, aliases...)
 }
 
 // AddWorkFunc registers a function as the worker for the kind of T, with
@@ -103,13 +107,18 @@ func AddWorkFunc[T JobArgs](workers *Workers, fn func(ctx context.Context, job *
 	AddWorker(workers, workFunc[T](fn))
 }
 
-func (w *Workers) add(info *workerInfo) {
+// add registers info under its kind and each of aliases, or panics, adding
+// none of them, if one is already registered or repeated.
+func (w *Workers) add(info *workerInfo, aliases ...string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	kinds := append([]string{info.kind}, info.aliases...)
+	kinds := append([]string{info.kind}, aliases...)
 	for i, kind := range kinds {
 		if _, dup := w.kinds[kind]; dup || slices.Contains(kinds[:i], kind) {
-			panic(fmt.Sprintf("hopper: worker for kind %q registered twice", kind))
+			if i == 0 {
+				panic(fmt.Sprintf("hopper: worker for kind %q registered twice", kind))
+			}
+			panic(fmt.Sprintf("hopper: worker for kind %q registered twice (as a kind alias of %q)", kind, info.kind))
 		}
 	}
 	for _, kind := range kinds {
