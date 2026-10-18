@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -502,18 +503,29 @@ func (f *finalizer) followUp(ctx context.Context, finished []pending) {
 // not apply was fenced, or, for a job completed with CompleteTx, skipped
 // because the worker's transaction still held its row; the job's row tells
 // which.
+//
+// The statement returns the IDs it applied, and a batch can hold two
+// results of one job: a rescued attempt's late one and that of the claim
+// after it, on this client. At most one of them applied, and only the later
+// claim's can have, since a job's fence only increases: an applied ID counts
+// for its result with the greatest fence alone.
 func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []driver.JobID) []pending {
-	var ok map[driver.JobID]struct{}
+	var ok map[driver.JobID]int64
 	if len(applied) != len(batch) {
-		ok = make(map[driver.JobID]struct{}, len(applied))
+		ok = make(map[driver.JobID]int64, len(applied))
 		for _, id := range applied {
-			ok[id] = struct{}{}
+			ok[id] = math.MinInt64
+		}
+		for _, p := range batch {
+			if fence, was := ok[p.result.ID]; was && p.result.Fence > fence {
+				ok[p.result.ID] = p.result.Fence
+			}
 		}
 	}
 	var finished []pending
 	for _, p := range batch {
 		if ok != nil {
-			if _, was := ok[p.result.ID]; !was {
+			if fence, was := ok[p.result.ID]; !was || p.result.Fence != fence {
 				if p, done := f.notWritten(ctx, p); done {
 					finished = append(finished, p)
 				}

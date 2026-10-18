@@ -537,3 +537,45 @@ func (h dropCounter) Handle(_ context.Context, r slog.Record) error {
 }
 func (h dropCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h dropCounter) WithGroup(string) slog.Handler      { return h }
+
+// laterClaimExec reads its job running in a later claim than the results it
+// is given.
+type laterClaimExec struct {
+	stubExec
+	job driver.JobRow
+}
+
+func (e *laterClaimExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error) {
+	j := e.job
+	return &j, nil
+}
+
+// A batch can hold a rescued attempt's late result and the result of the
+// claim after it, on the same client. The statement applies the later
+// claim's alone and returns the job's ID once: the late result is dropped,
+// not reported as applied, whichever comes first in the batch.
+func TestFinalizerAppliedIDCountsForTheLatestClaim(t *testing.T) {
+	id := driver.JobID{1}
+	exec := &laterClaimExec{job: driver.JobRow{ID: id, Queue: "default", State: driver.JobStateRunning, AttemptedBy: 7, Attempt: 2, Fence: 2}}
+	var got []driver.JobFinalize
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeBatch: 10, finalizeBuffer: 10}, 0, func(string) {},
+		func(_ *driver.JobRow, r driver.JobFinalize) { got = append(got, r) })
+	late := pending{
+		job:    &driver.JobRow{ID: id, Queue: "default", State: driver.JobStateRunning, AttemptedBy: 7, Attempt: 1, Fence: 1},
+		result: driver.JobFinalize{ID: id, AttemptedBy: 7, Fence: 1, State: driver.JobStateCompleted, Output: []byte(`1`)},
+	}
+	current := pending{
+		job:    &exec.job,
+		result: driver.JobFinalize{ID: id, AttemptedBy: 7, Fence: 2, State: driver.JobStateRetryable, Delay: time.Hour},
+	}
+	for _, batch := range [][]pending{{late, current}, {current, late}} {
+		got = nil
+		finished := f.afterFlush(context.Background(), batch, []driver.JobID{id})
+		if len(got) != 1 || got[0].Fence != 2 || got[0].State != driver.JobStateRetryable {
+			t.Errorf("batch with fences %d, %d: applied %+v; want the fence 2 result alone", batch[0].result.Fence, batch[1].result.Fence, got)
+		}
+		if len(finished) != 0 {
+			t.Errorf("batch with fences %d, %d: finished %+v; the job is retrying", batch[0].result.Fence, batch[1].result.Fence, finished)
+		}
+	}
+}
