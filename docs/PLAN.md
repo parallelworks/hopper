@@ -1508,7 +1508,7 @@ start. `NewClient`, for
 `Config.Periodic`, and `Add` build each job's insert as `Insert` would and fail if it
 cannot be built, such as for invalid `InsertOpts`. `Add` also applies `StrictKinds`, as
 an `Insert` at that moment would; `NewClient` leaves it to each insert, since workers may
-be registered after it. A job's `UniqueOpts.ByPeriod` key is computed from its slot, so each
+be registered after it. A periodic job's `UniqueReplace` acts as `UniqueSkip`. A job's `UniqueOpts.ByPeriod` key is computed from its slot, so each
 back-filled or retried slot keys its own period. A `RunOnStart` insert whose reply is
 lost after it committed is inserted again when retried, since its slot is the database
 time of the try. A client

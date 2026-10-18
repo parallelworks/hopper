@@ -36,7 +36,7 @@ type UniqueOpts struct {
 	ByQueue bool
 	// ByPeriod includes the current time, truncated to this period, so that
 	// at most one job exists per period. For example 24 * time.Hour allows
-	// one job per UTC day.
+	// one job per UTC day. A periodic job's key uses its slot instead.
 	ByPeriod time.Duration
 	// OnConflict is what to do when the job exists.
 	OnConflict UniqueConflict

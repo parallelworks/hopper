@@ -49,7 +49,9 @@ type PeriodicOpts struct {
 	// Location evaluates a cron expression in this zone when the
 	// expression does not name one. Defaults to UTC.
 	Location *time.Location
-	// InsertOpts are applied to every inserted job.
+	// InsertOpts are applied to every inserted job. A UniqueOpts.OnConflict
+	// of UniqueReplace is treated as UniqueSkip: a slot whose job is a
+	// duplicate keeps the existing job.
 	InsertOpts *InsertOpts
 }
 
