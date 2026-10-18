@@ -1800,11 +1800,10 @@ the partition's extension lock, so the data volume has no size limit.
   tagged and retry-heavy workloads, a workflow workload (ten-step workflows, one step,
   then eight after it, then one after those, each step recording a small output, which
   measures the finalize tail, dependency promotion and output), the two insert paths,
-  pickup latency on an idle queue and
-  under a paced load (`loaded`, at `-rate` jobs/s), and `-history N` to preload history
-  rows. It warms up before measuring, because the first leader
-  election creates history partitions, which briefly blocks finalizes. Fan-out arrives
-  with messaging (M6).
+  pickup latency on an idle queue and under a paced load (`loaded`, at `-rate` jobs/s),
+  and `-history N` to preload history rows. It warms up before measuring, because the
+  first leader election creates history partitions, which briefly blocks finalizes.
+  Fan-out arrives with messaging (M6).
 - CI runs a reduced benchmark on every PR that touches the insert, claim or finalize
   paths, on the PR and on its base alternately on the same runner, scenario by scenario
   for several rounds, comparing the average of the faster half of each side's runs (noise

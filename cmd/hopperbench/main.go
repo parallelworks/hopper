@@ -23,7 +23,7 @@
 //	tagged      as throughput, with two tags on every job
 //	retry       as throughput, with every job failing its first attempt
 //	workflow    as throughput, in workflows of ten steps (one, then eight after it, then one after those),
-//	            each step recording a small output
+//	            each step recording a small output; -jobs is rounded down to a multiple of ten
 //	insert      InsertMany in batches of 100 (the unnest statement)
 //	copy        InsertMany in batches of 5000 (the COPY path)
 //	latency     commit-to-Work on an idle queue, local wake-up
@@ -323,36 +323,42 @@ func (b *bench) drain(ctx context.Context, name string, params []hopper.InsertPa
 
 const workflowSteps = 10
 
+const drainStall = 2 * time.Minute
+
 func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
 	n := jobs / workflowSteps
-	if n == 0 {
+	if n < 1 {
 		return result{}, fmt.Errorf("-jobs must be at least %d", workflowSteps)
 	}
 	load := func(inserter *hopper.Client[pgx.Tx]) error {
-		const inserters, perTx = 8, 100
-		var wg sync.WaitGroup
-		errs := make([]error, inserters)
-		for w := range inserters {
-			wg.Go(func() {
-				for first := w * perTx; first < n; first += inserters * perTx {
-					errs[w] = pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
-						for i := first; i < min(first+perTx, n); i++ {
-							if _, err := inserter.InsertWorkflowTx(ctx, tx, benchWorkflow(i)); err != nil {
-								return err
-							}
-						}
-						return nil
-					})
-					if errs[w] != nil {
-						return
+		return fanOut(ctx, n, 100, func(ctx context.Context, lo, hi int) error {
+			return pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
+				for i := lo; i < hi; i++ {
+					if _, err := inserter.InsertWorkflowTx(ctx, tx, benchWorkflow(i)); err != nil {
+						return err
 					}
 				}
+				return nil
 			})
-		}
-		wg.Wait()
-		return errors.Join(errs...)
+		})
 	}
-	return b.drainLoaded(ctx, "workflow", n*workflowSteps, load, outputWorker)
+	r, err := b.drainLoaded(ctx, "workflow", n*workflowSteps, load, outputWorker)
+	if err != nil {
+		return result{}, err
+	}
+	var outputs, open int
+	if err := b.pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM hopper_job_history WHERE kind = 'bench' AND output IS NOT NULL),
+		(SELECT count(*) FROM hopper_batches WHERE completed_at IS NULL)`).Scan(&outputs, &open); err != nil {
+		return result{}, err
+	}
+	if outputs != r.Jobs {
+		return result{}, fmt.Errorf("%d of %d jobs stored an output", outputs, r.Jobs)
+	}
+	if open != 0 {
+		return result{}, fmt.Errorf("%d of %d workflows not completed", open, n)
+	}
+	return r, nil
 }
 
 func benchWorkflow(i int) *hopper.Workflow {
@@ -367,8 +373,32 @@ func benchWorkflow(i int) *hopper.Workflow {
 	return wf
 }
 
+type benchOutput struct {
+	N        int    `json:"n"`
+	Artifact string `json:"artifact"`
+}
+
 func outputWorker(ctx context.Context, job *hopper.Job[benchArgs]) error {
-	return hopper.SetOutput(ctx, map[string]any{"n": job.Args.N, "artifact": "bench/" + strconv.Itoa(job.Args.N)})
+	return hopper.SetOutput(ctx, benchOutput{N: job.Args.N, Artifact: "bench/" + strconv.Itoa(job.Args.N)})
+}
+
+func fanOut(ctx context.Context, n, chunk int, fn func(ctx context.Context, lo, hi int) error) error {
+	const inserters = 8
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var wg sync.WaitGroup
+	for w := range inserters {
+		wg.Go(func() {
+			for lo := w * chunk; lo < n && ctx.Err() == nil; lo += inserters * chunk {
+				if err := fn(ctx, lo, min(lo+chunk, n)); err != nil {
+					cancel(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	return context.Cause(ctx)
 }
 
 func (b *bench) drainLoaded(ctx context.Context, name string, jobs int, load func(*hopper.Client[pgx.Tx]) error, work func(context.Context, *hopper.Job[benchArgs]) error) (result, error) {
@@ -398,12 +428,20 @@ func (b *bench) drainLoaded(ctx context.Context, name string, jobs int, load fun
 		}
 		cs[i] = c
 	}
+	var started []*hopper.Client[pgx.Tx]
+	defer func() {
+		for _, c := range started {
+			_ = c.Stop(ctx)
+		}
+	}()
 	start := time.Now()
 	for _, c := range cs {
 		if err := c.Start(ctx); err != nil {
 			return result{}, err
 		}
+		started = append(started, c)
 	}
+	last, changed := -1, time.Now()
 	for {
 		var live int
 		if err := b.pool.QueryRow(ctx, "SELECT count(*) FROM hopper_jobs").Scan(&live); err != nil {
@@ -412,10 +450,21 @@ func (b *bench) drainLoaded(ctx context.Context, name string, jobs int, load fun
 		if live == 0 {
 			break
 		}
+		if live != last {
+			last, changed = live, time.Now()
+		} else if time.Since(changed) > drainStall {
+			var states string
+			if err := b.pool.QueryRow(ctx, "SELECT string_agg(state || ' ' || n, ', ') FROM (SELECT state::text, count(*) AS n FROM hopper_jobs GROUP BY state) s").Scan(&states); err != nil {
+				return result{}, err
+			}
+			return result{}, fmt.Errorf("no progress for %s with %d jobs left: %s", drainStall, live, states)
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	elapsed := time.Since(start)
-	for _, c := range cs {
+	stopping := started
+	started = nil
+	for _, c := range stopping {
 		if err := c.Stop(ctx); err != nil {
 			return result{}, err
 		}
@@ -445,27 +494,14 @@ func (b *bench) insert(ctx context.Context, jobs, batch int) (result, error) {
 	}
 	defer c.Stop(ctx) //nolint:errcheck // flushes pending notifications
 	params := b.params(jobs, nil)
-	// Eight concurrent inserters, as an application with several replicas would have.
-	const inserters = 8
-	var wg sync.WaitGroup
-	errs := make([]error, inserters)
 	start := time.Now()
-	for w := range inserters {
-		wg.Go(func() {
-			for i := w * batch; i < len(params); i += inserters * batch {
-				if _, err := c.InsertMany(ctx, params[i:min(i+batch, len(params))]); err != nil {
-					errs[w] = err
-					return
-				}
-			}
-		})
-	}
-	wg.Wait()
+	err = fanOut(ctx, len(params), batch, func(ctx context.Context, lo, hi int) error {
+		_, err := c.InsertMany(ctx, params[lo:hi])
+		return err
+	})
 	elapsed := time.Since(start)
-	for _, err := range errs {
-		if err != nil {
-			return result{}, err
-		}
+	if err != nil {
+		return result{}, err
 	}
 	name := "insert"
 	if batch >= 256 {
