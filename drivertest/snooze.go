@@ -211,12 +211,12 @@ func testSnoozeReasonConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				results := make([]driver.JobFinalize, 0, 2*len(res.Jobs))
 				for i, j := range res.Jobs {
 					if (c+round+i)%3 == 0 {
-						results = append(results, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateRetryable})
+						results = append(results, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateRetryable})
 					} else {
 						reason := fmt.Sprintf("client %d claim %d", clientID, j.AttemptedAt.UnixMicro())
-						results = append(results, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateScheduled, Snooze: true, SnoozeReason: reason})
+						results = append(results, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateScheduled, Snooze: true, SnoozeReason: reason})
 					}
-					results = append(results, driver.JobFinalize{ID: j.ID, AttemptedBy: stale, State: driver.JobStateScheduled, Snooze: true, SnoozeReason: "stale"})
+					results = append(results, driver.JobFinalize{ID: j.ID, AttemptedBy: stale, Fence: j.Fence, State: driver.JobStateScheduled, Snooze: true, SnoozeReason: "stale"})
 				}
 				applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results})
 				if err != nil {

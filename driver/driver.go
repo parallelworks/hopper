@@ -133,7 +133,8 @@ type Executor interface {
 	// only for batches with no unique keys, and only if Capabilities().Copy.
 	JobInsertCopy(ctx context.Context, params []JobInsertParams, opts JobInsertOpts) ([]JobInsertResult, error)
 	// JobClaim atomically moves up to Limit claimable jobs in a queue to
-	// running, owned by ClientID, and returns them in claim order. With
+	// running, owned by ClientID with their fences incremented, and returns
+	// them in claim order. With
 	// Limited, the claim runs inside a transaction that locks the queue row
 	// and applies its global, rate and partition limits; the result then
 	// says how long to wait when the rate limit allowed nothing.
@@ -191,7 +192,8 @@ type Executor interface {
 	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)
 	// JobRescueCandidates returns running jobs whose owning client has no
 	// unexpired lease, plus, if StuckAfter is positive, running jobs claimed
-	// longer ago than that. The caller finalizes them.
+	// longer ago than that. The caller finalizes them, fenced to the claim
+	// each was found in.
 	JobRescueCandidates(ctx context.Context, params JobRescueParams) ([]*JobRow, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
@@ -405,7 +407,11 @@ type JobRow struct {
 	// AttemptedAt is the time of the latest claim, or zero if never claimed.
 	AttemptedAt time.Time
 	// AttemptedBy is the client ID holding the claim, or zero.
-	AttemptedBy  int64
+	AttemptedBy int64
+	// Fence numbers the job's claims: each claim increments it. Snoozes,
+	// retries, the archive and JobRetry keep it, so for a given job it
+	// never repeats. Zero means the job was never claimed.
+	Fence        int64
 	Args         json.RawMessage
 	Metadata     json.RawMessage
 	Errors       []AttemptError
@@ -491,7 +497,9 @@ type AttemptError struct {
 	// At is the database time at which the failure was recorded.
 	At      time.Time `json:"at"`
 	Attempt int       `json:"attempt"`
-	Error   string    `json:"error"`
+	// Fence is the fence of the claim whose attempt failed, or zero.
+	Fence int64  `json:"fence,omitempty"`
+	Error string `json:"error"`
 	// Trace is the stack trace when the attempt panicked.
 	Trace string `json:"trace,omitempty"`
 }
@@ -821,6 +829,8 @@ type JobFinalize struct {
 	// AttemptedBy is the client that claimed the attempt. The engine applies
 	// the result only if the job is still running and owned by this client.
 	AttemptedBy int64
+	// Fence is the fence of the attempt's claim.
+	Fence int64
 	// State is the state to move to: completed, canceled or discarded (the
 	// job moves to history) or retryable or scheduled (it stays live).
 	State JobState

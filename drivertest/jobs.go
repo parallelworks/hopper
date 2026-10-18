@@ -263,11 +263,11 @@ func testFinalizeSkipLocked[TTx any](t *testing.T, f Fixture[TTx], noBatches boo
 	tx, _, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // rolled back below
 	finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: held, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
-	failed := driver.JobFinalize{ID: held, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}}
+	failed := driver.JobFinalize{ID: held, AttemptedBy: clientID, Fence: 1, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}}
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	applied, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: []driver.JobFinalize{
-		failed, {ID: free, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+		failed, {ID: free, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true},
 	}})
 	if err != nil || !slices.Equal(applied, []driver.JobID{free}) {
 		t.Fatalf("finalize with a held row = %v, %v; want only %s", applied, err, free)
@@ -399,7 +399,7 @@ func testFinalizeTxConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		done := make(chan []driver.JobID, 1)
 		go func() {
 			applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-				{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}},
+				{ID: r.Job.ID, AttemptedBy: clientID, Fence: 1, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}},
 			}})
 			if err != nil {
 				t.Error(err)
@@ -667,7 +667,7 @@ func testRetryOrderingKeyConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		var wg sync.WaitGroup
 		wg.Go(func() { wakeKey(key) })
 		wg.Go(func() {
-			res := driver.JobFinalize{ID: job, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true}
+			res := driver.JobFinalize{ID: job, AttemptedBy: clientID, Fence: 1, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true}
 			if applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{res}}); err != nil || len(applied) != 1 {
 				t.Errorf("finalize = %v, %v", applied, err)
 			}

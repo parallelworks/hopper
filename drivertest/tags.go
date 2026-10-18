@@ -661,7 +661,7 @@ func testTagsRowsFollowJobs[TTx any](t *testing.T, f Fixture[TTx]) {
 			}
 			fin := make([]driver.JobFinalize, len(res.Jobs))
 			for k, j := range res.Jobs {
-				fin[k] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+				fin[k] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
 				switch (i + k) % 5 {
 				case 1:
 					fin[k].State, fin[k].Error = driver.JobStateDiscarded, &driver.AttemptError{Attempt: j.Attempt, Error: "x"}

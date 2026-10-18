@@ -33,7 +33,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 17
+	const latest = 18
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -1084,4 +1084,126 @@ func dbHour(ctx context.Context, t *testing.T, pool *pgxpool.Pool) time.Time {
 		t.Fatal(err)
 	}
 	return now.UTC().Truncate(time.Hour)
+}
+
+// TestFenceUpgrade upgrades to v18 with jobs the previous release left: a
+// waiting job, a running one, and one in history, which read fence 0. The
+// running job's result, fenced to fence 0, still applies; the others' first
+// claim is fence 1, also after a JobRetry from history. A claim waits at
+// most one short try of the migration's loop, which locks hopper_jobs and
+// then history, while a transaction that wrote both stays open.
+func TestFenceUpgrade(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	exec := d.Executor()
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 17}); err != nil {
+		t.Fatal(err)
+	}
+	q := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, query, args...); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	previous, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "previous-release", TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var waiting, running, archived driver.JobID
+	for _, id := range []*driver.JobID{&waiting, &running, &archived} {
+		if err := pool.QueryRow(ctx, `SELECT hopper_insert('k', '{}')`).Scan(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q(`UPDATE hopper_jobs SET state = 'running', attempt = 1, attempted_at = now(), attempted_by = $1 WHERE id = $2`, previous, running)
+	q(`WITH j AS (DELETE FROM hopper_jobs WHERE id = $1 RETURNING *)
+	   INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at,
+	     args, metadata, errors, await, created_at, finalized_at)
+	   SELECT id, seq, kind, queue, 'discarded', priority, 1, max_attempts, scheduled_at, args, metadata, errors, await, created_at, now() FROM j`, archived)
+
+	held, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Rollback(ctx) //nolint:errcheck // committed below
+	if _, err := held.Exec(ctx, `UPDATE hopper_jobs SET priority = 2 WHERE id = $1`, waiting); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := held.Exec(ctx, `UPDATE hopper_job_history SET priority = 2 WHERE id = $1`, archived); err != nil {
+		t.Fatal(err)
+	}
+	var (
+		wg      sync.WaitGroup
+		stop    = make(chan struct{})
+		slowest time.Duration
+	)
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+			start := time.Now()
+			if _, err := pool.Exec(ctx, `SELECT id FROM hopper_jobs WHERE state IN ('available', 'scheduled', 'retryable')
+			                             ORDER BY priority, scheduled_at, seq LIMIT 8 FOR UPDATE SKIP LOCKED`); err != nil {
+				t.Errorf("claim during the migration: %v", err)
+				return
+			}
+			slowest = max(slowest, time.Since(start))
+		}
+	})
+	wg.Go(func() {
+		time.Sleep(time.Second)
+		if err := held.Commit(ctx); err != nil {
+			t.Errorf("commit the held transaction: %v", err)
+		}
+	})
+	uctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	start := time.Now()
+	_, err = hoppermigrate.Up(uctx, d, &hoppermigrate.Options{Logger: logger})
+	took := time.Since(start)
+	close(stop)
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("Up while a transaction held both tables: %v", err)
+	}
+	if took < 900*time.Millisecond {
+		t.Errorf("Up took %s, less than the held transaction: it did not wait for its locks", took)
+	}
+	if slowest > 500*time.Millisecond {
+		t.Errorf("a claim waited %s during the migration", slowest)
+	}
+
+	for _, id := range []driver.JobID{waiting, running, archived} {
+		if j, err := exec.JobGet(ctx, id); err != nil || j.Fence != 0 {
+			t.Fatalf("job %s after the upgrade = %+v, %v; want fence 0", id, j, err)
+		}
+	}
+	applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+		{ID: running, AttemptedBy: previous, Fence: 0, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}},
+	}})
+	if err != nil || len(applied) != 1 {
+		t.Fatalf("finalize of the previous release's running job = %v, %v", applied, err)
+	}
+	if _, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: archived}); err != nil {
+		t.Fatal(err)
+	}
+	clientID, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 10})
+	if err != nil || len(claimed.Jobs) != 3 {
+		t.Fatalf("claim = %+v, %v", claimed, err)
+	}
+	for _, j := range claimed.Jobs {
+		if j.Fence != 1 {
+			t.Errorf("job %s claimed at fence %d, want 1", j.ID, j.Fence)
+		}
+	}
 }

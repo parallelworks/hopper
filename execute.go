@@ -129,7 +129,7 @@ func readTx(ctx context.Context, exec interface {
 
 // completedResult is the result of an attempt that succeeded.
 func completedResult(row *driver.JobRow, qcfg QueueConfig) driver.JobFinalize {
-	return driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy, State: driver.JobStateCompleted, Archive: !qcfg.DeleteCompleted}
+	return driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy, Fence: row.Fence, State: driver.JobStateCompleted, Archive: !qcfg.DeleteCompleted}
 }
 
 func (c *Client[TTx]) runWorker(ctx context.Context, row *driver.JobRow) (workUnit, error) {
@@ -190,9 +190,9 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 	if errors.As(err, &snooze) {
 		return snoozed(row, snooze.Duration, snooze.Reason)
 	}
-	f := driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy}
+	f := driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy, Fence: row.Fence}
 
-	attemptErr := &driver.AttemptError{Attempt: row.Attempt, Error: err.Error()}
+	attemptErr := &driver.AttemptError{Attempt: row.Attempt, Fence: row.Fence, Error: err.Error()}
 	var panicked *PanicError
 	if errors.As(err, &panicked) {
 		attemptErr.Trace = panicked.Stack
@@ -251,7 +251,7 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 // back.
 func snoozed(row *driver.JobRow, d time.Duration, reason string) driver.JobFinalize {
 	return driver.JobFinalize{
-		ID: row.ID, AttemptedBy: row.AttemptedBy, State: driver.JobStateScheduled,
+		ID: row.ID, AttemptedBy: row.AttemptedBy, Fence: row.Fence, State: driver.JobStateScheduled,
 		Delay: d, Snooze: true, SnoozeReason: reason,
 	}
 }

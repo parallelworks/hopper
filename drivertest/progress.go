@@ -125,7 +125,7 @@ func testJobRecordProgressRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 	if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
 		t.Fatal("claim")
 	}
-	lost := driver.JobFinalize{AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}}
+	lost := driver.JobFinalize{AttemptedBy: clientID, Fence: 1, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}}
 
 	// The progress write first: the finalize waits for it, and keeps it.
 	id := inserted[0].Job.ID

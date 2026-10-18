@@ -238,7 +238,7 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		return res.Promoted
 	}
 	completed := func(id driver.JobID) driver.JobFinalize {
-		return driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+		return driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true}
 	}
 
 	tx, commit, rollback := f.Begin(ctx, t, d)

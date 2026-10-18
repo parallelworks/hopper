@@ -36,10 +36,10 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		}
 		var results []driver.JobFinalize
 		for _, j := range jobs {
-			r := driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateRetryable}
+			r := driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateRetryable}
 			if j.ID == id {
 				r = result
-				r.ID, r.AttemptedBy = id, clientID
+				r.ID, r.AttemptedBy, r.Fence = id, clientID, j.Fence
 			}
 			results = append(results, r)
 		}
@@ -159,7 +159,7 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 		if snooze {
 			log := driver.AttemptLog{Attempt: 1, Log: "first snooze\n"}
 			if ids, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{
-				ID: id, AttemptedBy: owner, State: state, Snooze: true, Log: &log,
+				ID: id, AttemptedBy: owner, Fence: 1, State: state, Snooze: true, Log: &log,
 			}}}); err != nil || len(ids) != 1 {
 				t.Fatalf("round %d: first snooze = %v, %v", round, ids, err)
 			}
@@ -167,6 +167,10 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 			if jobs := claim(ctx, t, exec, owner, 1); len(jobs) != 1 || jobs[0].ID != id {
 				t.Fatal("claim after the snooze")
 			}
+		}
+		fence := int64(1)
+		if snooze {
+			fence = 2
 		}
 		const stale = 4
 		var wg sync.WaitGroup
@@ -177,7 +181,7 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 				by = owner + int64(i)*1000
 			}
 			wg.Go(func() {
-				r := driver.JobFinalize{ID: id, AttemptedBy: by, State: state, Delay: time.Hour, Snooze: snooze}
+				r := driver.JobFinalize{ID: id, AttemptedBy: by, Fence: fence, State: state, Delay: time.Hour, Snooze: snooze}
 				if !snooze {
 					r.Archive, r.Error = true, &driver.AttemptError{Attempt: 1, Error: "x"}
 					r.Log = &driver.AttemptLog{Attempt: 1, Log: fmt.Sprintf("client %d\n", by)}

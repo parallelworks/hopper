@@ -329,7 +329,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	sweep := func() driver.BatchSettleResult { t.Helper(); return settle() }
 	completed := func(id driver.JobID) driver.JobFinalize {
-		return driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+		return driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true}
 	}
 
 	batch := newBatch("pair", 2)
@@ -530,7 +530,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				}
 				results := make([]driver.JobFinalize, len(res.Jobs))
 				for i, j := range res.Jobs {
-					results[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: owner, State: driver.JobStateCompleted, Archive: true}
+					results[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: owner, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
 					if argsN(j) < wantFailed[j.Kind] {
 						results[i].State, results[i].Error = driver.JobStateDiscarded, &driver.AttemptError{Attempt: 1, Error: "x"}
 					}

@@ -11,7 +11,7 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing (also inside a caller's transaction), snooze reasons, leases, leader election, rescue candidates,
+// fencing to the claim (also inside a caller's transaction), snooze reasons, leases, leader election, rescue candidates,
 // cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
 // notifications and history maintenance. Engine-specific behavior, such as how partitions are managed,
 // belongs in the driver's own tests.
@@ -94,6 +94,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeFencesNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeFences(t, f, true) }},
 		{"FinalizeSkipLocked", func(t *testing.T, f Fixture[TTx]) { testFinalizeSkipLocked(t, f, false) }},
 		{"FinalizeSkipLockedNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeSkipLocked(t, f, true) }},
+		{"ClaimFence", testClaimFence[TTx]},
 		{"FinalizeTx", testFinalizeTx[TTx]},
 		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},
@@ -207,13 +208,38 @@ func claim(ctx context.Context, t *testing.T, exec driver.Executor, clientID int
 	return res.Jobs
 }
 
+// finalize applies results. A result without a Fence gets the job's current
+// one, as a client's result carries the fence of the claim it ran in; a test
+// of the fence sets it.
 func finalize(ctx context.Context, t *testing.T, exec driver.Executor, jobs ...driver.JobFinalize) []driver.JobID {
 	t.Helper()
+	jobs = withFences(ctx, t, exec, jobs)
 	applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: jobs})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return applied
+}
+
+// withFences returns jobs with the current fence of each job filled in where
+// a result has none.
+func withFences(ctx context.Context, t *testing.T, exec driver.Executor, jobs []driver.JobFinalize) []driver.JobFinalize {
+	t.Helper()
+	out := slices.Clone(jobs)
+	for i, f := range out {
+		if f.Fence != 0 {
+			continue
+		}
+		j, err := exec.JobGet(ctx, f.ID)
+		if errors.Is(err, driver.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[i].Fence = j.Fence
+	}
+	return out
 }
 
 // argsN reads the "i" field of a job's args, or -1.

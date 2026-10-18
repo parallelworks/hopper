@@ -43,7 +43,7 @@ import (
 func finishedColumns(errorsExpr, logsExpr, outputExpr, archiveExpr, stateExpr, doneChannelParam string) string {
 	return fmt.Sprintf(`j.id, j.seq, j.kind, j.queue, j.priority, j.attempt, j.max_attempts, j.scheduled_at, j.attempted_at,
     j.attempted_by, j.args, j.metadata, %s AS errors, j.unique_key, j.ordering_key, j.partition_key, j.batch_id,
-    j.expires_at, j.cancel_requested_at, j.await, j.created_at, j.progress, j.tags, %s AS logs, %s AS output, %s AS archive,
+    j.expires_at, j.cancel_requested_at, j.await, j.created_at, j.progress, j.tags, j.fence, %s AS logs, %s AS output, %s AS archive,
     %s AS final_state, CASE WHEN j.await THEN pg_notify(%s, j.id::text) END AS notified`,
 		errorsExpr, logsExpr, outputExpr, archiveExpr, stateExpr, doneChannelParam)
 }
@@ -61,7 +61,7 @@ func appendErrorSQL(message string) string {
 // finalized_at and output, as history rows scan.
 const finishedSelectColumns = `id, kind, queue, final_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
   attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id, expires_at,
-  cancel_requested_at, await, created_at, NULL::text AS snooze_reason, progress, tags, now() AS finalized_at, output`
+  cancel_requested_at, await, created_at, NULL::text AS snooze_reason, progress, tags, fence, now() AS finalized_at, output`
 
 // batchProgressSQL sums a batch's progress rows, joined LATERAL to a
 // relation that has the batch's id as id.
@@ -93,10 +93,10 @@ const archivedSQL = `archived AS (
   INSERT INTO {{schema}}.hopper_job_history (
     id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, attempted_at,
     attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, progress, tags, logs, finalized_at, output)
+    expires_at, cancel_requested_at, await, created_at, progress, tags, fence, logs, finalized_at, output)
   SELECT id, seq, kind, queue, final_state::{{schema}}.hopper_job_state, priority, attempt, max_attempts, scheduled_at, attempted_at,
     attempted_by, args, metadata, errors, unique_key, ordering_key, partition_key, batch_id,
-    expires_at, cancel_requested_at, await, created_at, progress, tags, logs, now(), output
+    expires_at, cancel_requested_at, await, created_at, progress, tags, fence, logs, now(), output
   FROM done WHERE archive
   RETURNING id
 )`

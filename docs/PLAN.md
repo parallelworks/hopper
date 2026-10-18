@@ -501,8 +501,9 @@ CREATE TABLE hopper_jobs (
   wake_requested_at   timestamptz,               -- JobRetryOrderingKey reached the job while it ran (schema v10); live table only
   progress            jsonb,                     -- last step finished, cursor and time (schema v15); kept in history
   logs                jsonb,                     -- the latest attempts' log lines (schema v16); kept in history
-  tags                jsonb                      -- array of strings, NULL for none (schema v17); kept in history, with the same CHECK
-    CHECK (jsonb_typeof(tags) = 'array' AND NOT jsonb_path_exists(tags, 'strict $[*] ? (@.type() != "string")')) NOT VALID
+  tags                jsonb,                     -- array of strings, NULL for none (schema v17); kept in history, with the same CHECK
+    CHECK (jsonb_typeof(tags) = 'array' AND NOT jsonb_path_exists(tags, 'strict $[*] ? (@.type() != "string")')) NOT VALID,
+  fence               bigint      NOT NULL DEFAULT 0  -- numbers the job's claims (schema v18, §7.3); kept in history
 ) WITH (fillfactor = 70);
 
 -- Claim path: the only index the hot query touches.
@@ -624,7 +625,8 @@ the whole queue nor a new index on the hot table. Schema v14 adds the history in
 declared and built the same way. Schema v15 adds `progress` to `hopper_jobs` and
 history (§7.5), and v16 adds `logs` the same way (§7.5). Schema v17 adds `tags` the
 same way, with `hopper_job_tags`, `hopper_job_history_tags` (whose time partitions the
-leader keeps with history's) and the triggers that maintain them (§7.2).
+leader keeps with history's) and the triggers that maintain them (§7.2). Schema v18
+adds `fence` to `hopper_jobs` and history (§7.3), in the loop v17's columns took.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -924,11 +926,24 @@ WITH c AS MATERIALIZED (
   ) cand
 )
 UPDATE hopper_jobs j
-SET state = 'running', attempt = attempt + 1, attempted_at = now(), attempted_by = $client
+SET state = 'running', attempt = attempt + 1, fence = fence + 1, attempted_at = now(), attempted_by = $client
 FROM c WHERE j.id = c.id AND c.n <= $n
 RETURNING j.*;
 ```
 
+- **Fence.** Every claim increments the job's `fence`, returned as `JobRow.Fence`, and
+  each result, progress write and rescue names the fence of the claim it belongs to
+  (§7.5). The attempt number cannot serve: a snooze gives it back, so the claim after
+  a snooze has the same number, and a job rescued while its client is alive
+  (`RescueStuckAfter`) can be claimed again by that same client. Snoozes, retries and
+  the archive keep the fence, and `JobRetry` carries it back from history, so for a
+  given job it never repeats; the error recorded for a failed attempt carries it too.
+  It is a counter on the row rather than a sequence, which would be a hotspot shared
+  by every claim and, cached per session, would not increase per job. `fence` has no
+  index, so the claim's update stays HOT. A client of the previous release claims
+  without incrementing it, archives a job with `fence` 0 and drops it in `JobRetry` from
+  history; the finalize fence still holds then, since it checks the client too, but a
+  fence passed outside hopper only increases once every client runs this release.
 - **Plan stability.** Drivers cache prepared statements, and Postgres keeps a
   statement's generic plan until something invalidates it. A plan made while
   `hopper_jobs` was empty (an idle queue, drained and vacuumed to zero pages) costs every
@@ -1023,7 +1038,7 @@ updated in place, a snooze with its reason. Terminal outcomes are moved to histo
 
 ```sql
 WITH r AS (SELECT * FROM unnest($ids, $attempted_by, $states, $delays, $snoozes, $errors, $outputs, $archives,
-                                 $snooze_reasons) AS r(...)),
+                                 $snooze_reasons, $fences) AS r(...)),
 retry AS (
   UPDATE hopper_jobs j SET state = r.state,
          scheduled_at = CASE WHEN j.wake_requested_at >= j.attempted_at THEN now() ELSE now() + r.delay END,
@@ -2082,11 +2097,11 @@ observability without new machinery.
   reports the partition, which it backs off and warns about, and goes on to the next.
   The migration's transaction is read committed, and keeps no snapshot between its statements, so the build never waits
   for it while it waits for the lock. A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v13 and v14
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9, v10, v15 to v18, and v13 and v14
   for the `SHARE` lock that declaring a history index takes, which finalizes wait for), because a lock
   request queued behind an open transaction on the table would hold up every claim
   behind it; claims wait at most one try at a time. A try that changes both `hopper_jobs`
-  and history (v17) locks them first, `hopper_jobs` before history, the order a finalize
+  and history (v17, v18) locks them first, `hopper_jobs` before history, the order a finalize
   takes them in: a finalize that has `hopper_jobs` and waits for history would otherwise
   hold up the try until its timeout, and under steady finalizes almost every try would
   fail that way. From v17 the short timeout is set inside the loop and restored after

@@ -132,9 +132,10 @@ func (c *Client[TTx]) resign(ctx context.Context) {
 
 // rescue moves running jobs whose client has lost its lease back to
 // retryable, or to discarded when they are out of attempts. The transition
-// goes through the same fenced finalize statement as a worker's result, so
-// a client that finalizes its own result first wins and the rescue of that
-// job is dropped.
+// goes through the same fenced finalize statement as a worker's result,
+// fenced to the claim each job was found in, so a client that finalizes its
+// own result first wins and the rescue of that job is dropped, even if the
+// job has been claimed again since.
 func (c *Client[TTx]) rescue(ctx context.Context) {
 	for {
 		jobs, err := c.exec.JobRescueCandidates(ctx, driver.JobRescueParams{
@@ -169,8 +170,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			f := driver.JobFinalize{
 				ID:          j.ID,
 				AttemptedBy: j.AttemptedBy,
+				Fence:       j.Fence,
 				State:       driver.JobStateRetryable,
-				Error:       &driver.AttemptError{Attempt: j.Attempt, Error: reason},
+				Error:       &driver.AttemptError{Attempt: j.Attempt, Fence: j.Fence, Error: reason},
 				Archive:     true,
 			}
 			if j.Attempt >= j.MaxAttempts {
