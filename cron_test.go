@@ -1,6 +1,7 @@
 package hopper_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -137,6 +138,7 @@ func TestPeriodicJobValidation(t *testing.T) {
 		"nil args":       {Workers: workers, Periodic: []hopper.PeriodicJob{hopper.Every(time.Second, nil, nil)}},
 		"duplicate name": {Workers: workers, Periodic: []hopper.PeriodicJob{hopper.Every(time.Second, noop{}, nil), hopper.Every(time.Minute, noop{}, nil)}},
 		"nil middleware": {Workers: workers, Middleware: []hopper.Middleware{nil}},
+		"bad insert":     {Workers: workers, Periodic: []hopper.PeriodicJob{hopper.Every(time.Second, noop{}, &hopper.PeriodicOpts{InsertOpts: &hopper.InsertOpts{Metadata: []byte("{")}})}},
 	} {
 		if _, err := hopper.NewClient(h.d, cfg); err == nil {
 			t.Errorf("%s: NewClient succeeded", name)
@@ -148,5 +150,20 @@ func TestPeriodicJobValidation(t *testing.T) {
 	}}
 	if _, err := hopper.NewClient(h.d, ok); err != nil {
 		t.Errorf("distinct names rejected: %v", err)
+	}
+
+	// Workers may be added after NewClient, so StrictKinds applies to each
+	// insert and to Add, not to Config.Periodic in NewClient.
+	strict := &hopper.Config{Workers: hopper.NewWorkers(), StrictKinds: true, Periodic: []hopper.PeriodicJob{hopper.Every(time.Second, noop{}, nil)}}
+	c, err := hopper.NewClient(h.d, strict)
+	if err != nil {
+		t.Fatalf("StrictKinds with a worker registered later: %v", err)
+	}
+	if err := c.PeriodicJobs().Add(hopper.Every(time.Second, noop{}, &hopper.PeriodicOpts{Name: "late"})); err == nil {
+		t.Error("Add of a kind with no worker succeeded under StrictKinds")
+	}
+	hopper.AddWorkFunc(strict.Workers, func(context.Context, *hopper.Job[noop]) error { return nil })
+	if err := c.PeriodicJobs().Add(hopper.Every(time.Second, noop{}, &hopper.PeriodicOpts{Name: "late"})); err != nil {
+		t.Errorf("Add after its worker was registered: %v", err)
 	}
 }

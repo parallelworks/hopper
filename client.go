@@ -30,6 +30,7 @@ type Client[TTx any] struct {
 	logger   *slog.Logger
 	workers  *Workers
 	notifier *notifier
+	periodic *PeriodicJobs
 
 	// clientID is the lease row ID while running. It changes if the lease is
 	// lost and re-registered.
@@ -109,6 +110,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		workers:     resolved.Workers,
 		leaderPoke:  make(chan struct{}, 1),
 		streamPoke:  make(chan struct{}, 1),
+		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, !resolved.leads()),
 		events:      newEventBus(),
 		running:     map[JobID]context.CancelCauseFunc{},
 		doneWaiters: map[JobID][]chan struct{}{},
@@ -116,6 +118,21 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 	if c.workers == nil {
 		c.workers = NewWorkers()
 	}
+	c.periodic.validate = func(p *PeriodicJob) error {
+		_, err := c.periodicParams(p, time.Now())
+		return err
+	}
+	// Workers may be added after NewClient, so StrictKinds is left to Add
+	// and to each insert. c is returned only once StrictKinds is restored,
+	// so an error or a panic here cannot leave a client without it.
+	strict := c.cfg.StrictKinds
+	c.cfg.StrictKinds = false
+	for _, r := range c.periodic.jobs {
+		if _, err := c.periodicParams(&r.job, time.Now()); err != nil {
+			return nil, fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
+		}
+	}
+	c.cfg.StrictKinds = strict
 	c.notifier = newNotifier(c.exec, c.logger, c.tuning.notifyInterval)
 	return c, nil
 }
@@ -188,7 +205,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	if c.caps.Listen {
 		c.listenWG.Go(func() { c.listenLoop(c.bgCtx) })
 	}
-	if !c.cfg.NeverLead {
+	if c.cfg.leads() {
 		c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
 	}
 	c.leaseWG.Go(func() { c.leaseLoop(c.bgCtx) })
