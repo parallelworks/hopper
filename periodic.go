@@ -35,7 +35,9 @@ type PeriodicOpts struct {
 	Name string
 	// RunOnStart inserts a job as soon as a leader starts scheduling the
 	// periodic job, at the start of its term or when the job is added on
-	// it, in addition to the regular slots.
+	// it, in addition to the regular slots. Its slot is the database time,
+	// so an insert that committed but reported an error, as when the
+	// connection drops before the reply, is inserted again when retried.
 	RunOnStart bool
 	// CatchUp inserts up to this many slots missed while no leader was
 	// running (for example during a full outage), oldest first, at most
@@ -202,9 +204,9 @@ func (c *Client[TTx]) PeriodicJobs() *PeriodicJobs {
 // if the job it inserts could not be built (as Insert would fail with its
 // args and InsertOpts), or if its name (PeriodicOpts.Name, or else the
 // args' kind) is already registered; to change a job, Remove it and Add it
-// again. A job added while this client is
-// leader is scheduled at once, as if the leader had just started: RunOnStart
-// inserts a job and CatchUp back-fills missed slots.
+// again. A job added while this client is leader is scheduled at once, as if
+// the leader had just started: RunOnStart inserts a job and CatchUp
+// back-fills missed slots.
 func (p *PeriodicJobs) Add(job PeriodicJob) error {
 	return p.AddMany([]PeriodicJob{job})
 }

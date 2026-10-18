@@ -24,7 +24,8 @@ type Config struct {
 	Workers *Workers
 	// Periodic lists jobs inserted on a schedule by the leader. See Cron
 	// and Every. It is the initial set, which Client.PeriodicJobs changes
-	// at runtime.
+	// at runtime. NewClient builds each job's insert and fails if it cannot
+	// be built; with StrictKinds, register their workers before NewClient.
 	Periodic []PeriodicJob
 	// Middleware wraps job execution and inserts, outermost first.
 	Middleware []Middleware
@@ -157,13 +158,13 @@ const (
 	DefaultStreamRetention    = 7 * 24 * time.Hour
 )
 
-// withDefaults validates cfg and fills in defaults. It does not modify cfg.
 // leads reports whether a client with this config competes for leadership:
 // one with no queues holds no lease, and so never leads.
 func (cfg *Config) leads() bool {
 	return !cfg.NeverLead && len(cfg.Queues) > 0
 }
 
+// withDefaults validates cfg and fills in defaults. It does not modify cfg.
 func (cfg *Config) withDefaults() (Config, error) {
 	var out Config
 	if cfg != nil {
