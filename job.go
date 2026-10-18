@@ -16,10 +16,25 @@ type JobArgs interface {
 }
 
 // JobArgsWithInsertOpts is implemented by args that carry per-kind insert
-// defaults. Options passed to Insert override them field by field.
+// defaults. Options passed to Insert override them field by field. Args are
+// inserted as values, so InsertOpts needs a value receiver to be seen.
 type JobArgsWithInsertOpts interface {
 	JobArgs
 	InsertOpts() InsertOpts
+}
+
+// JobArgsWithKindAliases is implemented by args whose kind was renamed.
+// KindAliases returns the earlier kinds, and the worker registered for the
+// args also works jobs stored under them, decoding their stored args into
+// these args, so the encoding must stay compatible. A job keeps the kind it
+// was inserted with, and unique keys, periodic job names and job filters
+// match that stored kind. KindAliases is read once, from the zero value, when
+// the worker is registered, so like Kind it must not depend on the value's
+// fields. An alias must not be empty, repeated, the args' own kind, or
+// another registered kind or alias.
+type JobArgsWithKindAliases interface {
+	JobArgs
+	KindAliases() []string
 }
 
 // Job is a claimed job with its decoded args.

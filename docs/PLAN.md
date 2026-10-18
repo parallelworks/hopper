@@ -131,6 +131,34 @@ hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[ResizeImag
 `http.Handle`. Calling `Insert` with an args type that has no registered worker on this
 client is allowed (another service may work it), but `Config.StrictKinds` rejects it.
 
+A kind is renamed with aliases: args that implement `KindAliases() []string`
+(`JobArgsWithKindAliases`) register their worker under each earlier kind too, so jobs
+stored under the old kind still run while the new one is inserted. The alias lives on
+the args, beside `Kind`, and is resolved only in the registry, when a job is worked
+(and by `StrictKinds`, which accepts an aliased kind). Claiming selects by queue, never
+by kind, so nothing in the database changes: a job keeps its stored kind through
+retries and snoozes, and that is `job.Kind`. The worker decodes the stored args into
+the new args type, so the rename must keep their encoding: with JSON, a field renamed
+at the same time decodes to its zero value, and the job runs with it. An alias that
+is empty, repeated, the args' own kind, or another registered kind or alias panics,
+and a rejected registration adds none of its names. Everything that keys on the stored
+kind keeps doing so: a unique key does not match across the old and new kinds, so a duplicate can
+be inserted during the rename; `JobFilter.Kinds` and the UI list each kind by its own
+name; middleware, `OnError` and `hopperotel` see the stored kind, so spans and metrics
+carry both names until the old jobs are gone; and a periodic job's default name is its
+kind, so one renamed without a `Name` starts a new schedule. Ordering keys and limits
+are per queue and do not see kinds.
+
+In a rolling deploy, a client of the previous release has no worker for the new kind,
+so a job of it that client claims fails with `UnknownKindError` and uses an attempt (a
+job on its last attempt is discarded). A rename that must not spend attempts takes two
+releases: the first keeps the old `Kind` and adds the new kind as its alias, and the
+second, once no client runs an older release, swaps them. A job of the old kind kept in
+history fails the same way if `JobRetry` re-drives it after the alias is removed, and
+so does a callback of the old kind that a batch or workflow still open when the alias
+is removed inserts on completion: the callback is stored with the batch, not as a job,
+so a search for jobs of the old kind does not find it.
+
 A worker whose work is in the same database can complete its job in the same
 transaction, so the job runs exactly once even if the process dies right after:
 
