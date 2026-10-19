@@ -997,9 +997,12 @@ RETURNING j.*;
   otherwise once a tenth of the table has changed but at most every thirty seconds: an
   analyze invalidates every connection's cached plans, and one in the middle of a burst
   cost a CPU-starved server a fifth of its throughput. The live tags table and
-  `hopper_job_deps` are kept the same way, with the server's sample size: until the
-  dependency table has statistics, the planner takes each lookup of a job's edges for a
-  two-hundredth of the table, and scans it instead. It never waits for a lock. Schema v6
+  `hopper_job_deps` are kept the same way, with the server's sample size, except that
+  the dependency table is analyzed on churn only until it has statistics, and then only
+  when its row count is off: until it has them, the planner takes each lookup of a job's
+  edges for a two-hundredth of the table, and scans it instead, while what it reads from
+  them (edges per job, dependents per job) does not change as workflows come and go, and
+  each analyze has every connection replan the finalize statement. It never waits for a lock. Schema v6
   also sets the table's autovacuum thresholds low with no cost delay.
 
 - **Batching.** A producer claims only when at least `min(MaxWorkers/4, free slots)`

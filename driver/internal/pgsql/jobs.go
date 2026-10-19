@@ -605,22 +605,22 @@ retry AS (
                            THEN r.snooze_reason END,
       wake_requested_at = NULL
   FROM r
-  WHERE j.id = r.id AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
+  WHERE j.id = r.id AND j.` + runningSQL + ` AND j.attempted_by = r.attempted_by AND j.fence = r.fence
     AND r.state IN ('retryable', 'scheduled')
   RETURNING j.id
 ),
 finished AS (
   DELETE FROM {{schema}}.hopper_jobs j
   USING r
-  WHERE j.id = r.id AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
+  WHERE j.id = r.id AND j.` + runningSQL + ` AND j.attempted_by = r.attempted_by AND j.fence = r.fence
     AND r.state IN ('completed', 'canceled', 'discarded')
   RETURNING ` + finishedColumns(`CASE WHEN r.error IS NULL THEN j.errors
          ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END`, appendLogSQL, "r.output", "r.archive", "r.state", "$9") + `
 ),
 `
 
-// runningSQL is the running check of jobFinalizeHeadSQL for a statement
-// whose hopper_jobs row needs no alias.
+// runningSQL is the running check of jobFinalizeHeadSQL, which prefixes it
+// with its alias, for the statements that find one running job by ID.
 const runningSQL = "state::text = 'running'"
 
 var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `

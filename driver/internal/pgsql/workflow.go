@@ -119,8 +119,9 @@ const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
 // instead, it guessed hundreds of rows for them, and with no statistics on
 // hopper_job_deps a probe looked like a few hundred rows more, so it scanned
 // hopper_job_deps, hopper_jobs and hopper_batches whole on every finalize,
-// at a cost that grew with the workflows in flight. The recursive step of
-// the cascade cannot take that form, and relies on the leader keeping
+// at a cost that grew with the workflows in flight. The cascade itself
+// still joins, its first step to finished and its recursive step to its
+// own rows, which cannot take that form, and relies on the leader keeping
 // hopper_job_deps analyzed (JobsMaintain).
 func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 	return `cascade AS (
