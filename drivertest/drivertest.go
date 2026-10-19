@@ -96,6 +96,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeSkipLockedNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeSkipLocked(t, f, true) }},
 		{"ClaimFence", testClaimFence[TTx]},
 		{"FinalizeFencesReclaim", testFinalizeFencesReclaim[TTx]},
+		{"FinalizeReportsTheAppliedFence", testFinalizeReportsTheAppliedFence[TTx]},
 		{"RescueRacesReclaim", testRescueRacesReclaim[TTx]},
 		{"RecordProgressFencesSnooze", testRecordProgressFencesSnooze[TTx]},
 		{"FinalizeTx", testFinalizeTx[TTx]},
@@ -162,7 +163,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 // outside batches see the same results through it.
 type noBatchesExec struct{ driver.Executor }
 
-func (e noBatchesExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e noBatchesExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	params.NoBatches = true
 	return e.Executor.JobFinalizeMany(ctx, params)
 }
@@ -220,7 +221,16 @@ func finalize(ctx context.Context, t *testing.T, exec driver.Executor, jobs ...d
 	if err != nil {
 		t.Fatal(err)
 	}
-	return applied
+	return appliedIDs(applied)
+}
+
+// appliedIDs returns the jobs of the results a finalize applied.
+func appliedIDs(applied []driver.JobFinalized) []driver.JobID {
+	ids := make([]driver.JobID, len(applied))
+	for i, a := range applied {
+		ids[i] = a.ID
+	}
+	return ids
 }
 
 // finalizeCurrent is finalize for tests of something other than the fence:

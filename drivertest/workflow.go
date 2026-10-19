@@ -393,7 +393,7 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			ids, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{Jobs: fin})
 			scancel()
 			if err == nil {
-				return ids
+				return appliedIDs(ids)
 			}
 			mu.Lock()
 			lastErr = err

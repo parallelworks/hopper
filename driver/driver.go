@@ -144,9 +144,11 @@ type Executor interface {
 	JobAge(ctx context.Context, queue string, after time.Duration) (int64, error)
 	// JobFinalizeMany applies a batch of results in one statement. A result is
 	// applied only if its job is still running in the claim that produced
-	// it, by the same client at the same fence; the IDs that were applied are
-	// returned, and the caller treats the rest as fenced.
-	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
+	// it, by the same client at the same fence; the job and fence of each
+	// applied result are returned, and the caller treats the rest as fenced.
+	// Of two results of one job, at most one applies, and its fence says
+	// which.
+	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobFinalized, error)
 	// JobRecordProgress stores a running job's progress, fenced like a
 	// finalize: only while the job is running in the given claim, by the
 	// given client at the given fence and attempt. It returns the progress as stored, or nil if the attempt
@@ -833,6 +835,13 @@ type WorkflowPromoteResult struct {
 	// greatest of their IDs, the After of the next chunk.
 	Scanned int64
 	Last    JobID
+}
+
+// JobFinalized names a result JobFinalizeMany applied: its job, and the
+// fence of the claim it belonged to.
+type JobFinalized struct {
+	ID    JobID
+	Fence int64
 }
 
 // JobFinalize is the result of one attempt.
