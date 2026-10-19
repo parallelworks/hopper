@@ -1193,7 +1193,7 @@ func TestRescueCandidatesWithoutAttemptTime(t *testing.T) {
 	if _, err := exec.JobInsertMany(ctx, insertParams("k", 1), driver.JobInsertOpts{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Pool().Exec(ctx, `UPDATE hopper_jobs SET state = 'running', attempt = 1`); err != nil {
+	if _, err := d.Pool().Exec(ctx, `UPDATE hopper_jobs SET state = 'running', attempt = 1, attempted_by = 1`); err != nil {
 		t.Fatal(err)
 	}
 	got, err := exec.JobRescueCandidates(ctx, driver.JobRescueParams{StuckAfter: time.Minute, Limit: 10})
