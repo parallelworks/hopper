@@ -967,7 +967,20 @@ RETURNING j.*;
   the update to it with a sequential scan and a hash, so every claim scanned the table
   (a 94% loss under `force_generic_plan`), and in the automatic mode the planner rejected
   that plan and replanned every execution instead (−27% on the CI runner). Rows locked
-  beyond the count are released when the statement ends.
+  beyond the count are released when the statement ends. The finalize statement finds
+  its results' rows by primary key whatever the statistics say, comparing the running
+  state as text, which no partial index's predicate matches: compared as the enum,
+  statistics taken while few jobs ran (an analyze just after a backlog was inserted)
+  made a scan of all of `hopper_jobs_running` look like a page, and the statement
+  compared every running row with every result, 0.6 s a statement at 40,000 running
+  rows, which piled up as the finalizes fell behind, so a workflow drain of 3 s took
+  20–48 s. The statements that look up one running job by ID check it the same way.
+  The finalize tail and the dependents' promotion look up rows keyed by the
+  statement's own rows (the finished jobs, their batches, the candidates) as
+  `= ANY (ARRAY(...))`, which the planner takes for ten keys and so probes an index
+  for: joined to the CTEs, it guessed hundreds of rows for them, and scanned
+  `hopper_job_deps`, `hopper_jobs` and `hopper_batches` whole on every finalize, at a
+  cost that grew with the workflows in flight.
 - **Live-table maintenance.** Every claim walks the claim index past the entries of
   jobs that have run and left, which only a vacuum removes, so pickup latency climbs
   between vacuums: at 30,000 jobs/s on the reference hardware, from 10 ms to seconds
@@ -980,10 +993,14 @@ RETURNING j.*;
   on the live table for autovacuum too;
   what matters is their number, about five hundred index pages, not their share of the
   table, so a short burst never triggers one) and re-analyzes it, with a small sample,
-  only when the row count the planner holds is ten times off the live count: an analyze
-  in the middle of a burst cost a CPU-starved server a fifth of its throughput, so it is
-  not done on churn alone. It never waits for a lock. Schema v6 also sets the table's
-  autovacuum thresholds low with no cost delay.
+  at once when the row count the planner holds is ten times off the live count, and
+  otherwise once a tenth of the table has changed but at most every thirty seconds: an
+  analyze invalidates every connection's cached plans, and one in the middle of a burst
+  cost a CPU-starved server a fifth of its throughput. The live tags table and
+  `hopper_job_deps` are kept the same way, with the server's sample size: until the
+  dependency table has statistics, the planner takes each lookup of a job's edges for a
+  two-hundredth of the table, and scans it instead. It never waits for a lock. Schema v6
+  also sets the table's autovacuum thresholds low with no cost delay.
 
 - **Batching.** A producer claims only when at least `min(MaxWorkers/4, free slots)`
   slots are free or a short cooldown (20ms by default) has passed. Busy queues are
