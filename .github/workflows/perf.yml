@@ -49,7 +49,7 @@ jobs:
           --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_bench?sslmode=disable
-      SCENARIOS: throughput,insert,copy
+      SCENARIOS: throughput,insert,copy,workflow
       ROUNDS: "6"
       JOBS: "300000"
     steps:
