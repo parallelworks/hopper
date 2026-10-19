@@ -575,6 +575,15 @@ func claimRows(ctx context.Context, conn Conn, query string, args ...any) ([]*dr
 // and workflow dependents. Error timestamps come from database time and
 // awaited jobs announce themselves on the done channel. An attempt's log
 // is appended to the job's, which keep the latest $13 attempts.
+//
+// The running state is compared as text, which no partial index's
+// predicate matches, so the results always find their rows by primary key.
+// Compared as the enum, it lets the planner scan hopper_jobs_running
+// instead, which statistics taken while few jobs ran (right after a backlog
+// was inserted, say) make look like a page or two: the statement then
+// compared every running row with every result, and slowed down as
+// unfinalized results piled up as running rows. runningSQL is the same
+// check for statements that find one running job by ID.
 var jobFinalizeHeadSQL = `
 WITH RECURSIVE r AS (
   SELECT * FROM unnest(
@@ -596,19 +605,23 @@ retry AS (
                            THEN r.snooze_reason END,
       wake_requested_at = NULL
   FROM r
-  WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
+  WHERE j.id = r.id AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
     AND r.state IN ('retryable', 'scheduled')
   RETURNING j.id
 ),
 finished AS (
   DELETE FROM {{schema}}.hopper_jobs j
   USING r
-  WHERE j.id = r.id AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
+  WHERE j.id = r.id AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
     AND r.state IN ('completed', 'canceled', 'discarded')
   RETURNING ` + finishedColumns(`CASE WHEN r.error IS NULL THEN j.errors
          ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END`, appendLogSQL, "r.output", "r.archive", "r.state", "$9") + `
 ),
 `
+
+// runningSQL is the running check of jobFinalizeHeadSQL for a statement
+// whose hopper_jobs row needs no alias.
+const runningSQL = "state::text = 'running'"
 
 var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
 SELECT id FROM retry UNION ALL SELECT id FROM finished`
@@ -761,7 +774,7 @@ SET progress = jsonb_build_object(
       'step', CASE WHEN $5 THEN coalesce(progress->>'step', '') ELSE $4::text END,
       'at', statement_timestamp())
     || CASE WHEN $6::jsonb IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('cursor', $6::jsonb) END
-WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND fence = $3 AND attempt = $7%s
+WHERE id = $1 AND ` + runningSQL + ` AND attempted_by = $2 AND fence = $3 AND attempt = $7%s
 RETURNING progress::text`
 
 var (
@@ -769,7 +782,7 @@ var (
 	jobRecordProgressNoWaitQuery = fmt.Sprintf(jobRecordProgressSQL, `
 WITH locked AS (
   SELECT id FROM {{schema}}.hopper_jobs
-  WHERE id = $1 AND state = 'running' AND attempted_by = $2 AND fence = $3 AND attempt = $7
+  WHERE id = $1 AND `+runningSQL+` AND attempted_by = $2 AND fence = $3 AND attempt = $7
   FOR UPDATE NOWAIT
 )`, " AND id IN (SELECT id FROM locked)")
 )
@@ -1502,7 +1515,7 @@ const jobLockStateSQL = "SELECT state FROM {{schema}}.hopper_jobs WHERE id = $1 
 var (
 	jobCancelRunningSQL = fmt.Sprintf(`
 UPDATE {{schema}}.hopper_jobs SET cancel_requested_at = coalesce(cancel_requested_at, now())
-WHERE id = $1 AND state = 'running'
+WHERE id = $1 AND `+runningSQL+`
 RETURNING %s`, JobColumns(""))
 	// jobCancelWaitingSQL finalizes a waiting job as canceled, with
 	// everything that entails for its batch and its dependents.
