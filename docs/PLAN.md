@@ -975,12 +975,19 @@ RETURNING j.*;
   compared every running row with every result, 0.6 s a statement at 40,000 running
   rows, which piled up as the finalizes fell behind, so a workflow drain of 3 s took
   20–48 s. The statements that look up one running job by ID check it the same way.
+  The cast stays because Postgres (14–18) uses a partial index only for a condition on
+  the identical expression, and no index but the primary key serves a lookup by ID;
+  matching by primary key with the state checked after, `= ANY ('{running}')` or a
+  scalar subquery all still matched `hopper_jobs_running` in EXPLAIN.
   The finalize tail and the dependents' promotion look up rows keyed by the
-  statement's own rows (the finished jobs, their batches, the candidates) as
+  statement's own rows (the finished jobs, the completed batches, the candidates) as
   `= ANY (ARRAY(...))`, which the planner takes for ten keys and so probes an index
   for: joined to the CTEs, it guessed hundreds of rows for them, and scanned
   `hopper_job_deps`, `hopper_jobs` and `hopper_batches` whole on every finalize, at a
-  cost that grew with the workflows in flight.
+  cost that grew with the workflows in flight. The counted batches are looked up one by
+  one by primary key, in a `LATERAL` subquery fenced with `OFFSET 0`: as `= ANY` the
+  planner rescanned the counts once per batch row, quadratic in the batches a statement
+  touches.
 - **Live-table maintenance.** Every claim walks the claim index past the entries of
   jobs that have run and left, which only a vacuum removes, so pickup latency climbs
   between vacuums: at 30,000 jobs/s on the reference hardware, from 10 ms to seconds
@@ -998,12 +1005,14 @@ RETURNING j.*;
   analyze invalidates every connection's cached plans, and one in the middle of a burst
   cost a CPU-starved server a fifth of its throughput. The live tags table and
   `hopper_job_deps` are kept the same way, with the server's sample size, except that
-  the dependency table is analyzed on churn only until it has statistics, and then only
-  when its row count is off: until it has them, the planner takes each lookup of a job's
-  edges for a two-hundredth of the table, and scans it instead, while what it reads from
-  them (edges per job, dependents per job) does not change as workflows come and go, and
-  each analyze has every connection replan the finalize statement. It never waits for a lock. Schema v6
-  also sets the table's autovacuum thresholds low with no cost delay.
+  the dependency table is analyzed on churn only until it has been analyzed once (a
+  vacuum gives the planner its row count but no statistics), and then only when its row
+  count is off: until it has statistics, the planner takes each lookup of a job's edges
+  for a two-hundredth of the table, and scans it instead, while what it reads from them
+  (edges per job, dependents per job) does not change as workflows come and go, and each
+  analyze has every connection replan the finalize statement. The maintenance never
+  waits for a lock. Schema v6 also sets `hopper_jobs`' autovacuum thresholds low with no
+  cost delay.
 
 - **Batching.** A producer claims only when at least `min(MaxWorkers/4, free slots)`
   slots are free or a short cooldown (20ms by default) has passed. Busy queues are

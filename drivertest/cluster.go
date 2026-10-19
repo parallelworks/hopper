@@ -1111,10 +1111,11 @@ func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 }
 
 // testDepsTableMaintained checks that the leader's live table maintenance
-// analyzes the dependency table once a burst of workflows has filled it:
-// until the table has statistics, the planner takes each lookup of a job's
-// edges for a two-hundredth of the table, and finalizes and the promotion
-// sweep scan it instead.
+// analyzes the dependency table once a burst of workflows has filled it,
+// even when a vacuum has already given the planner its row count: until
+// the table has statistics, the planner takes each lookup of a job's edges
+// for a two-hundredth of the table, and finalizes and the promotion sweep
+// scan it instead.
 func testDepsTableMaintained[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -1139,6 +1140,9 @@ func testDepsTableMaintained[TTx any](t *testing.T, f Fixture[TTx]) {
 	if stat("last_analyze IS NULL") != "true" {
 		t.Fatal("dependency table analyzed before maintenance")
 	}
+	// A vacuum gives the planner the table's row count but no column
+	// statistics: the table still needs its first analyze.
+	f.Exec(ctx, t, d, "VACUUM hopper_job_deps")
 	// The result's Analyzed would also report the analyze of hopper_jobs,
 	// which the workflow's 1201 jobs earn, so the table's own statistics
 	// are what tell.

@@ -441,6 +441,11 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				case replay <- fin:
 				case <-wctx.Done():
 				}
+				// As the client does, a flush that finished nothing is not
+				// followed up: a nil DependsOn is the leader's sweep.
+				if len(finished) == 0 {
+					continue
+				}
 				// The follow-up may time out on a batch row; the sweeps
 				// below settle what it leaves.
 				_, _ = exec.BatchSettle(wctx, driver.BatchSettleParams{IDs: batches})

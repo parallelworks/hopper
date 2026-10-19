@@ -387,9 +387,9 @@ const analyzeEvery = 30 * time.Second
 //
 // ANALYZE keeps two things current that the planner needs: the row count,
 // which a plan cached while the table was empty gets wrong by orders of
-// magnitude, and the mix of states, which decides how the finalize joins
-// its parameter list to the running rows (with a stale mix that says
-// almost nothing is running, it probes the list once per running row).
+// magnitude, and the mix of states, from which the planner costs scans of
+// the partial indexes by state. (The finalize does not depend on it: it
+// compares the running state as text; see jobFinalizeHeadSQL.)
 // So it runs at once when the planner's row count is ten times off, and
 // otherwise once a tenth of the table has changed but no more than every
 // thirty seconds, since an analyze invalidates every connection's cached
@@ -417,27 +417,18 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 	for i, t := range liveTables {
 		names[i] = e.Schema.Table(t.name)
 	}
-	rows, err := e.Conn.Query(ctx, `
+	all, err := scanLiveTableStats(e.Conn.Query(ctx, `
 		SELECT n, s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, c.reltuples,
-		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
+		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9),
+		  greatest(s.last_analyze, s.last_autoanalyze) IS NOT NULL
 		FROM unnest($1::text[]) n
-		JOIN pg_stat_user_tables s ON s.relid = to_regclass(n) JOIN pg_class c ON c.oid = s.relid`, textArray(names))
+		JOIN pg_stat_user_tables s ON s.relid = to_regclass(n) JOIN pg_class c ON c.oid = s.relid`, textArray(names)))
 	if err != nil {
 		return res, fmt.Errorf("hopper: live table statistics: %w", err)
 	}
-	stats := map[string]liveTableStats{}
-	for rows.Next() {
-		var name string
-		var st liveTableStats
-		if err := rows.Scan(&name, &st.dead, &st.live, &st.modified, &st.believed, &st.sinceAnalyze); err != nil {
-			rows.Close()
-			return res, fmt.Errorf("hopper: live table statistics: %w", err)
-		}
-		stats[name] = st
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return res, fmt.Errorf("hopper: live table statistics: %w", err)
+	stats := make(map[string]liveTableStats, len(all))
+	for _, st := range all {
+		stats[st.table] = st
 	}
 	var errs []error
 	for i, t := range liveTables {
@@ -456,12 +447,22 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 	return res, errors.Join(errs...)
 }
 
-// liveTableStats are a live table's activity counters and the row count
-// the planner holds.
+// liveTableStats are a live table's activity counters, the row count the
+// planner holds, and whether it was ever analyzed. A vacuum, or an index
+// built over existing rows, also sets the row count, so a count that is
+// known does not mean the table has column statistics.
 type liveTableStats struct {
+	table                  string
 	dead, live, modified   int64
 	believed, sinceAnalyze float64
+	everAnalyzed           bool
 }
+
+var scanLiveTableStats = collect(func(r Row) (liveTableStats, error) {
+	var st liveTableStats
+	err := r.Scan(&st.table, &st.dead, &st.live, &st.modified, &st.believed, &st.sinceAnalyze, &st.everAnalyzed)
+	return st, err
+})
 
 // liveTables are the tables JobsMaintain keeps, with the statistics target
 // their analyze uses, or zero for the server's. The tags table keeps the
@@ -475,16 +476,16 @@ var liveTables = []liveTable{
 	{"hopper_job_deps", 0, false},
 }
 
-// liveTable is a table JobsMaintain keeps. A table without churn is
-// analyzed on churn only until it has statistics, and then only when its
-// size is off: what the planner reads from the dependency table, how many
-// edges a job has and how many jobs depend on one, does not change as
-// workflows come and go, and each analyze has every connection replan the
-// finalize statement.
+// liveTable is a table JobsMaintain keeps. One without analyzeOnChurn is
+// analyzed on churn only until it has been analyzed once, and then only
+// when its size is off: what the planner reads from the dependency table,
+// how many edges a job has and how many jobs depend on one, does not
+// change as workflows come and go, and each analyze has every connection
+// replan the finalize statement.
 type liveTable struct {
 	name             string
 	statisticsTarget int
-	churn            bool
+	analyzeOnChurn   bool
 }
 
 func (e *Executor) maintainLiveTable(ctx context.Context, t liveTable, table string, st liveTableStats) (vacuumed, analyzed bool, err error) {
@@ -501,7 +502,7 @@ func (e *Executor) maintainLiveTable(ctx context.Context, t liveTable, table str
 	}
 	floor := func(v float64) float64 { return max(v, 100) }
 	sizeOff := st.believed >= 0 && (float64(st.live) >= 10*floor(st.believed) || st.believed >= 10*floor(float64(st.live)))
-	churned := st.modified >= 1000 && st.modified*10 >= st.live && st.sinceAnalyze >= analyzeEvery.Seconds() && (t.churn || st.believed < 0)
+	churned := st.modified >= 1000 && st.modified*10 >= st.live && st.sinceAnalyze >= analyzeEvery.Seconds() && (t.analyzeOnChurn || !st.everAnalyzed)
 	if !sizeOff && !churned {
 		return false, false, nil
 	}
