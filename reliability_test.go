@@ -808,11 +808,14 @@ func TestCancelReachesAReclaimedAttempt(t *testing.T) {
 		}
 		// The second attempt, and any after it should a slow host let the
 		// second be rescued too: the cancel reaches the latest claim. One
-		// rescued meanwhile ends at the stop, once the test has its cause.
+		// rescued meanwhile is canceled with ErrJobFenced by the claim that
+		// replaces it here, which is not the cause the test waits for.
 		<-ctx.Done()
-		select {
-		case causes <- context.Cause(ctx):
-		default:
+		if cause := context.Cause(ctx); !errors.Is(cause, hopper.ErrJobFenced) {
+			select {
+			case causes <- cause:
+			default:
+			}
 		}
 		return ctx.Err()
 	})
