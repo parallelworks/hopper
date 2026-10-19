@@ -399,7 +399,11 @@ const analyzeEvery = 30 * time.Second
 //
 // The live tags table churns with tagged jobs, and a listing by tag walks
 // its index, so it is kept the same way, except that its analyze keeps the
-// server's statistics target. Each table is kept whether or not the other's
+// server's statistics target. So does the dependency table, which churns
+// with workflows: until it has statistics, the planner takes each lookup of
+// a job's edges for a two-hundredth of the table, and scans the table
+// instead, in finalizes and in the sweep that promotes dependents (see
+// finalizeTailSQL). Each table is kept whether or not another's
 // maintenance fails, such as a vacuum of a large hopper_jobs that runs past
 // the role's statement_timeout on every pass.
 func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
@@ -424,13 +428,15 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 // their analyze uses, or zero for the server's. The tags table keeps the
 // server's target: a listing by several tags (rarestTagSQL) tells common
 // tags apart by its most common values, of which a target of 10 would keep
-// only ten.
+// only ten. So does the dependency table, whose estimates rest on how many
+// distinct jobs its sample holds, which a larger sample counts better.
 var liveTables = []struct {
 	name             string
 	statisticsTarget int
 }{
 	{"hopper_jobs", 10},
 	{"hopper_job_tags", 0},
+	{"hopper_job_deps", 0},
 }
 
 func (e *Executor) maintainLiveTable(ctx context.Context, table string, statisticsTarget int) (vacuumed, analyzed bool, err error) {

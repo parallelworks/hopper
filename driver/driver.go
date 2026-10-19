@@ -330,9 +330,10 @@ type Executor interface {
 	// that have left, so pickup latency climbs between vacuums; autovacuum
 	// looks only every autovacuum_naptime (a minute by default). On Postgres
 	// the live tags table (schema v17), whose index a listing by tag walks,
-	// is kept the same way, and each table is kept whether or not the
-	// other's maintenance fails. Engines without such maintenance return
-	// zero values.
+	// and the workflow dependency table, whose statistics the finalize
+	// statement's plan rests on, are kept the same way, and each table is
+	// kept whether or not another's maintenance fails. Engines without such
+	// maintenance return zero values.
 	JobsMaintain(ctx context.Context) (JobsMaintainResult, error)
 }
 
