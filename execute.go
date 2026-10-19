@@ -79,7 +79,9 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 }
 
 // replaced reports whether a later claim of the job on this client replaced
-// the attempt jobCtx belongs to (trackRunning).
+// the attempt jobCtx belongs to (trackRunning). An attempt that a JobCancel
+// reached first keeps that cause and is handled as canceled; its result is
+// dropped all the same.
 func replaced(jobCtx context.Context) bool {
 	return errors.Is(context.Cause(jobCtx), ErrJobFenced)
 }

@@ -504,7 +504,10 @@ type AttemptError struct {
 	// At is the database time at which the failure was recorded.
 	At      time.Time `json:"at"`
 	Attempt int       `json:"attempt"`
-	// Fence is the fence of the claim whose attempt failed, or zero.
+	// Fence is the fence of the claim whose attempt failed. It is zero in
+	// entries hopper records itself for a job that is not running (a
+	// cancel, an expiry, a failed dependency), and in those of earlier
+	// releases.
 	Fence int64  `json:"fence,omitempty"`
 	Error string `json:"error"`
 	// Trace is the stack trace when the attempt panicked.
