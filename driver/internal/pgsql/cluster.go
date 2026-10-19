@@ -400,12 +400,15 @@ const analyzeEvery = 30 * time.Second
 // The live tags table churns with tagged jobs, and a listing by tag walks
 // its index, so it is kept the same way, except that its analyze keeps the
 // server's statistics target. So is the dependency table, which churns
-// with workflows, except that it is analyzed on churn only until it has
-// statistics (see liveTable): until then, the planner takes each lookup of
+// with workflows, except that churn re-analyzes it at most every
+// analyzeDepsEvery: until it has statistics, the planner takes each lookup of
 // a job's edges for a two-hundredth of the table, and scans the table
 // instead, in finalizes and in the sweep that promotes dependents (see
-// finalizeTailSQL). The counters of all three are read in one statement.
-// Each table is kept whether or not another's
+// finalizeTailSQL). The counters of all three are read in one statement,
+// each table's in a LATERAL subquery that OFFSET 0 keeps from being
+// flattened: joined, the view's GROUP BY kept the table's OID from reaching
+// pg_class, so every pass summed the counters of every relation in the
+// database. Each table is kept whether or not another's
 // maintenance fails, such as a vacuum of a large hopper_jobs that runs past
 // the role's statement_timeout on every pass.
 func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
@@ -418,11 +421,11 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 		names[i] = e.Schema.Table(t.name)
 	}
 	all, err := scanLiveTableStats(e.Conn.Query(ctx, `
-		SELECT n, s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, c.reltuples,
-		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9),
-		  greatest(s.last_analyze, s.last_autoanalyze) IS NOT NULL
-		FROM unnest($1::text[]) n
-		JOIN pg_stat_user_tables s ON s.relid = to_regclass(n) JOIN pg_class c ON c.oid = s.relid`, textArray(names)))
+		SELECT n, s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, s.reltuples,
+		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
+		FROM unnest($1::text[]) n, LATERAL (
+		  SELECT s.*, c.reltuples FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+		  WHERE s.relid = to_regclass(n) OFFSET 0) s`, textArray(names)))
 	if err != nil {
 		return res, fmt.Errorf("hopper: live table statistics: %w", err)
 	}
@@ -448,19 +451,18 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 }
 
 // liveTableStats are a live table's activity counters, the row count the
-// planner holds, and whether it was ever analyzed. A vacuum, or an index
-// built over existing rows, also sets the row count, so a count that is
-// known does not mean the table has column statistics.
+// planner holds, and the time since its last analyze (1e9 s if never: a
+// vacuum, or an index built over existing rows, also sets the row count,
+// so a count that is known does not mean the table has statistics).
 type liveTableStats struct {
 	table                  string
 	dead, live, modified   int64
 	believed, sinceAnalyze float64
-	everAnalyzed           bool
 }
 
 var scanLiveTableStats = collect(func(r Row) (liveTableStats, error) {
 	var st liveTableStats
-	err := r.Scan(&st.table, &st.dead, &st.live, &st.modified, &st.believed, &st.sinceAnalyze, &st.everAnalyzed)
+	err := r.Scan(&st.table, &st.dead, &st.live, &st.modified, &st.believed, &st.sinceAnalyze)
 	return st, err
 })
 
@@ -471,21 +473,28 @@ var scanLiveTableStats = collect(func(r Row) (liveTableStats, error) {
 // only ten. So does the dependency table, whose estimates rest on how many
 // distinct jobs its sample holds, which a larger sample counts better.
 var liveTables = []liveTable{
-	{"hopper_jobs", 10, true},
-	{"hopper_job_tags", 0, true},
-	{"hopper_job_deps", 0, false},
+	{"hopper_jobs", 10, analyzeEvery},
+	{"hopper_job_tags", 0, analyzeEvery},
+	{"hopper_job_deps", 0, analyzeDepsEvery},
 }
 
-// liveTable is a table JobsMaintain keeps. One without analyzeOnChurn is
-// analyzed on churn only until it has been analyzed once, and then only
-// when its size is off: what the planner reads from the dependency table,
-// how many edges a job has and how many jobs depend on one, does not
-// change as workflows come and go, and each analyze has every connection
-// replan the finalize statement.
+// analyzeDepsEvery is the least time between the dependency table's
+// statistics refreshes driven by churn. What the planner reads from it,
+// how many edges a job has and how many jobs depend on one, changes only
+// as the shape of the workflows does, and each analyze has every
+// connection replan the finalize statement; but a table first analyzed
+// empty, or holding one large fan-out, has the planner scan it on every
+// lookup, so its statistics are still refreshed now and then. A table
+// never analyzed is analyzed at once.
+const analyzeDepsEvery = 10 * time.Minute
+
+// liveTable is a table JobsMaintain keeps, with its analyze's statistics
+// target (zero for the server's) and the least time between analyzes
+// driven by churn.
 type liveTable struct {
 	name             string
 	statisticsTarget int
-	analyzeOnChurn   bool
+	analyzeEvery     time.Duration
 }
 
 func (e *Executor) maintainLiveTable(ctx context.Context, t liveTable, table string, st liveTableStats) (vacuumed, analyzed bool, err error) {
@@ -502,7 +511,7 @@ func (e *Executor) maintainLiveTable(ctx context.Context, t liveTable, table str
 	}
 	floor := func(v float64) float64 { return max(v, 100) }
 	sizeOff := st.believed >= 0 && (float64(st.live) >= 10*floor(st.believed) || st.believed >= 10*floor(float64(st.live)))
-	churned := st.modified >= 1000 && st.modified*10 >= st.live && st.sinceAnalyze >= analyzeEvery.Seconds() && (t.analyzeOnChurn || !st.everAnalyzed)
+	churned := st.modified >= 1000 && st.modified*10 >= st.live && st.sinceAnalyze >= t.analyzeEvery.Seconds()
 	if !sizeOff && !churned {
 		return false, false, nil
 	}
