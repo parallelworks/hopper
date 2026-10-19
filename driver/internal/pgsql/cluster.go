@@ -424,7 +424,8 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 		SELECT n, s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, s.reltuples,
 		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
 		FROM unnest($1::text[]) n, LATERAL (
-		  SELECT s.*, c.reltuples FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+		  SELECT s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, s.last_analyze, s.last_autoanalyze, c.reltuples
+		  FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
 		  WHERE s.relid = to_regclass(n) OFFSET 0) s`, textArray(names)))
 	if err != nil {
 		return res, fmt.Errorf("hopper: live table statistics: %w", err)
@@ -481,11 +482,15 @@ var liveTables = []liveTable{
 // analyzeDepsEvery is the least time between the dependency table's
 // statistics refreshes driven by churn. What the planner reads from it,
 // how many edges a job has and how many jobs depend on one, changes only
-// as the shape of the workflows does, and each analyze has every
-// connection replan the finalize statement; but a table first analyzed
-// empty, or holding one large fan-out, has the planner scan it on every
-// lookup, so its statistics are still refreshed now and then. A table
-// never analyzed is analyzed at once.
+// as the shape of the workflows does, so a refresh now and then corrects a
+// first analyze that sampled the table empty or holding one large fan-out,
+// which has the planner scan it on every lookup. The cap bounds the cost
+// of sampling the table, not replanning: analyzes of hopper_jobs make
+// every connection replan the finalize statement at least as often, and
+// autovacuum's own analyzes, at the table's default thresholds, keep the
+// statistics fresh in between. A table never analyzed is analyzed without
+// the wait, once a thousand of its rows have changed: until then it is
+// small enough that a scan costs little.
 const analyzeDepsEvery = 10 * time.Minute
 
 // liveTable is a table JobsMaintain keeps, with its analyze's statistics
