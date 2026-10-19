@@ -44,6 +44,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 				term = c.startTerm(ctx)
 			}
 			c.rescue(ctx)
+			c.expireJobLeases(ctx)
 			c.expire(ctx)
 			c.settleBatches(ctx)
 			c.promoteReady(ctx)
@@ -164,16 +165,16 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		for i, cand := range candidates {
 			j := cand.Job
 			noBatches = noBatches && j.BatchID.IsZero()
-			reason := "hopper: client lost"
+			reason, why := "hopper: client lost", driver.RescueClientLost
 			if cand.Stuck {
-				reason = "hopper: job ran longer than RescueStuckAfter"
+				reason, why = "hopper: job ran longer than RescueStuckAfter", driver.RescueStuck
 			}
 			f := driver.JobFinalize{
 				ID:          j.ID,
 				AttemptedBy: j.AttemptedBy,
 				Fence:       j.Fence,
 				State:       driver.JobStateRetryable,
-				Error:       &driver.AttemptError{Attempt: j.Attempt, Fence: j.Fence, Error: reason},
+				Error:       &driver.AttemptError{Attempt: j.Attempt, Fence: j.Fence, Error: reason, Rescue: why},
 				Archive:     true,
 			}
 			if j.Attempt >= j.MaxAttempts {
@@ -249,6 +250,45 @@ func (c *Client[TTx]) age(ctx context.Context) {
 		if n > 0 {
 			c.logger.DebugContext(ctx, "hopper: promoted waiting jobs", "queue", q.Name, "count", n)
 			c.wakeQueue(q.Name)
+		}
+	}
+}
+
+// expireJobLeases ends the attempts of jobs claimed by ID whose job leases
+// were not renewed in time: retryable at once, or discarded on their last
+// attempt, or canceled if a cancel was requested. The statement locks each
+// job's row and skips those another statement holds, such as a Finish in
+// flight, and a renewal that commits first keeps its lease.
+func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
+	for {
+		jobs, err := c.exec.JobExpireLeases(ctx, c.tuning.rescueBatch)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.logger.ErrorContext(ctx, "hopper: expire job leases", "error", err)
+			}
+			return
+		}
+		var retried, ended int
+		queues := map[string]struct{}{}
+		for _, j := range jobs {
+			c.emit(EventJobRescued, j, "hopper: job lease expired")
+			if j.State.Terminal() {
+				ended++
+				c.signalDone(j.ID)
+				continue
+			}
+			retried++
+			queues[j.Queue] = struct{}{}
+		}
+		if len(jobs) > 0 {
+			c.logger.WarnContext(ctx, "hopper: job leases expired", "retried", retried, "ended", ended)
+		}
+		for q := range queues {
+			c.wakeQueue(q)
+			c.notifier.mark(q)
+		}
+		if len(jobs) < c.tuning.rescueBatch {
+			return
 		}
 	}
 }
