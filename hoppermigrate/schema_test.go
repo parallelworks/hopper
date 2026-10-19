@@ -170,7 +170,7 @@ func verifySchema(t *testing.T, ctx context.Context, e driver.Executor) {
 				t.Fatal("job claimed twice")
 			}
 			seen[j.ID] = true
-			p := driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{ID: j.ID, AttemptedBy: clients[1-i], State: driver.JobStateCompleted, Archive: true}}}
+			p := driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{ID: j.ID, AttemptedBy: clients[1-i], Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}}}
 			ids, err := e.JobFinalizeMany(ctx, p)
 			if err != nil {
 				t.Fatal(err)

@@ -132,12 +132,13 @@ func (c *Client[TTx]) resign(ctx context.Context) {
 
 // rescue moves running jobs whose client has lost its lease back to
 // retryable, or to discarded when they are out of attempts. The transition
-// goes through the same fenced finalize statement as a worker's result, so
-// a client that finalizes its own result first wins and the rescue of that
-// job is dropped.
+// goes through the same fenced finalize statement as a worker's result,
+// fenced to the claim each job was found in, so a client that finalizes its
+// own result first wins and the rescue of that job is dropped, even if the
+// job has been claimed again since.
 func (c *Client[TTx]) rescue(ctx context.Context) {
 	for {
-		jobs, err := c.exec.JobRescueCandidates(ctx, driver.JobRescueParams{
+		candidates, err := c.exec.JobRescueCandidates(ctx, driver.JobRescueParams{
 			StuckAfter: c.cfg.RescueStuckAfter,
 			Limit:      c.tuning.rescueBatch,
 		})
@@ -147,30 +148,32 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			}
 			return
 		}
-		if len(jobs) == 0 {
+		if len(candidates) == 0 {
 			return
 		}
 		// Finding our own jobs among the candidates, other than as stuck,
 		// means our lease has lapsed and the lease loop has not noticed
 		// yet. Fence first, so the jobs stop before they are handed back.
-		if me := c.clientID.Load(); slices.ContainsFunc(jobs, func(j *driver.JobRow) bool { return j.AttemptedBy == me && !c.stuck(j) }) {
+		if me := c.clientID.Load(); slices.ContainsFunc(candidates, func(cand driver.RescueCandidate) bool { return cand.Job.AttemptedBy == me && !cand.Stuck }) {
 			c.fence(ctx, me)
 		}
 
-		fin := make([]driver.JobFinalize, len(jobs))
-		queueOf := make(map[JobID]string, len(jobs))
+		fin := make([]driver.JobFinalize, len(candidates))
+		queueOf := make(map[JobID]string, len(candidates))
 		noBatches := true
-		for i, j := range jobs {
+		for i, cand := range candidates {
+			j := cand.Job
 			noBatches = noBatches && j.BatchID.IsZero()
 			reason := "hopper: client lost"
-			if c.stuck(j) {
+			if cand.Stuck {
 				reason = "hopper: job ran longer than RescueStuckAfter"
 			}
 			f := driver.JobFinalize{
 				ID:          j.ID,
 				AttemptedBy: j.AttemptedBy,
+				Fence:       j.Fence,
 				State:       driver.JobStateRetryable,
-				Error:       &driver.AttemptError{Attempt: j.Attempt, Error: reason},
+				Error:       &driver.AttemptError{Attempt: j.Attempt, Fence: j.Fence, Error: reason},
 				Archive:     true,
 			}
 			if j.Attempt >= j.MaxAttempts {
@@ -193,7 +196,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		for _, f := range fin {
 			byID[f.ID] = f
 		}
+		rescued := make(map[JobID]struct{}, len(applied))
 		for _, id := range applied {
+			rescued[id] = struct{}{}
 			if byID[id].State == driver.JobStateDiscarded {
 				discarded++
 				continue
@@ -201,17 +206,20 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			retried++
 			queues[queueOf[id]] = struct{}{}
 		}
-		c.logger.WarnContext(ctx, "hopper: rescued jobs from lost clients", "retried", retried, "discarded", discarded, "dropped", len(jobs)-len(applied))
-		for _, j := range jobs {
-			if f, was := byID[j.ID]; was && slices.Contains(applied, j.ID) {
-				c.emit(EventJobRescued, j, f.Error.Error)
+		c.logger.WarnContext(ctx, "hopper: rescued jobs from lost clients", "retried", retried, "discarded", discarded, "dropped", len(candidates)-len(applied))
+		for _, cand := range candidates {
+			if _, was := rescued[cand.Job.ID]; was {
+				c.emit(EventJobRescued, cand.Job, byID[cand.Job.ID].Error.Error)
 			}
 		}
 		for q := range queues {
 			c.wakeQueue(q)
 			c.notifier.mark(q)
 		}
-		if len(jobs) < c.tuning.rescueBatch {
+		// A full batch that rescued nothing would be read again as it is:
+		// rows that transactions hold, which the finalize skips, or that it
+		// cannot apply to. The next pass tries them again.
+		if len(candidates) < c.tuning.rescueBatch || len(applied) == 0 {
 			return
 		}
 	}
@@ -325,12 +333,6 @@ func (c *Client[TTx]) promoteReady(ctx context.Context) {
 			return
 		}
 	}
-}
-
-// stuck reports whether a rescue candidate qualifies by RescueStuckAfter,
-// as opposed to by a lost lease.
-func (c *Client[TTx]) stuck(j *driver.JobRow) bool {
-	return c.cfg.RescueStuckAfter > 0 && time.Since(j.AttemptedAt) >= c.cfg.RescueStuckAfter
 }
 
 func (c *Client[TTx]) pruneClients(ctx context.Context) {

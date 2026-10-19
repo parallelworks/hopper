@@ -69,8 +69,8 @@ func TestHistoryMaintain(t *testing.T) {
 		t.Fatalf("claim: %v, %d", err, len(jobs))
 	}
 	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-		{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
-		{ID: jobs[1].ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true},
+		{ID: jobs[0].ID, AttemptedBy: clientID, Fence: jobs[0].Fence, State: driver.JobStateCompleted, Archive: true},
+		{ID: jobs[1].ID, AttemptedBy: clientID, Fence: jobs[1].Fence, State: driver.JobStateDiscarded, Archive: true},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +567,7 @@ func TestTagsAndFiltersInLatin1(t *testing.T) {
 	if err != nil || len(claimed.Jobs) != 1 {
 		t.Fatalf("claim = %+v, %v", claimed, err)
 	}
-	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{ID: claimed.Jobs[0].ID, AttemptedBy: client, State: driver.JobStateCompleted, Archive: true}}}); err != nil {
+	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{ID: claimed.Jobs[0].ID, AttemptedBy: client, Fence: claimed.Jobs[0].Fence, State: driver.JobStateCompleted, Archive: true}}}); err != nil {
 		t.Fatal(err)
 	}
 	callbacks, err := exec.JobList(ctx, driver.JobListParams{Queue: "callbacks", Limit: 10})
@@ -774,7 +774,7 @@ func TestHistoryTagsRowsUnique(t *testing.T) {
 		t.Fatalf("claim = %+v, %v", claimed, err)
 	}
 	id := claimed.Jobs[0].ID
-	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{ID: id, AttemptedBy: client, State: driver.JobStateCompleted, Archive: true}}}); err != nil {
+	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{ID: id, AttemptedBy: client, Fence: 1, State: driver.JobStateCompleted, Archive: true}}}); err != nil {
 		t.Fatal(err)
 	}
 	var partition string
@@ -893,7 +893,7 @@ func TestTagListingPlansWhatItReads(t *testing.T) {
 	}
 	for _, j := range claimed.Jobs {
 		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-			{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+			{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true},
 		}}); err != nil {
 			t.Fatal(err)
 		}
@@ -964,7 +964,7 @@ func TestTagListingPreparesOnce(t *testing.T) {
 	}
 	for _, j := range claimed.Jobs {
 		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-			{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+			{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true},
 		}}); err != nil {
 			t.Fatal(err)
 		}
@@ -1023,7 +1023,7 @@ func TestTagListingRoundTrips(t *testing.T) {
 	}
 	for _, j := range claimed.Jobs {
 		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-			{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+			{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true},
 		}}); err != nil {
 			t.Fatal(err)
 		}
@@ -1138,7 +1138,7 @@ func finishTagged(ctx context.Context, t *testing.T, exec driver.Executor, clien
 	}
 	fin := make([]driver.JobFinalize, n)
 	for i, j := range claimed.Jobs {
-		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
 	}
 	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin}); err != nil {
 		t.Fatal(err)
@@ -1169,7 +1169,7 @@ func TestTagListingSnapshotSpansStatements(t *testing.T) {
 	}
 	log := &statementLog{afterSQL: "LEFT JOIN LATERAL", after: func() {
 		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-			{ID: res[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+			{ID: res[0].Job.ID, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true},
 		}}); err != nil {
 			t.Error(err)
 		}
@@ -1180,5 +1180,24 @@ func TestTagListingSnapshotSpansStatements(t *testing.T) {
 	}
 	if log.after != nil {
 		t.Error("the job was not finalized during the listing")
+	}
+}
+
+// TestRescueCandidatesWithoutAttemptTime has a direct SQL write leave a
+// running row with no attempted_at and no live client. With StuckAfter the
+// rescuer still reads its batch, the row in it, reported as not stuck,
+// rather than failing the scan of a NULL stuck flag on every pass.
+func TestRescueCandidatesWithoutAttemptTime(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	if _, err := exec.JobInsertMany(ctx, insertParams("k", 1), driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool().Exec(ctx, `UPDATE hopper_jobs SET state = 'running', attempt = 1`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := exec.JobRescueCandidates(ctx, driver.JobRescueParams{StuckAfter: time.Minute, Limit: 10})
+	if err != nil || len(got) != 1 || got[0].Stuck {
+		t.Fatalf("candidates = %+v, %v; want the row, not stuck", got, err)
 	}
 }

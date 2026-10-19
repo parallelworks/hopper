@@ -122,7 +122,7 @@ func testJobTags[TTx any](t *testing.T, f Fixture[TTx]) {
 		if want := p[argsN(j)].Tags; !slices.Equal(j.Tags, want) {
 			t.Errorf("claimed job %d tags = %q, want %q", argsN(j), j.Tags, want)
 		}
-		finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	}
 	if n := f.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_job_history_tags_completed_default"); n != "0" {
 		t.Errorf("%s tags rows of jobs finished on a new installation in the DEFAULT partition, want 0", n)
@@ -188,7 +188,7 @@ func testJobTags[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err != nil || len(shards.Jobs) != 1 {
 		t.Fatalf("claim = %+v, %v", shards, err)
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: shards.Jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: shards.Jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	callbacks, err := exec.JobList(ctx, driver.JobListParams{Queue: "callbacks", Limit: 10})
 	if err != nil || len(callbacks) != 1 || !slices.Equal(callbacks[0].Tags, []string{"callback"}) {
 		t.Errorf("callbacks = %+v, %v", callbacks, err)
@@ -217,7 +217,7 @@ func testJobTags[TTx any](t *testing.T, f Fixture[TTx]) {
 		if err != nil || len(shards.Jobs) != 1 {
 			t.Fatalf("claim = %+v, %v", shards, err)
 		}
-		finalize(ctx, t, exec, driver.JobFinalize{ID: shards.Jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: shards.Jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 		callbacks, err := exec.JobList(ctx, driver.JobListParams{Queue: "odd-callbacks", Limit: 10})
 		if err != nil || len(callbacks) != 1 || !slices.Equal(callbacks[0].Tags, odd.want) {
 			t.Errorf("callback with tags %s = %+v, %v, want tags %q", odd.tags, callbacks, err, odd.want)
@@ -259,11 +259,11 @@ func testJobListFilters[TTx any](t *testing.T, f Fixture[TTx]) {
 		case n == 2:
 			discarded := driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true}
 			discarded.Error = &driver.AttemptError{Attempt: j.Attempt, Error: "x"}
-			finalize(ctx, t, exec, discarded)
+			finalizeCurrent(ctx, t, exec, discarded)
 		case n < 4:
-			finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+			finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 		default:
-			finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateScheduled, Snooze: true, Delay: time.Hour})
+			finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateScheduled, Snooze: true, Delay: time.Hour})
 		}
 	}
 	for _, c := range []struct {
@@ -398,7 +398,7 @@ func testTagsPartitionWaitsForHistory[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
-	finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	mctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	res, err := exec.HistoryMaintain(mctx, p)
@@ -661,7 +661,7 @@ func testTagsRowsFollowJobs[TTx any](t *testing.T, f Fixture[TTx]) {
 			}
 			fin := make([]driver.JobFinalize, len(res.Jobs))
 			for k, j := range res.Jobs {
-				fin[k] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+				fin[k] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
 				switch (i + k) % 5 {
 				case 1:
 					fin[k].State, fin[k].Error = driver.JobStateDiscarded, &driver.AttemptError{Attempt: j.Attempt, Error: "x"}
@@ -934,7 +934,7 @@ func testTagsFollowDirectUpdates[TTx any](t *testing.T, f Fixture[TTx]) {
 	clientID := register(ctx, t, exec)
 	for _, j := range claim(ctx, t, exec, clientID, 9) {
 		if !slices.Contains(j.Tags, "t4") && !slices.Contains(j.Tags, "t5") {
-			finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+			finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 		}
 	}
 	id := func(tag string) string {
@@ -1063,7 +1063,7 @@ func testTagsFollowTruncate[TTx any](t *testing.T, f Fixture[TTx]) {
 		insert(ctx, t, exec, p)
 		clientID := register(ctx, t, exec)
 		for _, j := range claim(ctx, t, exec, clientID, 2) {
-			finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+			finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 		}
 	}
 	rows := func(table string) string {
@@ -1112,7 +1112,7 @@ func testTagsPagePastFilteredHistory[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	clientID := register(ctx, t, exec)
 	for _, j := range claim(ctx, t, exec, clientID, 33) {
-		finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	}
 	want = append(want, insert(ctx, t, exec, tagged("want", 1))[0].Job.ID)
 	for _, c := range []struct {

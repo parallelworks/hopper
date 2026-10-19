@@ -184,7 +184,7 @@ func testFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	applied := finalize(ctx, t, exec,
+	applied := finalizeCurrent(ctx, t, exec,
 		driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true, Output: []byte(`{"ok":true}`)},
 		driver.JobFinalize{ID: id(1), AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: false},
 		driver.JobFinalize{ID: id(2), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: 30 * time.Second, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}},
@@ -262,12 +262,12 @@ func testFinalizeSkipLocked[TTx any](t *testing.T, f Fixture[TTx], noBatches boo
 	held, free := jobs[0].ID, jobs[1].ID
 	tx, _, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // rolled back below
-	finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: held, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
-	failed := driver.JobFinalize{ID: held, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}}
+	finalizeCurrent(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: held, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	failed := driver.JobFinalize{ID: held, AttemptedBy: clientID, Fence: 1, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}}
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	applied, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: []driver.JobFinalize{
-		failed, {ID: free, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+		failed, {ID: free, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true},
 	}})
 	if err != nil || !slices.Equal(applied, []driver.JobID{free}) {
 		t.Fatalf("finalize with a held row = %v, %v; want only %s", applied, err, free)
@@ -295,15 +295,15 @@ func testFinalizeFences[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 	id := jobs[0].ID
 	// A result from a client that does not own the job is dropped.
-	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: b, State: driver.JobStateCompleted, Archive: true}); len(applied) != 0 {
+	if applied := finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: b, State: driver.JobStateCompleted, Archive: true}); len(applied) != 0 {
 		t.Fatalf("stale finalize applied: %v", applied)
 	}
 	if j, _ := exec.JobGet(ctx, id); j.State != driver.JobStateRunning || j.AttemptedBy != a {
 		t.Errorf("job after stale finalize = %+v", j)
 	}
 	// A result for a job that is no longer running is dropped too.
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: a, State: driver.JobStateRetryable, Delay: time.Hour})
-	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: a, State: driver.JobStateCompleted, Archive: true}); len(applied) != 0 {
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: a, State: driver.JobStateRetryable, Delay: time.Hour})
+	if applied := finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: a, State: driver.JobStateCompleted, Archive: true}); len(applied) != 0 {
 		t.Fatalf("finalize of a non-running job applied: %v", applied)
 	}
 	if j, _ := exec.JobGet(ctx, id); j.State != driver.JobStateRetryable {
@@ -331,7 +331,7 @@ func testFinalizeTx[TTx any](t *testing.T, f Fixture[TTx]) {
 	// cannot leave it open and hang the pool's close.
 	tx, _, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already ended on the happy path
-	if applied := finalize(ctx, t, d.UnwrapTx(tx), result); len(applied) != 1 {
+	if applied := finalizeCurrent(ctx, t, d.UnwrapTx(tx), result); len(applied) != 1 {
 		t.Fatalf("finalize in tx applied %v", applied)
 	}
 	if j, err := exec.JobGet(ctx, id); err != nil || j.State != driver.JobStateRunning {
@@ -346,7 +346,7 @@ func testFinalizeTx[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	tx, _, rollback = f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already ended on the happy path
-	if applied := finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: id, AttemptedBy: b, State: driver.JobStateCompleted, Archive: true}); len(applied) != 0 {
+	if applied := finalizeCurrent(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: id, AttemptedBy: b, State: driver.JobStateCompleted, Archive: true}); len(applied) != 0 {
 		t.Errorf("finalize in tx by a client that does not own the job applied %v", applied)
 	}
 	if err := rollback(); err != nil {
@@ -355,10 +355,10 @@ func testFinalizeTx[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
-	if applied := finalize(ctx, t, d.UnwrapTx(tx), result); len(applied) != 1 {
+	if applied := finalizeCurrent(ctx, t, d.UnwrapTx(tx), result); len(applied) != 1 {
 		t.Fatalf("finalize in tx applied %v", applied)
 	}
-	if applied := finalize(ctx, t, d.UnwrapTx(tx), result); len(applied) != 0 {
+	if applied := finalizeCurrent(ctx, t, d.UnwrapTx(tx), result); len(applied) != 0 {
 		t.Errorf("second finalize in the same tx applied %v", applied)
 	}
 	if err := commit(); err != nil {
@@ -393,13 +393,13 @@ func testFinalizeTxConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		// Rolled back on exit too, so a failed check cannot leave it open
 		// with the competing finalize waiting on it.
 		defer rollback() //nolint:errcheck // already ended on the happy path
-		if applied := finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
+		if applied := finalizeCurrent(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
 			t.Fatalf("finalize in tx applied %v", applied)
 		}
 		done := make(chan []driver.JobID, 1)
 		go func() {
 			applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-				{ID: r.Job.ID, AttemptedBy: clientID, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}},
+				{ID: r.Job.ID, AttemptedBy: clientID, Fence: 1, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}},
 			}})
 			if err != nil {
 				t.Error(err)
@@ -508,7 +508,7 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	if got := claim(ctx, t, exec, clientID, 1); len(got) != 1 || got[0].ID != inserted[2].Job.ID {
 		t.Errorf("claim after retry = %+v", got)
 	}
-	finalize(ctx, t, exec,
+	finalizeCurrent(ctx, t, exec,
 		driver.JobFinalize{ID: inserted[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}},
 		driver.JobFinalize{ID: inserted[1].Job.ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}},
 	)
@@ -613,11 +613,11 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 
 	// The running job was marked, so its retry runs at once.
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
 	claimed(id(0))
 
 	// A snooze with no wake waits, and blocks the key, until a wake.
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
 	claimed()
 	wake("default", 10, 1)
 	if r := storedReason(ctx, t, f, d, id(0)); r != "" {
@@ -627,7 +627,7 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	// A wake during the attempt makes its snooze run at once, without a reason.
 	wake("default", 10, 0)
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
 	if r := storedReason(ctx, t, f, d, id(0)); r != "" {
 		t.Errorf("snooze after a wake kept reason %q", r)
 	}
@@ -635,7 +635,7 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	// A mark from before the attempt started does not count.
 	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET wake_requested_at = attempted_at - interval '1s' WHERE id = $1::uuid", id(0).String())
-	finalize(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
 	claimed()
 	if n, err := exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: "default", OrderingKey: "none", Limit: 10}); err != nil || n != 0 {
 		t.Errorf("unknown key = %d, %v", n, err)
@@ -667,7 +667,7 @@ func testRetryOrderingKeyConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		var wg sync.WaitGroup
 		wg.Go(func() { wakeKey(key) })
 		wg.Go(func() {
-			res := driver.JobFinalize{ID: job, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true}
+			res := driver.JobFinalize{ID: job, AttemptedBy: clientID, Fence: 1, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true}
 			if applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{res}}); err != nil || len(applied) != 1 {
 				t.Errorf("finalize = %v, %v", applied, err)
 			}
@@ -751,7 +751,7 @@ func testTTL[TTx any](t *testing.T, f Fixture[TTx]) {
 	if len(ran) != 3 {
 		t.Fatalf("claimed %d", len(ran))
 	}
-	finalize(ctx, t, exec,
+	finalizeCurrent(ctx, t, exec,
 		driver.JobFinalize{ID: ran[0].ID, AttemptedBy: clientID, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "boom"}},
 		driver.JobFinalize{ID: ran[1].ID, AttemptedBy: clientID, State: driver.JobStateScheduled, Snooze: true, SnoozeReason: "later"},
 	)
@@ -791,7 +791,7 @@ func testListOrderingKeyLane[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	archived := insert(ctx, t, exec, keyed(1))[0].Job.ID
 	claim(ctx, t, exec, clientID, 1)
-	finalize(ctx, t, exec, driver.JobFinalize{ID: archived, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: archived, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 
 	other := params("a", 2)
 	other[1].OrderingKey = "other"
@@ -857,7 +857,7 @@ func testList[TTx any](t *testing.T, f Fixture[TTx]) {
 	inserted := insert(ctx, t, exec, p)
 	clientID := register(ctx, t, exec)
 	claimed := claim(ctx, t, exec, clientID, 1)
-	finalize(ctx, t, exec, driver.JobFinalize{ID: claimed[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: claimed[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 
 	list := func(q driver.JobListParams) []driver.JobID {
 		t.Helper()
@@ -956,7 +956,7 @@ func testJobDelete[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	done := insert(ctx, t, exec, params("a", 1))[0].Job.ID
 	claim(ctx, t, exec, clientID, 1)
-	finalize(ctx, t, exec, driver.JobFinalize{ID: done, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: done, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	if job, err := exec.JobDelete(ctx, done); err != nil || job.ID != done || job.State != driver.JobStateCompleted {
 		t.Errorf("delete completed = %+v, %v", job, err)
 	}
@@ -1070,7 +1070,7 @@ func testRetryOrderingKeyTx[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err := commit(); err != nil {
 		t.Fatal(err)
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: job, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: job, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true})
 	if due := f.QueryText(ctx, t, d, "SELECT (scheduled_at <= now())::text FROM hopper_jobs WHERE id = $1::uuid", job.String()); due != "true" {
 		t.Error("a wake in a transaction older than the attempt was lost")
 	}

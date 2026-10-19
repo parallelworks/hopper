@@ -163,7 +163,7 @@ func TestTagListingPreparesOnce(t *testing.T) {
 	}
 	for _, j := range claimed.Jobs {
 		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
-			{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
+			{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true},
 		}}); err != nil {
 			t.Fatal(err)
 		}
@@ -280,7 +280,7 @@ func tagged(ctx context.Context, t *testing.T, x driver.Executor, kind, tag stri
 	}
 	fin := make([]driver.JobFinalize, len(claimed.Jobs))
 	for i, j := range claimed.Jobs {
-		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
 	}
 	if _, err := x.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin}); err != nil {
 		t.Fatal(err)

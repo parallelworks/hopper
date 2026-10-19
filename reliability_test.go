@@ -2,6 +2,7 @@ package hopper_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -715,6 +716,227 @@ func TestRescueStuckAfter(t *testing.T) {
 		t.Errorf("stuck job = %+v", job)
 	}
 	close(w.release)
+}
+
+type reclaimed struct{}
+
+// droppedResult is what the finalizer logs for a result whose attempt no
+// longer owns its job.
+const droppedResult = "hopper: result dropped: job no longer owned by this attempt"
+
+func (reclaimed) Kind() string { return "reclaimed" }
+
+// TestRescuedAttemptsResultSkipsTheNextClaim rescues a stuck attempt whose
+// client is alive, so that the same client claims the job again while the
+// first attempt still runs. The first attempt's late result, from the same
+// client, must not finalize the second claim: the job's output is that of
+// the attempt it completed in.
+func TestRescuedAttemptsResultSkipsTheNextClaim(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	started := make(chan int, 10)
+	first, second := make(chan struct{}), make(chan struct{})
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[reclaimed]) error {
+		started <- job.Attempt
+		switch job.Attempt {
+		case 1:
+			<-first // ignores its context
+		default:
+			// The second attempt, and any after it should a slow host let
+			// the second be rescued too: none completes before the check.
+			<-second
+		}
+		return hopper.SetOutput(ctx, job.Attempt)
+	})
+	logs := &messageLog{}
+	c := h.client(&hopper.Config{
+		Queues:           map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers:          workers,
+		RescueStuckAfter: time.Second,
+		JobTimeout:       time.Hour,
+		Logger:           slog.New(logs),
+	})
+	releaseFirst, releaseSecond := sync.OnceFunc(func() { close(first) }), sync.OnceFunc(func() { close(second) })
+	t.Cleanup(releaseFirst)
+	t.Cleanup(releaseSecond)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, reclaimed{}, &hopper.InsertOpts{MaxAttempts: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAttempt(t, started, 1)
+	waitAttempt(t, started, 2)
+	releaseFirst()
+	// The first attempt's result is written and dropped, or, unfenced,
+	// finalizes the job.
+	waitFor(t, func() bool {
+		job, err := c.JobGet(ctx, res.Job.ID)
+		return logs.count(droppedResult) > 0 || err == nil && job.State == hopper.JobStateCompleted
+	})
+	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State == hopper.JobStateCompleted {
+		t.Fatalf("after the rescued attempt returned, job = %+v, %v; want it left to a later claim", job, err)
+	}
+	releaseSecond()
+	job := waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted)
+	var out int
+	if err := json.Unmarshal(job.Output, &out); err != nil || out != job.Attempt || out < 2 {
+		t.Errorf("completed at attempt %d with output %s (%v): another attempt's result", job.Attempt, job.Output, err)
+	}
+}
+
+// TestCancelReachesAReclaimedAttempt rescues a stuck attempt and lets the
+// same client claim the job again. The second claim cancels the first
+// attempt, and once that returns, a JobCancel must still reach the second.
+func TestCancelReachesAReclaimedAttempt(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	started := make(chan int, 10)
+	first := make(chan struct{})
+	causes, firstCause := make(chan error, 1), make(chan error, 1)
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[reclaimed]) error {
+		started <- job.Attempt
+		if job.Attempt == 1 {
+			<-first // ignores its context
+			firstCause <- context.Cause(ctx)
+			return nil
+		}
+		// The second attempt, and any after it should a slow host let the
+		// second be rescued too: the cancel reaches the latest claim. One
+		// rescued meanwhile is canceled with ErrJobFenced by the claim that
+		// replaces it here, which is not the cause the test waits for.
+		<-ctx.Done()
+		if cause := context.Cause(ctx); !errors.Is(cause, hopper.ErrJobFenced) {
+			select {
+			case causes <- cause:
+			default:
+			}
+		}
+		return ctx.Err()
+	})
+	logs := &messageLog{}
+	c := h.client(&hopper.Config{
+		Queues:           map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers:          workers,
+		RescueStuckAfter: 2 * time.Second,
+		JobTimeout:       time.Hour,
+		Logger:           slog.New(logs),
+	})
+	releaseFirst := sync.OnceFunc(func() { close(first) })
+	t.Cleanup(releaseFirst)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, reclaimed{}, &hopper.InsertOpts{MaxAttempts: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAttempt(t, started, 1)
+	waitAttempt(t, started, 2)
+	releaseFirst()
+	if cause := <-firstCause; !errors.Is(cause, hopper.ErrJobFenced) {
+		t.Errorf("rescued attempt's cause = %v once claimed again, want ErrJobFenced", cause)
+	}
+	// The first attempt's result is dropped once the attempt has returned
+	// and let go of its claim, so the cancel comes after that.
+	waitFor(t, func() bool { return logs.count(droppedResult) > 0 })
+	if _, err := c.JobCancel(ctx, res.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case cause := <-causes:
+		if !errors.Is(cause, hopper.ErrJobCanceled) {
+			t.Errorf("second attempt's cause = %v, want ErrJobCanceled", cause)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("JobCancel did not reach the second attempt")
+	}
+	waitForJob(t, c, res.Job.ID, hopper.JobStateCanceled)
+}
+
+// TestReplacedAttemptsFailureIsNotTheJobs rescues a stuck attempt and lets
+// the same client claim the job again, which cancels the first attempt with
+// ErrJobFenced. The first attempt's failure, from that cancel, is not the
+// job's: Config.OnError is not called for it, as for any rescued job, and it
+// is not logged as a failed job.
+func TestReplacedAttemptsFailureIsNotTheJobs(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	started := make(chan int, 10)
+	first, second := make(chan struct{}), make(chan struct{})
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[reclaimed]) error {
+		started <- job.Attempt
+		if job.Attempt == 1 {
+			<-first // ignores its context
+			return context.Cause(ctx)
+		}
+		<-second
+		return nil
+	})
+	var onErrorMu sync.Mutex
+	var onError []error
+	logs := &messageLog{}
+	c := h.client(&hopper.Config{
+		Queues:           map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+		Workers:          workers,
+		RescueStuckAfter: time.Second,
+		JobTimeout:       time.Hour,
+		Logger:           slog.New(logs),
+		OnError: func(_ context.Context, _ *hopper.JobRow, err error) hopper.ErrorOutcome {
+			onErrorMu.Lock()
+			onError = append(onError, err)
+			onErrorMu.Unlock()
+			return hopper.ErrorOutcome{}
+		},
+	})
+	releaseFirst, releaseSecond := sync.OnceFunc(func() { close(first) }), sync.OnceFunc(func() { close(second) })
+	t.Cleanup(releaseFirst)
+	t.Cleanup(releaseSecond)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, reclaimed{}, &hopper.InsertOpts{MaxAttempts: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitAttempt(t, started, 1)
+	waitAttempt(t, started, 2)
+	releaseFirst()
+	waitFor(t, func() bool { return logs.count(droppedResult) > 0 })
+	onErrorMu.Lock()
+	calls := slices.Clone(onError)
+	onErrorMu.Unlock()
+	if len(calls) != 0 {
+		t.Errorf("Config.OnError called for the replaced attempt with %v", calls)
+	}
+	if n := logs.count("hopper: job failed"); n != 0 {
+		t.Errorf("the replaced attempt was logged as a failed job %d times", n)
+	}
+	releaseSecond()
+	waitForJob(t, c, res.Job.ID, hopper.JobStateCompleted)
+}
+
+// waitAttempt waits for the worker to start attempt n.
+func waitAttempt(t *testing.T, started <-chan int, n int) {
+	t.Helper()
+	timeout := time.After(15 * time.Second)
+	for {
+		select {
+		case a := <-started:
+			if a == n {
+				return
+			}
+		case <-timeout:
+			t.Fatalf("attempt %d did not start", n)
+		}
+	}
 }
 
 func TestInsertOnlyClientNotifiesWorkers(t *testing.T) {

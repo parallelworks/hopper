@@ -501,8 +501,9 @@ CREATE TABLE hopper_jobs (
   wake_requested_at   timestamptz,               -- JobRetryOrderingKey reached the job while it ran (schema v10); live table only
   progress            jsonb,                     -- last step finished, cursor and time (schema v15); kept in history
   logs                jsonb,                     -- the latest attempts' log lines (schema v16); kept in history
-  tags                jsonb                      -- array of strings, NULL for none (schema v17); kept in history, with the same CHECK
-    CHECK (jsonb_typeof(tags) = 'array' AND NOT jsonb_path_exists(tags, 'strict $[*] ? (@.type() != "string")')) NOT VALID
+  tags                jsonb,                     -- array of strings, NULL for none (schema v17); kept in history, with the same CHECK
+    CHECK (jsonb_typeof(tags) = 'array' AND NOT jsonb_path_exists(tags, 'strict $[*] ? (@.type() != "string")')) NOT VALID,
+  fence               bigint      NOT NULL DEFAULT 0  -- numbers the job's claims (schema v18, §7.3); kept in history
 ) WITH (fillfactor = 70);
 
 -- Claim path: the only index the hot query touches.
@@ -624,7 +625,8 @@ the whole queue nor a new index on the hot table. Schema v14 adds the history in
 declared and built the same way. Schema v15 adds `progress` to `hopper_jobs` and
 history (§7.5), and v16 adds `logs` the same way (§7.5). Schema v17 adds `tags` the
 same way, with `hopper_job_tags`, `hopper_job_history_tags` (whose time partitions the
-leader keeps with history's) and the triggers that maintain them (§7.2).
+leader keeps with history's) and the triggers that maintain them (§7.2). Schema v18
+adds `fence` to `hopper_jobs` and history (§7.3), in the loop v17's columns took.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -924,11 +926,30 @@ WITH c AS MATERIALIZED (
   ) cand
 )
 UPDATE hopper_jobs j
-SET state = 'running', attempt = attempt + 1, attempted_at = now(), attempted_by = $client
+SET state = 'running', attempt = attempt + 1, fence = fence + 1, attempted_at = now(), attempted_by = $client
 FROM c WHERE j.id = c.id AND c.n <= $n
 RETURNING j.*;
 ```
 
+- **Fence.** Every claim increments the job's `fence`, returned as `JobRow.Fence`, and
+  each result, progress write and rescue names the fence of the claim it belongs to
+  (§7.5). The attempt number cannot serve: a snooze gives it back, so the claim after
+  a snooze has the same number, and a job rescued while its client is alive
+  (`RescueStuckAfter`) can be claimed again by that same client. Snoozes, retries and
+  the archive keep the fence, and `JobRetry` carries it back from history, so for a
+  given job it never repeats; the error recorded for a failed attempt carries it too.
+  It is a counter on the row rather than a sequence, which would be a hotspot shared
+  by every claim and, cached per session, would not increase per job. `fence` is in no
+  index, so incrementing it adds no index write to the claim. A client of the previous release claims
+  without incrementing it, archives a job with `fence` 0 and drops it in `JobRetry` from
+  history; the finalize fence still holds then against other clients, since it checks
+  the client too, and progress writes check the attempt number as well. A fence reset
+  that way can come round to the same value for the same client, and a late result of
+  that client's earlier claim at that value, still running all that while, would
+  finalize the later one: this needs the reset and a stuck attempt that outlives as
+  many claims of its job, and is accepted rather than adding the attempt number to the
+  finalize. A fence passed outside hopper only increases once every client runs this
+  release.
 - **Plan stability.** Drivers cache prepared statements, and Postgres keeps a
   statement's generic plan until something invalidates it. A plan made while
   `hopper_jobs` was empty (an idle queue, drained and vacuumed to zero pages) costs every
@@ -1023,7 +1044,7 @@ updated in place, a snooze with its reason. Terminal outcomes are moved to histo
 
 ```sql
 WITH r AS (SELECT * FROM unnest($ids, $attempted_by, $states, $delays, $snoozes, $errors, $outputs, $archives,
-                                 $snooze_reasons) AS r(...)),
+                                 $snooze_reasons, $fences) AS r(...)),
 retry AS (
   UPDATE hopper_jobs j SET state = r.state,
          scheduled_at = CASE WHEN j.wake_requested_at >= j.attempted_at THEN now() ELSE now() + r.delay END,
@@ -1032,23 +1053,32 @@ retry AS (
          snooze_reason = CASE WHEN r.snooze AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false) THEN r.snooze_reason END,
          wake_requested_at = NULL
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
-    AND j.state = 'running' AND j.attempted_by = r.attempted_by
+    AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
   RETURNING j.id),
 done AS (
   DELETE FROM hopper_jobs j USING r
   WHERE j.id = r.id AND r.state IN ('completed','canceled','discarded')
-    AND j.state = 'running' AND j.attempted_by = r.attempted_by
+    AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
   RETURNING j.*, r.state AS final_state, r.error, r.output, r.archive),
 archived AS (INSERT INTO hopper_job_history SELECT … , now() FROM done WHERE archive)
 SELECT id FROM retry UNION ALL SELECT id FROM done;
 ```
 
-- The `state = 'running' AND attempted_by = r.attempted_by` condition fences out
-  stale results. Each result carries the client ID that claimed its attempt, so a
-  client that re-registered under a new ID still finalizes the attempts it claimed
-  under the old one. If the job was rescued and reclaimed, the result is dropped and
+- The `state = 'running' AND attempted_by = r.attempted_by AND fence = r.fence`
+  condition fences out stale results. Each result carries the client ID and the fence
+  of the claim it ran in, so a client that re-registered under a new ID still
+  finalizes the attempts it claimed under the old one. If the job was rescued and
+  claimed again, by another client or by the same one, the result is dropped and
   logged, so a finalize can never overwrite a newer attempt. The statement returns
-  the IDs it applied; the client logs the rest.
+  the IDs it applied; the client logs the rest. A flush can hold two results of one
+  job, a rescued attempt's late one and that of the claim after it, and the statement
+  would return the job's ID once whichever applied, so the finalizer writes the second
+  in a statement of its own, and the late result emits no event. The client keeps the
+  cancel function of each running job's latest claim, and an attempt that returns
+  removes only its own claim's, so that the return of a rescued attempt does not take
+  away the cancel of the claim after it. A claim that replaces another cancels the
+  earlier attempt with `ErrJobFenced`, since its result can no longer apply; that
+  attempt's failure, like a rescued job's, goes to neither `Config.OnError` nor the log.
 - Retry delays are sent as durations and applied to database `now()`; error
   timestamps are set by the database too (§7.1).
 - Queues with `DeleteCompleted: true` delete completed jobs without writing history.
@@ -1109,7 +1139,9 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   when `tx` commits.
 - After the worker returns, the client reads the job (one primary-key read of the
   live table and history), because a fenced result cannot tell a commit from a rescue
-  that applied once `tx` rolled back.
+  that applied once `tx` rolled back. The read matches the job to this attempt by its
+  client, fence and attempt number: a `JobRetry` from history by a client of the
+  previous release drops the fence, and the claim after it can repeat this one's.
   - **Committed.** If the job is in history as this attempt completed it, or gone (a
     completed job on a `DeleteCompleted` queue), `tx` committed, whatever the worker
     returned: the client emits `job.completed`, settles the job's batch and promotes
@@ -1143,8 +1175,9 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   the commit.
 - **Progress.** `RecordStep` and `RecordCursor` write the job's `progress` column
   (`{"step", "cursor", "at"}`, the time `statement_timestamp()`) with one `UPDATE`
-  fenced like a finalize: `state = 'running'`, the attempt's client and its attempt
-  number. A fenced write changes nothing and returns `ErrJobFenced`. They run on the
+  fenced like a finalize: `state = 'running'`, the attempt's client, its claim's
+  fence and its attempt number, which guards a fence that a client of the previous
+  release reset. A fenced write changes nothing and returns `ErrJobFenced`. They run on the
   pool and are not batched: a step is long next to its write, and the write must be
   durable before the worker goes on. `RecordStepTx` and `RecordCursorTx` run the same
   statement through `Driver.UnwrapTx(tx)`, so the progress commits with the step's
@@ -1288,9 +1321,15 @@ the largest source of write amplification in heartbeat-based designs.
 - **Rescue.** The leader's rescuer finds `running` jobs whose `attempted_by` has no
   unexpired lease and moves them to `retryable` with the error `client lost` (or to
   `discarded` if they are out of attempts). A crashed pod's jobs run again within about
-  20s. The rescue's finalize skips rows another transaction holds (a `CompleteTx` that
+  20s. The rescue reads its candidates and then finalizes them, fenced to the claim
+  each was found in, so a job its client finalized and claimed again in between is
+  left to that claim. The rescue's finalize skips rows another transaction holds (a `CompleteTx` that
   has not ended, §7.5) and retries them on the next pass, so one such row cannot hold
-  up the leader's loop and its lease renewal.
+  up the leader's loop and its lease renewal; a full batch that rescues nothing ends
+  the pass rather than read the same rows again. The read takes the oldest candidates
+  first, so while a full batch of them stays held, candidates behind them wait for
+  those transactions to end; reading past held rows would change the rescue's query
+  for a case that needs `RescueBatch` rows held at once.
 - **Fencing.** If a renewal matches zero rows (after a long GC pause or a partition),
   the client has lost its lease. It cancels the context of every in-flight job that has
   attempts left and re-registers under a new ID. A job on its last attempt keeps
@@ -1302,7 +1341,10 @@ the largest source of write amplification in heartbeat-based designs.
   notices.
 - **Hung jobs.** A live client with a stuck goroutine is handled by timeouts. An
   optional `RescueStuckAfter` also rescues jobs that are still running past an absolute
-  age.
+  age, measured by database time: the candidate query reports which jobs it found as
+  stuck, and the rescue's error says so. The rescue does not reach the stuck attempt:
+  it runs on until it returns, and its result is dropped, unless its own client claims
+  the job again, which cancels it (§7.5).
 - **Graceful stop** deletes the lease after the finalizer flushes, so nothing needs
   rescuing.
 
@@ -2082,11 +2124,11 @@ observability without new machinery.
   reports the partition, which it backs off and warns about, and goes on to the next.
   The migration's transaction is read committed, and keeps no snapshot between its statements, so the build never waits
   for it while it waits for the lock. A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a 50 ms `lock_timeout` in a loop (schema v9 and v10, and v13 and v14
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9, v10, v15 to v18, and v13 and v14
   for the `SHARE` lock that declaring a history index takes, which finalizes wait for), because a lock
   request queued behind an open transaction on the table would hold up every claim
   behind it; claims wait at most one try at a time. A try that changes both `hopper_jobs`
-  and history (v17) locks them first, `hopper_jobs` before history, the order a finalize
+  and history (v17, v18) locks them first, `hopper_jobs` before history, the order a finalize
   takes them in: a finalize that has `hopper_jobs` and waits for history would otherwise
   hold up the try until its timeout, and under steady finalizes almost every try would
   fail that way. From v17 the short timeout is set inside the loop and restored after
@@ -2153,7 +2195,7 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease, backdate an attempt, count rows). Engine internals such as partition management stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |

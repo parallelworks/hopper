@@ -11,7 +11,7 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing (also inside a caller's transaction), snooze reasons, leases, leader election, rescue candidates,
+// fencing to the claim (also inside a caller's transaction), snooze reasons, leases, leader election, rescue candidates,
 // cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
 // notifications and history maintenance. Engine-specific behavior, such as how partitions are managed,
 // belongs in the driver's own tests.
@@ -94,6 +94,10 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeFencesNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeFences(t, f, true) }},
 		{"FinalizeSkipLocked", func(t *testing.T, f Fixture[TTx]) { testFinalizeSkipLocked(t, f, false) }},
 		{"FinalizeSkipLockedNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeSkipLocked(t, f, true) }},
+		{"ClaimFence", testClaimFence[TTx]},
+		{"FinalizeFencesReclaim", testFinalizeFencesReclaim[TTx]},
+		{"RescueRacesReclaim", testRescueRacesReclaim[TTx]},
+		{"RecordProgressFencesSnooze", testRecordProgressFencesSnooze[TTx]},
 		{"FinalizeTx", testFinalizeTx[TTx]},
 		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},
@@ -207,6 +211,7 @@ func claim(ctx context.Context, t *testing.T, exec driver.Executor, clientID int
 	return res.Jobs
 }
 
+// finalize applies results as given, their fences included.
 func finalize(ctx context.Context, t *testing.T, exec driver.Executor, jobs ...driver.JobFinalize) []driver.JobID {
 	t.Helper()
 	applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: jobs})
@@ -214,6 +219,36 @@ func finalize(ctx context.Context, t *testing.T, exec driver.Executor, jobs ...d
 		t.Fatal(err)
 	}
 	return applied
+}
+
+// finalizeCurrent is finalize for tests of something other than the fence:
+// a result without a Fence gets the job's current one, as if it came from
+// the job's latest claim. It fences only by the other conditions, such as
+// the client, so a test of the fence uses finalize.
+func finalizeCurrent(ctx context.Context, t *testing.T, exec driver.Executor, jobs ...driver.JobFinalize) []driver.JobID {
+	t.Helper()
+	return finalize(ctx, t, exec, withFences(ctx, t, exec, jobs)...)
+}
+
+// withFences returns jobs with the current fence of each job filled in where
+// a result has none.
+func withFences(ctx context.Context, t *testing.T, exec driver.Executor, jobs []driver.JobFinalize) []driver.JobFinalize {
+	t.Helper()
+	out := slices.Clone(jobs)
+	for i, f := range out {
+		if f.Fence != 0 {
+			continue
+		}
+		j, err := exec.JobGet(ctx, f.ID)
+		if errors.Is(err, driver.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[i].Fence = j.Fence
+	}
+	return out
 }
 
 // argsN reads the "i" field of a job's args, or -1.
@@ -316,7 +351,7 @@ func testInsertUnique[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 
 	// Finalizing frees the key.
-	finalize(ctx, t, exec, driver.JobFinalize{ID: first[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: first[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	if third := insert(ctx, t, exec, []driver.JobInsertParams{unique("u", 6, time.Time{})}); third[0].Duplicate {
 		t.Error("finalized job still blocks its unique key")
 	}

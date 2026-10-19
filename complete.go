@@ -9,8 +9,11 @@ import (
 )
 
 // ErrJobFenced is returned by CompleteTx, RecordStep and RecordCursor when
-// the attempt no longer owns its job: the job was rescued after this client
-// lost its lease, or it was already finalized.
+// the attempt no longer owns its job: the job was rescued, after this client
+// lost its lease or for RescueStuckAfter, and perhaps claimed again, or it
+// was already finalized. It is also the cause of the job's context
+// cancellation (check it with context.Cause) when the job, rescued while the
+// attempt still ran, is claimed again on the same client.
 var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt")
 
 // CompleteTx completes the running job inside tx, so that the worker's own

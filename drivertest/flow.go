@@ -70,7 +70,7 @@ func testGlobalLimit[TTx any](t *testing.T, f Fixture[TTx]) {
 	if second := claimLimited(ctx, t, exec, b, 10); len(second.Jobs) != 0 || second.Wait != 0 {
 		t.Errorf("claim at the limit = %+v", second)
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: first.Jobs[0].ID, AttemptedBy: a, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: first.Jobs[0].ID, AttemptedBy: a, State: driver.JobStateCompleted, Archive: true})
 	if third := claimLimited(ctx, t, exec, b, 10); len(third.Jobs) != 1 {
 		t.Errorf("claim after one finished = %d, want 1", len(third.Jobs))
 	}
@@ -144,7 +144,7 @@ func testPartitionLimit[TTx any](t *testing.T, f Fixture[TTx]) {
 	if again := claimLimited(ctx, t, exec, register(ctx, t, exec), 10); len(again.Jobs) != 0 {
 		t.Errorf("claimed %d over the partition limit", len(again.Jobs))
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: inserted[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: inserted[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	next := claimLimited(ctx, t, exec, clientID, 10)
 	if len(next.Jobs) != 1 || next.Jobs[0].PartitionKey != "a" {
 		t.Errorf("claim after one of a finished = %v", next.Jobs)
@@ -203,7 +203,7 @@ func testBatches[TTx any](t *testing.T, f Fixture[TTx]) {
 	clientID := register(ctx, t, exec)
 	running := claim(ctx, t, exec, clientID, 3)
 	// Two complete in one flush; the batch counts them off but is not done.
-	finalize(ctx, t, exec,
+	finalizeCurrent(ctx, t, exec,
 		driver.JobFinalize{ID: running[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
 		driver.JobFinalize{ID: running[1].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
 	)
@@ -223,7 +223,7 @@ func testBatches[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("callbacks inserted early: %v", got)
 	}
 	// The last one is discarded: the failure and the completion callbacks run.
-	finalize(ctx, t, exec, driver.JobFinalize{ID: running[2].ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: running[2].ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
 	b, _ = exec.BatchGet(ctx, id)
 	if b.Pending != 0 || b.Failed != 1 || b.CompletedAt.IsZero() {
 		t.Errorf("completed batch = %+v", b)
@@ -260,7 +260,7 @@ func testBatches[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	running = claim(ctx, t, exec, clientID, 1)
-	finalize(ctx, t, exec, driver.JobFinalize{ID: running[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: running[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	b, _ = exec.BatchGet(ctx, id2)
 	if b.Pending != 0 || b.Failed != 1 {
 		t.Errorf("batch with a canceled job = %+v", b)
@@ -329,7 +329,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	sweep := func() driver.BatchSettleResult { t.Helper(); return settle() }
 	completed := func(id driver.JobID) driver.JobFinalize {
-		return driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+		return driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true}
 	}
 
 	batch := newBatch("pair", 2)
@@ -339,7 +339,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
-	finalize(ctx, t, d.UnwrapTx(tx), completed(jobs[0].ID))
+	finalizeCurrent(ctx, t, d.UnwrapTx(tx), completed(jobs[0].ID))
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if applied, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(jobs[1].ID)}}); err != nil || len(applied) != 1 {
@@ -374,13 +374,13 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if len(jobs) != 3 {
 		t.Fatalf("claimed %d", len(jobs))
 	}
-	finalize(ctx, t, exec, completed(jobs[0].ID))
+	finalizeCurrent(ctx, t, exec, completed(jobs[0].ID))
 	tx, commit, rollback = f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
 	if res, err := d.UnwrapTx(tx).BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{held}}); err != nil || res.Folded != 1 {
 		t.Fatalf("BatchSettle in a transaction = %+v, %v", res, err)
 	}
-	finalize(ctx, t, exec, completed(jobs[1].ID))
+	finalizeCurrent(ctx, t, exec, completed(jobs[1].ID))
 	start := time.Now()
 	if res := settle(held); res != (driver.BatchSettleResult{}) {
 		t.Errorf("BatchSettle of a held batch row = %+v", res)
@@ -391,7 +391,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err := commit(); err != nil {
 		t.Fatal(err)
 	}
-	finalize(ctx, t, exec, completed(jobs[2].ID))
+	finalizeCurrent(ctx, t, exec, completed(jobs[2].ID))
 	if b, err := exec.BatchGet(ctx, held); err != nil || b.Pending != 0 || b.CompletedAt.IsZero() {
 		t.Errorf("held batch = %+v, %v", b, err)
 	}
@@ -409,8 +409,8 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	txB, commitB, rollbackB := f.Begin(ctx, t, d)
 	defer rollbackB() //nolint:errcheck // already committed on the happy path
-	finalize(ctx, t, d.UnwrapTx(txB), completed(jobs[1].ID))
-	finalize(ctx, t, exec, completed(jobs[0].ID))
+	finalizeCurrent(ctx, t, d.UnwrapTx(txB), completed(jobs[1].ID))
+	finalizeCurrent(ctx, t, exec, completed(jobs[0].ID))
 	txA, commitA, rollbackA := f.Begin(ctx, t, d)
 	defer rollbackA() //nolint:errcheck // already committed on the happy path
 	if res, err := d.UnwrapTx(txA).BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{raced}}); err != nil || res.Completed != 0 {
@@ -451,7 +451,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	var rest []driver.JobFinalize
 	for _, j := range claim(ctx, t, exec, clientID, 4) {
 		if argsN(j) == 0 {
-			finalize(ctx, t, exec, completed(j.ID))
+			finalizeCurrent(ctx, t, exec, completed(j.ID))
 		} else {
 			rest = append(rest, completed(j.ID))
 		}
@@ -492,7 +492,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err != nil || len(cbs) != 1 || cbs[0].Priority != 1 || cbs[0].MaxAttempts != 32767 {
 		t.Errorf("legacy callback = %+v, %v", cbs, err)
 	}
-	finalize(ctx, t, exec, rest...)
+	finalizeCurrent(ctx, t, exec, rest...)
 	for _, id := range open {
 		if b, err := exec.BatchGet(ctx, id); err != nil || b.CompletedAt.IsZero() {
 			t.Errorf("batch finished after its sweep = %+v, %v", b, err)
@@ -530,7 +530,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				}
 				results := make([]driver.JobFinalize, len(res.Jobs))
 				for i, j := range res.Jobs {
-					results[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: owner, State: driver.JobStateCompleted, Archive: true}
+					results[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: owner, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
 					if argsN(j) < wantFailed[j.Kind] {
 						results[i].State, results[i].Error = driver.JobStateDiscarded, &driver.AttemptError{Attempt: 1, Error: "x"}
 					}
@@ -579,10 +579,10 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if len(jobs) != 2 {
 		t.Fatalf("claimed %d", len(jobs))
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateDiscarded, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
 	sweep()
 	f.Exec(ctx, t, d, "DELETE FROM hopper_job_history WHERE kind = 'pruned'")
-	finalize(ctx, t, exec, completed(jobs[1].ID))
+	finalizeCurrent(ctx, t, exec, completed(jobs[1].ID))
 	if b, err := exec.BatchGet(ctx, pruned); err != nil || b.CompletedAt.IsZero() || b.Failed != 1 {
 		t.Errorf("batch whose failure's history was pruned = %+v, %v", b, err)
 	}

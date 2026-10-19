@@ -220,6 +220,7 @@ func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.
 		State:       hopper.JobStateRunning,
 		Priority:    int(hopper.PriorityNormal),
 		Attempt:     1,
+		Fence:       1,
 		MaxAttempts: hopper.DefaultMaxAttempts,
 		ScheduledAt: now,
 		AttemptedAt: now,
@@ -232,7 +233,9 @@ func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.
 		row.Queue = opts.Queue
 	}
 	if opts.Attempt > 0 {
-		row.Attempt = opts.Attempt
+		// Every claim increments the fence, so attempt n has had n claims
+		// at least.
+		row.Attempt, row.Fence = opts.Attempt, int64(opts.Attempt)
 	}
 	if opts.Priority != 0 {
 		row.Priority = int(opts.Priority)

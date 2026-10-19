@@ -333,7 +333,7 @@ func printJob(w io.Writer, j *hopper.JobRow, logs []hopper.AttemptLog, logsErr s
 		fmt.Fprintf(w, "snooze_reason: %q\n", j.SnoozeReason)
 	}
 	if !j.AttemptedAt.IsZero() {
-		fmt.Fprintf(w, "attempted_at:  %s (client %d)\n", j.AttemptedAt.Local().Format(time.RFC3339), j.AttemptedBy)
+		fmt.Fprintf(w, "attempted_at:  %s (client %d, fence %d)\n", j.AttemptedAt.Local().Format(time.RFC3339), j.AttemptedBy, j.Fence)
 	}
 	if !j.FinalizedAt.IsZero() {
 		fmt.Fprintf(w, "finalized_at:  %s\n", j.FinalizedAt.Local().Format(time.RFC3339))

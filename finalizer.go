@@ -58,6 +58,8 @@ type finalizer struct {
 	// applied is called for each result that was applied, for events and
 	// local waiters.
 	applied func(job *driver.JobRow, result driver.JobFinalize)
+	// seen is repeatedJob's set, used only by the goroutine that runs run.
+	seen map[driver.JobID]struct{}
 
 	in   chan pending
 	done chan struct{} // closed when run returns
@@ -417,8 +419,18 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 // every other result of the batch. Past heldWait the batch is written again
 // skipping held rows, and a held job's result is tried again later
 // (notWritten), so that the transaction holds up only its own job.
+//
+// A batch can hold two results of one job: a rescued attempt's late one and
+// that of the claim after it, on this client. The statement applies at most
+// one and returns the job's ID once, which would not say which, so the
+// results from the second of them on go in a statement of their own.
 func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool) {
 	if len(batch) == 0 {
+		return
+	}
+	if n := f.repeatedJob(batch); n > 0 {
+		f.write(ctx, batch[:n], skipLocked)
+		f.write(ctx, batch[n:], skipLocked)
 		return
 	}
 	jobs := make([]driver.JobFinalize, len(batch))
@@ -466,6 +478,26 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 	}
 }
 
+// repeatedJob returns the index of the first result in batch whose job an
+// earlier one has, or 0 if every job is there once. Every write checks, so
+// the set is kept between writes rather than allocated for each.
+func (f *finalizer) repeatedJob(batch []pending) int {
+	if len(batch) < 2 {
+		return 0
+	}
+	if f.seen == nil {
+		f.seen = make(map[driver.JobID]struct{}, len(batch))
+	}
+	defer clear(f.seen)
+	for i, p := range batch {
+		if _, was := f.seen[p.result.ID]; was {
+			return i
+		}
+		f.seen[p.result.ID] = struct{}{}
+	}
+	return 0
+}
+
 // followUp settles the batches of jobs that have finished and promotes
 // their dependents, once the statements that finished them have committed:
 // of two clients that finalized a batch's or a dependent's last jobs at the
@@ -502,6 +534,8 @@ func (f *finalizer) followUp(ctx context.Context, finished []pending) {
 // not apply was fenced, or, for a job completed with CompleteTx, skipped
 // because the worker's transaction still held its row; the job's row tells
 // which.
+// The statement returns the IDs it applied, which name the results only
+// because write never puts two results of one job in one statement.
 func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []driver.JobID) []pending {
 	var ok map[driver.JobID]struct{}
 	if len(applied) != len(batch) {

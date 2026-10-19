@@ -103,7 +103,7 @@ func testRescue[TTx any](t *testing.T, f Fixture[TTx]) {
 	if len(liveJobs) != 2 || len(deadJobs) != 1 {
 		t.Fatal("claims")
 	}
-	candidates := func(stuck time.Duration) []*driver.JobRow {
+	candidates := func(stuck time.Duration) []driver.RescueCandidate {
 		t.Helper()
 		got, err := exec.JobRescueCandidates(ctx, driver.JobRescueParams{StuckAfter: stuck, Limit: 10})
 		if err != nil {
@@ -115,7 +115,8 @@ func testRescue[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatalf("candidates with live leases = %v", got)
 	}
 	f.ExpireLease(ctx, t, d, dead)
-	if got := candidates(0); len(got) != 1 || got[0].ID != deadJobs[0].ID || got[0].AttemptedBy != dead {
+	if got := candidates(0); len(got) != 1 || got[0].Job.ID != deadJobs[0].ID || got[0].Job.AttemptedBy != dead ||
+		got[0].Job.Fence != deadJobs[0].Fence || got[0].Stuck {
 		t.Fatalf("candidates = %v", got)
 	}
 	if _, err := exec.ClientPruneExpired(ctx); err != nil {
@@ -124,12 +125,17 @@ func testRescue[TTx any](t *testing.T, f Fixture[TTx]) {
 	if got := candidates(0); len(got) != 1 {
 		t.Fatalf("candidates after prune = %v", got)
 	}
+	// A job is stuck by database time: its attempt began StuckAfter ago by
+	// the database's clock, whatever the caller's.
 	f.AgeAttempt(ctx, t, d, liveJobs[0].ID, 10*time.Minute)
-	if got := candidates(5 * time.Minute); len(got) != 2 || got[0].ID != liveJobs[0].ID {
-		t.Fatalf("candidates with StuckAfter = %v (oldest first)", got)
+	if got := candidates(5 * time.Minute); len(got) != 2 || got[0].Job.ID != liveJobs[0].ID || !got[0].Stuck || got[1].Stuck {
+		t.Fatalf("candidates with StuckAfter = %v (oldest first, the first stuck)", got)
+	}
+	if got := candidates(15 * time.Minute); len(got) != 1 || got[0].Stuck {
+		t.Fatalf("candidates with a longer StuckAfter = %v", got)
 	}
 	// The rescue itself is the fenced finalize.
-	applied := finalize(ctx, t, exec, driver.JobFinalize{ID: deadJobs[0].ID, AttemptedBy: dead, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}})
+	applied := finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: deadJobs[0].ID, AttemptedBy: dead, State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "hopper: client lost"}})
 	if len(applied) != 1 {
 		t.Fatal("rescue finalize not applied")
 	}
@@ -239,7 +245,7 @@ func testStats[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: clientID, TTL: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: claimed[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: claimed[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	if got := claim(ctx, t, exec, clientID, 1); len(got) != 1 {
 		t.Fatal("claim")
 	}
@@ -345,7 +351,7 @@ func testNotify[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.JobCancel(ctx, res[0].Job.ID); err != nil {
 		t.Fatal(err)
 	}
-	finalize(ctx, t, exec, driver.JobFinalize{ID: res[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCanceled})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: res[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCanceled})
 	deadline := time.Now().Add(2 * time.Second)
 	var sawCancel, sawDone bool
 	for !sawCancel || !sawDone {
@@ -384,7 +390,7 @@ func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
 	insert(ctx, t, exec, p)
 	clientID := register(ctx, t, exec)
 	for _, j := range claim(ctx, t, exec, clientID, 2) {
-		finalize(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	}
 	unattached := func() string {
 		t.Helper()
@@ -1037,7 +1043,7 @@ func testHistoryMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 	insert(ctx, t, exec, params("k", 1))
 	clientID := register(ctx, t, exec)
 	jobs := claim(ctx, t, exec, clientID, 1)
-	finalize(ctx, t, exec, driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	p := driver.HistoryMaintainParams{CompletedRetention: 24 * time.Hour, FailedRetention: 7 * 24 * time.Hour}
 	if _, err := exec.HistoryMaintain(ctx, p); err != nil {
 		t.Fatal(err)
@@ -1097,7 +1103,7 @@ func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 	for i, j := range running {
 		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted}
 	}
-	finalize(ctx, t, exec, fin...)
+	finalizeCurrent(ctx, t, exec, fin...)
 	time.Sleep(time.Second)
 	if res, err := exec.JobsMaintain(ctx); err != nil || res.Vacuumed {
 		t.Errorf("vacuumed after a small burst: %+v, %v", res, err)
@@ -1172,7 +1178,7 @@ func testHistoryMaintainWhileInUse[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
-	finalize(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	finalizeCurrent(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	mctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	res, err := exec.HistoryMaintain(mctx, p)
@@ -1183,7 +1189,7 @@ func testHistoryMaintainWhileInUse[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("maintenance while history is in use = %+v; want %s and %s deferred", res, ahead, old)
 	}
 	// Other finalizes are not queued behind a waiting attach or drop.
-	if applied := finalize(ctx, t, exec, driver.JobFinalize{ID: jobs[1].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
+	if applied := finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: jobs[1].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}); len(applied) != 1 {
 		t.Errorf("finalize during maintenance applied %v", applied)
 	}
 	if err := commit(); err != nil {

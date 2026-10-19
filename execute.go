@@ -24,7 +24,8 @@ import (
 //
 // The job's context descends from the lease generation (canceled by a hard
 // stop or fencing) and can also be canceled by JobCancel, with cause
-// ErrJobCanceled, and by the timeout, with cause ErrJobTimeout.
+// ErrJobCanceled, by the timeout, with cause ErrJobTimeout, and by a later
+// claim of the job on this client after a rescue, with cause ErrJobFenced.
 func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) pending {
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -41,8 +42,8 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	defer func() { a.closeLog(c.logCloseTimeout(ctx)) }()
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
-	c.trackRunning(row.ID, cancel)
-	defer c.untrackRunning(row.ID)
+	claim := c.trackRunning(row.ID, cancel)
+	defer c.untrackRunning(row.ID, claim)
 
 	unit, err := c.runWorker(jobCtx, row)
 	completed := a.completedTx()
@@ -70,10 +71,19 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	if f.KeepsLog() {
 		f.Log = a.keptLog()
 	}
-	if known {
+	// A replaced attempt's result is dropped, and the finalizer logs that.
+	if known && !replaced(jobCtx) {
 		c.logOutcome(ctx, row, f, err)
 	}
 	return pending{job: row, result: f, completedTx: completed, heldByTx: a.txHeld()}
+}
+
+// replaced reports whether a later claim of the job on this client replaced
+// the attempt jobCtx belongs to (trackRunning). An attempt that a JobCancel
+// reached first keeps that cause and is handled as canceled; its result is
+// dropped all the same.
+func replaced(jobCtx context.Context) bool {
+	return errors.Is(context.Cause(jobCtx), ErrJobFenced)
 }
 
 // errNotCommitted fails an attempt whose worker completed it with
@@ -103,7 +113,10 @@ const readTxTimeout = 5 * time.Second
 
 // readTx reads the job a worker completed with CompleteTx. A fenced result
 // cannot tell a commit from a rescue that applied once the transaction
-// rolled back, since both fence it; the job's row can.
+// rolled back, since both fence it; the job's row can. The attempt number
+// is checked with the fence, as the finalize checks the client with it: a
+// JobRetry from history by a client of the previous release drops the
+// fence, and the claim after it can repeat this one's.
 func readTx(ctx context.Context, exec interface {
 	JobGet(context.Context, driver.JobID) (*driver.JobRow, error)
 }, row *driver.JobRow,
@@ -116,7 +129,7 @@ func readTx(ctx context.Context, exec interface {
 		return txCommitted
 	case err != nil:
 		return txUnknown
-	case job.AttemptedBy != row.AttemptedBy || job.Attempt != row.Attempt:
+	case job.AttemptedBy != row.AttemptedBy || job.Fence != row.Fence || job.Attempt != row.Attempt:
 		return txLost
 	case job.State == driver.JobStateCompleted:
 		return txCommitted
@@ -129,7 +142,7 @@ func readTx(ctx context.Context, exec interface {
 
 // completedResult is the result of an attempt that succeeded.
 func completedResult(row *driver.JobRow, qcfg QueueConfig) driver.JobFinalize {
-	return driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy, State: driver.JobStateCompleted, Archive: !qcfg.DeleteCompleted}
+	return driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy, Fence: row.Fence, State: driver.JobStateCompleted, Archive: !qcfg.DeleteCompleted}
 }
 
 func (c *Client[TTx]) runWorker(ctx context.Context, row *driver.JobRow) (workUnit, error) {
@@ -190,15 +203,23 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 	if errors.As(err, &snooze) {
 		return snoozed(row, snooze.Duration, snooze.Reason)
 	}
-	f := driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy}
+	f := driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy, Fence: row.Fence}
 
-	attemptErr := &driver.AttemptError{Attempt: row.Attempt, Error: err.Error()}
+	attemptErr := &driver.AttemptError{Attempt: row.Attempt, Fence: row.Fence, Error: err.Error()}
 	var panicked *PanicError
 	if errors.As(err, &panicked) {
 		attemptErr.Trace = panicked.Stack
 	}
 	f.Error = attemptErr
 	f.Archive = true
+
+	// A later claim of the job on this client replaced this attempt, which
+	// was rescued: its result cannot apply, and its failure is not the
+	// job's, so Config.OnError is not asked, as for any rescued job.
+	if replaced(jobCtx) {
+		f.State = driver.JobStateRetryable
+		return f
+	}
 
 	var cancel *CancelError
 	byWorker := errors.As(err, &cancel)
@@ -251,7 +272,7 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 // back.
 func snoozed(row *driver.JobRow, d time.Duration, reason string) driver.JobFinalize {
 	return driver.JobFinalize{
-		ID: row.ID, AttemptedBy: row.AttemptedBy, State: driver.JobStateScheduled,
+		ID: row.ID, AttemptedBy: row.AttemptedBy, Fence: row.Fence, State: driver.JobStateScheduled,
 		Delay: d, Snooze: true, SnoozeReason: reason,
 	}
 }

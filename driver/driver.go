@@ -133,7 +133,8 @@ type Executor interface {
 	// only for batches with no unique keys, and only if Capabilities().Copy.
 	JobInsertCopy(ctx context.Context, params []JobInsertParams, opts JobInsertOpts) ([]JobInsertResult, error)
 	// JobClaim atomically moves up to Limit claimable jobs in a queue to
-	// running, owned by ClientID, and returns them in claim order. With
+	// running, owned by ClientID with their fences incremented, and returns
+	// them in claim order. With
 	// Limited, the claim runs inside a transaction that locks the queue row
 	// and applies its global, rate and partition limits; the result then
 	// says how long to wait when the rate limit allowed nothing.
@@ -142,13 +143,13 @@ type Executor interface {
 	// for longer than after, one level per call, and returns how many.
 	JobAge(ctx context.Context, queue string, after time.Duration) (int64, error)
 	// JobFinalizeMany applies a batch of results in one statement. A result is
-	// applied only if its job is still running and owned by the client that
-	// produced it; the IDs that were applied are returned, and the caller
-	// treats the rest as fenced.
+	// applied only if its job is still running in the claim that produced
+	// it, by the same client at the same fence; the IDs that were applied are
+	// returned, and the caller treats the rest as fenced.
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
 	// JobRecordProgress stores a running job's progress, fenced like a
-	// finalize: only while the job is running in the given attempt of the
-	// given client. It returns the progress as stored, or nil if the attempt
+	// finalize: only while the job is running in the given claim, by the
+	// given client at the given fence and attempt. It returns the progress as stored, or nil if the attempt
 	// no longer owns the job.
 	JobRecordProgress(ctx context.Context, params JobRecordProgressParams) (*Progress, error)
 	// JobGet returns a job by ID, live or from history.
@@ -191,8 +192,9 @@ type Executor interface {
 	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)
 	// JobRescueCandidates returns running jobs whose owning client has no
 	// unexpired lease, plus, if StuckAfter is positive, running jobs claimed
-	// longer ago than that. The caller finalizes them.
-	JobRescueCandidates(ctx context.Context, params JobRescueParams) ([]*JobRow, error)
+	// longer ago than that by database time. The caller finalizes them,
+	// fenced to the claim each was found in.
+	JobRescueCandidates(ctx context.Context, params JobRescueParams) ([]RescueCandidate, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
 	ClientRegister(ctx context.Context, params ClientRegisterParams) (int64, error)
@@ -405,7 +407,14 @@ type JobRow struct {
 	// AttemptedAt is the time of the latest claim, or zero if never claimed.
 	AttemptedAt time.Time
 	// AttemptedBy is the client ID holding the claim, or zero.
-	AttemptedBy  int64
+	AttemptedBy int64
+	// Fence numbers the job's claims: each claim increments it. Snoozes,
+	// retries, the archive and JobRetry keep it, so for a given job it
+	// never repeats. Zero means the job was never claimed, or only by
+	// clients of earlier releases (built for schema v17 or before), which
+	// claim without incrementing it, and whose archive and JobRetry from
+	// history drop it.
+	Fence        int64
 	Args         json.RawMessage
 	Metadata     json.RawMessage
 	Errors       []AttemptError
@@ -471,9 +480,13 @@ type JobRetryParams struct {
 // JobRecordProgressParams is a running job's new progress.
 type JobRecordProgressParams struct {
 	ID JobID
-	// AttemptedBy and Attempt identify the attempt, which must still own
-	// the job.
+	// AttemptedBy, Fence and Attempt identify the attempt's claim, which
+	// must still own the job. The attempt number is checked with the fence,
+	// as the finalize checks the client with it: a client of the previous
+	// release drops the fence when it archives a job or retries it from
+	// history, and a later claim can repeat it.
 	AttemptedBy int64
+	Fence       int64
 	Attempt     int
 	// Step is the last step finished. With KeepStep the stored step is
 	// kept and Step is ignored.
@@ -491,7 +504,12 @@ type AttemptError struct {
 	// At is the database time at which the failure was recorded.
 	At      time.Time `json:"at"`
 	Attempt int       `json:"attempt"`
-	Error   string    `json:"error"`
+	// Fence is the fence of the claim whose attempt failed. It is zero in
+	// entries hopper records itself for a job that is not running (a
+	// cancel, an expiry, a failed dependency), and in those of earlier
+	// releases.
+	Fence int64  `json:"fence,omitempty"`
+	Error string `json:"error"`
 	// Trace is the stack trace when the attempt panicked.
 	Trace string `json:"trace,omitempty"`
 }
@@ -818,9 +836,11 @@ type WorkflowPromoteResult struct {
 // JobFinalize is the result of one attempt.
 type JobFinalize struct {
 	ID JobID
-	// AttemptedBy is the client that claimed the attempt. The engine applies
-	// the result only if the job is still running and owned by this client.
+	// AttemptedBy and Fence identify the claim of the attempt. The engine
+	// applies the result only if the job is still running in that claim:
+	// owned by this client, at this fence.
 	AttemptedBy int64
+	Fence       int64
 	// State is the state to move to: completed, canceled or discarded (the
 	// job moves to history) or retryable or scheduled (it stays live).
 	State JobState
@@ -865,6 +885,14 @@ type JobRescueParams struct {
 	// than this, whatever the state of their client's lease.
 	StuckAfter time.Duration
 	Limit      int
+}
+
+// RescueCandidate is a running job to rescue. Stuck reports that it was
+// claimed longer ago than StuckAfter, by database time; otherwise its client
+// has lost its lease.
+type RescueCandidate struct {
+	Job   *JobRow
+	Stuck bool
 }
 
 // LeaderParams describes a leadership attempt.

@@ -537,3 +537,92 @@ func (h dropCounter) Handle(_ context.Context, r slog.Record) error {
 }
 func (h dropCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h dropCounter) WithGroup(string) slog.Handler      { return h }
+
+// claimExec has one job running in a claim, and applies only the results
+// of that claim, as the finalize statement does.
+type claimExec struct {
+	stubExec
+	job        driver.JobRow
+	statements [][]driver.JobID
+}
+
+func (e *claimExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error) {
+	j := e.job
+	return &j, nil
+}
+
+func (e *claimExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+	var ids, applied []driver.JobID
+	for _, r := range params.Jobs {
+		ids = append(ids, r.ID)
+		if r.ID == e.job.ID && r.AttemptedBy == e.job.AttemptedBy && r.Fence == e.job.Fence {
+			applied = append(applied, r.ID)
+		}
+	}
+	e.statements = append(e.statements, ids)
+	return applied, nil
+}
+
+// A batch can hold a rescued attempt's late result and the result of the
+// claim after it, on the same client. The two go in separate statements, so
+// the applied ID names the result that applied, whichever came first, and
+// whichever has the greater fence: a JobRetry from history by a client of
+// the previous release resets it.
+func TestFinalizerWritesAJobsResultsApart(t *testing.T) {
+	id := driver.JobID{1}
+	for _, fences := range [][2]int64{{1, 2}, {5, 1}} {
+		late, current := fences[0], fences[1]
+		job := driver.JobRow{ID: id, Queue: "default", State: driver.JobStateRunning, AttemptedBy: 7, Attempt: 2, Fence: current}
+		lateRow := job
+		lateRow.Fence, lateRow.Attempt = late, 1
+		results := []pending{
+			{job: &lateRow, result: driver.JobFinalize{ID: id, AttemptedBy: 7, Fence: late, State: driver.JobStateCompleted, Archive: true}},
+			{job: &job, result: driver.JobFinalize{ID: id, AttemptedBy: 7, Fence: current, State: driver.JobStateRetryable, Delay: time.Hour}},
+		}
+		for _, batch := range [][]pending{results, {results[1], results[0]}} {
+			exec := &claimExec{job: job}
+			var got []driver.JobFinalize
+			f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeBatch: 10, finalizeBuffer: 10}, 0, func(string) {},
+				func(_ *driver.JobRow, r driver.JobFinalize) { got = append(got, r) })
+			f.write(context.Background(), batch, false)
+			if len(exec.statements) != 2 || len(exec.statements[0]) != 1 || len(exec.statements[1]) != 1 {
+				t.Errorf("fences %d, %d: statements %v; want one result of the job in each", batch[0].result.Fence, batch[1].result.Fence, exec.statements)
+			}
+			if len(got) != 1 || got[0].Fence != current || got[0].State != driver.JobStateRetryable {
+				t.Errorf("fences %d, %d: applied %+v; want the current claim's result alone", batch[0].result.Fence, batch[1].result.Fence, got)
+			}
+		}
+	}
+}
+
+// fixedJob is a JobGet that reads one job, as it is.
+type fixedJob driver.JobRow
+
+func (j fixedJob) JobGet(context.Context, driver.JobID) (*driver.JobRow, error) {
+	row := driver.JobRow(j)
+	return &row, nil
+}
+
+// readTx matches a job to the attempt by its client, fence and attempt
+// number: a JobRetry from history by a client of the previous release drops
+// the fence, so a later claim by the same client can repeat it.
+func TestReadTxChecksTheAttemptWithTheFence(t *testing.T) {
+	claimed := driver.JobRow{ID: driver.JobID{1}, State: driver.JobStateRunning, AttemptedBy: 7, Attempt: 1, Fence: 1}
+	for _, c := range []struct {
+		name string
+		edit func(*driver.JobRow)
+		want txState
+	}{
+		{"running in this attempt", func(*driver.JobRow) {}, txRunning},
+		{"completed in this attempt", func(j *driver.JobRow) { j.State = driver.JobStateCompleted }, txCommitted},
+		{"another client", func(j *driver.JobRow) { j.AttemptedBy = 8 }, txLost},
+		{"another claim", func(j *driver.JobRow) { j.Fence = 2 }, txLost},
+		{"another attempt at the same fence", func(j *driver.JobRow) { j.Attempt = 3 }, txLost},
+	} {
+		job := claimed
+		c.edit(&job)
+		if got := readTx(context.Background(), fixedJob(job), &claimed); got != c.want {
+			t.Errorf("%s: readTx = %d, want %d", c.name, got, c.want)
+		}
+	}
+}

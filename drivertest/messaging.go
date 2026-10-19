@@ -162,7 +162,7 @@ func testOrderingClaim[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	// Finishing a key's job frees the next one; a retry with a delay keeps
 	// the key blocked until it is due.
-	finalize(ctx, t, exec,
+	finalizeCurrent(ctx, t, exec,
 		driver.JobFinalize{ID: inserted[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true},
 		driver.JobFinalize{ID: inserted[3].Job.ID, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}},
 	)

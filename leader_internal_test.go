@@ -147,3 +147,42 @@ func TestMaintainHistoryCountsDeferralsPastFailure(t *testing.T) {
 		t.Errorf("lock timeouts = %v, then %d deferrals; want %v, then 0", exec.timeouts, c.ddlDeferrals, want)
 	}
 }
+
+// heldRescueExec has a full batch of rescue candidates whose rows other
+// transactions hold, so that the rescue's finalize, which skips them,
+// applies none. It stops offering them after a few reads.
+type heldRescueExec struct {
+	driver.Executor
+	batch int
+	reads int
+}
+
+func (e *heldRescueExec) JobRescueCandidates(context.Context, driver.JobRescueParams) ([]driver.RescueCandidate, error) {
+	e.reads++
+	if e.reads > 3 {
+		return nil, nil
+	}
+	out := make([]driver.RescueCandidate, e.batch)
+	for i := range out {
+		out[i] = driver.RescueCandidate{Job: &driver.JobRow{ID: driver.JobID{byte(i + 1)}, Queue: "q", AttemptedBy: 1, Fence: 1, Attempt: 1, MaxAttempts: 5}}
+	}
+	return out, nil
+}
+
+func (e *heldRescueExec) JobFinalizeMany(context.Context, driver.JobFinalizeParams) ([]driver.JobID, error) {
+	return nil, nil
+}
+
+// A full batch of candidates that the rescue applies to none of ends the
+// pass, rather than being read again at once until their rows are free.
+func TestRescueEndsAPassThatRescuedNothing(t *testing.T) {
+	exec := &heldRescueExec{batch: 4}
+	tun := defaultTuning
+	tun.rescueBatch = exec.batch
+	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.DiscardHandler), tuning: tun}
+	c.clientID.Store(2)
+	c.rescue(context.Background())
+	if exec.reads != 1 {
+		t.Errorf("the rescue read its candidates %d times in one pass, want 1", exec.reads)
+	}
+}
