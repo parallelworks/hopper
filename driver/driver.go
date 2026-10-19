@@ -323,7 +323,8 @@ type Executor interface {
 	// maintenance passes: it reclaims the space and index entries of jobs
 	// that have run and left once enough have accumulated (a hundred
 	// thousand on Postgres), and refreshes planner statistics when the
-	// planner's idea of the table's size is off by an order of magnitude. It
+	// planner's idea of the table's size is off by an order of magnitude or
+	// enough of the table has changed since the last refresh. It
 	// never waits for a lock, so it costs nothing while the engine's own
 	// pass is running. The live table churns at the job rate, and on
 	// Postgres every claim walks the claim index past the entries of jobs
