@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/parallelworks/hopper"
 	"github.com/parallelworks/hopper/hoppermigrate"
@@ -109,6 +110,17 @@ func TestCLI(t *testing.T) {
 	}
 	if got := hopperCmd("jobs", "list", "-tag", "nightly", "-tag", "other"); strings.Contains(got, taggedID) {
 		t.Errorf("jobs list with a tag it lacks = %q", got)
+	}
+	remote, err := client.Insert(ctx, ping{}, &hopper.InsertOpts{Queue: "remote"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leased, err := client.Leases().Claim(ctx, remote.Job.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hopperCmd("jobs", "get", remote.Job.ID.String()); !strings.Contains(got, "(job lease, fence 1, expires "+leased.ExpiresAt.Local().Format(time.RFC3339)+")") {
+		t.Errorf("jobs get of a leased job = %q", got)
 	}
 	if got := hopperCmd("jobs", "get", taggedID); !strings.Contains(got, `tags:          ["nightly" "tenant:acme"]`) {
 		t.Errorf("jobs get of a tagged job = %q", got)
