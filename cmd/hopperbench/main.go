@@ -29,6 +29,9 @@
 //	latency     commit-to-Work on an idle queue, local wake-up
 //	loaded      commit-to-Work while -clients clients work a stream of inserts at -rate jobs/s for -seconds;
 //	            with -report N it also prints one "loaded-window" line every N seconds (for soaks)
+//	leases      jobs run under job leases, as on remote workers: a tenth of -jobs (at most 10,000), each claimed
+//	            by ID, renewed three times, given a step and finished, by -clients x 16 goroutines; jobs_per_sec
+//	            counts leased attempts. It is for the record: CI's gate does not run it
 //
 // -history preloads that many rows of history first, to measure the live
 // table's independence from accumulated history.
@@ -175,6 +178,8 @@ func run(ctx context.Context, url, schema string, scenarios []string, opts optio
 			r, err = b.latency(ctx, opts.samples)
 		case "loaded":
 			r, err = b.loaded(ctx, opts.rate, time.Duration(opts.seconds)*time.Second)
+		case "leases":
+			r, err = b.leases(ctx, min(opts.jobs/10, 10000))
 		default:
 			return fmt.Errorf("unknown scenario %q", s)
 		}
@@ -237,7 +242,7 @@ type bench struct {
 func (b *bench) reset(ctx context.Context) error {
 	// The tags tables (schema v17) are listed so that their truncate
 	// triggers find them empty, rather than truncating them one by one.
-	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic, hopper_batches, hopper_batch_progress, hopper_job_deps"); err != nil {
+	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic, hopper_batches, hopper_batch_progress, hopper_job_deps, hopper_job_leases"); err != nil {
 		return err
 	}
 	if b.opts.history > 0 {
@@ -521,6 +526,70 @@ func (b *bench) insert(ctx context.Context, jobs, batch int) (result, error) {
 		name = "copy"
 	}
 	return result{Scenario: name, Jobs: jobs, Seconds: elapsed.Seconds(), JobsPerSec: float64(jobs) / elapsed.Seconds()}, nil
+}
+
+// leases runs jobs under job leases, as a coordinator does whose workers
+// run elsewhere: each is claimed by ID, renewed three times, given a step
+// and finished, from -clients x 16 goroutines on one client that works no
+// queue.
+func (b *bench) leases(ctx context.Context, jobs int) (result, error) {
+	if err := b.reset(ctx); err != nil {
+		return result{}, err
+	}
+	c, err := hopper.NewClient(b.d, &hopper.Config{Logger: b.logger})
+	if err != nil {
+		return result{}, err
+	}
+	params := b.params(jobs, func(_ int, o *hopper.InsertOpts) { o.Queue = "remote" })
+	ids := make(chan hopper.JobID, jobs)
+	if err := fanOut(ctx, len(params), 100, func(ctx context.Context, lo, hi int) error {
+		res, err := c.InsertMany(ctx, params[lo:hi])
+		for _, r := range res {
+			ids <- r.Job.ID
+		}
+		return err
+	}); err != nil {
+		return result{}, err
+	}
+	close(ids)
+	start := time.Now()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var wg sync.WaitGroup
+	for range max(b.opts.clients, 1) * 16 {
+		wg.Go(func() {
+			for id := range ids {
+				if err := leaseOnce(ctx, c, id); err != nil {
+					cancel(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	if err := context.Cause(ctx); err != nil {
+		return result{}, err
+	}
+	return result{Scenario: "leases", Jobs: jobs, Clients: b.opts.clients, Seconds: elapsed.Seconds(), JobsPerSec: float64(jobs) / elapsed.Seconds()}, nil
+}
+
+// leaseOnce claims a job by ID, renews its lease three times, records a
+// step and finishes it.
+func leaseOnce(ctx context.Context, c *hopper.Client[pgx.Tx], id hopper.JobID) error {
+	l, err := c.Leases().Claim(ctx, id, nil)
+	if err != nil {
+		return err
+	}
+	for range 3 {
+		if _, err := c.Leases().Renew(ctx, l.Token); err != nil {
+			return err
+		}
+	}
+	if _, err := c.Leases().RecordStep(ctx, l.Token, "placed", nil); err != nil {
+		return err
+	}
+	return c.Leases().Finish(ctx, l.Token, hopper.LeaseResult{})
 }
 
 // latency measures commit-to-Work on an idle queue, with the insert coming
