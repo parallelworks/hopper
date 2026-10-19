@@ -1005,12 +1005,12 @@ RETURNING j.*;
   analyze invalidates every connection's cached plans, and one in the middle of a burst
   cost a CPU-starved server a fifth of its throughput. The live tags table and
   `hopper_job_deps` are kept the same way, with the server's sample size, except that
-  the dependency table is analyzed on churn only until it has been analyzed once (a
-  vacuum gives the planner its row count but no statistics), and then only when its row
-  count is off: until it has statistics, the planner takes each lookup of a job's edges
-  for a two-hundredth of the table, and scans it instead, while what it reads from them
-  (edges per job, dependents per job) does not change as workflows come and go, and each
-  analyze has every connection replan the finalize statement. The maintenance never
+  churn re-analyzes the dependency table at most every ten minutes (at once if it was
+  never analyzed; a vacuum gives the planner its row count but no statistics): until it
+  has statistics, the planner takes each lookup of a job's edges for a two-hundredth of
+  the table, and scans it instead, while what it reads from them (edges per job,
+  dependents per job) changes only with the shape of the workflows, and each analyze has
+  every connection replan the finalize statement. The maintenance never
   waits for a lock. Schema v6 also sets `hopper_jobs`' autovacuum thresholds low with no
   cost delay.
 
@@ -1082,12 +1082,12 @@ retry AS (
          snooze_reason = CASE WHEN r.snooze AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false) THEN r.snooze_reason END,
          wake_requested_at = NULL
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
-    AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
+    AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
   RETURNING j.id),
 done AS (
   DELETE FROM hopper_jobs j USING r
   WHERE j.id = r.id AND r.state IN ('completed','canceled','discarded')
-    AND j.state = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
+    AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
   RETURNING j.*, r.state AS final_state, r.error, r.output, r.archive),
 archived AS (INSERT INTO hopper_job_history SELECT … , now() FROM done WHERE archive)
 SELECT id FROM retry UNION ALL SELECT id FROM done;
