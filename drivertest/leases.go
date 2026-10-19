@@ -10,10 +10,11 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
-// claimByID claims a job by ID under a one-minute lease.
+// claimByID claims a job by ID, at its fence as JobGet reads it, under a
+// one-minute lease.
 func claimByID(ctx context.Context, t *testing.T, exec driver.Executor, id driver.JobID) *driver.JobLeaseRow {
 	t.Helper()
-	l, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, TTL: time.Minute})
+	l, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, Fence: get(ctx, t, exec, id).Fence, TTL: time.Minute})
 	if err != nil {
 		t.Fatalf("claim %s by ID: %v", id, err)
 	}
@@ -57,62 +58,146 @@ func testClaimByID[TTx any](t *testing.T, f Fixture[TTx]) {
 		if j := get(ctx, t, exec, id); !j.LeaseExpiresAt.Equal(l.ExpiresAt) || j.AttemptedBy != 0 {
 			t.Errorf("JobGet of a leased job: lease expires %v, attempted by %d; want %v, 0", j.LeaseExpiresAt, j.AttemptedBy, l.ExpiresAt)
 		}
-		if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, TTL: time.Minute}); !errors.Is(err, driver.ErrJobRunning) {
+		if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, Fence: l.Job.Fence, TTL: time.Minute}); !errors.Is(err, driver.ErrJobRunning) {
 			t.Errorf("claim of a leased job = %v, want ErrJobRunning", err)
+		}
+		// A claim at the fence before the lease's comes from a placement
+		// the lease's attempt superseded.
+		if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, Fence: before.Fence, TTL: time.Minute}); !errors.Is(err, driver.ErrJobFenced) {
+			t.Errorf("claim of a leased job at the fence before its lease's = %v, want ErrJobFenced", err)
 		}
 	}
 
-	notClaimable := func(name string, id driver.JobID, want error) {
+	// Each claim names the job's fence, so that it fails for the reason
+	// given, and then the next fence, which fails with atOther: a live
+	// job's fence is checked before its state, and a job unknown or in
+	// history fails at any fence as at its own.
+	notClaimable := func(name string, id driver.JobID, want, atOther error) {
 		t.Helper()
-		if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, TTL: time.Minute}); !errors.Is(err, want) {
+		var fence int64
+		if j, err := exec.JobGet(ctx, id); err == nil {
+			fence = j.Fence
+		}
+		if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, Fence: fence, TTL: time.Minute}); !errors.Is(err, want) {
 			t.Errorf("claim of a job %s = %v, want %v", name, err, want)
 		}
-		if j, err := exec.JobGet(ctx, id); err == nil && j.State == driver.JobStateRunning && want != driver.ErrJobRunning {
+		if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, Fence: fence + 1, TTL: time.Minute}); !errors.Is(err, atOther) {
+			t.Errorf("claim of a job %s at fence %d = %v, want %v", name, fence+1, err, atOther)
+		}
+		if j, err := exec.JobGet(ctx, id); err == nil && j.State == driver.JobStateRunning && !errors.Is(want, driver.ErrJobRunning) {
 			t.Errorf("a job %s was claimed", name)
 		}
 	}
-	notClaimable("unknown", driver.JobID{1}, driver.ErrNotFound)
+	notClaimable("unknown", driver.JobID{1}, driver.ErrNotFound, driver.ErrNotFound)
 
 	running := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	claimOne(ctx, t, exec, clientID, running)
-	notClaimable("a client runs", running, driver.ErrJobRunning)
+	notClaimable("a client runs", running, driver.ErrJobRunning, driver.ErrJobFenced)
+	if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: running, Fence: 0, TTL: time.Minute}); !errors.Is(err, driver.ErrJobFenced) {
+		t.Errorf("claim at fence 0 of a job a client runs at fence 1 = %v, want ErrJobFenced", err)
+	}
 	finalize(ctx, t, exec, driver.JobFinalize{ID: running, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true})
-	notClaimable("finished", running, driver.ErrJobNotClaimable)
+	notClaimable("finished", running, driver.ErrJobNotClaimable, driver.ErrJobNotClaimable)
+	// A completed job kept out of history, as DeleteCompleted keeps it.
+	deleted := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+	claimOne(ctx, t, exec, clientID, deleted)
+	finalize(ctx, t, exec, driver.JobFinalize{ID: deleted, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted})
+	notClaimable("deleted", deleted, driver.ErrNotFound, driver.ErrNotFound)
 
 	pending := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	f.MakePending(ctx, t, d, pending)
-	notClaimable("pending", pending, driver.ErrJobNotClaimable)
+	notClaimable("pending", pending, driver.ErrJobNotClaimable, driver.ErrJobFenced)
+	// A workflow step with an ordering key, and no waiting job of its key.
+	keyedPending := params("k", 1)
+	keyedPending[0].OrderingKey = "pending"
+	pendingKeyed := insert(ctx, t, exec, keyedPending)[0].Job.ID
+	f.MakePending(ctx, t, d, pendingKeyed)
+	notClaimable("pending, with an ordering key", pendingKeyed, driver.ErrJobNotClaimable, driver.ErrJobFenced)
 
 	expired := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	f.ExpireJob(ctx, t, d, expired)
-	notClaimable("past its TTL", expired, driver.ErrJobNotClaimable)
+	notClaimable("past its TTL", expired, driver.ErrJobNotClaimable, driver.ErrJobFenced)
 
 	keyed := params("k", 2)
 	keyed[0].OrderingKey, keyed[1].OrderingKey = "key", "key"
 	keyedIDs := insert(ctx, t, exec, keyed)
-	notClaimable("behind an older one of its ordering key", keyedIDs[1].Job.ID, driver.ErrJobNotClaimable)
+	notClaimable("behind an older one of its ordering key", keyedIDs[1].Job.ID, driver.ErrJobNotClaimable, driver.ErrJobFenced)
 	claimByID(ctx, t, exec, keyedIDs[0].Job.ID)
-	notClaimable("whose ordering key runs another", keyedIDs[1].Job.ID, driver.ErrJobNotClaimable)
+	notClaimable("whose ordering key runs another", keyedIDs[1].Job.ID, driver.ErrJobNotClaimable, driver.ErrJobFenced)
 
 	fenced := insert(ctx, t, exec, params("k", 1))[0].Job.ID
-	if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: fenced, IfFence: 3, TTL: time.Minute}); !errors.Is(err, driver.ErrJobFenced) {
-		t.Errorf("claim at a stale fence = %v, want ErrJobFenced", err)
+	if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: fenced, Fence: 1, TTL: time.Minute}); !errors.Is(err, driver.ErrJobFenced) {
+		t.Errorf("claim of a job never claimed at fence 1 = %v, want ErrJobFenced", err)
 	}
 	claimOne(ctx, t, exec, clientID, fenced)
 	finalize(ctx, t, exec, driver.JobFinalize{ID: fenced, AttemptedBy: clientID, Fence: 1, State: driver.JobStateRetryable})
-	if l, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: fenced, IfFence: 1, TTL: time.Minute}); err != nil || l.Job.Fence != 2 {
+	if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: fenced, Fence: 0, TTL: time.Minute}); !errors.Is(err, driver.ErrJobFenced) {
+		t.Errorf("claim at fence 0 of a job claimed since = %v, want ErrJobFenced", err)
+	}
+	if j := get(ctx, t, exec, fenced); j.State != driver.JobStateRetryable || j.Fence != 1 {
+		t.Errorf("after the claims at other fences: %+v", j)
+	}
+	if l, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: fenced, Fence: 1, TTL: time.Minute}); err != nil || l.Job.Fence != 2 {
 		t.Errorf("claim at the current fence = %+v, %v", l, err)
+	}
+	fresh := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+	if l, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: fresh, Fence: 0, TTL: time.Minute}); err != nil || l.Job.Fence != 1 {
+		t.Errorf("claim at fence 0 of a job never claimed = %+v, %v", l, err)
 	}
 
 	paused := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	if err := exec.QueuePause(ctx, "default"); err != nil {
 		t.Fatal(err)
 	}
-	notClaimable("in a paused queue", paused, driver.ErrJobNotClaimable)
+	notClaimable("in a paused queue", paused, driver.ErrJobNotClaimable, driver.ErrJobFenced)
 	if err := exec.QueueResume(ctx, "default"); err != nil {
 		t.Fatal(err)
 	}
 	claimByID(ctx, t, exec, paused)
+
+	short := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+	if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: short, TTL: 500 * time.Nanosecond}); err == nil {
+		t.Error("claim with a lease TTL under a microsecond succeeded")
+	}
+}
+
+// testClaimByIDInTx claims a job by ID in a transaction that began a while
+// before: the claim's time is its statement's, not the transaction's
+// start. The lease's TTL runs from the claim, so a coordinator's longer
+// transaction does not shorten it; the attempt is dated at the claim; and a
+// job whose own TTL passed while the transaction ran is not claimed.
+func testClaimByIDInTx[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	ins := insert(ctx, t, exec, params("k", 2))
+	id, expired := ins[0].Job.ID, ins[1].Job.ID
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
+	const ttl, before = time.Minute, time.Second
+	time.Sleep(before)
+	// Its TTL passed a second ago, after the transaction began.
+	f.ExpireJob(ctx, t, d, expired)
+	if _, err := d.UnwrapTx(tx).JobClaimByID(ctx, driver.JobClaimByIDParams{ID: expired, TTL: ttl}); !errors.Is(err, driver.ErrJobNotClaimable) {
+		t.Errorf("claim in a transaction of a job whose TTL passed while it ran = %v, want ErrJobNotClaimable", err)
+	}
+	l, err := d.UnwrapTx(tx).JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, TTL: ttl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now, err := exec.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left := l.ExpiresAt.Sub(now); left < ttl-before/2 {
+		t.Errorf("a lease claimed in a transaction %s old expires in %s, want about %s", before, left, ttl)
+	}
+	if age := now.Sub(l.Job.AttemptedAt); age > before/2 {
+		t.Errorf("an attempt claimed in a transaction %s old is dated %s before the claim", before, age)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // testClaimByIDRacesClaim claims jobs by ID while a client claims them from
@@ -133,8 +218,9 @@ func testClaimByIDRacesClaim[TTx any](t *testing.T, f Fixture[TTx]) {
 	go func() {
 		defer wg.Done()
 		for _, r := range ins {
+			// A job the client claimed first runs at fence 1.
 			l, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: r.Job.ID, TTL: time.Minute})
-			if err != nil && !errors.Is(err, driver.ErrJobRunning) {
+			if err != nil && !errors.Is(err, driver.ErrJobFenced) {
 				t.Error(err)
 				return
 			}
@@ -274,6 +360,9 @@ func testLeaseFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		}
 		res := leaseResult(l, state)
 		res.Error = &driver.AttemptError{Attempt: 1, Fence: l.Lease.Fence, Error: "x"}
+		if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{res}, SkipLocked: true}); err == nil {
+			t.Errorf("%s with SkipLocked succeeded", state)
+		}
 		applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{res}})
 		if err != nil || len(applied) != 1 || applied[0] != (driver.JobFinalized{ID: id, Fence: l.Lease.Fence}) {
 			t.Fatalf("%s = %v, %v", state, applied, err)
@@ -316,7 +405,8 @@ func testLeaseFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	// In a transaction.
 	id = insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	l := claimByID(ctx, t, exec, id)
-	tx, commit, rollback := f.Begin(ctx, t, d)
+	tx, _, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already ended on the happy path
 	if applied := finalize(ctx, t, d.UnwrapTx(tx), leaseResult(l, driver.JobStateCompleted)); len(applied) != 1 {
 		t.Fatal("finalize in a transaction did not apply")
 	}
@@ -326,7 +416,8 @@ func testLeaseFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	if j := get(ctx, t, exec, id); j.State != driver.JobStateRunning {
 		t.Fatalf("after a rollback: %s", j.State)
 	}
-	tx, commit, _ = f.Begin(ctx, t, d)
+	tx, commit, rollbackCommitted := f.Begin(ctx, t, d)
+	defer rollbackCommitted() //nolint:errcheck // already committed on the happy path
 	finalize(ctx, t, d.UnwrapTx(tx), leaseResult(l, driver.JobStateCompleted))
 	if err := commit(); err != nil {
 		t.Fatal(err)
@@ -365,6 +456,7 @@ func testLeaseProgress[TTx any](t *testing.T, f Fixture[TTx]) {
 		}
 	}
 	tx, _, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already ended on the happy path
 	if p, err := d.UnwrapTx(tx).JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: id, Lease: &l.Lease, Step: "c"}); err != nil || p == nil {
 		t.Fatalf("lease progress in a transaction = %+v, %v", p, err)
 	}
@@ -515,7 +607,8 @@ func testExpireRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 	id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	l := claimByID(ctx, t, exec, id)
 	f.ExpireJobLease(ctx, t, d, id)
-	tx, commit, _ := f.Begin(ctx, t, d)
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
 	if applied := finalize(ctx, t, d.UnwrapTx(tx), leaseResult(l, driver.JobStateCompleted)); len(applied) != 1 {
 		t.Fatal("finalize in a transaction did not apply")
 	}
@@ -543,6 +636,62 @@ func testExpireRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if j := get(ctx, t, exec, id); j.State != driver.JobStateRetryable {
 		t.Errorf("after the expiry won: %s", j.State)
+	}
+}
+
+// testExpireRacesCancel expires leases while their jobs are canceled. A
+// cancel that commits after the expiry statement began, but before it
+// locked the job, must still leave the job ended or in its lease: never
+// running with its lease gone, which no rescue or expiry would reach.
+func testExpireRacesCancel[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	if singleWriter(d) {
+		t.Skip("a single-writer engine reads the job and ends its attempt under one write lock")
+	}
+	exec := d.Executor()
+	const n, cancelers = 400, 4
+	ins := insert(ctx, t, exec, params("k", n))
+	for _, r := range ins {
+		claimByID(ctx, t, exec, r.Job.ID)
+		f.ExpireJobLease(ctx, t, d, r.Job.ID)
+	}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		<-start
+		if _, err := exec.JobExpireLeases(ctx, n); err != nil {
+			t.Error(err)
+		}
+	})
+	// The expiry locks the jobs in lease expiry order, so the cancels start
+	// from the other end.
+	for g := range cancelers {
+		wg.Go(func() {
+			<-start
+			for i := n - 1 - g; i >= 0; i -= cancelers {
+				if _, err := exec.JobCancel(ctx, ins[i].Job.ID); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	for {
+		jobs, err := exec.JobExpireLeases(ctx, n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(jobs) == 0 {
+			break
+		}
+	}
+	for _, r := range ins {
+		if j := get(ctx, t, exec, r.Job.ID); j.State == driver.JobStateRunning {
+			t.Fatalf("job %s is still running after its cancel and the expiry, lease expiry %v", j.ID, j.LeaseExpiresAt)
+		}
 	}
 }
 
