@@ -11,7 +11,7 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing to the claim (also inside a caller's transaction), snooze reasons, leases, leader election, rescue candidates,
+// fencing to the claim (also inside a caller's transaction), snooze reasons, leases, claims by ID and their job leases, leader election, rescue candidates,
 // cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
 // notifications and history maintenance. Engine-specific behavior, such as how partitions are managed,
 // belongs in the driver's own tests.
@@ -46,6 +46,9 @@ type Fixture[TTx any] interface {
 	MakeClaimable(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
 	// AgeAttempt backdates a running job's attempted time by age.
 	AgeAttempt(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID, age time.Duration)
+	// ExpireJobLease makes the job lease of a job claimed by ID expired, as
+	// a worker that stopped renewing it would.
+	ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
 	// CountLive and CountHistory count jobs in the live table and in history.
 	CountLive(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
 	CountHistory(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
@@ -99,6 +102,18 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeReportsTheAppliedFence", testFinalizeReportsTheAppliedFence[TTx]},
 		{"RescueRacesReclaim", testRescueRacesReclaim[TTx]},
 		{"RecordProgressFencesSnooze", testRecordProgressFencesSnooze[TTx]},
+		{"ClaimByID", testClaimByID[TTx]},
+		{"ClaimByIDRacesClaim", testClaimByIDRacesClaim[TTx]},
+		{"LeaseRenew", testLeaseRenew[TTx]},
+		{"LeaseRenewConcurrent", testLeaseRenewConcurrent[TTx]},
+		{"LeaseFinalize", func(t *testing.T, f Fixture[TTx]) { testLeaseFinalize(t, f, false) }},
+		{"LeaseFinalizeNoBatches", func(t *testing.T, f Fixture[TTx]) { testLeaseFinalize(t, f, true) }},
+		{"LeaseProgress", testLeaseProgress[TTx]},
+		{"LeaseFencesClients", testLeaseFencesClients[TTx]},
+		{"LeasesOutsideLimits", testLeasesOutsideLimits[TTx]},
+		{"ExpireLeases", testExpireLeases[TTx]},
+		{"ExpireRacesRenew", testExpireRacesRenew[TTx]},
+		{"ExpireRacesFinalize", testExpireRacesFinalize[TTx]},
 		{"FinalizeTx", testFinalizeTx[TTx]},
 		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},

@@ -69,6 +69,13 @@ func (pgxFixture) AgeAttempt(ctx context.Context, t *testing.T, d driver.Driver[
 	}
 }
 
+func (pgxFixture) ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], id driver.JobID) {
+	t.Helper()
+	if _, err := pool(d).Exec(ctx, "UPDATE hopper_job_leases SET expires_at = now() - interval '1s', renewed_at = now() - interval '1s' - ttl WHERE id = $1", [16]byte(id)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (pgxFixture) CountLive(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx]) int {
 	return count(ctx, t, d, "hopper_jobs")
 }

@@ -70,6 +70,10 @@ func (sqlFixture) AgeAttempt(ctx context.Context, t *testing.T, d driver.Driver[
 	exec(ctx, t, d, "UPDATE hopper_jobs SET attempted_at = now() - make_interval(secs => $2) WHERE id = $1", id, age.Seconds())
 }
 
+func (sqlFixture) ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
+	exec(ctx, t, d, "UPDATE hopper_job_leases SET expires_at = now() - interval '1s', renewed_at = now() - interval '1s' - ttl WHERE id = $1", id)
+}
+
 func (sqlFixture) CountLive(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
 	return count(ctx, t, d, "hopper_jobs")
 }
