@@ -64,7 +64,7 @@ func testClaimByID[TTx any](t *testing.T, f Fixture[TTx]) {
 		if _, err := exec.JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, TTL: time.Minute}); !errors.Is(err, want) {
 			t.Errorf("claim of a job %s = %v, want %v", name, err, want)
 		}
-		if j, err := exec.JobGet(ctx, id); err == nil && j.State == driver.JobStateRunning && want != driver.ErrJobRunning {
+		if j, err := exec.JobGet(ctx, id); err == nil && j.State == driver.JobStateRunning && !errors.Is(want, driver.ErrJobRunning) {
 			t.Errorf("a job %s was claimed", name)
 		}
 	}
@@ -312,7 +312,7 @@ func testLeaseFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	// In a transaction.
 	id = insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	l := claimByID(ctx, t, exec, id)
-	tx, commit, rollback := f.Begin(ctx, t, d)
+	tx, _, rollback := f.Begin(ctx, t, d)
 	if applied := finalize(ctx, t, d.UnwrapTx(tx), leaseResult(l, driver.JobStateCompleted)); len(applied) != 1 {
 		t.Fatal("finalize in a transaction did not apply")
 	}
@@ -322,7 +322,7 @@ func testLeaseFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	if j := get(ctx, t, exec, id); j.State != driver.JobStateRunning {
 		t.Fatalf("after a rollback: %s", j.State)
 	}
-	tx, commit, _ = f.Begin(ctx, t, d)
+	tx, commit, _ := f.Begin(ctx, t, d)
 	finalize(ctx, t, d.UnwrapTx(tx), leaseResult(l, driver.JobStateCompleted))
 	if err := commit(); err != nil {
 		t.Fatal(err)

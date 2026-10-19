@@ -565,11 +565,14 @@ type AttemptError struct {
 type RescueReason string
 
 const (
-	// RescueClientLost: the client running the attempt lost its lease.
+	// RescueClientLost is the reason when the client running the attempt
+	// lost its lease.
 	RescueClientLost RescueReason = "client_lost"
-	// RescueStuck: the attempt ran past RescueStuckAfter.
+	// RescueStuck is the reason when the attempt ran past
+	// RescueStuckAfter.
 	RescueStuck RescueReason = "stuck"
-	// RescueLeaseExpired: the attempt's job lease was not renewed in time.
+	// RescueLeaseExpired is the reason when the attempt's job lease was not
+	// renewed in time.
 	RescueLeaseExpired RescueReason = "lease_expired"
 )
 
