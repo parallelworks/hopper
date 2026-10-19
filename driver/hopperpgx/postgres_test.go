@@ -1343,7 +1343,10 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 	log.mu.Lock()
 	statements, args := log.sql, log.args
 	log.mu.Unlock()
-	scan := regexp.MustCompile(`"Node Type": "Seq Scan",[^}]*?"Relation Name": "(hopper_jobs|hopper_job_deps|hopper_batches)"`)
+	// A node's own relation comes before its child plans, so the match
+	// stays inside the node: a scan of another table whose subplan probes
+	// one of these is not a scan of it.
+	scan := regexp.MustCompile(`"Node Type": "Seq Scan",[^{}]*?"Relation Name": "(hopper_jobs|hopper_job_deps|hopper_batches)"`)
 	explained := 0
 	for i, q := range statements {
 		if !strings.Contains(q, "hopper_jobs") || strings.HasPrefix(strings.TrimSpace(q), "SELECT state FROM") {

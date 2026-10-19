@@ -1154,6 +1154,25 @@ func testDepsTableMaintained[TTx any](t *testing.T, f Fixture[TTx]) {
 			t.Fatal(err)
 		}
 	}
+	// Churn alone re-analyzes it only every ten minutes.
+	analyzedAt := stat("last_analyze")
+	if _, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Name: "fan-out", Jobs: params("step", len(deps)+1), Deps: deps}); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); stat("n_mod_since_analyze >= 1200") != "true"; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the second workflow's edges were not counted")
+		}
+	}
+	for range 3 {
+		if _, err := exec.JobsMaintain(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(time.Second)
+	if got := stat("last_analyze"); got != analyzedAt {
+		t.Errorf("dependency table analyzed again on churn within ten minutes: %s, then %s", analyzedAt, got)
+	}
 }
 
 // analyzeEmpty gives the engine statistics that say the live table is
