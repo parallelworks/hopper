@@ -487,13 +487,20 @@ func (f *finalizer) followUp(ctx context.Context, finished []pending) {
 	if len(jobs) == 0 {
 		return
 	}
+	settleAndPromote(ctx, f.exec, f.logger, batches, jobs)
+}
+
+// settleAndPromote settles batches and promotes the dependents of jobs,
+// which have finished in statements that have committed. A failure is
+// logged and left to the leader.
+func settleAndPromote(ctx context.Context, exec finalizeExecutor, logger *slog.Logger, batches, jobs []driver.JobID) {
 	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
 	defer cancel()
-	if _, err := f.exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: batches}); err != nil {
-		f.logger.WarnContext(ctx, "hopper: settle batches; the leader will", "count", len(batches), "error", err)
+	if _, err := exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: batches}); err != nil {
+		logger.WarnContext(ctx, "hopper: settle batches; the leader will", "count", len(batches), "error", err)
 	}
-	if _, err := f.exec.WorkflowPromoteReady(opCtx, driver.WorkflowPromoteParams{DependsOn: jobs}); err != nil {
-		f.logger.WarnContext(ctx, "hopper: promote dependents; the leader will", "count", len(jobs), "error", err)
+	if _, err := exec.WorkflowPromoteReady(opCtx, driver.WorkflowPromoteParams{DependsOn: jobs}); err != nil {
+		logger.WarnContext(ctx, "hopper: promote dependents; the leader will", "count", len(jobs), "error", err)
 	}
 }
 
@@ -504,7 +511,9 @@ func (f *finalizer) followUp(ctx context.Context, finished []pending) {
 // which.
 // A batch can hold two results of one job, a rescued attempt's late one and
 // that of the claim after it on this client; the fence the statement
-// returns with each job says which applied.
+// returns with each job says which applied. Only when a previous release's
+// JobRetry reset the fence can the two share one, and then which of them
+// applied is the engine's choice, and both are reported.
 func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []driver.JobFinalized) []pending {
 	var ok map[driver.JobFinalized]struct{}
 	if len(applied) != len(batch) {
