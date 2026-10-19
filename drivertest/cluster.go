@@ -1139,10 +1139,9 @@ func testDepsTableMaintained[TTx any](t *testing.T, f Fixture[TTx]) {
 	if stat("last_analyze IS NULL") != "true" {
 		t.Fatal("dependency table analyzed before maintenance")
 	}
-	res := waitMaintain(ctx, t, exec, func(r driver.JobsMaintainResult) bool { return r.Analyzed })
-	if !res.Analyzed {
-		t.Fatalf("maintenance after 1200 edges = %+v", res)
-	}
+	// The result's Analyzed would also report the analyze of hopper_jobs,
+	// which the workflow's 1201 jobs earn, so the table's own statistics
+	// are what tell.
 	for deadline := time.Now().Add(10 * time.Second); stat("last_analyze IS NOT NULL") != "true"; time.Sleep(100 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("dependency table not analyzed")

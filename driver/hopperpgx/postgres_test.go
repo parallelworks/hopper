@@ -1225,8 +1225,9 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 		exec1("ALTER TABLE " + table + " SET (autovacuum_enabled = false)")
 	}
 	// Five thousand workflows of ten steps: one, eight after it, one after
-	// those.
-	exec1(`CREATE TEMP TABLE steps AS
+	// those. The steps table is in the test's schema, not a temporary one,
+	// which only the pool's connection that created it would see.
+	exec1(`CREATE UNLOGGED TABLE steps AS
 		SELECT w, s, hopper_uuidv7() AS id, b.id AS batch_id
 		FROM (SELECT w, hopper_uuidv7() AS id FROM generate_series(1, 5000) w) b, generate_series(0, 9) s ORDER BY w, s`)
 	exec1(`INSERT INTO hopper_batches (id, pending, total, name) SELECT DISTINCT batch_id, 10, 10, 'w' FROM steps`)
@@ -1275,7 +1276,20 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 	if err != nil || len(finished) != 100 {
 		t.Fatalf("finalize = %d, %v", len(finished), err)
 	}
-	if _, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results(running[100:200]), NoBatches: true}); err != nil {
+	// Jobs outside workflows, first in the claim order, for the statement
+	// that finalizes jobs without batches.
+	plain := insertParams("plain", 100)
+	for i := range plain {
+		plain[i].Priority = 1
+	}
+	if _, err := exec.JobInsertMany(ctx, plain, driver.JobInsertOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 100})
+	if err != nil || len(claimed.Jobs) != 100 || claimed.Jobs[0].Kind != "plain" || claimed.Jobs[99].Kind != "plain" {
+		t.Fatalf("claim of the jobs outside workflows = %d jobs, %v", len(claimed.Jobs), err)
+	}
+	if _, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results(claimed.Jobs), NoBatches: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := traced.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: finished}); err != nil {

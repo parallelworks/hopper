@@ -361,6 +361,7 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	var (
 		mu      sync.Mutex
 		applied = map[driver.JobID]int{}
+		lastErr error
 		errs    = make(chan error, 16)
 		replay  = make(chan []driver.JobFinalize, 256)
 		wg      sync.WaitGroup
@@ -383,12 +384,20 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	// A failed statement is sent again whole, as the finalizer does; a
 	// deadlock between two finalizes completing batches fails one of them.
+	// The statement runs on a context the end of the test does not cancel:
+	// canceled while its reply was on the way, a finalize the database
+	// applied would count as never applied.
 	finalizeRetrying := func(fin []driver.JobFinalize) []driver.JobID {
 		for wctx.Err() == nil {
-			ids, err := exec.JobFinalizeMany(wctx, driver.JobFinalizeParams{Jobs: fin})
+			sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
+			ids, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{Jobs: fin})
+			scancel()
 			if err == nil {
 				return ids
 			}
+			mu.Lock()
+			lastErr = err
+			mu.Unlock()
 			time.Sleep(time.Millisecond)
 		}
 		return nil
@@ -430,7 +439,7 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				record(finished)
 				select {
 				case replay <- fin:
-				default:
+				case <-wctx.Done():
 				}
 				// The follow-up may time out on a batch row; the sweeps
 				// below settle what it leaves.
@@ -480,7 +489,7 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	if timedOut {
-		t.Fatalf("not finished in a minute: %s", f.QueryText(ctx, t, d,
+		t.Fatalf("not finished in a minute (last finalize error: %v): %s", lastErr, f.QueryText(ctx, t, d,
 			"SELECT coalesce(string_agg(state || ' ' || n, ', '), 'none') FROM (SELECT state::text, count(*) AS n FROM hopper_jobs GROUP BY state) s"))
 	}
 
