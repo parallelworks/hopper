@@ -331,7 +331,7 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 // claimed in one statement and following up as a client does, while the
 // leader's sweeps run and every statement's results are sent a second time.
 // In one workflow in five, a middle step fails. Every job is finalized
-// once, no step runs before its dependencies have finished, the step after
+// once, no step is claimed while a dependency is live, the step after
 // a failed one is canceled, and every workflow completes once, with its
 // failures counted.
 func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
@@ -409,15 +409,25 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				}
 				fin := make([]driver.JobFinalize, len(res.Jobs))
 				batches := make([]driver.JobID, len(res.Jobs))
+				ids := make([]string, len(res.Jobs))
 				for i, j := range res.Jobs {
 					fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
 					if j.Kind == "fail" {
 						fin[i].State = driver.JobStateDiscarded
 					}
 					batches[i] = j.BatchID
+					ids[i] = j.ID.String()
 				}
-				ids := finalizeRetrying(fin)
-				record(ids)
+				// A dependency leaves the live table when its finalize
+				// commits, and never returns: one still there ran after
+				// its dependent was claimed.
+				if n := f.QueryText(ctx, t, d, `SELECT count(*)::text FROM hopper_job_deps e
+					JOIN hopper_jobs x ON x.id = e.depends_on WHERE e.job_id = ANY($1::uuid[])`, "{"+strings.Join(ids, ",")+"}"); n != "0" {
+					fail(fmt.Errorf("claimed %d jobs with %s dependencies still live", len(ids), n))
+					return
+				}
+				finished := finalizeRetrying(fin)
+				record(finished)
 				select {
 				case replay <- fin:
 				default:
@@ -425,7 +435,7 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				// The follow-up may time out on a batch row; the sweeps
 				// below settle what it leaves.
 				_, _ = exec.BatchSettle(wctx, driver.BatchSettleParams{IDs: batches})
-				_, _ = exec.WorkflowPromoteReady(wctx, driver.WorkflowPromoteParams{DependsOn: ids})
+				_, _ = exec.WorkflowPromoteReady(wctx, driver.WorkflowPromoteParams{DependsOn: finished})
 			}
 		})
 	}
@@ -490,10 +500,6 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			"history rows, distinct jobs", `SELECT count(*) || ' ' || count(DISTINCT id) FROM hopper_job_history WHERE queue = 'default'`,
 			fmt.Sprintf("%d %d", workflows*(middles+2), workflows*(middles+2)),
 		},
-		{"steps run before a dependency finished", `SELECT count(*) FROM hopper_job_history s
-			JOIN hopper_job_history dep ON dep.batch_id = s.batch_id
-			  AND (s.kind IN ('mid', 'fail') AND dep.kind = 'root' OR s.kind = 'last' AND dep.kind IN ('mid', 'fail'))
-			WHERE s.attempted_at IS NOT NULL AND s.attempted_at < dep.finalized_at`, "0"},
 		{
 			"last steps by state", `SELECT string_agg(state || ' ' || n, ', ' ORDER BY state) FROM (
 			SELECT state::text, count(*) AS n FROM hopper_job_history WHERE kind = 'last' GROUP BY state) s`,
