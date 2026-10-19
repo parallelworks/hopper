@@ -399,11 +399,13 @@ const analyzeEvery = 30 * time.Second
 //
 // The live tags table churns with tagged jobs, and a listing by tag walks
 // its index, so it is kept the same way, except that its analyze keeps the
-// server's statistics target. So does the dependency table, which churns
-// with workflows: until it has statistics, the planner takes each lookup of
+// server's statistics target. So is the dependency table, which churns
+// with workflows, except that it is analyzed on churn only until it has
+// statistics (see liveTable): until then, the planner takes each lookup of
 // a job's edges for a two-hundredth of the table, and scans the table
 // instead, in finalizes and in the sweep that promotes dependents (see
-// finalizeTailSQL). Each table is kept whether or not another's
+// finalizeTailSQL). The counters of all three are read in one statement.
+// Each table is kept whether or not another's
 // maintenance fails, such as a vacuum of a large hopper_jobs that runs past
 // the role's statement_timeout on every pass.
 func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
@@ -411,9 +413,39 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 	if e.InTx {
 		return res, errors.New("hopper: live table maintenance must run on the pool, not in a transaction")
 	}
+	names := make([]string, len(liveTables))
+	for i, t := range liveTables {
+		names[i] = e.Schema.Table(t.name)
+	}
+	rows, err := e.Conn.Query(ctx, `
+		SELECT n, s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, c.reltuples,
+		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
+		FROM unnest($1::text[]) n
+		JOIN pg_stat_user_tables s ON s.relid = to_regclass(n) JOIN pg_class c ON c.oid = s.relid`, textArray(names))
+	if err != nil {
+		return res, fmt.Errorf("hopper: live table statistics: %w", err)
+	}
+	stats := map[string]liveTableStats{}
+	for rows.Next() {
+		var name string
+		var st liveTableStats
+		if err := rows.Scan(&name, &st.dead, &st.live, &st.modified, &st.believed, &st.sinceAnalyze); err != nil {
+			rows.Close()
+			return res, fmt.Errorf("hopper: live table statistics: %w", err)
+		}
+		stats[name] = st
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return res, fmt.Errorf("hopper: live table statistics: %w", err)
+	}
 	var errs []error
-	for _, t := range liveTables {
-		vacuumed, analyzed, err := e.maintainLiveTable(ctx, t.name, t.statisticsTarget)
+	for i, t := range liveTables {
+		st, ok := stats[names[i]]
+		if !ok {
+			continue
+		}
+		vacuumed, analyzed, err := e.maintainLiveTable(ctx, t, names[i], st)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -424,63 +456,66 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 	return res, errors.Join(errs...)
 }
 
+// liveTableStats are a live table's activity counters and the row count
+// the planner holds.
+type liveTableStats struct {
+	dead, live, modified   int64
+	believed, sinceAnalyze float64
+}
+
 // liveTables are the tables JobsMaintain keeps, with the statistics target
 // their analyze uses, or zero for the server's. The tags table keeps the
 // server's target: a listing by several tags (rarestTagSQL) tells common
 // tags apart by its most common values, of which a target of 10 would keep
 // only ten. So does the dependency table, whose estimates rest on how many
 // distinct jobs its sample holds, which a larger sample counts better.
-var liveTables = []struct {
-	name             string
-	statisticsTarget int
-}{
-	{"hopper_jobs", 10},
-	{"hopper_job_tags", 0},
-	{"hopper_job_deps", 0},
+var liveTables = []liveTable{
+	{"hopper_jobs", 10, true},
+	{"hopper_job_tags", 0, true},
+	{"hopper_job_deps", 0, false},
 }
 
-func (e *Executor) maintainLiveTable(ctx context.Context, table string, statisticsTarget int) (vacuumed, analyzed bool, err error) {
-	var dead, live, modified int64
-	var believed, sinceAnalyze float64
-	err = e.Conn.QueryRow(ctx, `
-		SELECT s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, c.reltuples,
-		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
-		FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
-		WHERE s.relid = to_regclass($1)`, e.Schema.Table(table)).Scan(&dead, &live, &modified, &believed, &sinceAnalyze)
-	if errors.Is(err, ErrNoRows) {
-		return false, false, nil
-	}
-	if err != nil {
-		return false, false, fmt.Errorf("hopper: %s statistics: %w", table, err)
-	}
-	if dead >= vacuumDeadRows {
+// liveTable is a table JobsMaintain keeps. A table without churn is
+// analyzed on churn only until it has statistics, and then only when its
+// size is off: what the planner reads from the dependency table, how many
+// edges a job has and how many jobs depend on one, does not change as
+// workflows come and go, and each analyze has every connection replan the
+// finalize statement.
+type liveTable struct {
+	name             string
+	statisticsTarget int
+	churn            bool
+}
+
+func (e *Executor) maintainLiveTable(ctx context.Context, t liveTable, table string, st liveTableStats) (vacuumed, analyzed bool, err error) {
+	if st.dead >= vacuumDeadRows {
 		// TRUNCATE false: a vacuum otherwise ends by trying, for up to five
 		// seconds, to take an exclusive lock to give back empty trailing
 		// pages, and whenever it briefly gets one every claim and finalize
 		// waits behind it. A churning live table reuses those pages within
 		// seconds anyway.
-		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, TRUNCATE false) "+e.Schema.Table(table)); err != nil {
-			return false, false, fmt.Errorf("hopper: vacuum %s: %w", table, err)
+		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, TRUNCATE false) "+table); err != nil {
+			return false, false, fmt.Errorf("hopper: vacuum %s: %w", t.name, err)
 		}
 		return true, false, nil
 	}
 	floor := func(v float64) float64 { return max(v, 100) }
-	sizeOff := believed >= 0 && (float64(live) >= 10*floor(believed) || believed >= 10*floor(float64(live)))
-	churned := modified >= 1000 && modified*10 >= live && sinceAnalyze >= analyzeEvery.Seconds()
+	sizeOff := st.believed >= 0 && (float64(st.live) >= 10*floor(st.believed) || st.believed >= 10*floor(float64(st.live)))
+	churned := st.modified >= 1000 && st.modified*10 >= st.live && st.sinceAnalyze >= analyzeEvery.Seconds() && (t.churn || st.believed < 0)
 	if !sizeOff && !churned {
 		return false, false, nil
 	}
 	err = e.withTx(ctx, func(tx Tx) error {
-		if statisticsTarget > 0 {
-			if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = "+strconv.Itoa(statisticsTarget)); err != nil {
+		if t.statisticsTarget > 0 {
+			if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = "+strconv.Itoa(t.statisticsTarget)); err != nil {
 				return err
 			}
 		}
-		_, err := tx.Exec(ctx, "ANALYZE (SKIP_LOCKED) "+e.Schema.Table(table))
+		_, err := tx.Exec(ctx, "ANALYZE (SKIP_LOCKED) "+table)
 		return err
 	})
 	if err != nil {
-		return false, false, fmt.Errorf("hopper: analyze %s: %w", table, err)
+		return false, false, fmt.Errorf("hopper: analyze %s: %w", t.name, err)
 	}
 	return false, true, nil
 }
