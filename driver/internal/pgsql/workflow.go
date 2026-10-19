@@ -113,16 +113,20 @@ const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
 // the insert channel. Jobs without a batch or dependents cost index probes
 // on small tables and nothing else.
 //
-// Every lookup keyed by the statement's own rows (the cascade, done, the
-// batches counted and those completed) is a = ANY (ARRAY(...)), which the
-// planner takes for ten keys and so probes an index for. Joined to the CTEs
-// instead, it guessed hundreds of rows for them, and with no statistics on
-// hopper_job_deps a probe looked like a few hundred rows more, so it scanned
-// hopper_job_deps, hopper_jobs and hopper_batches whole on every finalize,
-// at a cost that grew with the workflows in flight. The cascade itself
-// still joins, its first step to finished and its recursive step to its
-// own rows, which cannot take that form, and relies on the leader keeping
-// hopper_job_deps analyzed (JobsMaintain).
+// The lookups keyed by the statement's own rows (the cascade's jobs, done,
+// the batches completed) are = ANY (ARRAY(...)), which the planner takes
+// for ten keys and so probes an index for. Joined to the CTEs instead, it
+// guessed hundreds of rows for them, the cascade's alone guessed at 180,
+// and with no statistics on hopper_job_deps a probe looked like a few
+// hundred rows more, so it scanned hopper_job_deps, hopper_jobs and
+// hopper_batches whole on every finalize, at a cost that grew with the
+// workflows in flight. ready looks each counted batch up by primary key
+// in a LATERAL subquery that OFFSET 0 keeps from being flattened into a
+// join: joined, a hopper_batches without statistics was scanned whole, and
+// with a = ANY the planner rescanned batch_counts for every batch row.
+// The cascade still joins too, its first step to finished and its
+// recursive step to its own rows, which cannot take that form, and relies
+// on the leader keeping hopper_job_deps analyzed (JobsMaintain).
 func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 	return `cascade AS (
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN finished f ON d.depends_on = f.id
@@ -144,8 +148,10 @@ batch_counts AS (
 ),
 ready AS (
   SELECT b.id, b.failed + p.failed + c.f AS failed
-  FROM batch_counts c JOIN {{schema}}.hopper_batches b ON b.id = c.batch_id, ` + batchProgressSQL + `
-  WHERE b.id = ANY (ARRAY(SELECT batch_id FROM batch_counts)) AND b.completed_at IS NULL AND b.pending - p.done - c.n <= 0
+  FROM batch_counts c,
+    LATERAL (SELECT b.id, b.failed, b.pending FROM {{schema}}.hopper_batches b
+             WHERE b.id = c.batch_id AND b.completed_at IS NULL OFFSET 0) b, ` + batchProgressSQL + `
+  WHERE b.pending - p.done - c.n <= 0
 ),
 batches AS (
   UPDATE {{schema}}.hopper_batches b SET completed_at = now(), pending = 0, failed = r.failed
