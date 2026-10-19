@@ -112,6 +112,12 @@ var scanIDs = collect(func(r Row) (driver.JobID, error) {
 	return id, err
 })
 
+var scanFinalized = collect(func(r Row) (driver.JobFinalized, error) {
+	var f driver.JobFinalized
+	err := r.Scan(&f.ID, &f.Fence)
+	return f, err
+})
+
 // jobInsertSQL inserts a batch in one statement. On a unique-key conflict a
 // DO UPDATE (rather than DO NOTHING) makes RETURNING include the existing
 // row, and xmax <> 0 marks those rows as duplicates. For ConflictSkip the
@@ -607,7 +613,7 @@ retry AS (
   FROM r
   WHERE j.id = r.id AND ` + isRunning("j.state") + ` AND j.attempted_by = r.attempted_by AND j.fence = r.fence
     AND r.state IN ('retryable', 'scheduled')
-  RETURNING j.id
+  RETURNING j.id, j.fence
 ),
 finished AS (
   DELETE FROM {{schema}}.hopper_jobs j
@@ -625,7 +631,7 @@ finished AS (
 func isRunning(column string) string { return column + "::text = 'running'" }
 
 var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
-SELECT id FROM retry UNION ALL SELECT id FROM finished`
+SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
 
 // appendLogSQL appends an attempt's log, if it has one, to its job's logs,
 // keeping the latest $13. A snooze gives its attempt back, so a job that
@@ -650,7 +656,7 @@ const appendLogSQL = `CASE
 // no batch or workflow (driver.JobFinalizeParams.NoBatches): without the
 // insert channel, so the parameters after it move down one.
 var jobFinalizePlainSQL = strings.NewReplacer("$11", "$10", "$12", "$11", "$13", "$12", "$14", "$13").Replace(jobFinalizeHeadSQL) + plainFinalizeTailSQL + `
-SELECT id FROM retry UNION ALL SELECT id FROM finished`
+SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
 
 // skipLockedSQL makes a finalize statement skip the jobs whose rows another
 // transaction holds (driver.JobFinalizeParams.SkipLocked).
@@ -669,7 +675,7 @@ var (
 )
 
 // JobFinalizeMany implements driver.Executor.
-func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	if len(params.Jobs) == 0 {
 		return nil, nil
 	}
@@ -728,7 +734,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 			query = jobFinalizePlainSkipLockedSQL
 		}
 	}
-	applied, err := scanIDs(e.Conn.Query(ctx, query, args...))
+	applied, err := scanFinalized(e.Conn.Query(ctx, query, args...))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 	}

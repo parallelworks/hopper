@@ -1150,14 +1150,14 @@ retry AS (
          wake_requested_at = NULL
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
     AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
-  RETURNING j.id),
+  RETURNING j.id, j.fence),
 done AS (
   DELETE FROM hopper_jobs j USING r
   WHERE j.id = r.id AND r.state IN ('completed','canceled','discarded')
     AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
   RETURNING j.*, r.state AS final_state, r.error, r.output, r.archive),
 archived AS (INSERT INTO hopper_job_history SELECT … , now() FROM done WHERE archive)
-SELECT id FROM retry UNION ALL SELECT id FROM done;
+SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
 ```
 
 - The `state = 'running' AND attempted_by = r.attempted_by AND fence = r.fence`
@@ -1166,10 +1166,10 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   finalizes the attempts it claimed under the old one. If the job was rescued and
   claimed again, by another client or by the same one, the result is dropped and
   logged, so a finalize can never overwrite a newer attempt. The statement returns
-  the IDs it applied; the client logs the rest. A flush can hold two results of one
-  job, a rescued attempt's late one and that of the claim after it, and the statement
-  would return the job's ID once whichever applied, so the finalizer writes the second
-  in a statement of its own, and the late result emits no event. The client keeps the
+  the job and fence of each result it applied; the client logs the rest. A flush can
+  hold two results of one job, a rescued attempt's late one and that of the claim
+  after it: at most one applies, its fence says which, and the late result emits no
+  event. The client keeps the
   cancel function of each running job's latest claim, and an attempt that returns
   removes only its own claim's, so that the return of a rescued attempt does not take
   away the cancel of the claim after it. A claim that replaces another cancels the

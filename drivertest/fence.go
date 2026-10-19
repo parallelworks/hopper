@@ -188,3 +188,32 @@ func testRecordProgressFencesSnooze[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatalf("the second claim's progress write = %+v, %v", p, err)
 	}
 }
+
+// testFinalizeReportsTheAppliedFence sends a stale result and the current
+// claim's result of one job in one statement, in both orders: the statement
+// applies the current one and returns its fence with the job.
+func testFinalizeReportsTheAppliedFence[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	for _, staleFirst := range []bool{true, false} {
+		id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+		claimOne(ctx, t, exec, clientID, id)
+		finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: 1, State: driver.JobStateRetryable})
+		claimOne(ctx, t, exec, clientID, id)
+		stale := driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true}
+		current := driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: 2, State: driver.JobStateRetryable, Delay: time.Hour}
+		results := []driver.JobFinalize{stale, current}
+		if !staleFirst {
+			results = []driver.JobFinalize{current, stale}
+		}
+		applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results})
+		if err != nil || len(applied) != 1 || applied[0] != (driver.JobFinalized{ID: id, Fence: 2}) {
+			t.Fatalf("stale first %v: applied %+v, %v; want the job at fence 2", staleFirst, applied, err)
+		}
+		if j := get(ctx, t, exec, id); j.State != driver.JobStateRetryable {
+			t.Fatalf("stale first %v: job %s, want retryable", staleFirst, j.State)
+		}
+	}
+}

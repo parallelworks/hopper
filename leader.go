@@ -197,7 +197,8 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			byID[f.ID] = f
 		}
 		rescued := make(map[JobID]struct{}, len(applied))
-		for _, id := range applied {
+		for _, a := range applied {
+			id := a.ID
 			rescued[id] = struct{}{}
 			if byID[id].State == driver.JobStateDiscarded {
 				discarded++

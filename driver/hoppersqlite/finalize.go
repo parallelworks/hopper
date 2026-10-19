@@ -245,10 +245,11 @@ func encodeResults(jobs []driver.JobFinalize) ([]result, error) {
 
 // JobFinalizeMany implements driver.Executor. A result applies only to a
 // job running in the claim that produced it, by the same client at the same
-// fence, so a stale result never overwrites a newer attempt. With
+// fence, so a stale result never overwrites a newer attempt; each applied
+// result is reported with its fence. With
 // SkipLocked, a write lock another transaction holds is waited for only
 // briefly, after which no result is applied.
-func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	if len(params.Jobs) == 0 {
 		return nil, nil
 	}
@@ -257,7 +258,7 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		return nil, err
 	}
 	keep := keepLogs(params.KeepLogs)
-	var applied []driver.JobID
+	var applied []driver.JobFinalized
 	write := e.write
 	if params.SkipLocked {
 		write = e.writeBrief
@@ -293,7 +294,7 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 					return err
 				}
 				done = append(done, f)
-				applied = append(applied, r.ID)
+				applied = append(applied, driver.JobFinalized{ID: r.ID, Fence: r.Fence})
 				continue
 			}
 			// A wake since the attempt began (JobRetryOrderingKey) makes the
@@ -317,7 +318,7 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 				WHERE id = ?`, string(r.State), scheduledAt, attempt, errs, logs, reason, idParam(r.ID)); err != nil {
 				return err
 			}
-			applied = append(applied, r.ID)
+			applied = append(applied, driver.JobFinalized{ID: r.ID, Fence: r.Fence})
 		}
 		if params.NoBatches {
 			return nil
