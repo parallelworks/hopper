@@ -112,6 +112,21 @@ const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
 // are announced on the done channel, and promoted jobs and callbacks on
 // the insert channel. Jobs without a batch or dependents cost index probes
 // on small tables and nothing else.
+//
+// The lookups keyed by the statement's own rows (the cascade's jobs, done,
+// the batches completed) are = ANY (ARRAY(...)), which the planner takes
+// for ten keys and so probes an index for. Joined to the CTEs instead, it
+// guessed hundreds of rows for them, the cascade's alone guessed at 180,
+// and with no statistics on hopper_job_deps a probe looked like a few
+// hundred rows more, so it scanned hopper_job_deps, hopper_jobs and
+// hopper_batches whole on every finalize, at a cost that grew with the
+// workflows in flight. ready looks each counted batch up by primary key
+// in a LATERAL subquery that OFFSET 0 keeps from being flattened into a
+// join: joined, a hopper_batches without statistics was scanned whole, and
+// with a = ANY the planner rescanned batch_counts for every batch row.
+// The cascade still joins too, its first step to finished and its
+// recursive step to its own rows, which cannot take that form, and relies
+// on the leader keeping hopper_job_deps analyzed (JobsMaintain).
 func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 	return `cascade AS (
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN finished f ON d.depends_on = f.id
@@ -121,8 +136,8 @@ func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
   WHERE d.on_failure = 'cancel'
 ),
 cascaded AS (
-  DELETE FROM {{schema}}.hopper_jobs j USING (SELECT DISTINCT job_id FROM cascade) c
-  WHERE j.id = c.job_id AND j.state = 'pending'
+  DELETE FROM {{schema}}.hopper_jobs j
+  WHERE j.id = ANY (ARRAY(SELECT job_id FROM cascade)) AND j.state = 'pending'
   RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "j.logs", "NULL::jsonb", "true", "'canceled'::text", doneChannelParam) + `
 ),
 done AS (SELECT * FROM finished UNION ALL SELECT * FROM cascaded),
@@ -133,8 +148,10 @@ batch_counts AS (
 ),
 ready AS (
   SELECT b.id, b.failed + p.failed + c.f AS failed
-  FROM batch_counts c JOIN {{schema}}.hopper_batches b ON b.id = c.batch_id, ` + batchProgressSQL + `
-  WHERE b.completed_at IS NULL AND b.pending - p.done - c.n <= 0
+  FROM batch_counts c,
+    LATERAL (SELECT b.id, b.failed, b.pending FROM {{schema}}.hopper_batches b
+             WHERE b.id = c.batch_id AND b.completed_at IS NULL OFFSET 0) b, ` + batchProgressSQL + `
+  WHERE b.pending - p.done - c.n <= 0
 ),
 batches AS (
   UPDATE {{schema}}.hopper_batches b SET completed_at = now(), pending = 0, failed = r.failed
@@ -147,14 +164,14 @@ progress AS (
   RETURNING batch_id
 ),
 progress_cleared AS (
-  DELETE FROM {{schema}}.hopper_batch_progress p WHERE p.batch_id IN (SELECT id FROM batches) RETURNING p.batch_id
+  DELETE FROM {{schema}}.hopper_batch_progress p WHERE p.batch_id = ANY (ARRAY(SELECT id FROM batches)) RETURNING p.batch_id
 ),
 ` + batchCallbacksSQL(insertChannelParam) + `,
 promoted AS (
   UPDATE {{schema}}.hopper_jobs j
   SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
   WHERE j.state = 'pending'
-    AND j.id IN (SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN done ON d.depends_on = done.id)
+    AND j.id = ANY (ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY (ARRAY(SELECT id FROM done))))
     AND j.id NOT IN (SELECT id FROM cascaded)
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
@@ -162,7 +179,7 @@ promoted AS (
   RETURNING pg_notify(` + insertChannelParam + `, j.queue)
 ),
 edges AS (
-  DELETE FROM {{schema}}.hopper_job_deps d WHERE d.job_id IN (SELECT id FROM done) RETURNING d.job_id
+  DELETE FROM {{schema}}.hopper_job_deps d WHERE d.job_id = ANY (ARRAY(SELECT id FROM done)) RETURNING d.job_id
 )`
 }
 
@@ -170,12 +187,15 @@ edges AS (
 // candidates selects none of whose dependencies is still live, skipping rows
 // a finalize holds: that finalize decides them. It returns how many it
 // promoted, how many candidates there were, and the greatest candidate ID.
+// The candidates are looked up as finalizeTailSQL looks up its own rows:
+// joined instead, a sweep's LIMIT $2, which a generic plan takes for a
+// tenth of the edges, had it scan hopper_jobs whole for every chunk.
 func workflowPromoteSQL(candidates string) string {
 	return `
 WITH candidates AS (` + candidates + `),
 ready AS (
   SELECT j.id FROM {{schema}}.hopper_jobs j
-  WHERE j.id IN (SELECT id FROM candidates)
+  WHERE j.id = ANY (ARRAY(SELECT id FROM candidates))
     AND j.state = 'pending'
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on

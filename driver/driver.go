@@ -323,16 +323,18 @@ type Executor interface {
 	// maintenance passes: it reclaims the space and index entries of jobs
 	// that have run and left once enough have accumulated (a hundred
 	// thousand on Postgres), and refreshes planner statistics when the
-	// planner's idea of the table's size is off by an order of magnitude. It
+	// planner's idea of the table's size is off by an order of magnitude or
+	// enough of the table has changed since the last refresh. It
 	// never waits for a lock, so it costs nothing while the engine's own
 	// pass is running. The live table churns at the job rate, and on
 	// Postgres every claim walks the claim index past the entries of jobs
 	// that have left, so pickup latency climbs between vacuums; autovacuum
 	// looks only every autovacuum_naptime (a minute by default). On Postgres
 	// the live tags table (schema v17), whose index a listing by tag walks,
-	// is kept the same way, and each table is kept whether or not the
-	// other's maintenance fails. Engines without such maintenance return
-	// zero values.
+	// and the workflow dependency table, whose statistics the finalize
+	// statement's plan rests on, are kept the same way, and each table is
+	// kept whether or not another's maintenance fails. Engines without such
+	// maintenance return zero values.
 	JobsMaintain(ctx context.Context) (JobsMaintainResult, error)
 }
 

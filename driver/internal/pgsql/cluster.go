@@ -387,9 +387,9 @@ const analyzeEvery = 30 * time.Second
 //
 // ANALYZE keeps two things current that the planner needs: the row count,
 // which a plan cached while the table was empty gets wrong by orders of
-// magnitude, and the mix of states, which decides how the finalize joins
-// its parameter list to the running rows (with a stale mix that says
-// almost nothing is running, it probes the list once per running row).
+// magnitude, and the mix of states, from which the planner costs scans of
+// the partial indexes by state. (The finalize does not depend on it: it
+// compares the running state as text; see jobFinalizeHeadSQL.)
 // So it runs at once when the planner's row count is ten times off, and
 // otherwise once a tenth of the table has changed but no more than every
 // thirty seconds, since an analyze invalidates every connection's cached
@@ -399,7 +399,16 @@ const analyzeEvery = 30 * time.Second
 //
 // The live tags table churns with tagged jobs, and a listing by tag walks
 // its index, so it is kept the same way, except that its analyze keeps the
-// server's statistics target. Each table is kept whether or not the other's
+// server's statistics target. So is the dependency table, which churns
+// with workflows, except that churn re-analyzes it at most every
+// analyzeDepsEvery: until it has statistics, the planner takes each lookup of
+// a job's edges for a two-hundredth of the table, and scans the table
+// instead, in finalizes and in the sweep that promotes dependents (see
+// finalizeTailSQL). The counters of all three are read in one statement,
+// each table's in a LATERAL subquery that OFFSET 0 keeps from being
+// flattened: joined, the view's GROUP BY kept the table's OID from reaching
+// pg_class, so every pass summed the counters of every relation in the
+// database. Each table is kept whether or not another's
 // maintenance fails, such as a vacuum of a large hopper_jobs that runs past
 // the role's statement_timeout on every pass.
 func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
@@ -407,9 +416,31 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 	if e.InTx {
 		return res, errors.New("hopper: live table maintenance must run on the pool, not in a transaction")
 	}
+	names := make([]string, len(liveTables))
+	for i, t := range liveTables {
+		names[i] = e.Schema.Table(t.name)
+	}
+	all, err := scanLiveTableStats(e.Conn.Query(ctx, `
+		SELECT n, s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, s.reltuples,
+		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
+		FROM unnest($1::text[]) n, LATERAL (
+		  SELECT s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, s.last_analyze, s.last_autoanalyze, c.reltuples
+		  FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
+		  WHERE s.relid = to_regclass(n) OFFSET 0) s`, textArray(names)))
+	if err != nil {
+		return res, fmt.Errorf("hopper: live table statistics: %w", err)
+	}
+	stats := make(map[string]liveTableStats, len(all))
+	for _, st := range all {
+		stats[st.table] = st
+	}
 	var errs []error
-	for _, t := range liveTables {
-		vacuumed, analyzed, err := e.maintainLiveTable(ctx, t.name, t.statisticsTarget)
+	for i, t := range liveTables {
+		st, ok := stats[names[i]]
+		if !ok {
+			continue
+		}
+		vacuumed, analyzed, err := e.maintainLiveTable(ctx, t, names[i], st)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -420,61 +451,86 @@ func (e *Executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 	return res, errors.Join(errs...)
 }
 
+// liveTableStats are a live table's activity counters, the row count the
+// planner holds, and the time since its last analyze (1e9 s if never: a
+// vacuum, or an index built over existing rows, also sets the row count,
+// so a count that is known does not mean the table has statistics).
+type liveTableStats struct {
+	table                  string
+	dead, live, modified   int64
+	believed, sinceAnalyze float64
+}
+
+var scanLiveTableStats = collect(func(r Row) (liveTableStats, error) {
+	var st liveTableStats
+	err := r.Scan(&st.table, &st.dead, &st.live, &st.modified, &st.believed, &st.sinceAnalyze)
+	return st, err
+})
+
 // liveTables are the tables JobsMaintain keeps, with the statistics target
 // their analyze uses, or zero for the server's. The tags table keeps the
 // server's target: a listing by several tags (rarestTagSQL) tells common
 // tags apart by its most common values, of which a target of 10 would keep
-// only ten.
-var liveTables = []struct {
-	name             string
-	statisticsTarget int
-}{
-	{"hopper_jobs", 10},
-	{"hopper_job_tags", 0},
+// only ten. So does the dependency table, whose estimates rest on how many
+// distinct jobs its sample holds, which a larger sample counts better.
+var liveTables = []liveTable{
+	{"hopper_jobs", 10, analyzeEvery},
+	{"hopper_job_tags", 0, analyzeEvery},
+	{"hopper_job_deps", 0, analyzeDepsEvery},
 }
 
-func (e *Executor) maintainLiveTable(ctx context.Context, table string, statisticsTarget int) (vacuumed, analyzed bool, err error) {
-	var dead, live, modified int64
-	var believed, sinceAnalyze float64
-	err = e.Conn.QueryRow(ctx, `
-		SELECT s.n_dead_tup, s.n_live_tup, s.n_mod_since_analyze, c.reltuples,
-		  coalesce(extract(epoch FROM now() - greatest(s.last_analyze, s.last_autoanalyze)), 1e9)
-		FROM pg_stat_user_tables s JOIN pg_class c ON c.oid = s.relid
-		WHERE s.relid = to_regclass($1)`, e.Schema.Table(table)).Scan(&dead, &live, &modified, &believed, &sinceAnalyze)
-	if errors.Is(err, ErrNoRows) {
-		return false, false, nil
-	}
-	if err != nil {
-		return false, false, fmt.Errorf("hopper: %s statistics: %w", table, err)
-	}
-	if dead >= vacuumDeadRows {
+// analyzeDepsEvery is the least time between the dependency table's
+// statistics refreshes driven by churn. What the planner reads from it,
+// how many edges a job has and how many jobs depend on one, changes only
+// as the shape of the workflows does, so a refresh now and then corrects a
+// first analyze that sampled the table empty or holding one large fan-out,
+// which has the planner scan it on every lookup. The cap bounds the cost
+// of sampling the table, not replanning: analyzes of hopper_jobs make
+// every connection replan the finalize statement at least as often, and
+// autovacuum's own analyzes, at the table's default thresholds, keep the
+// statistics fresh in between. A table never analyzed is analyzed without
+// the wait, once a thousand of its rows have changed: until then it is
+// small enough that a scan costs little.
+const analyzeDepsEvery = 10 * time.Minute
+
+// liveTable is a table JobsMaintain keeps, with its analyze's statistics
+// target (zero for the server's) and the least time between analyzes
+// driven by churn.
+type liveTable struct {
+	name             string
+	statisticsTarget int
+	analyzeEvery     time.Duration
+}
+
+func (e *Executor) maintainLiveTable(ctx context.Context, t liveTable, table string, st liveTableStats) (vacuumed, analyzed bool, err error) {
+	if st.dead >= vacuumDeadRows {
 		// TRUNCATE false: a vacuum otherwise ends by trying, for up to five
 		// seconds, to take an exclusive lock to give back empty trailing
 		// pages, and whenever it briefly gets one every claim and finalize
 		// waits behind it. A churning live table reuses those pages within
 		// seconds anyway.
-		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, TRUNCATE false) "+e.Schema.Table(table)); err != nil {
-			return false, false, fmt.Errorf("hopper: vacuum %s: %w", table, err)
+		if _, err := e.Conn.Exec(ctx, "VACUUM (SKIP_LOCKED, TRUNCATE false) "+table); err != nil {
+			return false, false, fmt.Errorf("hopper: vacuum %s: %w", t.name, err)
 		}
 		return true, false, nil
 	}
 	floor := func(v float64) float64 { return max(v, 100) }
-	sizeOff := believed >= 0 && (float64(live) >= 10*floor(believed) || believed >= 10*floor(float64(live)))
-	churned := modified >= 1000 && modified*10 >= live && sinceAnalyze >= analyzeEvery.Seconds()
+	sizeOff := st.believed >= 0 && (float64(st.live) >= 10*floor(st.believed) || st.believed >= 10*floor(float64(st.live)))
+	churned := st.modified >= 1000 && st.modified*10 >= st.live && st.sinceAnalyze >= t.analyzeEvery.Seconds()
 	if !sizeOff && !churned {
 		return false, false, nil
 	}
 	err = e.withTx(ctx, func(tx Tx) error {
-		if statisticsTarget > 0 {
-			if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = "+strconv.Itoa(statisticsTarget)); err != nil {
+		if t.statisticsTarget > 0 {
+			if _, err := tx.Exec(ctx, "SET LOCAL default_statistics_target = "+strconv.Itoa(t.statisticsTarget)); err != nil {
 				return err
 			}
 		}
-		_, err := tx.Exec(ctx, "ANALYZE (SKIP_LOCKED) "+e.Schema.Table(table))
+		_, err := tx.Exec(ctx, "ANALYZE (SKIP_LOCKED) "+table)
 		return err
 	})
 	if err != nil {
-		return false, false, fmt.Errorf("hopper: analyze %s: %w", table, err)
+		return false, false, fmt.Errorf("hopper: analyze %s: %w", t.name, err)
 	}
 	return false, true, nil
 }

@@ -144,8 +144,10 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"BatchesConcurrent", testBatchesConcurrent[TTx]},
 		{"Workflows", testWorkflows[TTx]},
 		{"WorkflowFanInConcurrent", testWorkflowFanInConcurrent[TTx]},
+		{"WorkflowsConcurrent", testWorkflowsConcurrent[TTx]},
 		{"Streams", testStreams[TTx]},
 		{"Maintain", testMaintain[TTx]},
+		{"DepsTableMaintained", testDepsTableMaintained[TTx]},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
