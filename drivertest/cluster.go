@@ -1110,6 +1110,49 @@ func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+// testDepsTableMaintained checks that the leader's live table maintenance
+// analyzes the dependency table once a burst of workflows has filled it:
+// until the table has statistics, the planner takes each lookup of a job's
+// edges for a two-hundredth of the table, and finalizes and the promotion
+// sweep scan it instead.
+func testDepsTableMaintained[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	f.Exec(ctx, t, d, "ALTER TABLE hopper_job_deps SET (autovacuum_enabled = false)")
+	deps := make([]driver.JobDependency, 1200)
+	for i := range deps {
+		deps[i] = driver.JobDependency{Job: i + 1, DependsOn: 0}
+	}
+	if _, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Name: "fan-out", Jobs: params("step", len(deps)+1), Deps: deps}); err != nil {
+		t.Fatal(err)
+	}
+	stat := func(q string) string {
+		return f.QueryText(ctx, t, d, "SELECT ("+q+")::text FROM pg_stat_user_tables WHERE relid = 'hopper_job_deps'::regclass")
+	}
+	// Postgres 14's statistics collector reports the inserts a moment later.
+	for deadline := time.Now().Add(10 * time.Second); stat("n_mod_since_analyze >= 1200") != "true"; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the dependency table's inserts were not counted")
+		}
+	}
+	if stat("last_analyze IS NULL") != "true" {
+		t.Fatal("dependency table analyzed before maintenance")
+	}
+	res := waitMaintain(ctx, t, exec, func(r driver.JobsMaintainResult) bool { return r.Analyzed })
+	if !res.Analyzed {
+		t.Fatalf("maintenance after 1200 edges = %+v", res)
+	}
+	for deadline := time.Now().Add(10 * time.Second); stat("last_analyze IS NOT NULL") != "true"; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("dependency table not analyzed")
+		}
+		if _, err := exec.JobsMaintain(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // analyzeEmpty gives the engine statistics that say the live table is
 // empty, as an idle installation has, through the Fixture when it can.
 func analyzeEmpty(ctx context.Context, t *testing.T, exec driver.Executor) {

@@ -1201,3 +1201,152 @@ func TestRescueCandidatesWithoutAttemptTime(t *testing.T) {
 		t.Fatalf("candidates = %+v, %v; want the row, not stuck", got, err)
 	}
 }
+
+// TestFinalizePlansIgnoreStaleStatistics explains, with generic and custom
+// plans, the statements that finalize jobs, follow a flush up, and find a
+// running job by ID, under the statistics a backlog of workflows has once
+// it starts running: the leader analyzed it as it was inserted, when
+// nothing ran, and thousands of its jobs have been claimed since. The
+// results' rows are found by primary key, not by a scan of
+// hopper_jobs_running, which those statistics say is all but empty, and no
+// statement scans hopper_jobs, hopper_job_deps or hopper_batches whole,
+// which would cost every finalize more with each workflow in flight.
+func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	exec1 := func(q string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	for _, table := range []string{"hopper_jobs", "hopper_job_deps", "hopper_batches", "hopper_batch_progress"} {
+		exec1("ALTER TABLE " + table + " SET (autovacuum_enabled = false)")
+	}
+	// Five thousand workflows of ten steps: one, eight after it, one after
+	// those.
+	exec1(`CREATE TEMP TABLE steps AS
+		SELECT w, s, hopper_uuidv7() AS id, b.id AS batch_id
+		FROM (SELECT w, hopper_uuidv7() AS id FROM generate_series(1, 5000) w) b, generate_series(0, 9) s ORDER BY w, s`)
+	exec1(`INSERT INTO hopper_batches (id, pending, total, name) SELECT DISTINCT batch_id, 10, 10, 'w' FROM steps`)
+	exec1(`INSERT INTO hopper_jobs (id, kind, state, args, batch_id)
+		SELECT id, 'step', (CASE WHEN s = 0 THEN 'available' ELSE 'pending' END)::hopper_job_state, '{}', batch_id FROM steps ORDER BY w, s`)
+	exec1(`INSERT INTO hopper_job_deps (job_id, depends_on)
+		SELECT m.id, r.id FROM steps m JOIN steps r ON r.w = m.w AND r.s = 0 WHERE m.s BETWEEN 1 AND 8
+		UNION ALL SELECT l.id, m.id FROM steps l JOIN steps m ON m.w = l.w AND m.s BETWEEN 1 AND 8 WHERE l.s = 9`)
+	analyzed := func() bool {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_user_tables
+			WHERE relid IN ('hopper_jobs'::regclass, 'hopper_job_deps'::regclass) AND last_analyze IS NOT NULL`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 2
+	}
+	// Postgres 14's statistics collector reports the inserts a moment later.
+	for deadline := time.Now().Add(10 * time.Second); !analyzed(); time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the leader's maintenance did not analyze hopper_jobs and hopper_job_deps")
+		}
+		if _, err := exec.JobsMaintain(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientID := register(t, ctx, exec)
+	var running []*driver.JobRow
+	for len(running) < 2000 {
+		res, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 500})
+		if err != nil || len(res.Jobs) == 0 {
+			t.Fatalf("claim = %d jobs, %v", len(res.Jobs), err)
+		}
+		running = append(running, res.Jobs...)
+	}
+	results := func(jobs []*driver.JobRow) []driver.JobFinalize {
+		out := make([]driver.JobFinalize, len(jobs))
+		for i, j := range jobs {
+			out[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
+		}
+		return out
+	}
+
+	log := &statementLog{}
+	traced := tracedDriver(t, pool, log).Executor()
+	finished, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results(running[:100])})
+	if err != nil || len(finished) != 100 {
+		t.Fatalf("finalize = %d, %v", len(finished), err)
+	}
+	if _, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results(running[100:200]), NoBatches: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := traced.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: finished}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := traced.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{Limit: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	j := running[200]
+	if _, err := traced.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, Attempt: j.Attempt, Step: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := traced.JobRecordProgress(ctx, driver.JobRecordProgressParams{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, Attempt: j.Attempt, Step: "s", NoWait: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := traced.JobCancel(ctx, running[201].ID); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	explain := func(mode, query string, args []any) string {
+		t.Helper()
+		if _, err := conn.Exec(ctx, "SET plan_cache_mode = "+mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(ctx, "PREPARE explained AS "+query); err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Exec(ctx, "DEALLOCATE explained") //nolint:errcheck // the connection's last use
+		var types []string
+		if err := conn.QueryRow(ctx, "SELECT parameter_types::text[] FROM pg_prepared_statements WHERE name = 'explained'").Scan(&types); err != nil {
+			t.Fatal(err)
+		}
+		literals := make([]string, len(args))
+		for i, arg := range args {
+			if err := conn.QueryRow(ctx, "SELECT quote_nullable($1::"+types[i]+")", arg).Scan(&literals[i]); err != nil {
+				t.Fatalf("argument %d: %v", i+1, err)
+			}
+			literals[i] += "::" + types[i]
+		}
+		var plan string
+		if err := conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) EXECUTE explained("+strings.Join(literals, ", ")+")").Scan(&plan); err != nil {
+			t.Fatal(err)
+		}
+		return plan
+	}
+	log.mu.Lock()
+	statements, args := log.sql, log.args
+	log.mu.Unlock()
+	scan := regexp.MustCompile(`"Node Type": "Seq Scan",[^}]*?"Relation Name": "(hopper_jobs|hopper_job_deps|hopper_batches)"`)
+	explained := 0
+	for i, q := range statements {
+		if !strings.Contains(q, "hopper_jobs") || strings.HasPrefix(strings.TrimSpace(q), "SELECT state FROM") {
+			continue
+		}
+		explained++
+		for _, mode := range []string{"force_generic_plan", "force_custom_plan"} {
+			plan := explain(mode, q, args[i])
+			if strings.Contains(plan, `"Index Name": "hopper_jobs_running"`) {
+				t.Errorf("%s plan scans hopper_jobs_running:\n%s\n%s", mode, q, plan)
+			}
+			if m := scan.FindStringSubmatch(plan); m != nil {
+				t.Errorf("%s plan scans %s whole:\n%s\n%s", mode, m[1], q, plan)
+			}
+		}
+	}
+	if explained != 7 {
+		t.Errorf("explained %d statements, want 7", explained)
+	}
+}

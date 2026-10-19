@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -319,6 +322,193 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	for _, step := range steps {
 		if j, err := exec.JobGet(ctx, step); err != nil || j.State != driver.JobStateAvailable {
 			t.Errorf("swept step = %+v, %v", j, err)
+		}
+	}
+}
+
+// testWorkflowsConcurrent works a hundred workflows (a step, four after it,
+// one after those) with eight workers at once, each finalizing what it
+// claimed in one statement and following up as a client does, while the
+// leader's sweeps run and every statement's results are sent a second time.
+// In one workflow in five, a middle step fails. Every job is finalized
+// once, no step runs before its dependencies have finished, the step after
+// a failed one is canceled, and every workflow completes once, with its
+// failures counted.
+func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	const workflows, middles = 100, 4
+	cb := &driver.JobInsertParams{Kind: "done", Queue: "callbacks", Priority: 2, MaxAttempts: 3, Args: json.RawMessage(`{}`)}
+	for w := range workflows {
+		jobs := params("root", 1)
+		mids := params("mid", middles)
+		if w%5 == 0 {
+			mids[0].Kind = "fail"
+		}
+		jobs = append(append(jobs, mids...), params("last", 1)...)
+		var deps []driver.JobDependency
+		for m := 1; m <= middles; m++ {
+			deps = append(deps, driver.JobDependency{Job: m, DependsOn: 0}, driver.JobDependency{Job: middles + 1, DependsOn: m})
+		}
+		if _, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Name: "chaos", Jobs: jobs, Deps: deps, OnComplete: cb}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	wctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	var (
+		mu      sync.Mutex
+		applied = map[driver.JobID]int{}
+		errs    = make(chan error, 16)
+		replay  = make(chan []driver.JobFinalize, 256)
+		wg      sync.WaitGroup
+	)
+	record := func(ids []driver.JobID) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, id := range ids {
+			applied[id]++
+		}
+	}
+	fail := func(err error) {
+		if wctx.Err() == nil {
+			select {
+			case errs <- err:
+			default:
+			}
+			cancel()
+		}
+	}
+	// A failed statement is sent again whole, as the finalizer does; a
+	// deadlock between two finalizes completing batches fails one of them.
+	finalizeRetrying := func(fin []driver.JobFinalize) []driver.JobID {
+		for wctx.Err() == nil {
+			ids, err := exec.JobFinalizeMany(wctx, driver.JobFinalizeParams{Jobs: fin})
+			if err == nil {
+				return ids
+			}
+			time.Sleep(time.Millisecond)
+		}
+		return nil
+	}
+	// Small claims split a workflow's middle steps across statements.
+	for w := range 8 {
+		clientID := register(ctx, t, exec)
+		wg.Go(func() {
+			for wctx.Err() == nil {
+				res, err := exec.JobClaim(wctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 1 + w%3})
+				if err != nil {
+					fail(fmt.Errorf("claim: %w", err))
+					return
+				}
+				if len(res.Jobs) == 0 {
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				fin := make([]driver.JobFinalize, len(res.Jobs))
+				batches := make([]driver.JobID, len(res.Jobs))
+				for i, j := range res.Jobs {
+					fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
+					if j.Kind == "fail" {
+						fin[i].State = driver.JobStateDiscarded
+					}
+					batches[i] = j.BatchID
+				}
+				ids := finalizeRetrying(fin)
+				record(ids)
+				select {
+				case replay <- fin:
+				default:
+				}
+				// The follow-up may time out on a batch row; the sweeps
+				// below settle what it leaves.
+				_, _ = exec.BatchSettle(wctx, driver.BatchSettleParams{IDs: batches})
+				_, _ = exec.WorkflowPromoteReady(wctx, driver.WorkflowPromoteParams{DependsOn: ids})
+			}
+		})
+	}
+	wg.Go(func() {
+		for wctx.Err() == nil {
+			select {
+			case fin := <-replay:
+				record(finalizeRetrying(fin))
+			case <-wctx.Done():
+			}
+		}
+	})
+	wg.Go(func() {
+		var settleAfter, promoteAfter driver.JobID
+		for wctx.Err() == nil {
+			s, err := exec.BatchSettle(wctx, driver.BatchSettleParams{After: settleAfter, Limit: 16})
+			if err == nil {
+				settleAfter = s.Last
+				if s.Folded < 16 {
+					settleAfter = driver.JobID{}
+				}
+			}
+			p, err := exec.WorkflowPromoteReady(wctx, driver.WorkflowPromoteParams{After: promoteAfter, Limit: 16})
+			if err == nil {
+				promoteAfter = p.Last
+				if p.Scanned < 16 {
+					promoteAfter = driver.JobID{}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+	for wctx.Err() == nil && f.QueryText(ctx, t, d, `SELECT ((SELECT count(*) FROM hopper_jobs WHERE queue = 'default') = 0
+		AND (SELECT count(*) FROM hopper_batches WHERE completed_at IS NULL) = 0)::text`) != "true" {
+		time.Sleep(20 * time.Millisecond)
+	}
+	timedOut := wctx.Err() != nil
+	cancel()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if timedOut {
+		t.Fatalf("not finished in a minute: %s", f.QueryText(ctx, t, d,
+			"SELECT coalesce(string_agg(state || ' ' || n, ', '), 'none') FROM (SELECT state::text, count(*) AS n FROM hopper_jobs GROUP BY state) s"))
+	}
+
+	failing := workflows / 5
+	want := workflows*(middles+2) - failing
+	twice := 0
+	for _, n := range applied {
+		if n != 1 {
+			twice++
+		}
+	}
+	if len(applied) != want || twice != 0 {
+		t.Errorf("results applied for %d jobs, %d of them more than once; want %d jobs, once each", len(applied), twice, want)
+	}
+	checks := []struct{ what, query, want string }{
+		{
+			"history rows, distinct jobs", `SELECT count(*) || ' ' || count(DISTINCT id) FROM hopper_job_history WHERE queue = 'default'`,
+			fmt.Sprintf("%d %d", workflows*(middles+2), workflows*(middles+2)),
+		},
+		{"steps run before a dependency finished", `SELECT count(*) FROM hopper_job_history s
+			JOIN hopper_job_history dep ON dep.batch_id = s.batch_id
+			  AND (s.kind IN ('mid', 'fail') AND dep.kind = 'root' OR s.kind = 'last' AND dep.kind IN ('mid', 'fail'))
+			WHERE s.attempted_at IS NOT NULL AND s.attempted_at < dep.finalized_at`, "0"},
+		{
+			"last steps by state", `SELECT string_agg(state || ' ' || n, ', ' ORDER BY state) FROM (
+			SELECT state::text, count(*) AS n FROM hopper_job_history WHERE kind = 'last' GROUP BY state) s`,
+			fmt.Sprintf("canceled %d, completed %d", failing, workflows-failing),
+		},
+		{"canceled last steps that ran", `SELECT count(*) FROM hopper_job_history WHERE kind = 'last' AND state = 'canceled' AND attempted_at IS NOT NULL`, "0"},
+		{"workflows whose failures miscount", `SELECT count(*) FROM hopper_batches b
+			WHERE b.failed <> (SELECT count(*) FROM hopper_job_history h WHERE h.batch_id = b.id AND h.state <> 'completed')`, "0"},
+		{"failures", `SELECT sum(failed) FROM hopper_batches`, strconv.Itoa(2 * failing)},
+		{"completion callbacks", `SELECT count(*) FROM hopper_jobs WHERE queue = 'callbacks'`, strconv.Itoa(workflows)},
+		{"edges left", `SELECT count(*) FROM hopper_job_deps`, "0"},
+	}
+	for _, c := range checks {
+		if got := f.QueryText(ctx, t, d, "SELECT ("+c.query+")::text"); got != c.want {
+			t.Errorf("%s = %s, want %s", c.what, got, c.want)
 		}
 	}
 }
