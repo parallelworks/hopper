@@ -2,6 +2,8 @@ module github.com/parallelworks/hopper/tools/dev
 
 go 1.27.2
 
+toolchain go1.27.3
+
 tool github.com/parallelworks/foundation/dev/cmd/dev
 
 require (

@@ -2,6 +2,8 @@ module github.com/parallelworks/hopper
 
 go 1.27.0
 
+toolchain go1.27.3
+
 // hopper does no cryptography of its own. Running tests and `go run` in
 // fips140=only mode proves that nothing non-approved sneaks in.
 godebug fips140=only
