@@ -2,6 +2,8 @@ module github.com/parallelworks/hopper/hopperui
 
 go 1.27.0
 
+toolchain go1.27.3
+
 godebug fips140=only
 
 require (
