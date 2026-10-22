@@ -52,6 +52,11 @@ func RecordStep[T JobArgs](ctx context.Context, job *Job[T], step string, cursor
 // before the step returns, since RunSteps records the next finished step on
 // the pool, and a record on the pool while tx is open returns ErrJobLocked.
 // A job's finalize skips a row tx still holds, and is retried once tx ends.
+// On an engine that runs one writer at a time
+// (driver.Capabilities.SingleWriter, SQLite), tx holds the whole database
+// for writes from its first statement until it ends: every other write
+// waits for it, lease renewals included, and a write of the worker's own
+// on the pool fails rather than wait for tx.
 func RecordStepTx[TTx any, T JobArgs](ctx context.Context, tx TTx, job *Job[T], step string, cursor any) error {
 	return record(ctx, job, func() (driver.Executor, error) { return txExecutor(ctx, tx, job.ID) }, step, false, cursor)
 }

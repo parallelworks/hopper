@@ -494,9 +494,17 @@ func (c *Client[TTx]) wakeQueue(queue string) {
 // ID. Results still in flight are submitted anyway; the finalize statement
 // rejects any whose job was rescued meanwhile and applies the rest, which is
 // equivalent to a rescue.
+//
+// A renewal waits until the lease it renews would expire, and at least one
+// renewal interval: on an engine that runs one writer at a time, a
+// transaction that holds the database holds every renewal up, and a renewal
+// that gives up is reported, with what the engine says of who holds the
+// lock, and tried again, rather than left waiting past the lease without a
+// word.
 func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaseRenew)
 	defer ticker.Stop()
+	renewed := time.Now() // the lease was taken just before the loop starts
 	for {
 		select {
 		case <-ctx.Done():
@@ -504,7 +512,10 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 		id := c.clientID.Load()
-		res, err := c.exec.ClientRenew(ctx, driver.ClientRenewParams{ClientID: id, TTL: c.tuning.leaseTTL})
+		start := time.Now()
+		rctx, cancel := context.WithTimeout(ctx, max(time.Until(renewed.Add(c.tuning.leaseTTL)), c.tuning.leaseRenew))
+		res, err := c.exec.ClientRenew(rctx, driver.ClientRenewParams{ClientID: id, TTL: c.tuning.leaseTTL})
+		cancel()
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.WarnContext(ctx, "hopper: renew client lease", "client_id", id, "error", err)
@@ -513,8 +524,10 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		}
 		if !res.Renewed {
 			c.fence(ctx, id)
+			renewed = time.Now()
 			continue
 		}
+		renewed = start
 		// Control state rides along with every renewal, in case a
 		// notification was missed.
 		for _, jobID := range res.CancelRequested {

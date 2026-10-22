@@ -83,6 +83,26 @@ type Capabilities struct {
 	SingleWriter bool
 }
 
+// ownerKey is the context key of a context's Owner.
+type ownerKey struct{}
+
+// WithOwner returns ctx marked as running for owner: a job's attempt, whose
+// worker's statements, in its own transactions and on the pool, all carry
+// it. An engine that runs one writer at a time (Capabilities.SingleWriter)
+// uses it to refuse at once a write that would wait for a transaction the
+// same owner holds, which would wait until its context ended, holding up
+// every other write meanwhile, and to say who holds the lock a write waits
+// for. Owners compare by identity, so owner should be a pointer.
+func WithOwner(ctx context.Context, owner fmt.Stringer) context.Context {
+	return context.WithValue(ctx, ownerKey{}, owner)
+}
+
+// Owner returns the owner ctx runs for, or nil.
+func Owner(ctx context.Context) fmt.Stringer {
+	o, _ := ctx.Value(ownerKey{}).(fmt.Stringer)
+	return o
+}
+
 // Notification channels. Payloads are documented on each.
 const (
 	// ChannelInsert carries the queue name of a committed insert.
@@ -377,12 +397,13 @@ type MigrationExecutor interface {
 	Close(ctx context.Context) error
 }
 
-// MigrationScripts is implemented by a MigrationExecutor whose engine is not
-// Postgres, whose scripts hoppermigrate embeds. hoppermigrate then gives
-// Apply the engine's own script for each schema version instead. An engine
-// has a script, up and down, for every schema version hoppermigrate knows,
-// so that a version names the same schema on every engine: the tables and
-// columns a release's statements need.
+// MigrationScripts is implemented by the MigrationExecutor of an engine
+// other than Postgres. hoppermigrate embeds Postgres's scripts; for an
+// executor that implements MigrationScripts, it gives Apply the engine's
+// own script for each schema version instead. Such an engine has a script,
+// up and down, for every schema version hoppermigrate knows, so that a
+// version names the same schema on every engine: the tables and columns a
+// release's statements need.
 type MigrationScripts interface {
 	// Script returns the engine's script for a schema version: the one that
 	// applies it (up) or the one that reverts it.
