@@ -416,7 +416,7 @@ the way that performs best on that engine.
 | `hopper/driver/hopperpgx` | Postgres via pgx v5 (the reference driver): COPY, LISTEN, pipelined statements | core |
 | `hopper/driver/hoppersql` | Postgres via `database/sql` (lib/pq, pgx stdlib); polling only | core |
 | `hopper/drivertest` | Conformance, concurrency and chaos suite every driver must pass | core |
-| `hoppersqlite` (later) | SQLite: embedded, single-node and local development | separate module |
+| `hopper/driver/hoppersqlite` | SQLite (modernc.org/sqlite, pure Go): embedded, single-node and local development | separate module |
 | `hoppermongo` (later) | MongoDB (replica set, for transactions) | separate module |
 
 The two Postgres drivers share one implementation of the SQL and the logic around it
@@ -434,10 +434,25 @@ clock. Push notifications are optional, because polling is always available. The
 planned engines meet these requirements differently, which is why the interface is
 defined as operations rather than SQL:
 
-- **SQLite** has a single writer, so a claim is an `UPDATE … RETURNING` inside a
-  `BEGIN IMMEDIATE` transaction, and SKIP LOCKED is unnecessary. There is no LISTEN,
-  so clients in the same process wake each other directly and other processes poll.
-  Retention is a batched `DELETE`.
+- **SQLite** has a single writer (`Capabilities.SingleWriter`), so a claim is an
+  `UPDATE … RETURNING` inside a transaction that holds the write lock, and SKIP LOCKED
+  is unnecessary. Every transaction that may write takes the lock before its first
+  statement reads (`BEGIN IMMEDIATE`), so what it reads cannot go stale before it
+  writes; the driver's `database/sql` connections do that lazily, on a transaction's
+  first statement, so that beginning one never blocks. Within a process, writers queue
+  for the lock in turn, for as long as their context allows; across processes, SQLite's
+  busy handler polls for it. With no other writer in between, the finalizing transaction
+  reads each job, checks it in Go and writes it back, settles the job's batch and promotes
+  its dependents itself, so `BatchSettle` and `WorkflowPromoteReady` find nothing a race
+  left; `SkipLocked` and `NoWait` wait briefly for another transaction's writes and then
+  skip every job or return `ErrJobLocked`. Notifications are rows of a table, written in
+  the notifying transaction: a listener in the same process is woken when it commits,
+  and listeners in other processes look every 50ms, when `PRAGMA data_version` says
+  another connection committed. Retention is a batched `DELETE`; stream events commit
+  in append order, so a position is an event's sequence number. The database must be on
+  a local filesystem, where SQLite's locks hold: `Open` refuses one on NFS, SMB, Lustre,
+  GPFS, FUSE and the like. Its migrations follow `hoppermigrate`'s versions one for one
+  (`driver.MigrationScripts`).
 - **MongoDB** claims with atomic `findOneAndUpdate` or `updateMany` (tagging a batch
   with a claim token, then reading it back). It uses `$$NOW` for server time, change
   streams for notifications, and TTL indexes or dropped collections for retention.
@@ -673,7 +688,10 @@ there is **no scheduler loop** moving jobs between states.
 
 ### 7.1 Clock
 All time comparisons use the database's `now()`, never the application clock, so clock
-skew between pods cannot cause early or duplicate execution.
+skew between pods cannot cause early or duplicate execution. SQLite's clock is the host's,
+which every process that opens the database shares, since it must be on a local
+filesystem: hoppersqlite reads it once a transaction holds the write lock, so each write's
+time is no earlier than the writes before it.
 
 ### 7.2 Insert
 - **Single and small batches:** one `INSERT … SELECT FROM unnest($kinds, $args, …)
@@ -1758,6 +1776,10 @@ rates:
   connection is named `hopper-listener:<schema>` in `pg_stat_activity`.
 - **Channels are per database**, not per schema. Two hopper schemas in one database
   see each other's notifications, which only causes spurious wake-ups.
+- **SQLite** has no LISTEN: hoppersqlite writes notifications to a table in the
+  notifying transaction, wakes the listeners of its own process when it commits, and
+  has listeners in other processes look for new rows every 50ms, when another
+  connection has committed. Rows are kept for a minute.
 
 ### 7.12 Shutdown
 `Stop(ctx)` and `Run` (when its context is canceled) shut down in three steps:
@@ -2105,6 +2127,15 @@ observability without new machinery.
 
 - SQL files are embedded in the `hoppermigrate` package, versioned, and forward-only by
   default. Down migrations exist for development.
+- The embedded scripts are Postgres's. Another engine's driver has its own script, up
+  and down, for every version (`driver.MigrationScripts`), and `hoppermigrate` applies
+  those, so that a version names the same tables and columns on every engine and
+  `Client.Start`'s check holds on each. hoppersqlite's follow Postgres's version for
+  version; one that changes only what SQLite lacks (partitions, autovacuum settings, SQL
+  functions) is a script of comments. Its migrator holds SQLite's write lock from `Lock`
+  to `Close` and applies each version in a savepoint, so writers wait for the migration,
+  which takes milliseconds; its upgrade test (`TestUpgradeUnderTraffic`) starts from every
+  earlier version.
 - `hoppermigrate.Up(ctx, driver)` applies them under an advisory lock taken on a
   dedicated connection, not a pooled one. This avoids a pool-starvation deadlock:
   processes waiting for the lock must not hold the connections the migration needs.
@@ -2223,7 +2254,7 @@ observability without new machinery.
 | --- | --- |
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
-| Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease, backdate an attempt, count rows). Engine internals such as partition management stay in the driver's own tests. |
+| Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease or a job, backdate an attempt, store a value as a direct write would, wait until a statement waits for a lock, count rows); what depends on row locks is tested either way by `Capabilities.SingleWriter`. `drivertest.RunPostgres` adds the tests of what the Postgres drivers share beyond the interface (partitions and their indexes, the tags tables, progress rows, planner statistics); other engine internals stay in the driver's own tests. |
 | Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
@@ -2259,7 +2290,7 @@ The estimates assume one engineer. Each milestone is one or more PRs.
 | M6 | Messaging | Subscriptions, AMQP topic patterns, typed `Message[T]`, PublishTx fan-out, dedup, ordering keys, request/reply, SQL publish contract, `ReplayDiscarded`, the upgrade test. **Done.** | 5d |
 | M7 | Flow control and batches | Global limits, rate limits, partitioned limits, priority aging, batches with callbacks, `hoppersql` driver. **Done.** | 5d |
 | M8 | Workflows, streams, UI | Job dependencies and DAG workflows, streams with consumers, `hopperui`. **Done**, one PR each. | 2–3w |
-| M9 | More engines (later) | `hoppersqlite`, then `hoppermongo`, each in its own module and passing `drivertest`. Not scheduled yet. | per engine |
+| M9 | More engines | `hoppersqlite`, in its own module and passing `drivertest`. **Done.** `hoppermongo` later, not scheduled yet. | per engine |
 
 M0–M4 take roughly four weeks to a production-ready job queue that meets its performance
 targets. v1.0.0 follows M8, once the API has been proven in production.

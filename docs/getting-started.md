@@ -68,6 +68,35 @@ application's `search_path` is unchanged, so the pool can be shared.
 **Existing installations:** set `Schema` to the schema where your Hopper tables
 already live (for example `public`) before upgrading. Changing this setting
 selects another installation; it does not move existing jobs or tables.
+
+### SQLite
+
+An application that runs on one machine, such as a command-line tool or a
+single-node service, can keep hopper in a SQLite file instead, with no server
+to run. The driver is pure Go (`modernc.org/sqlite`), so the program still
+builds with `CGO_ENABLED=0`, and it is a module of its own,
+`github.com/parallelworks/hopper/driver/hoppersqlite`:
+
+```go
+driver, err := hoppersqlite.Open(filepath.Join(stateDir, "hopper.db"), nil)
+if err != nil {
+    return err // hoppersqlite.ErrNetworkFilesystem for a file on NFS and the like
+}
+defer driver.Close()
+if _, err := hoppermigrate.Up(ctx, driver, nil); err != nil {
+    return err
+}
+client, err := hopper.NewClient(driver, cfg)
+```
+
+Its transactions are `*sql.Tx`; begin them on `driver.DB()`, whose
+connections take the database's write lock when a transaction runs its first
+statement. SQLite runs one writing transaction at a time, so keep them short,
+and write through the transaction (`InsertTx`, `CompleteTx`) rather than the
+pool while one is open. Several processes can share the file: clients in
+other processes are woken within 50ms of an insert. The file must be on a
+local disk; `Open` refuses one on a network filesystem, where SQLite's locks
+do not hold.
 Migration credentials need permission to create the schema, or you can create
 it beforehand. Migrating down to zero removes Hopper objects and leaves the
 namespace itself intact.

@@ -66,6 +66,10 @@
         {
           "type": "generic",
           "path": "hopperui/go.mod"
+        },
+        {
+          "type": "generic",
+          "path": "driver/hoppersqlite/go.mod"
         }
       ]
     }

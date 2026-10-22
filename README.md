@@ -5,7 +5,8 @@
 hopper runs background jobs and delivers messages using the PostgreSQL database
 your application already has. There's no broker to operate and no separate worker
 service: it is a library that runs inside your process and scales out with it.
-Postgres is the first engine, behind a driver interface designed for more.
+Postgres is the first engine, behind a driver interface designed for more; SQLite
+is the second, for an application that runs on one machine.
 
 - **Fast:** set-based claim, finalize and insert (including `COPY`), a live
   table that stays small however much history accumulates, and retention by
@@ -36,7 +37,8 @@ Postgres is the first engine, behind a driver interface designed for more.
 > ordering keys, streams with consumers, a SQL contract for producers in other
 > languages), flow control, batches and workflows, plus the `hopper` CLI,
 > `hoppertest`, `hopperotel`, the `hopperui` web UI and the `drivertest`
-> conformance suite. [docs/PLAN.md](docs/PLAN.md) is the plan of record and
+> conformance suite, and a SQLite driver (`driver/hoppersqlite`, pure Go, a module
+> of its own) that passes it. [docs/PLAN.md](docs/PLAN.md) is the plan of record and
 > [docs/getting-started.md](docs/getting-started.md) the place to start.
 > Until v1.0.0, minor versions may change the API. Feedback is welcome
 > through issues and PRs.
