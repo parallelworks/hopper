@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ErrNetworkFilesystem is returned by Open for a database on a network or
@@ -26,38 +27,80 @@ const maxLinks = 40
 // resolved, a last link to a file that does not exist yet included. SQLite
 // opens the file a link names and keeps its write-ahead log and shared
 // memory beside it, not beside the link, so the path resolved is the one
-// to check and to open.
+// to check and to open. A path that exists is resolved as the kernel
+// resolves it (filepath.EvalSymlinks); one that does not yet, component by
+// component, as the kernel would to create it.
 func resolve(path string) (string, error) {
-	p, err := filepath.Abs(path)
-	if err != nil {
+	// Not filepath.Abs, which would clean ".." against what precedes it
+	// before the links in it are followed.
+	p := path
+	if !filepath.IsAbs(p) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		p = wd + string(filepath.Separator) + p
+	}
+	r, err := filepath.EvalSymlinks(p)
+	if err == nil {
+		return r, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
 		return "", err
 	}
-	for range maxLinks {
-		dir, err := filepath.EvalSymlinks(filepath.Dir(p))
+	return resolveMissing(p)
+}
+
+// resolveMissing resolves the links of an absolute path whose last
+// component, or the last a link in it leads to, does not exist: each
+// component in turn, a link's target in its place, and ".." from the
+// directory resolved so far, as the kernel does, not lexically.
+func resolveMissing(p string) (string, error) {
+	vol := filepath.VolumeName(p)
+	cur := vol + string(filepath.Separator)
+	rest := split(p[len(vol):])
+	links := 0
+	for len(rest) > 0 {
+		name := rest[0]
+		rest = rest[1:]
+		switch name {
+		case ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, name)
+		fi, err := os.Lstat(next)
+		switch {
+		case errors.Is(err, fs.ErrNotExist) && len(rest) == 0:
+			return next, nil // the file SQLite will create
+		case err != nil:
+			return "", err
+		case fi.Mode()&fs.ModeSymlink == 0:
+			cur = next
+			continue
+		}
+		if links++; links > maxLinks {
+			return "", fmt.Errorf("%s: more than %d symbolic links", p, maxLinks)
+		}
+		target, err := os.Readlink(next)
 		if err != nil {
 			return "", err
 		}
-		p = filepath.Join(dir, filepath.Base(p))
-		fi, err := os.Lstat(p)
-		if errors.Is(err, fs.ErrNotExist) {
-			return p, nil
+		if filepath.IsAbs(target) {
+			vol = filepath.VolumeName(target)
+			cur = vol + string(filepath.Separator)
+			target = target[len(vol):]
 		}
-		if err != nil {
-			return "", err
-		}
-		if fi.Mode()&fs.ModeSymlink == 0 {
-			return p, nil
-		}
-		target, err := os.Readlink(p)
-		if err != nil {
-			return "", err
-		}
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(dir, target)
-		}
-		p = target
+		rest = append(split(target), rest...)
 	}
-	return "", fmt.Errorf("%s: more than %d symbolic links", path, maxLinks)
+	return cur, nil
+}
+
+// split returns the components of a path, without empty ones.
+func split(p string) []string {
+	return strings.FieldsFunc(p, func(r rune) bool { return r < 0x80 && os.IsPathSeparator(byte(r)) }) //nolint:gosec // r < 0x80
 }
 
 // checkLocal returns ErrNetworkFilesystem if the database file at path, or

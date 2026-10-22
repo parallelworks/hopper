@@ -186,7 +186,7 @@ func TestFairness(t *testing.T) {
 	slices.Sort(waits)
 	p50, p90, worst := waits[len(waits)/2], waits[len(waits)*9/10], waits[len(waits)-1]
 	t.Logf("%d writes: p50 %s, p90 %s, max %s", len(waits), p50, p90, worst)
-	if worst > 2*time.Second {
+	if worst > slowdown*2*time.Second {
 		t.Errorf("a write waited %s while another process wrote", worst)
 	}
 }

@@ -37,20 +37,26 @@
 //     (InsertTx and the like), not through the client: a write on the pool
 //     would wait for the transaction's own lock. In a job's worker, whose
 //     context names the job's attempt, such a write fails at once with
-//     ErrLockHeldByOwner instead.
+//     ErrLockHeldByOwner instead, if the worker began the transaction with
+//     that context or one derived from it; begin it so. Writes of the
+//     attempt with no transaction of its own open wait their turn, from
+//     however many goroutines.
 //   - After some errors (an interrupted write, a full disk, an I/O error)
 //     SQLite rolls the whole transaction back itself. The transaction's
 //     later statements, and its Commit, then fail with
 //     ErrTransactionAborted, as those of a transaction an error aborted do
 //     on Postgres. An error that SQLite undoes only the statement of, such
 //     as a constraint's, leaves the transaction open, where Postgres would
-//     abort it.
+//     abort it. A COMMIT, END or ROLLBACK statement run in a transaction
+//     ends it: its later statements fail with sql.ErrTxDone.
 //   - The database must be on a local filesystem: Open refuses one on a
 //     network filesystem, or a virtual machine's shared folder, with
 //     ErrNetworkFilesystem, checking where symbolic links in the path
 //     lead. Its clock is therefore the host's, which every process that
 //     opens it shares, and the driver reads it as database time, never
-//     earlier than a time it read before in the process. A host that
+//     earlier than a time it read before in the same process (a host
+//     clock stepped back can still date one process's write before
+//     another's earlier one). A host that
 //     sleeps and wakes finds its clock moved on, as a database server's
 //     would, and may rescue the jobs of its own clients, whose leases
 //     expired while it slept.

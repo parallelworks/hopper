@@ -323,8 +323,8 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 	time.Sleep(20 * time.Millisecond)
 	close(stop)
 	wg.Wait()
-	if longest > 5*time.Second {
-		t.Errorf("a statement waited %s for the migration", longest)
+	if bound := slowdown * 5 * time.Second; longest > bound {
+		t.Errorf("a statement waited %s for the migration, more than %s", longest, bound)
 	}
 
 	// The release's client works every job left, the running ones once

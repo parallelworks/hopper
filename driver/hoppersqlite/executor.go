@@ -204,7 +204,10 @@ func (e *executor) writeLocking(ctx context.Context, wait time.Duration, fn func
 		_, err := q.ExecContext(ctx, "RELEASE hopper")
 		return err
 	}
-	tx, err := e.d.sqlDB.BeginTx(ctx, nil)
+	// A transaction of the driver's own, for this one operation, which may
+	// wait for a lock its owner's own transaction holds but never holds
+	// one that another write of the owner should not wait for.
+	tx, err := e.d.sqlDB.BeginTx(oneOperation(ctx), nil)
 	if err != nil {
 		return err
 	}

@@ -473,3 +473,83 @@ func TestOpenContext(t *testing.T) {
 		t.Errorf("OpenContext with an ended context = %v", err)
 	}
 }
+
+type fanArgs struct{}
+
+func (fanArgs) Kind() string { return "fan" }
+
+type leafArgs struct{ N int }
+
+func (leafArgs) Kind() string { return "leaf" }
+
+// TestConcurrentWritesOfOneAttempt runs a worker that writes on the pool
+// from eight goroutines at once, with no transaction of its own open, and
+// then records a step while it inserts: every write waits its turn and
+// succeeds, as on Postgres, rather than failing with ErrLockHeldByOwner
+// because another write of the same attempt holds the lock.
+func TestConcurrentWritesOfOneAttempt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	d := open(t)
+	var (
+		mu     sync.Mutex
+		errs   []error
+		worked = make(chan struct{})
+	)
+	note := func(err error) {
+		if err != nil {
+			mu.Lock()
+			errs = append(errs, err)
+			mu.Unlock()
+		}
+	}
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[fanArgs]) error {
+		defer close(worked)
+		c, _ := hopper.ClientFromContext[*sql.Tx](ctx)
+		var wg sync.WaitGroup
+		for g := range 8 {
+			wg.Go(func() {
+				for i := range 25 {
+					_, err := c.Insert(ctx, leafArgs{N: g*100 + i}, nil)
+					note(err)
+				}
+			})
+		}
+		wg.Wait()
+		wg.Go(func() { note(hopper.RecordStep(ctx, job, "a", nil)) })
+		wg.Go(func() { _, err := c.Insert(ctx, leafArgs{N: -1}, nil); note(err) })
+		wg.Wait()
+		return nil
+	})
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[leafArgs]) error { return nil })
+	c, err := hopper.NewClient(d, &hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers: workers,
+		Logger:  slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Stop(ctx) //nolint:errcheck // cleanup
+	if _, err := c.Insert(ctx, fanArgs{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-worked:
+	case <-time.After(time.Minute):
+		t.Fatal("the worker did not finish")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) > 0 {
+		t.Errorf("%d of 202 writes of one attempt failed, the first: %v", len(errs), errs[0])
+	}
+	var leaves int
+	if err := d.DB().QueryRowContext(ctx, "SELECT (SELECT count(*) FROM hopper_jobs WHERE kind = 'leaf') + (SELECT count(*) FROM hopper_job_history WHERE kind = 'leaf')").Scan(&leaves); err != nil || leaves != 201 {
+		t.Errorf("leaf jobs = %d, %v; want 201", leaves, err)
+	}
+}
