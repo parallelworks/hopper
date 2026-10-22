@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/driver/internal/jobcodec"
 	"github.com/parallelworks/hopper/internal/jobtags"
 )
 
@@ -748,12 +749,7 @@ func keepLogs(keep int) int32 {
 // marshalAttemptError encodes an error record without its timestamp, which
 // the finalize statement fills in from database time.
 func marshalAttemptError(e *driver.AttemptError) ([]byte, error) {
-	return json.Marshal(struct {
-		Attempt int    `json:"attempt"`
-		Fence   int64  `json:"fence,omitempty"`
-		Error   string `json:"error"`
-		Trace   string `json:"trace,omitempty"`
-	}{e.Attempt, e.Fence, storableText(e.Error), storableText(e.Trace)})
+	return jobcodec.MarshalAttemptError(e)
 }
 
 var jobGetQuery = fmt.Sprintf(`
@@ -818,27 +814,7 @@ func (e *Executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 // is not in the form JobRecordProgress writes, such as one written by hand:
 // a row must still scan, or a claim that took it would fail with the claim
 // already applied. A value that is not an object reads as none.
-func decodeProgress(stored string) *driver.Progress {
-	var v struct {
-		Step   any             `json:"step"`
-		Cursor json.RawMessage `json:"cursor"`
-		At     any             `json:"at"`
-	}
-	if !strings.HasPrefix(strings.TrimSpace(stored), "{") || json.Unmarshal([]byte(stored), &v) != nil {
-		return nil
-	}
-	p := &driver.Progress{Cursor: v.Cursor}
-	if s, ok := v.Step.(string); ok {
-		p.Step = s
-	}
-	if s, ok := v.At.(string); ok {
-		p.RecordedAt, _ = time.Parse(time.RFC3339Nano, s)
-	}
-	if string(p.Cursor) == "null" {
-		p.Cursor = nil
-	}
-	return p
-}
+func decodeProgress(stored string) *driver.Progress { return jobcodec.DecodeProgress(stored) }
 
 // JobGet implements driver.Executor.
 func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
@@ -873,21 +849,7 @@ func (e *Executor) JobLogs(ctx context.Context, id driver.JobID) ([]driver.Attem
 
 // decodeLogs reads a job's logs, skipping entries that are not in the form
 // the finalize writes, such as ones written by hand.
-func decodeLogs(stored string) []driver.AttemptLog {
-	// Anything but an array (or null) fails to decode into entries.
-	var entries []json.RawMessage
-	if json.Unmarshal([]byte(stored), &entries) != nil {
-		return nil
-	}
-	var logs []driver.AttemptLog
-	for _, raw := range entries {
-		var l driver.AttemptLog
-		if json.Unmarshal(raw, &l) == nil && l.Log != "" {
-			logs = append(logs, l)
-		}
-	}
-	return logs
-}
+func decodeLogs(stored string) []driver.AttemptLog { return jobcodec.DecodeLogs(stored) }
 
 var (
 	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM {{schema}}.hopper_jobs`, JobColumns(""))
