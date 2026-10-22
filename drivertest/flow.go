@@ -499,6 +499,14 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if kinds := h.callbacks(pruned); kinds["failed"] != 1 || kinds["ok"] != 0 {
 		t.Errorf("callbacks of the pruned batch = %v", kinds)
 	}
+
+	// Postgres records a batch's progress in rows of its own, which the
+	// settles above leave none of once every batch has completed.
+	if pf, ok := any(f).(PostgresFixture[TTx]); ok {
+		if left := pf.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_batch_progress"); left != "0" {
+			t.Errorf("%s progress rows left after every batch completed and settled", left)
+		}
+	}
 }
 
 // testBatchProgressRaces covers the progress rows Postgres's finalizes
@@ -646,7 +654,6 @@ func testBatchProgressRaces[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 			t.Errorf("batch finished after its sweep = %+v, %v", b, err)
 		}
 	}
-	h.sweep()
 	if left := f.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_batch_progress"); left != "0" {
 		t.Errorf("%s progress rows left after every batch completed and settled", left)
 	}

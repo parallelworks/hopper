@@ -130,20 +130,26 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 }
 
-// testJobLogsStored checks how the logs column is kept: a snooze that logs
+// testJobLogsStored checks how the logs column is kept, by both finalize
+// statements, keeping two logs as testJobLogs does: a snooze that logs
 // nothing leaves a job without logs as it is, stored as NULL rather than
 // rewritten, and takes one whose only log is a snooze's back to NULL.
-func testJobLogsStored[TTx any](t *testing.T, f PostgresFixture[TTx]) {
+func testJobLogsStored[TTx any](t *testing.T, f PostgresFixture[TTx], noBatches bool) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
-	exec := d.Executor()
+	exec := executor(d, noBatches)
 	id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	clientID := register(ctx, t, exec)
 	snooze := func(log *driver.AttemptLog) {
 		t.Helper()
 		f.MakeClaimable(ctx, t, d, id)
 		j := claimOne(ctx, t, exec, clientID, id)
-		finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateScheduled, Snooze: true, Log: log})
+		applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{KeepLogs: 2, Jobs: []driver.JobFinalize{
+			{ID: id, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateScheduled, Snooze: true, Log: log},
+		}})
+		if err != nil || len(applied) != 1 {
+			t.Fatalf("snooze = %v, %v", applied, err)
+		}
 	}
 	noLogs := func(what string) {
 		t.Helper()

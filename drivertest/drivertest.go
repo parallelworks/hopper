@@ -21,10 +21,12 @@
 package drivertest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"slices"
 	"strconv"
 	"strings"
@@ -204,7 +206,8 @@ func RunPostgres[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 		{"TagsDayGoesWithItsLastHour", testTagsDayGoesWithItsLastHour[TTx]},
 		{"TagsFollowDirectUpdates", testTagsFollowDirectUpdates[TTx]},
 		{"TagsFollowTruncate", testTagsFollowTruncate[TTx]},
-		{"JobLogsStored", testJobLogsStored[TTx]},
+		{"JobLogsStored", func(t *testing.T, f PostgresFixture[TTx]) { testJobLogsStored(t, f, false) }},
+		{"JobLogsStoredNoBatches", func(t *testing.T, f PostgresFixture[TTx]) { testJobLogsStored(t, f, true) }},
 		{"RetryOrderingKeyAgingOrder", testRetryOrderingKeyAgingOrder[TTx]},
 		{"BatchProgressRaces", testBatchProgressRaces[TTx]},
 		{"StreamsPartitioned", testStreamsPartitioned[TTx]},
@@ -352,17 +355,22 @@ func singleWriter[TTx any](d driver.Driver[TTx]) bool { return d.Capabilities().
 
 // jsonEqual reports whether two JSON texts hold the same value: an engine
 // need not keep the text as given (Postgres's jsonb orders an object's keys
-// and spaces them), only the value.
+// and spaces them), only the value. Numbers compare by their exact value,
+// not as float64s.
 func jsonEqual(got []byte, want string) bool {
-	var a, b any
-	if json.Unmarshal(got, &a) != nil || json.Unmarshal([]byte(want), &b) != nil {
-		return false
+	decode := func(b []byte) (any, bool) {
+		dec := json.NewDecoder(bytes.NewReader(b))
+		dec.UseNumber()
+		var v any
+		return v, dec.Decode(&v) == nil
 	}
-	return fmt.Sprint(normalizeJSON(a)) == fmt.Sprint(normalizeJSON(b))
+	a, ok := decode(got)
+	b, ok2 := decode([]byte(want))
+	return ok && ok2 && fmt.Sprint(normalizeJSON(a)) == fmt.Sprint(normalizeJSON(b))
 }
 
 // normalizeJSON gives a decoded JSON value a printed form that does not
-// depend on its object's key order.
+// depend on its object's key order, nor on how its numbers are written.
 func normalizeJSON(v any) any {
 	switch v := v.(type) {
 	case map[string]any:
@@ -384,6 +392,11 @@ func normalizeJSON(v any) any {
 		return "[" + strings.Join(out, ",") + "]"
 	case string:
 		return strconv.Quote(v)
+	case json.Number:
+		if r, ok := new(big.Rat).SetString(string(v)); ok {
+			return r.RatString()
+		}
+		return string(v)
 	default:
 		return v
 	}
