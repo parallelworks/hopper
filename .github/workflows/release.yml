@@ -67,17 +67,21 @@ jobs:
       - name: Tag the sub-modules at the same version
         # release-please manages one package, the core module, and rewrites
         # the sub-modules' requirement on it (x-release-please-version in
-        # their go.mod). Their tags are added here so that all three modules
-        # resolve at one version.
+        # their go.mod). Their tags are added here so that every module
+        # resolves at one version. A module in a subdirectory is tagged with
+        # its path, as the go command looks it up.
         env:
           TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          for m in hopperotel hopperui; do
+          modules="hopperotel hopperui driver/hoppersqlite"
+          tags=()
+          for m in $modules; do
             git tag -a "$m/$TAG" "$TAG" -m "$m $TAG"
+            tags+=("$m/$TAG")
           done
-          git push origin "hopperotel/$TAG" "hopperui/$TAG"
+          git push origin "${tags[@]}"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod

@@ -1,10 +1,17 @@
 # Releasing hopper
 
-hopper is three Go modules in one repository: the core module at the root,
-`hopperotel` and `hopperui`. A release is one version across all three, cut
-as three tags on the same commit of `canary`: `vX.Y.Z`, `hopperotel/vX.Y.Z`
-and `hopperui/vX.Y.Z`. Until v1.0.0, minor versions may change the API;
-patch versions do not.
+hopper is four Go modules in one repository: the core module at the root,
+`hopperotel`, `hopperui` and the SQLite driver, `driver/hoppersqlite`. A
+release is one version across all four, cut as four tags on the same commit
+of `canary`: `vX.Y.Z`, `hopperotel/vX.Y.Z`, `hopperui/vX.Y.Z` and
+`driver/hoppersqlite/vX.Y.Z`. Until v1.0.0, minor versions may change the
+API; patch versions do not.
+
+The sub-modules are released with the core module, not on their own, and
+depend on that version alone: `hoppersqlite` imports the core module's
+internal packages (`internal/jobtags`, `driver/internal/jobcodec`), which
+have no compatibility promise from one version to the next, so an
+application upgrades hopper and hoppersqlite together.
 
 Releases are automated with [release-please](https://github.com/googleapis/release-please)
 and [goreleaser](https://goreleaser.com) (`.github/workflows/release.yml`).
@@ -19,7 +26,7 @@ and [goreleaser](https://goreleaser.com) (`.github/workflows/release.yml`).
    bumps the minor version before v1.0.0 (`bump-minor-pre-major`).
    release-please manages one package, the core module; the sub-modules are
    versioned with it rather than on their own, so a change anywhere in the
-   repository releases all three.
+   repository releases all four.
 2. The release PR updates `CHANGELOG.md`, the manifest
    (`.release-please-manifest.json`), and the sub-modules' `go.mod`
    requirement on the core module, through the `// x-release-please-version`
@@ -29,7 +36,8 @@ and [goreleaser](https://goreleaser.com) (`.github/workflows/release.yml`).
 3. Merging the release PR (with `gh pr merge --squash --admin`, since the
    `canary` ruleset asks for two reviews) creates the `vX.Y.Z` tag and the
    GitHub release with the changelog entry. The workflow then tags
-   `hopperotel/vX.Y.Z` and `hopperui/vX.Y.Z` on the same commit, and
+   `hopperotel/vX.Y.Z`, `hopperui/vX.Y.Z` and `driver/hoppersqlite/vX.Y.Z`
+   on the same commit, and
    goreleaser builds `hopper`, `hopperbench` and `hopperui` for Linux and
    macOS (amd64, arm64) and attaches the archives and checksums to the
    release.
@@ -82,7 +90,8 @@ After the tags exist, from an empty module:
 
 ```sh
 cd "$(mktemp -d)" && go mod init check && go get github.com/parallelworks/hopper@vX.Y.Z \
-  github.com/parallelworks/hopper/hopperotel@vX.Y.Z github.com/parallelworks/hopper/hopperui@vX.Y.Z
+  github.com/parallelworks/hopper/hopperotel@vX.Y.Z github.com/parallelworks/hopper/hopperui@vX.Y.Z \
+  github.com/parallelworks/hopper/driver/hoppersqlite@vX.Y.Z
 ```
 
 ## History
