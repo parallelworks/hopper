@@ -35,9 +35,8 @@ type querier interface {
 // lock (writeBrief).
 var errLockBusy = errors.New("hoppersqlite: another transaction holds the database's write lock")
 
-// clock returns the database's time, which is the host's (see the package
-// documentation), in Postgres's precision.
-func clock() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
+// clock returns the database's time (database.clock).
+func (e *executor) clock() time.Time { return e.d.db.clock() }
 
 // w is a write in progress: a transaction that holds the write lock, and
 // its time, read once the lock was taken, so that every write sees a time
@@ -199,7 +198,7 @@ func (e *executor) writeLocking(ctx context.Context, wait time.Duration, fn func
 				err = errors.Join(err, rerr)
 			}
 		}()
-		if err := fn(&w{cached: q, now: clock()}); err != nil {
+		if err := fn(&w{cached: q, now: e.clock()}); err != nil {
 			return err
 		}
 		_, err := q.ExecContext(ctx, "RELEASE hopper")
@@ -218,7 +217,7 @@ func (e *executor) writeLocking(ctx context.Context, wait time.Duration, fn func
 	if err := lock(q, "SELECT 1"); err != nil {
 		return err
 	}
-	if err := fn(&w{cached: q, now: clock()}); err != nil {
+	if err := fn(&w{cached: q, now: e.clock()}); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -289,7 +288,7 @@ func (e *executor) Notify(ctx context.Context, channel string, payloads []string
 }
 
 // Now implements driver.Executor.
-func (e *executor) Now(context.Context) (time.Time, error) { return clock(), nil }
+func (e *executor) Now(context.Context) (time.Time, error) { return e.clock(), nil }
 
 // SchemaVersion implements driver.Executor.
 func (e *executor) SchemaVersion(ctx context.Context) (int, error) {
@@ -455,14 +454,14 @@ func smallint(v int, column string) (int, error) {
 	return v, nil
 }
 
-// jsonValue is a JSON parameter: raw, or def when empty. It refuses text
-// that is not JSON, as Postgres's jsonb does.
+// jsonValue is a JSON parameter: raw, or def when empty. It refuses what
+// Postgres's jsonb refuses (checkJSON).
 func jsonValue(raw []byte, def, what string) (string, error) {
 	if len(raw) == 0 {
 		return def, nil
 	}
-	if !json.Valid(raw) {
-		return "", fmt.Errorf("hopper: %s is not JSON: %.40q", what, raw)
+	if err := checkJSON(raw); err != nil {
+		return "", fmt.Errorf("hopper: %s %w: %.40q", what, err, raw)
 	}
 	return string(raw), nil
 }

@@ -5,6 +5,9 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"reflect"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +15,8 @@ import (
 
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
+
+	hopperdriver "github.com/parallelworks/hopper/driver"
 )
 
 // SQLite runs one writing transaction at a time, which it holds the
@@ -30,6 +35,13 @@ import (
 // on a channel, in turn and for as long as their statement's context
 // allows; across processes, SQLite's busy handler polls for it, in
 // quanta of busyQuantum, between which the context is checked.
+//
+// After some errors (an interrupted write, a full disk, an I/O error)
+// SQLite rolls the whole transaction back itself, and would run the
+// transaction's later statements on their own, each committing at once.
+// SQLite's rollback hook tells the connection, which then refuses every
+// later statement of the transaction (ErrTransactionAborted), as Postgres
+// does those of a transaction an error aborted.
 
 // busyQuantum is the busy_timeout of every connection: how long SQLite's
 // busy handler waits for a lock another process holds before the statement
@@ -37,9 +49,34 @@ import (
 // context allows.
 const busyQuantum = 50 * time.Millisecond
 
+// journalSizeLimit is the size SQLite truncates the write-ahead log to
+// when a checkpoint has copied it all back and it starts over, so that a
+// burst of writes, or a reader that held up checkpoints for a while, does
+// not leave a large log behind for good.
+const journalSizeLimit = 32 << 20
+
+// ErrTransactionAborted is returned for a statement of a transaction that
+// SQLite rolled back itself after an error, such as an interrupted write, a
+// full disk or an I/O error: the transaction's earlier statements are
+// undone, and its later ones are refused rather than run on their own, as
+// Postgres refuses those of a transaction an error aborted. Roll it back;
+// Commit rolls it back and returns this error too.
+var ErrTransactionAborted = errors.New("hoppersqlite: the transaction was rolled back after an error and runs no more statements; roll it back")
+
+// ErrLockHeldByOwner is returned for a write that would wait for the
+// database's write lock while a transaction of the same owner holds it (a
+// job's attempt: driver.WithOwner), which would wait until its context
+// ended and hold every other write up meanwhile. Write through that
+// transaction instead, as InsertTx and the other Tx methods do, or end it
+// first. A worker that writes from two goroutines at once, one of them in
+// a transaction, gets it too, where Postgres would run both; give the
+// other goroutine a context without the owner (driver.WithOwner(ctx, nil))
+// to have it wait its turn instead.
+var ErrLockHeldByOwner = errors.New("hoppersqlite: the write would wait for the database's write lock, which a transaction of the same job attempt holds; write through that transaction, or end it first")
+
 // database is what every connection to one database file in this process
-// shares: the write lock and the listeners to wake when a transaction that
-// notified commits.
+// shares: the write lock, the clock, and the listeners to wake when a
+// transaction that notified commits.
 type database struct {
 	path string
 	// lock holds a token while a connection of this process holds
@@ -50,9 +87,32 @@ type database struct {
 	waiting atomic.Int64
 	// refs counts the Drivers open on the database (registry.mu).
 	refs int
+	// last is the latest time the clock read, in microseconds.
+	last atomic.Int64
+
+	holderMu sync.Mutex
+	holder   holder
 
 	listenMu  sync.Mutex
 	listeners map[chan struct{}]struct{}
+}
+
+// holder is who holds the write lock: the owner its transaction runs for,
+// or none, since when.
+type holder struct {
+	owner fmt.Stringer
+	since time.Time
+}
+
+func (h holder) String() string {
+	if h.since.IsZero() {
+		return "a transaction that has just ended"
+	}
+	who := "a transaction of this process"
+	if h.owner != nil {
+		who = "a transaction of " + h.owner.String()
+	}
+	return fmt.Sprintf("%s for %s", who, time.Since(h.since).Round(time.Millisecond))
 }
 
 // registry holds the databases open in this process by path, so that two
@@ -82,25 +142,79 @@ func (db *database) close() {
 	}
 }
 
-// acquire takes the write lock for this process, waiting in turn for as
-// long as ctx allows.
-func (db *database) acquire(ctx context.Context) error {
-	select {
-	case db.lock <- struct{}{}:
-		return nil
-	default:
-	}
-	db.waiting.Add(1)
-	defer db.waiting.Add(-1)
-	select {
-	case db.lock <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+// clock returns the database's time: the host's, in Postgres's precision,
+// never earlier than a time it returned before in this process, so that a
+// wall clock stepped back (by NTP, say) cannot date a write before the
+// writes it follows.
+func (db *database) clock() time.Time {
+	now := time.Now().UTC().Truncate(time.Microsecond).UnixMicro()
+	for {
+		last := db.last.Load()
+		if now <= last {
+			return time.UnixMicro(last).UTC()
+		}
+		if db.last.CompareAndSwap(last, now) {
+			return time.UnixMicro(now).UTC()
+		}
 	}
 }
 
-func (db *database) release() { <-db.lock }
+// acquire takes the write lock for this process for owner, waiting in
+// turn for as long as ctx allows. It refuses at once to wait for a lock a
+// transaction of the same owner holds (ErrLockHeldByOwner), and a wait
+// that ctx ends says who held the lock.
+func (db *database) acquire(ctx context.Context, owner fmt.Stringer) error {
+	select {
+	case db.lock <- struct{}{}:
+		db.held(owner)
+		return nil
+	default:
+	}
+	db.holderMu.Lock()
+	h := db.holder
+	db.holderMu.Unlock()
+	if sameOwner(h.owner, owner) {
+		return fmt.Errorf("%w (%s)", ErrLockHeldByOwner, owner)
+	}
+	db.waiting.Add(1)
+	defer db.waiting.Add(-1)
+	start := time.Now()
+	select {
+	case db.lock <- struct{}{}:
+		db.held(owner)
+		return nil
+	case <-ctx.Done():
+		db.holderMu.Lock()
+		h := db.holder
+		db.holderMu.Unlock()
+		return fmt.Errorf("hoppersqlite: waited %s for the database's write lock, held by %s: %w",
+			time.Since(start).Round(time.Millisecond), h, ctx.Err())
+	}
+}
+
+// sameOwner reports whether a and b are one owner. Owners compare by
+// identity; one whose type cannot be compared is never the same as
+// another.
+func sameOwner(a, b fmt.Stringer) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	t := reflect.TypeOf(a)
+	return t == reflect.TypeOf(b) && t.Comparable() && a == b
+}
+
+func (db *database) held(owner fmt.Stringer) {
+	db.holderMu.Lock()
+	db.holder = holder{owner: owner, since: time.Now()}
+	db.holderMu.Unlock()
+}
+
+func (db *database) release() {
+	db.holderMu.Lock()
+	db.holder = holder{}
+	db.holderMu.Unlock()
+	<-db.lock
+}
 
 // listen registers a channel to be signaled when a transaction that wrote
 // notifications commits; the returned function unregisters it.
@@ -143,11 +257,13 @@ func retryBusy[T any](ctx context.Context, db *database, fn func() (T, error)) (
 	}
 	db.waiting.Add(1)
 	defer db.waiting.Add(-1)
+	start := time.Now()
 	for busy(err) && ctx.Err() == nil {
 		v, err = fn()
 	}
 	if busy(err) {
-		return v, errors.Join(ctx.Err(), err)
+		return v, fmt.Errorf("hoppersqlite: waited %s for a lock another process holds on the database: %w",
+			time.Since(start).Round(time.Millisecond), errors.Join(ctx.Err(), err))
 	}
 	return v, err
 }
@@ -161,6 +277,7 @@ type innerConn interface {
 	driver.Pinger
 	driver.SessionResetter
 	driver.Validator
+	sqlite.HookRegisterer
 }
 
 // connector opens the connections of a Driver's database/sql handle.
@@ -172,15 +289,22 @@ type connector struct {
 
 var _ driver.Connector = (*connector)(nil)
 
-// pragmas sets up a connection: the busy handler's quantum, the
-// durability of its commits, and foreign keys off, as SQLite has them by
-// default and hopper's schema has none.
+// pragmas sets up a connection: the busy handler's quantum; the
+// durability of its commits, on macOS with F_FULLFSYNC, without which fsync
+// leaves the commit in the disk's cache; the size the write-ahead log is
+// cut back to; and foreign keys off, as SQLite has them by default and
+// hopper's schema has none.
 func (c *connector) pragmas() []string {
-	return []string{
+	p := []string{
 		fmt.Sprintf("PRAGMA busy_timeout = %d", busyQuantum.Milliseconds()),
 		"PRAGMA synchronous = " + c.synchronous,
+		fmt.Sprintf("PRAGMA journal_size_limit = %d", journalSizeLimit),
 		"PRAGMA foreign_keys = OFF",
 	}
+	if runtime.GOOS == "darwin" && c.synchronous == "FULL" {
+		p = append(p, "PRAGMA fullfsync = ON", "PRAGMA checkpoint_fullfsync = ON")
+	}
+	return p
 }
 
 func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -199,7 +323,11 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 			return nil, fmt.Errorf("hoppersqlite: %s: %w", p, err)
 		}
 	}
-	return &conn{inner: inner, db: c.db}, nil
+	cn := &conn{inner: inner, db: c.db}
+	// SQLite calls the hook on the goroutine running the statement that
+	// rolls a transaction back, whether by ROLLBACK or after an error.
+	inner.RegisterRollbackHook(func() { cn.rolledBack = true })
+	return cn, nil
 }
 
 func (c *connector) Driver() driver.Driver { return connectorDriver{c} }
@@ -216,6 +344,9 @@ type conn struct {
 	inner innerConn
 	db    *database
 	tx    *tx
+	// rolledBack is set by SQLite's rollback hook when a transaction rolls
+	// back; a statement resets it before it runs.
+	rolledBack bool
 }
 
 var (
@@ -232,12 +363,19 @@ var (
 type tx struct {
 	c        *conn
 	readOnly bool
+	// owner is who the transaction runs for (driver.Owner of the context
+	// it began with).
+	owner fmt.Stringer
 	// begun reports that BEGIN has run, and locked that the transaction
 	// holds this process's write lock.
 	begun, locked bool
+	// read reports that a read-only transaction has run a statement.
+	read bool
 	// notified reports that the transaction wrote notifications, so that
 	// its commit wakes this process's listeners.
 	notified bool
+	// aborted is the error after which SQLite rolled the transaction back.
+	aborted error
 }
 
 func (c *conn) exec(ctx context.Context, query string) error {
@@ -279,12 +417,12 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	if c.tx != nil {
 		return nil, errors.New("hoppersqlite: a transaction is already open on this connection")
 	}
-	t := &tx{c: c, readOnly: opts.ReadOnly}
+	t := &tx{c: c, readOnly: opts.ReadOnly, owner: hopperdriver.Owner(ctx)}
 	if opts.ReadOnly {
 		if err := c.exec(ctx, "PRAGMA query_only = ON"); err != nil {
 			return nil, err
 		}
-		if _, err := retryBusy(ctx, c.db, func() (struct{}, error) { return struct{}{}, c.exec(ctx, "BEGIN") }); err != nil {
+		if err := c.exec(ctx, "BEGIN"); err != nil {
 			_ = c.exec(context.Background(), "PRAGMA query_only = OFF")
 			return nil, err
 		}
@@ -296,7 +434,7 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 
 // beginWrite takes the write lock for the open transaction and begins it.
 func (c *conn) beginWrite(ctx context.Context) error {
-	if err := c.db.acquire(ctx); err != nil {
+	if err := c.db.acquire(ctx, c.tx.owner); err != nil {
 		return err
 	}
 	if _, err := retryBusy(ctx, c.db, func() (struct{}, error) { return struct{}{}, c.exec(ctx, "BEGIN IMMEDIATE") }); err != nil {
@@ -307,51 +445,145 @@ func (c *conn) beginWrite(ctx context.Context) error {
 	return nil
 }
 
-// statement prepares the connection to run query: inside a transaction,
-// it begins the transaction if this is its first statement, and notes a
-// notification written; outside one, a statement that may write (exec)
-// takes the write lock for its run, which done releases.
-func (c *conn) statement(ctx context.Context, query string, write bool) (done func(), err error) {
-	if c.tx == nil {
-		if !write {
-			return func() {}, nil
-		}
-		if err := c.db.acquire(ctx); err != nil {
-			return nil, err
-		}
-		return c.db.release, nil
+// abortedError is the error of a statement refused in an aborted
+// transaction. It names the cause but does not wrap it: a statement
+// refused after an earlier one was interrupted did not see its own context
+// end.
+func abortedError(cause error) error {
+	return fmt.Errorf("%w (after: %v)", ErrTransactionAborted, cause) //nolint:errorlint // see above
+}
+
+// enter prepares the open transaction for a statement: it refuses one
+// after SQLite rolled the transaction back, begins the transaction on its
+// first statement, notes a notification written, and resets the rollback
+// hook's flag. It reports whether the statement may meet SQLITE_BUSY that
+// can be retried: the first of a read-only transaction, which has read no
+// snapshot yet.
+func (c *conn) enter(ctx context.Context, query string) (retry bool, err error) {
+	t := c.tx
+	if t.aborted != nil {
+		return false, abortedError(t.aborted)
 	}
-	if !c.tx.begun {
+	if !t.begun {
 		if err := c.beginWrite(ctx); err != nil {
-			return nil, err
+			return false, err
 		}
 	}
 	if query == notifySQL {
-		c.tx.notified = true
+		t.notified = true
 	}
-	return func() {}, nil
+	retry = t.readOnly && !t.read
+	t.read = true
+	c.rolledBack = false
+	return retry, nil
 }
 
-func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	done, err := c.statement(ctx, query, true)
+// leave notes whether a statement of the open transaction, ending with
+// err, made SQLite roll the transaction back.
+func (c *conn) leave(err error) {
+	if c.tx != nil && c.rolledBack && c.tx.aborted == nil {
+		if err == nil {
+			err = errors.New("SQLite rolled the transaction back")
+		}
+		c.tx.aborted = err
+	}
+}
+
+// runExec runs a statement that may write: in the open transaction, or on
+// its own, holding the write lock while it runs.
+func (c *conn) runExec(ctx context.Context, query string, run func() (driver.Result, error)) (driver.Result, error) {
+	if c.tx == nil {
+		if err := c.db.acquire(ctx, hopperdriver.Owner(ctx)); err != nil {
+			return nil, err
+		}
+		defer c.db.release()
+		return retryBusy(ctx, c.db, run)
+	}
+	if _, err := c.enter(ctx, query); err != nil {
+		return nil, err
+	}
+	res, err := run()
+	c.leave(err)
+	return res, err
+}
+
+// runQuery runs a query: in the open transaction, or on its own. On its
+// own, one that may write (mayWrite) holds the write lock until its rows
+// are closed, as a statement that writes in autocommit holds SQLite's
+// until it is done.
+func (c *conn) runQuery(ctx context.Context, query string, run func() (driver.Rows, error)) (driver.Rows, error) {
+	if c.tx == nil {
+		if !mayWrite(query) {
+			return retryBusy(ctx, c.db, run)
+		}
+		if err := c.db.acquire(ctx, hopperdriver.Owner(ctx)); err != nil {
+			return nil, err
+		}
+		r, err := retryBusy(ctx, c.db, run)
+		if err != nil {
+			c.db.release()
+			return nil, err
+		}
+		return &rows{inner: r, release: c.db.release}, nil
+	}
+	retry, err := c.enter(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	defer done()
-	if c.tx != nil {
-		return c.inner.ExecContext(ctx, query, args)
+	var r driver.Rows
+	if retry {
+		r, err = retryBusy(ctx, c.db, run)
+	} else {
+		r, err = run()
 	}
-	return retryBusy(ctx, c.db, func() (driver.Result, error) { return c.inner.ExecContext(ctx, query, args) })
+	c.leave(err)
+	if err != nil {
+		return nil, err
+	}
+	return &rows{inner: r, c: c, t: c.tx}, nil
+}
+
+// writeKeywords are the first words of the statements that may write.
+var writeKeywords = []string{"INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER", "VACUUM", "REINDEX", "ANALYZE"}
+
+// mayWrite reports whether a query, run on its own, may write: by its
+// first word after any comments, for a WITH statement by whether INSERT,
+// UPDATE, DELETE or REPLACE appears in it at all, and for a PRAGMA by
+// whether it sets a value.
+func mayWrite(query string) bool {
+	q := strings.TrimSpace(query)
+	for strings.HasPrefix(q, "--") || strings.HasPrefix(q, "/*") {
+		end := "\n"
+		if q[1] == '*' {
+			end = "*/"
+		}
+		_, rest, ok := strings.Cut(q, end)
+		if !ok {
+			return false
+		}
+		q = strings.TrimSpace(rest)
+	}
+	n := strings.IndexFunc(q, func(r rune) bool { return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') })
+	if n < 0 {
+		n = len(q)
+	}
+	switch word := strings.ToUpper(q[:n]); word {
+	case "WITH":
+		upper := strings.ToUpper(q)
+		return slices.ContainsFunc(writeKeywords[:4], func(k string) bool { return strings.Contains(upper, k) })
+	case "PRAGMA":
+		return strings.Contains(q, "=")
+	default:
+		return slices.Contains(writeKeywords, word)
+	}
+}
+
+func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	return c.runExec(ctx, query, func() (driver.Result, error) { return c.inner.ExecContext(ctx, query, args) })
 }
 
 func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if _, err := c.statement(ctx, query, false); err != nil {
-		return nil, err
-	}
-	if c.tx != nil {
-		return c.inner.QueryContext(ctx, query, args)
-	}
-	return retryBusy(ctx, c.db, func() (driver.Rows, error) { return c.inner.QueryContext(ctx, query, args) })
+	return c.runQuery(ctx, query, func() (driver.Rows, error) { return c.inner.QueryContext(ctx, query, args) })
 }
 
 func (c *conn) Ping(ctx context.Context) error { return c.inner.Ping(ctx) }
@@ -376,10 +608,16 @@ func (t *tx) end() {
 	t.c.tx = nil
 }
 
+// Commit commits the transaction, or, if SQLite rolled it back after an
+// error, rolls back what is left of it and returns ErrTransactionAborted.
 func (t *tx) Commit() error {
 	defer t.end()
 	if !t.begun {
 		return nil
+	}
+	if t.aborted != nil {
+		_ = t.rollback()
+		return abortedError(t.aborted)
 	}
 	if err := t.c.exec(context.Background(), "COMMIT"); err != nil {
 		// A COMMIT that failed can leave the transaction open, which
@@ -402,14 +640,92 @@ func (t *tx) Rollback() error {
 }
 
 // rollback rolls the transaction back. SQLite rolls a transaction back
-// itself after some errors (a full disk, an I/O error), which leaves
-// nothing to roll back here.
+// itself after some errors (a full disk, an I/O error, an interrupted
+// write), which leaves nothing to roll back here.
 func (t *tx) rollback() error {
 	err := t.c.exec(context.Background(), "ROLLBACK")
 	if err != nil && strings.Contains(err.Error(), "no transaction is active") {
 		return nil
 	}
 	return err
+}
+
+// rows reads a query's rows. In a transaction, it notes a rollback SQLite
+// makes while it steps; on its own, a query that may write holds the write
+// lock until it is closed.
+type rows struct {
+	inner   driver.Rows
+	c       *conn
+	t       *tx
+	release func()
+}
+
+var (
+	_ driver.RowsColumnTypeDatabaseTypeName = (*rows)(nil)
+	_ driver.RowsColumnTypeLength           = (*rows)(nil)
+	_ driver.RowsColumnTypeNullable         = (*rows)(nil)
+	_ driver.RowsColumnTypePrecisionScale   = (*rows)(nil)
+	_ driver.RowsColumnTypeScanType         = (*rows)(nil)
+)
+
+func (r *rows) Columns() []string { return r.inner.Columns() }
+
+func (r *rows) Close() error {
+	err := r.inner.Close()
+	if r.release != nil {
+		r.release()
+		r.release = nil
+	}
+	return err
+}
+
+func (r *rows) Next(dest []driver.Value) error {
+	if r.t == nil {
+		return r.inner.Next(dest)
+	}
+	if r.t.aborted != nil {
+		return abortedError(r.t.aborted)
+	}
+	err := r.inner.Next(dest)
+	if r.c.tx == r.t && r.c.rolledBack && r.t.aborted == nil {
+		r.c.leave(err)
+	}
+	return err
+}
+
+func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
+	if t, ok := r.inner.(driver.RowsColumnTypeDatabaseTypeName); ok {
+		return t.ColumnTypeDatabaseTypeName(index)
+	}
+	return ""
+}
+
+func (r *rows) ColumnTypeLength(index int) (int64, bool) {
+	if t, ok := r.inner.(driver.RowsColumnTypeLength); ok {
+		return t.ColumnTypeLength(index)
+	}
+	return 0, false
+}
+
+func (r *rows) ColumnTypeNullable(index int) (bool, bool) {
+	if t, ok := r.inner.(driver.RowsColumnTypeNullable); ok {
+		return t.ColumnTypeNullable(index)
+	}
+	return false, false
+}
+
+func (r *rows) ColumnTypePrecisionScale(index int) (int64, int64, bool) {
+	if t, ok := r.inner.(driver.RowsColumnTypePrecisionScale); ok {
+		return t.ColumnTypePrecisionScale(index)
+	}
+	return 0, 0, false
+}
+
+func (r *rows) ColumnTypeScanType(index int) reflect.Type {
+	if t, ok := r.inner.(driver.RowsColumnTypeScanType); ok {
+		return t.ColumnTypeScanType(index)
+	}
+	return reflect.TypeFor[any]()
 }
 
 // innerStmt is what a statement of modernc's driver implements.
@@ -444,25 +760,11 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
-	done, err := s.c.statement(ctx, s.query, true)
-	if err != nil {
-		return nil, err
-	}
-	defer done()
-	if s.c.tx != nil {
-		return s.inner.ExecContext(ctx, args)
-	}
-	return retryBusy(ctx, s.c.db, func() (driver.Result, error) { return s.inner.ExecContext(ctx, args) })
+	return s.c.runExec(ctx, s.query, func() (driver.Result, error) { return s.inner.ExecContext(ctx, args) })
 }
 
 func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	if _, err := s.c.statement(ctx, s.query, false); err != nil {
-		return nil, err
-	}
-	if s.c.tx != nil {
-		return s.inner.QueryContext(ctx, args)
-	}
-	return retryBusy(ctx, s.c.db, func() (driver.Rows, error) { return s.inner.QueryContext(ctx, args) })
+	return s.c.runQuery(ctx, s.query, func() (driver.Rows, error) { return s.inner.QueryContext(ctx, args) })
 }
 
 func named(args []driver.Value) []driver.NamedValue {

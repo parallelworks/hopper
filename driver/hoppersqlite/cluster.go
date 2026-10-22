@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -341,7 +342,7 @@ func (e *executor) Stats(ctx context.Context) (*driver.Stats, error) {
 		}
 		return q
 	}
-	now := clock()
+	now := e.clock()
 	err := e.readTx(ctx, func(q querier) error {
 		rows, err := q.QueryContext(ctx, `
 			SELECT queue, state, count(*),
@@ -551,7 +552,33 @@ func (e *executor) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult,
 			res.Analyzed = true
 		}
 	}
+	if err := e.truncateLog(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	return res, errors.Join(errs...)
+}
+
+// walTruncateSize is the size of write-ahead log past which JobsMaintain
+// checkpoints it and truncates it: twice what SQLite's automatic
+// checkpoints, every thousand pages, let it reach.
+const walTruncateSize = 8 << 20
+
+// truncateLog checkpoints the write-ahead log and truncates it to nothing
+// once it is past walTruncateSize. The log grows past that while a reader
+// keeps a snapshot from before the checkpoints, which then cannot start it
+// over, and SQLite cuts it back only to journalSizeLimit once one can. The
+// checkpoint waits for writers and readers at most busyQuantum each, and
+// gives up, to be tried at the next pass, if they are still there.
+func (e *executor) truncateLog(ctx context.Context) error {
+	st, err := os.Stat(e.d.db.path + "-wal")
+	if err != nil || st.Size() <= walTruncateSize {
+		return nil //nolint:nilerr // no log, or none to speak of
+	}
+	var busy, logPages, checkpointed int64
+	if err := e.d.sqlDB.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logPages, &checkpointed); err != nil {
+		return fmt.Errorf("hopper: checkpoint the write-ahead log: %w", err)
+	}
+	return nil
 }
 
 // believedRows returns the row count the planner's statistics hold for a

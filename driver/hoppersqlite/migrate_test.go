@@ -88,6 +88,38 @@ func TestMigrate(t *testing.T) {
 	}
 }
 
+// TestMigrations checks the scripts Migrations returns: SQLite's, one up
+// and one down for every version hoppermigrate knows, under its names,
+// which applied in order by hand build the schema Up builds.
+func TestMigrations(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pg := hoppermigrate.Migrations()
+	ms := hoppersqlite.Migrations()
+	if len(ms) != len(pg) {
+		t.Fatalf("%d migrations, want %d", len(ms), len(pg))
+	}
+	d := openEmpty(t)
+	for i, m := range ms {
+		if m.Version != pg[i].Version || m.Name != pg[i].Name || m.Up == "" || m.Down == "" || m.Up == pg[i].Up {
+			t.Fatalf("migration %d = version %d %q, up %d bytes, down %d bytes; want SQLite's scripts of version %d %q",
+				i, m.Version, m.Name, len(m.Up), len(m.Down), pg[i].Version, pg[i].Name)
+		}
+		if _, err := d.DB().ExecContext(ctx, m.Up); err != nil {
+			t.Fatalf("version %d: %v", m.Version, err)
+		}
+		if _, err := d.DB().ExecContext(ctx, "INSERT INTO hopper_schema (version, applied_at) VALUES (?, 0)", m.Version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v, err := hoppermigrate.Version(ctx, d); err != nil || v != hoppermigrate.Latest() {
+		t.Errorf("version after applying the scripts by hand = %d, %v", v, err)
+	}
+	if res, err := hoppermigrate.Up(ctx, d, quiet); err != nil || len(res.Applied) != 0 {
+		t.Errorf("Up after applying the scripts by hand = %+v, %v", res, err)
+	}
+}
+
 // TestUpConcurrent runs Up from several Drivers on one database at once:
 // one applies the migrations, and the others find them applied.
 func TestUpConcurrent(t *testing.T) {

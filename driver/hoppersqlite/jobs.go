@@ -828,7 +828,7 @@ func (e *executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 // client has no live lease, and, with StuckAfter, those claimed longer ago
 // than that, oldest first.
 func (e *executor) JobRescueCandidates(ctx context.Context, params driver.JobRescueParams) ([]driver.RescueCandidate, error) {
-	now := clock()
+	now := e.clock()
 	stuckBefore := int64(math.MinInt64)
 	if params.StuckAfter > 0 {
 		stuckBefore = now.Add(-params.StuckAfter).UnixMicro()

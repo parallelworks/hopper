@@ -9,7 +9,8 @@ import (
 // networkMagic names the filesystems, by statfs(2)'s magic number, whose
 // locks SQLite cannot rely on: network and cluster filesystems, the shared
 // folders of virtual machines, and FUSE, which sshfs, s3fs, GlusterFS and
-// many others are.
+// many others are, as are the bind mounts of Docker Desktop and of other
+// tools that run Linux in a virtual machine.
 var networkMagic = map[int64]string{
 	0x6969:     "NFS",
 	0x517b:     "SMB",
@@ -30,15 +31,17 @@ var networkMagic = map[int64]string{
 	0x20030528: "OrangeFS",
 	0x6a656a63: "virtiofs",
 	0x786f4256: "VirtualBox shared folders",
+	0x7c7c6673: "Parallels shared folders",
+	0xbacbacbc: "VMware shared folders",
 	0x65735546: "FUSE",
 }
 
 // statfs is unix.Statfs, which tests replace.
 var statfs = unix.Statfs
 
-func networkFilesystem(dir string) (string, error) {
+func networkFilesystem(path string) (string, error) {
 	var st unix.Statfs_t
-	if err := statfs(dir, &st); err != nil {
+	if err := statfs(path, &st); err != nil {
 		return "", err
 	}
 	if name, ok := networkMagic[int64(st.Type)&0xffffffff]; ok { //nolint:unconvert // st.Type is an int32 or a uint32 on some architectures

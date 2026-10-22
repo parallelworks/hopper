@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -273,80 +272,89 @@ const (
 	maxNumericFraction = 16383
 )
 
-// checkJSONFilter refuses a metadata filter Postgres's jsonb input would,
-// so that a listing's filter means the same on either engine: text that is
-// not UTF-8, a \u0000 escape, an unpaired surrogate escape, or a number
-// beyond numeric's range.
-func checkJSONFilter(s string) error {
-	if !utf8.ValidString(s) {
-		return fmt.Errorf("the metadata filter is not UTF-8")
+// checkJSON refuses JSON text Postgres's jsonb input refuses, so that a
+// value means the same on either engine and a job stored on one could be
+// stored on the other: text that is not JSON or not UTF-8, a \u0000 escape
+// (text cannot hold NUL), an unpaired surrogate escape, or a number beyond
+// the range of Postgres's numeric. It reads the text once, outside its
+// strings for numbers and inside them for escapes.
+func checkJSON(b []byte) error {
+	if !utf8.Valid(b) {
+		return errors.New("is not UTF-8")
 	}
-	if !json.Valid([]byte(s)) {
-		return fmt.Errorf("the metadata filter is not JSON")
+	if !json.Valid(b) {
+		return errors.New("is not JSON")
 	}
-	if err := checkEscapes(s); err != nil {
-		return err
-	}
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.UseNumber()
-	for {
-		tok, err := dec.Token()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("the metadata filter is not JSON: %w", err)
-		}
-		n, ok := tok.(json.Number)
-		if !ok {
-			continue
-		}
-		d, err := parseDecimal(string(n))
-		if err != nil {
-			return fmt.Errorf("the metadata filter's %w", err)
-		}
-		if whole := int64(len(d.digits)) + d.exp; d.digits != "" && whole > maxNumericWhole {
-			return fmt.Errorf("the metadata filter's number %.20s... is beyond the range of Postgres's numeric", n)
-		}
-		if d.exp < -maxNumericFraction {
-			return fmt.Errorf("the metadata filter's number %.20s... has more decimals than Postgres's numeric holds", n)
+	inString := false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case inString && c == '"':
+			inString = false
+		case inString && c == '\\':
+			n, err := checkEscape(b[i:])
+			if err != nil {
+				return err
+			}
+			i += n - 1
+		case inString:
+		case c == '"':
+			inString = true
+		case c == '-' || c >= '0' && c <= '9':
+			end := i
+			for end < len(b) && strings.IndexByte("+-.eE0123456789", b[end]) >= 0 {
+				end++
+			}
+			if err := checkNumber(string(b[i:end])); err != nil {
+				return err
+			}
+			i = end - 1
 		}
 	}
+	return nil
 }
 
-// checkEscapes refuses a \u0000 escape and an unpaired surrogate escape in
-// a JSON text's strings, which decoding would turn into a NUL and U+FFFD.
-func checkEscapes(s string) error {
-	b := []byte(s)
-	for i := 0; i < len(b); i++ {
-		if b[i] != '\\' {
-			continue
-		}
-		if i+1 < len(b) && b[i+1] != 'u' {
-			i++
-			continue
-		}
-		if i+6 > len(b) {
-			return nil // the decoder reports the truncated escape
-		}
-		r, err := strconv.ParseUint(string(b[i+2:i+6]), 16, 16)
-		switch {
-		case err != nil:
-			// The decoder reports the malformed escape.
-		case r == 0:
-			return fmt.Errorf("the metadata filter has a \\u0000 escape")
-		case utf16.IsSurrogate(rune(r)):
-			if r >= 0xdc00 || i+12 > len(b) || !bytes.HasPrefix(b[i+6:], []byte(`\u`)) {
-				return fmt.Errorf("the metadata filter has an unpaired surrogate escape")
-			}
-			low, err := strconv.ParseUint(string(b[i+8:i+12]), 16, 16)
-			if err != nil || low < 0xdc00 || low > 0xdfff {
-				return fmt.Errorf("the metadata filter has an unpaired surrogate escape")
-			}
-			i += 11
-		default:
-			i += 5
-		}
+// checkEscape checks the escape at the start of b, inside a string of valid
+// JSON, and returns its length.
+func checkEscape(b []byte) (int, error) {
+	if b[1] != 'u' {
+		return 2, nil
+	}
+	r, _ := strconv.ParseUint(string(b[2:6]), 16, 16)
+	switch {
+	case r == 0:
+		return 0, errors.New("has a \\u0000 escape")
+	case !utf16.IsSurrogate(rune(r)):
+		return 6, nil
+	case r >= 0xdc00 || len(b) < 12 || !bytes.HasPrefix(b[6:], []byte(`\u`)):
+		return 0, errors.New("has an unpaired surrogate escape")
+	}
+	if low, err := strconv.ParseUint(string(b[8:12]), 16, 16); err != nil || low < 0xdc00 || low > 0xdfff {
+		return 0, errors.New("has an unpaired surrogate escape")
+	}
+	return 12, nil
+}
+
+// checkNumber refuses a number beyond the range of Postgres's numeric.
+func checkNumber(n string) error {
+	d, err := parseDecimal(n)
+	if err != nil {
+		return err
+	}
+	if whole := int64(len(d.digits)) + d.exp; d.digits != "" && whole > maxNumericWhole {
+		return fmt.Errorf("has a number, %.20s..., beyond the range of Postgres's numeric", n)
+	}
+	if d.exp < -maxNumericFraction {
+		return fmt.Errorf("has a number, %.20s..., with more decimals than Postgres's numeric holds", n)
+	}
+	return nil
+}
+
+// checkJSONFilter refuses a metadata filter Postgres's jsonb input would
+// (checkJSON), so that a listing's filter means the same on either engine.
+func checkJSONFilter(s string) error {
+	if err := checkJSON([]byte(s)); err != nil {
+		return fmt.Errorf("the metadata filter %w", err)
 	}
 	return nil
 }

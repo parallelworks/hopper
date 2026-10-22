@@ -266,14 +266,17 @@ func TestClient(t *testing.T) {
 		mu.Lock()
 		finished := len(done)
 		mu.Unlock()
-		if finished == 504+1 { // 500, -1, -2, -3 and the workflow's three
+		if finished >= 506 { // 500, -1, -2, -3 and the workflow's three
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d jobs worked, want %d", finished, 505)
+			t.Fatalf("%d jobs worked, want %d", finished, 506)
 		}
 	}
 	mu.Lock()
+	if len(done) != 506 {
+		t.Errorf("%d jobs worked, want 506", len(done))
+	}
 	for n, times := range done {
 		if times != 1 {
 			t.Errorf("job %d worked %d times", n, times)
@@ -336,6 +339,10 @@ func TestHelperProcess(t *testing.T) {
 			driver.JobInsertOpts{Notify: true}); err != nil {
 			t.Fatal(err)
 		}
+	case "worker":
+		chaosWorker(ctx, t, d)
+	case "hog":
+		hog(ctx, t, d)
 	case "hold":
 		tx, err := d.DB().BeginTx(ctx, nil)
 		if err != nil {

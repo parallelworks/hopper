@@ -8,7 +8,9 @@
 //
 // The embedded scripts are Postgres's. A driver for another engine supplies
 // its own script for each version (driver.MigrationScripts), and Up and Down
-// apply those, at the same versions.
+// apply those, at the same versions; such a driver also returns its scripts
+// for other tools, as hoppersqlite.Migrations does. A new schema version
+// therefore needs a script for each engine.
 package hoppermigrate
 
 import (
@@ -37,7 +39,9 @@ type Migration struct {
 
 var migrations = mustLoad()
 
-// Migrations returns every known migration in ascending version order.
+// Migrations returns every known migration in ascending version order,
+// with Postgres's scripts. A driver for another engine has its own
+// (hoppersqlite.Migrations, for SQLite).
 func Migrations() []Migration { return slices.Clone(migrations) }
 
 // Latest returns the newest schema version this package knows.
