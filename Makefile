@@ -42,6 +42,7 @@ lint: ## Lint Go code
 	$(GOTOOL) golangci-lint run ./...
 	cd hopperotel && go tool -modfile=../tools/go.mod golangci-lint run ./...
 	cd hopperui && go tool -modfile=../tools/go.mod golangci-lint run ./...
+	cd driver/hoppersqlite && go tool -modfile=../../tools/go.mod golangci-lint run ./...
 
 .PHONY: fmt
 fmt: ## Format Go code
@@ -58,7 +59,20 @@ test-modules:
 	go test -race -cover -timeout 10m ./...
 	cd hopperotel && go test -race -cover -timeout 10m ./...
 	cd hopperui && go test -race -cover -timeout 10m ./...
+	cd driver/hoppersqlite && go test -race -cover -timeout 10m ./...
 
 .PHONY: bench
 bench: ## Run the benchmark harness against the test database
 	go run ./cmd/hopperbench -database-url "$(HOPPER_TEST_DATABASE_URL)"
+
+.PHONY: bench-sqlite
+bench-sqlite: ## Run the benchmark harness on a SQLite database in a temporary directory
+	cd driver/hoppersqlite && go run ./cmd/hopperbench-sqlite
+
+.PHONY: cgo-check
+cgo-check: ## Check that hoppersqlite, its tests and every module they import use no cgo
+	@cd driver/hoppersqlite && for os in linux darwin windows freebsd openbsd netbsd; do \
+		GOOS=$$os CGO_ENABLED=0 go vet ./... || exit 1; \
+		pkgs=$$(GOOS=$$os CGO_ENABLED=1 go list -deps -test -f '{{if and .CgoFiles (not .Standard)}}{{.ImportPath}}{{end}}' ./...) || exit 1; \
+		if [ -n "$$pkgs" ]; then echo "cgo is not allowed, but these packages use it on $$os:"; echo "$$pkgs"; exit 1; fi; \
+	done
