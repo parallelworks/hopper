@@ -71,6 +71,16 @@ type Capabilities struct {
 	// Listen reports whether Listener is implemented (LISTEN/NOTIFY on
 	// Postgres).
 	Listen bool
+	// SingleWriter reports that the engine runs one transaction that writes
+	// at a time, as SQLite does, rather than locking rows: a transaction
+	// that writes holds up every other write until it ends. A claim needs no
+	// SKIP LOCKED to be exclusive, and the transaction that finalizes a job
+	// settles its batch and promotes its dependents with no other to race
+	// it, so BatchSettle and WorkflowPromoteReady find nothing a race left.
+	// With JobFinalizeParams.SkipLocked or JobRecordProgressParams.NoWait,
+	// a statement waits only briefly for another transaction's writes to
+	// end, and then skips every job, or returns ErrJobLocked.
+	SingleWriter bool
 }
 
 // Notification channels. Payloads are documented on each.
@@ -367,6 +377,18 @@ type MigrationExecutor interface {
 	Close(ctx context.Context) error
 }
 
+// MigrationScripts is implemented by a MigrationExecutor whose engine is not
+// Postgres, whose scripts hoppermigrate embeds. hoppermigrate then gives
+// Apply the engine's own script for each schema version instead. An engine
+// has a script, up and down, for every schema version hoppermigrate knows,
+// so that a version names the same schema on every engine: the tables and
+// columns a release's statements need.
+type MigrationScripts interface {
+	// Script returns the engine's script for a schema version: the one that
+	// applies it (up) or the one that reverts it.
+	Script(version int, up bool) (string, error)
+}
+
 // JobState is a job's position in the state machine.
 type JobState string
 
@@ -497,7 +519,8 @@ type JobRecordProgressParams struct {
 	// Cursor is a JSON value, or nil for none.
 	Cursor json.RawMessage
 	// NoWait returns ErrJobLocked at once, instead of waiting, if another
-	// transaction holds the job's row.
+	// transaction holds the job's row; on a SingleWriter engine, if another
+	// transaction writes.
 	NoWait bool
 }
 
@@ -807,7 +830,8 @@ type JobFinalizeParams struct {
 	NoBatches bool
 	// SkipLocked skips the jobs whose rows another transaction holds, such
 	// as a worker's CompleteTx that has not ended, instead of waiting for
-	// it. A skipped job is not among the applied.
+	// it. A skipped job is not among the applied. On a SingleWriter engine
+	// every job is skipped while another transaction writes.
 	SkipLocked bool
 	// KeepLogs is the most attempt logs a job keeps, the latest; a job given
 	// another drops its oldest. Zero keeps them all.
