@@ -48,7 +48,7 @@ func testJobRecordProgress[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	// A cursor is stored as given, a null within it included.
 	got := record(exec, driver.JobRecordProgressParams{Fence: 1, Attempt: 1, Step: "download", Cursor: json.RawMessage(`{"page": 2, "etag": null}`)})
-	if got == nil || got.Step != "download" || string(got.Cursor) != `{"etag": null, "page": 2}` || got.RecordedAt.IsZero() {
+	if got == nil || got.Step != "download" || !jsonEqual(got.Cursor, `{"etag": null, "page": 2}`) || got.RecordedAt.IsZero() {
 		t.Fatalf("recorded = %+v", got)
 	}
 	if p := progress(); p == nil || p.Step != "download" || string(p.Cursor) != string(got.Cursor) || !p.RecordedAt.Equal(got.RecordedAt) {
@@ -150,7 +150,7 @@ func testJobRecordProgressRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 		}
 		done <- applied
 	}()
-	waitForLockWait(ctx, t, f, d)
+	f.WaitForLockWait(ctx, t, d)
 	if err := commit(); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func testJobRecordProgressRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 		}
 		recorded <- p
 	}()
-	waitForLockWait(ctx, t, f, d)
+	f.WaitForLockWait(ctx, t, d)
 	if err := commit(); err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func testJobProgressReset[TTx any](t *testing.T, f Fixture[TTx]) {
 	if j, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[1].Job.ID, FromStart: true}); err != nil || j.Progress != nil {
 		t.Errorf("JobRetry FromStart from history = %+v, %v", j, err)
 	}
-	f.Exec(ctx, t, d, `UPDATE hopper_jobs SET progress = '{"step": "e"}' WHERE id = $1`, inserted[0].Job.ID.String())
+	f.SetProgress(ctx, t, d, inserted[0].Job.ID, `{"step": "e"}`)
 	if j, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[0].Job.ID}); err != nil || j.Progress == nil || j.Progress.Step != "e" {
 		t.Errorf("JobRetry of a waiting job = %+v, %v", j, err)
 	}
@@ -271,9 +271,10 @@ func testJobProgressReset[TTx any](t *testing.T, f Fixture[TTx]) {
 		`{"step": 3, "cursor": null, "at": "yesterday"}`:                  {},
 		`{"step": "s", "cursor": {"p": 1}, "at": "2026-01-02T03:04:05Z"}`: {Step: "s", Cursor: json.RawMessage(`{"p": 1}`), RecordedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)},
 	} {
-		f.Exec(ctx, t, d, `UPDATE hopper_jobs SET progress = $1::jsonb WHERE id = $2`, value, inserted[0].Job.ID.String())
+		f.SetProgress(ctx, t, d, inserted[0].Job.ID, value)
 		got := get(inserted[0].Job.ID).Progress
-		if (got == nil) != (want == nil) || (got != nil && (got.Step != want.Step || string(got.Cursor) != string(want.Cursor) || !got.RecordedAt.Equal(want.RecordedAt))) {
+		if (got == nil) != (want == nil) || (got != nil && (got.Step != want.Step || (got.Cursor != nil) != (want.Cursor != nil) ||
+			(got.Cursor != nil && !jsonEqual(got.Cursor, string(want.Cursor))) || !got.RecordedAt.Equal(want.RecordedAt))) {
 			t.Errorf("progress %s reads as %+v, want %+v", value, got, want)
 		}
 	}

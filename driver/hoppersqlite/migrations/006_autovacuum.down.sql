@@ -1,0 +1,1 @@
+-- Nothing to revert: v6 changes nothing on SQLite.

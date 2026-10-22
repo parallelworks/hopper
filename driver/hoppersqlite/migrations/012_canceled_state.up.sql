@@ -1,0 +1,2 @@
+-- hopper schema v12: Postgres's canceled state is spelled canceled. SQLite's
+-- schema has spelled it so from v1.

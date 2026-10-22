@@ -81,7 +81,7 @@ func testPublish[TTx any](t *testing.T, f Fixture[TTx]) {
 		} else if meta.MessageID != messageID {
 			t.Error("deliveries of one message have different IDs")
 		}
-		if j.OrderingKey != "alloc:42" || j.UniqueKey != "msg:evt-1" || j.Priority != 1 || j.ExpiresAt.IsZero() || !j.Await || string(j.Args) != `{"id": 42}` {
+		if j.OrderingKey != "alloc:42" || j.UniqueKey != "msg:evt-1" || j.Priority != 1 || j.ExpiresAt.IsZero() || !j.Await || !jsonEqual(j.Args, `{"id": 42}`) {
 			t.Errorf("delivery = %+v", j)
 		}
 		switch j.Kind {

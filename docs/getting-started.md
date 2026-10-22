@@ -68,6 +68,7 @@ application's `search_path` is unchanged, so the pool can be shared.
 **Existing installations:** set `Schema` to the schema where your Hopper tables
 already live (for example `public`) before upgrading. Changing this setting
 selects another installation; it does not move existing jobs or tables.
+
 Migration credentials need permission to create the schema, or you can create
 it beforehand. Migrating down to zero removes Hopper objects and leaves the
 namespace itself intact.
@@ -75,6 +76,46 @@ namespace itself intact.
 The SQL files are in `hoppermigrate/migrations` for teams that run migrations
 with their own tool. Set a transaction-local `search_path` to the target schema
 when running the raw SQL. `hopper_schema` records the applied versions either way.
+
+### SQLite
+
+An application that runs on one machine, such as a command-line tool or a
+single-node service, can keep hopper in a SQLite file instead, with no server
+to run. The driver is pure Go (`modernc.org/sqlite`), so the program still
+builds with `CGO_ENABLED=0`, and it is a module of its own,
+`github.com/parallelworks/hopper/driver/hoppersqlite`:
+
+```go
+driver, err := hoppersqlite.Open(filepath.Join(stateDir, "hopper.db"), nil)
+if err != nil {
+    return err // hoppersqlite.ErrNetworkFilesystem for a file on NFS and the like
+}
+defer driver.Close()
+if _, err := hoppermigrate.Up(ctx, driver, nil); err != nil {
+    return err
+}
+client, err := hopper.NewClient(driver, cfg)
+```
+
+Its transactions are `*sql.Tx`; begin them on `driver.DB()`, whose
+connections take the database's write lock when a transaction runs its first
+statement. SQLite runs one writing transaction at a time, so keep them short:
+one held open holds up every client sharing the file, lease renewals
+included, and one held longer than the lease costs them their running jobs.
+Write through the transaction (`InsertTx`, `CompleteTx`) rather than the pool
+while one is open. In a worker, begin it with the job's context: a write on
+the pool then fails at once with `hoppersqlite.ErrLockHeldByOwner`, rather
+than wait for the worker's own transaction until the context ends. After an error that makes SQLite roll a
+transaction back (an interrupted write, a full disk), its later statements
+fail with `hoppersqlite.ErrTransactionAborted`; roll it back.
+
+Several processes can share the file: clients in other processes are woken
+within 50ms of an insert. The file must be on a local disk; `Open` refuses
+one on a network filesystem or a virtual machine's shared folder (Docker
+Desktop's bind mounts among them), where SQLite's locks do not hold.
+`hoppersqlite.Migrations` returns the SQLite scripts for teams that run
+migrations with their own tool. Upgrade hopper and hoppersqlite together:
+the driver uses hopper's internal packages.
 
 ## Define a job and its worker
 

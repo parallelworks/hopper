@@ -1,0 +1,2 @@
+-- hopper schema v7: no heap truncation on Postgres's live table. SQLite
+-- reuses the pages of deleted rows, and never runs a VACUUM on its own.

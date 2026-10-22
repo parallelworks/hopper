@@ -1,0 +1,5 @@
+-- hopper schema v11: on Postgres, batch progress in rows of its own, so
+-- that the concurrent finalizes of a batch's jobs do not queue on its row.
+-- SQLite runs one writer at a time: the transaction that finalizes a
+-- batch's jobs counts them down on the batch row, and nothing queues there
+-- that would not queue anyway.

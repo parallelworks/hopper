@@ -1,0 +1,1 @@
+-- Nothing to revert: v11 changes nothing on SQLite.

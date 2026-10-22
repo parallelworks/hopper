@@ -11,6 +11,9 @@
   owning client. Changes to the SQL in the claim, finalize, rescue or leader paths need
   a concurrency or chaos test.
 - Always use database time (`now()`), never application time, when comparing job times.
+- A schema change is a new version in `hoppermigrate/migrations` and the same version in
+  `driver/hoppersqlite/migrations`, up and down; for a change SQLite has no use for, its
+  script is a comment saying why. hoppersqlite's tests fail for a version it lacks.
 - Changes to the insert, claim or finalize paths include `hopperbench` results in the
   PR. A regression of more than 10% against `canary` blocks the merge.
 - [docs/PLAN.md](docs/PLAN.md) is the design of record. Change it in the same PR as a

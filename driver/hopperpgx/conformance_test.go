@@ -3,7 +3,6 @@ package hopperpgx_test
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -13,20 +12,12 @@ import (
 	"github.com/parallelworks/hopper/internal/testdb"
 )
 
-// pgxFixture runs the conformance suite against hopperpgx.
-type pgxFixture struct{}
+// pgxFixture runs the conformance suite against hopperpgx. Its hooks are
+// statements on hopper's schema (drivertest.Postgres), which pgxSQL runs on
+// the driver's pool.
+type pgxFixture struct{ drivertest.Postgres[pgx.Tx] }
 
-func pool(d driver.Driver[pgx.Tx]) interface {
-	Exec(ctx context.Context, sql string, args ...any) (interface{ RowsAffected() int64 }, error)
-} {
-	return execAdapter{d.(*hopperpgx.Driver)}
-}
-
-type execAdapter struct{ d *hopperpgx.Driver }
-
-func (a execAdapter) Exec(ctx context.Context, sql string, args ...any) (interface{ RowsAffected() int64 }, error) {
-	return a.d.Pool().Exec(ctx, sql, args...)
-}
+func newFixture() pgxFixture { return pgxFixture{drivertest.Postgres[pgx.Tx]{SQL: pgxSQL{}}} }
 
 func (pgxFixture) NewDriver(t *testing.T) driver.Driver[pgx.Tx] {
 	return testdb.Driver(testdb.Pool(t))
@@ -41,50 +32,17 @@ func (pgxFixture) Begin(ctx context.Context, t *testing.T, d driver.Driver[pgx.T
 	return tx, func() error { return tx.Commit(ctx) }, func() error { return tx.Rollback(ctx) }
 }
 
-func (pgxFixture) ExpireLease(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], clientID int64) {
+// pgxSQL runs the suite's statements on a driver's pool.
+type pgxSQL struct{}
+
+func (pgxSQL) Exec(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], query string, args ...any) {
 	t.Helper()
-	if _, err := pool(d).Exec(ctx, "UPDATE hopper_clients SET expires_at = now() - interval '1s' WHERE id = $1", clientID); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (pgxFixture) ExpireLeader(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx]) {
-	t.Helper()
-	if _, err := pool(d).Exec(ctx, "UPDATE hopper_leader SET expires_at = now() - interval '1s'"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (pgxFixture) MakeClaimable(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], id driver.JobID) {
-	t.Helper()
-	if _, err := pool(d).Exec(ctx, "UPDATE hopper_jobs SET scheduled_at = now() WHERE id = $1", [16]byte(id)); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (pgxFixture) AgeAttempt(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], id driver.JobID, age time.Duration) {
-	t.Helper()
-	if _, err := pool(d).Exec(ctx, "UPDATE hopper_jobs SET attempted_at = now() - make_interval(secs => $2) WHERE id = $1", [16]byte(id), age.Seconds()); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (pgxFixture) CountLive(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx]) int {
-	return count(ctx, t, d, "hopper_jobs")
-}
-
-func (pgxFixture) CountHistory(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx]) int {
-	return count(ctx, t, d, "hopper_job_history")
-}
-
-func (pgxFixture) Exec(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], query string, args ...any) {
-	t.Helper()
-	if _, err := pool(d).Exec(ctx, query, args...); err != nil {
+	if _, err := d.(*hopperpgx.Driver).Pool().Exec(ctx, query, args...); err != nil {
 		t.Error(err)
 	}
 }
 
-func (pgxFixture) QueryText(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], query string, args ...any) string {
+func (pgxSQL) QueryText(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], query string, args ...any) string {
 	t.Helper()
 	var s string
 	if err := d.(*hopperpgx.Driver).Pool().QueryRow(ctx, query, args...).Scan(&s); err != nil {
@@ -93,16 +51,12 @@ func (pgxFixture) QueryText(ctx context.Context, t *testing.T, d driver.Driver[p
 	return s
 }
 
-func count(ctx context.Context, t *testing.T, d driver.Driver[pgx.Tx], table string) int {
-	t.Helper()
-	var n int
-	if err := d.(*hopperpgx.Driver).Pool().QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
-}
-
 func TestConformance(t *testing.T) {
 	t.Parallel()
-	drivertest.Run(t, pgxFixture{})
+	drivertest.Run(t, newFixture())
+}
+
+func TestConformancePostgres(t *testing.T) {
+	t.Parallel()
+	drivertest.RunPostgres(t, newFixture())
 }

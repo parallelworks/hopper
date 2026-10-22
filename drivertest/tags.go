@@ -18,7 +18,7 @@ import (
 // testJobTags checks that a job's tags are stored with it on every insert
 // path, returned wherever the job is, kept through history and a retry
 // from it, and replaced by a replacing insert, and that a job without tags
-// stores none.
+// has none.
 func testJobTags[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -32,6 +32,102 @@ func testJobTags[TTx any](t *testing.T, f Fixture[TTx]) {
 			t.Errorf("inserted job %d tags = %q, want %q", i, r.Job.Tags, p[i].Tags)
 		}
 	}
+	if j := get(ctx, t, exec, res[2].Job.ID); j.Tags != nil {
+		t.Errorf("untagged job's tags = %q, want none", j.Tags)
+	}
+
+	clientID := register(ctx, t, exec)
+	running := claim(ctx, t, exec, clientID, 3)
+	for _, j := range running {
+		if want := p[argsN(j)].Tags; !slices.Equal(j.Tags, want) {
+			t.Errorf("claimed job %d tags = %q, want %q", argsN(j), j.Tags, want)
+		}
+		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	}
+	got, err := exec.JobGet(ctx, res[1].Job.ID)
+	if err != nil || got.State != driver.JobStateCompleted || !slices.Equal(got.Tags, p[1].Tags) {
+		t.Fatalf("job in history = %+v, %v", got, err)
+	}
+	retried, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: res[0].Job.ID})
+	if err != nil || !slices.Equal(retried.Tags, p[0].Tags) {
+		t.Errorf("job retried from history = %+v, %v", retried, err)
+	}
+
+	u := params("u", 1)[0]
+	u.UniqueKey, u.Tags = "one", []string{"old"}
+	insert(ctx, t, exec, []driver.JobInsertParams{u})
+	u.Tags = []string{"new"}
+	rep, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{u}, driver.JobInsertOpts{OnConflict: driver.ConflictReplace})
+	if err != nil || !rep[0].Duplicate || !slices.Equal(rep[0].Job.Tags, []string{"new"}) {
+		t.Errorf("replaced job = %+v, %v", rep, err)
+	}
+	if byTag, err := exec.JobList(ctx, driver.JobListParams{TagsAny: []string{"old", "new"}, Limit: 10}); err != nil || len(byTag) != 1 || !slices.Equal(byTag[0].Tags, []string{"new"}) {
+		t.Errorf("replaced job listed by its tags = %+v, %v", byTag, err)
+	}
+	u.Tags = nil
+	rep, err = exec.JobInsertMany(ctx, []driver.JobInsertParams{u}, driver.JobInsertOpts{OnConflict: driver.ConflictReplace})
+	if err != nil || rep[0].Job.Tags != nil {
+		t.Errorf("job replaced without tags = %+v, %v", rep, err)
+	}
+
+	if d.Capabilities().Copy {
+		c := params("copy", 2)
+		c[1].Tags = []string{"copied"}
+		copied, err := exec.JobInsertCopy(ctx, c, driver.JobInsertOpts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, r := range copied {
+			stored, err := exec.JobGet(ctx, r.Job.ID)
+			if err != nil || !slices.Equal(stored.Tags, c[i].Tags) || !slices.Equal(r.Job.Tags, c[i].Tags) {
+				t.Errorf("copied job %d tags = %q (result %q), want %q, %v", i, stored.Tags, r.Job.Tags, c[i].Tags, err)
+			}
+		}
+	}
+
+	w := params("wf", 2)
+	w[0].Tags = []string{"flow"}
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Jobs: w, Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(wf.Jobs[0].Job.Tags, []string{"flow"}) || wf.Jobs[1].Job.Tags != nil {
+		t.Errorf("workflow job tags = %q, %q", wf.Jobs[0].Job.Tags, wf.Jobs[1].Job.Tags)
+	}
+
+	// A batch's callback keeps its tags until the batch completes.
+	cb := &driver.JobInsertParams{Kind: "done", Queue: "callbacks", Priority: 1, MaxAttempts: 3, Tags: []string{"callback"}}
+	batch, err := exec.BatchInsert(ctx, driver.BatchInsertParams{Total: 1, OnComplete: cb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := params("shard", 1)
+	b[0].Queue, b[0].BatchID = "shards", batch
+	insert(ctx, t, exec, b)
+	shards, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "shards", ClientID: clientID, Limit: 1})
+	if err != nil || len(shards.Jobs) != 1 {
+		t.Fatalf("claim = %+v, %v", shards, err)
+	}
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: shards.Jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	callbacks, err := exec.JobList(ctx, driver.JobListParams{Queue: "callbacks", Limit: 10})
+	if err != nil || len(callbacks) != 1 || !slices.Equal(callbacks[0].Tags, []string{"callback"}) {
+		t.Errorf("callbacks = %+v, %v", callbacks, err)
+	}
+}
+
+// testJobTagsStored checks how tags are stored on Postgres: a job without
+// tags stores NULL; both tables' CHECKs refuse tags of another shape; tags a
+// direct SQL write made odd read as what they hold, in listings, a retry and
+// a batch's callback; and a job finished on a new installation keeps its
+// tags rows out of the DEFAULT partition.
+func testJobTagsStored[TTx any](t *testing.T, f PostgresFixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	p := params("k", 3)
+	p[0].Tags = []string{"tenant:acme", "nightly"}
+	p[1].Tags = []string{"a"}
+	insert(ctx, t, exec, p)
 	if n := f.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_jobs WHERE tags IS NULL"); n != "1" {
 		t.Errorf("%s jobs store NULL tags, want 1 (the untagged one)", n)
 	}
@@ -117,82 +213,13 @@ func testJobTags[TTx any](t *testing.T, f Fixture[TTx]) {
 	f.Exec(ctx, t, d, "DELETE FROM hopper_jobs WHERE queue = 'odd-tags'")
 
 	clientID := register(ctx, t, exec)
-	running := claim(ctx, t, exec, clientID, 3)
-	for _, j := range running {
-		if want := p[argsN(j)].Tags; !slices.Equal(j.Tags, want) {
-			t.Errorf("claimed job %d tags = %q, want %q", argsN(j), j.Tags, want)
-		}
+	for _, j := range claim(ctx, t, exec, clientID, 3) {
 		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	}
 	if n := f.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_job_history_tags_completed_default"); n != "0" {
 		t.Errorf("%s tags rows of jobs finished on a new installation in the DEFAULT partition, want 0", n)
 	}
-	got, err := exec.JobGet(ctx, res[1].Job.ID)
-	if err != nil || got.State != driver.JobStateCompleted || !slices.Equal(got.Tags, p[1].Tags) {
-		t.Fatalf("job in history = %+v, %v", got, err)
-	}
-	retried, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: res[0].Job.ID})
-	if err != nil || !slices.Equal(retried.Tags, p[0].Tags) {
-		t.Errorf("job retried from history = %+v, %v", retried, err)
-	}
 
-	u := params("u", 1)[0]
-	u.UniqueKey, u.Tags = "one", []string{"old"}
-	insert(ctx, t, exec, []driver.JobInsertParams{u})
-	u.Tags = []string{"new"}
-	rep, err := exec.JobInsertMany(ctx, []driver.JobInsertParams{u}, driver.JobInsertOpts{OnConflict: driver.ConflictReplace})
-	if err != nil || !rep[0].Duplicate || !slices.Equal(rep[0].Job.Tags, []string{"new"}) {
-		t.Errorf("replaced job = %+v, %v", rep, err)
-	}
-	u.Tags = nil
-	rep, err = exec.JobInsertMany(ctx, []driver.JobInsertParams{u}, driver.JobInsertOpts{OnConflict: driver.ConflictReplace})
-	if err != nil || rep[0].Job.Tags != nil {
-		t.Errorf("job replaced without tags = %+v, %v", rep, err)
-	}
-
-	if d.Capabilities().Copy {
-		c := params("copy", 2)
-		c[1].Tags = []string{"copied"}
-		copied, err := exec.JobInsertCopy(ctx, c, driver.JobInsertOpts{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		for i, r := range copied {
-			stored, err := exec.JobGet(ctx, r.Job.ID)
-			if err != nil || !slices.Equal(stored.Tags, c[i].Tags) || !slices.Equal(r.Job.Tags, c[i].Tags) {
-				t.Errorf("copied job %d tags = %q (result %q), want %q, %v", i, stored.Tags, r.Job.Tags, c[i].Tags, err)
-			}
-		}
-	}
-
-	w := params("wf", 2)
-	w[0].Tags = []string{"flow"}
-	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Jobs: w, Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(wf.Jobs[0].Job.Tags, []string{"flow"}) || wf.Jobs[1].Job.Tags != nil {
-		t.Errorf("workflow job tags = %q, %q", wf.Jobs[0].Job.Tags, wf.Jobs[1].Job.Tags)
-	}
-
-	// A batch's callback keeps its tags until the batch completes.
-	cb := &driver.JobInsertParams{Kind: "done", Queue: "callbacks", Priority: 1, MaxAttempts: 3, Tags: []string{"callback"}}
-	batch, err := exec.BatchInsert(ctx, driver.BatchInsertParams{Total: 1, OnComplete: cb})
-	if err != nil {
-		t.Fatal(err)
-	}
-	b := params("shard", 1)
-	b[0].Queue, b[0].BatchID = "shards", batch
-	insert(ctx, t, exec, b)
-	shards, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "shards", ClientID: clientID, Limit: 1})
-	if err != nil || len(shards.Jobs) != 1 {
-		t.Fatalf("claim = %+v, %v", shards, err)
-	}
-	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: shards.Jobs[0].ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
-	callbacks, err := exec.JobList(ctx, driver.JobListParams{Queue: "callbacks", Limit: 10})
-	if err != nil || len(callbacks) != 1 || !slices.Equal(callbacks[0].Tags, []string{"callback"}) {
-		t.Errorf("callbacks = %+v, %v", callbacks, err)
-	}
 	// A callback whose tags a direct SQL write made odd gets the tags they
 	// read as, rather than failing the finalize that completes its batch.
 	for _, odd := range []struct {
@@ -372,7 +399,7 @@ func testJobListFilters[TTx any](t *testing.T, f Fixture[TTx]) {
 // tags partition beside it is kept, so that a job still in history is still
 // listed by its tags. A read of the tags partition defers only the tags
 // partition's drop, which is dropped once the read ends.
-func testTagsPartitionWaitsForHistory[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsPartitionWaitsForHistory[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -446,7 +473,7 @@ func testTagsPartitionWaitsForHistory[TTx any](t *testing.T, f Fixture[TTx]) {
 // hourly history partitions. Its job's tags rows go with it, though the
 // day's tags partition stays for the second hour: left there, a listing by
 // tag walked them before the day's jobs still in history.
-func testTagsLeaveWithTheirHour[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsLeaveWithTheirHour[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	dropTaggedHour(t, f, false)
 }
 
@@ -455,14 +482,14 @@ func testTagsLeaveWithTheirHour[TTx any](t *testing.T, f Fixture[TTx]) {
 // a busy hour's delete does. The hour goes without deleting them, rather
 // than staying, with every later hour, for each pass to try again, and its
 // rows stay in the day's tags partition, which a listing by tag reads past.
-func testTagsHourOutlastsItsDelete[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsHourOutlastsItsDelete[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	dropTaggedHour(t, f, true)
 }
 
 // dropTaggedHour drops the first of a day's two hourly history partitions,
 // each holding a tagged job, by retention, its tags rows' delete canceled
 // if canceled, and checks what stays.
-func dropTaggedHour[TTx any](t *testing.T, f Fixture[TTx], canceled bool) {
+func dropTaggedHour[TTx any](t *testing.T, f PostgresFixture[TTx], canceled bool) {
 	t.Helper()
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -512,7 +539,7 @@ func dropTaggedHour[TTx any](t *testing.T, f Fixture[TTx], canceled bool) {
 // The hour's tags rows go with that partition, which the same pass drops
 // after the hour, rather than be deleted first: a trigger fails any delete
 // from it.
-func testTagsDayGoesWithItsLastHour[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsDayGoesWithItsLastHour[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -542,7 +569,7 @@ func testTagsDayGoesWithItsLastHour[TTx any](t *testing.T, f Fixture[TTx]) {
 // partition that another session drops first, as an overlapping leader's
 // pass does, while this pass's delete of its tags rows waits for it. The
 // pass reports the hour dropped, as it does one gone before its DROP.
-func testTagsHourDroppedMeanwhile[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsHourDroppedMeanwhile[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -587,7 +614,7 @@ func testTagsHourDroppedMeanwhile[TTx any](t *testing.T, f Fixture[TTx]) {
 // jobs, then checks that the tags tables hold exactly the tags of the jobs
 // beside them, and that a listing by each tag finds exactly the jobs that
 // have it, in order, across pages.
-func testTagsRowsFollowJobs[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsRowsFollowJobs[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -758,7 +785,7 @@ func testTagsRowsFollowJobs[TTx any](t *testing.T, f Fixture[TTx]) {
 // testTagsTableMaintained checks that the leader's live table maintenance
 // vacuums the live tags table, whose index a listing by tag walks, once its
 // dead rows number as many as the live table's would.
-func testTagsTableMaintained[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsTableMaintained[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -792,7 +819,7 @@ func testTagsTableMaintained[TTx any](t *testing.T, f Fixture[TTx]) {
 // testTagsTableMaintainedPastJobsError checks that the live tags table is
 // maintained even when hopper_jobs' maintenance fails, here by an extended
 // statistic whose expression its ANALYZE cannot compute.
-func testTagsTableMaintainedPastJobsError[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsTableMaintainedPastJobsError[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -829,7 +856,7 @@ func testTagsTableMaintainedPastJobsError[TTx any](t *testing.T, f Fixture[TTx])
 // history's DEFAULT partition takes its tags rows along, wherever they are,
 // and a tags row in the tags' DEFAULT partition stays while its job is in one
 // of history's time partitions.
-func testTagsFollowHistoryRetention[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsFollowHistoryRetention[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -922,7 +949,7 @@ func testTagsFollowHistoryRetention[TTx any](t *testing.T, f Fixture[TTx]) {
 // and a partition, which fire none of a partitioned table's statement
 // triggers. Each tags table then holds exactly its jobs' tags, and a listing
 // by tag finds each job where it now is.
-func testTagsFollowDirectUpdates[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsFollowDirectUpdates[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -1005,7 +1032,7 @@ func testTagsFollowDirectUpdates[TTx any](t *testing.T, f Fixture[TTx]) {
 // checkTagsRows checks that each tags table holds exactly the tags of the
 // jobs beside it, comparing the two with except: "EXCEPT", or "EXCEPT ALL"
 // to count a duplicate tags row as a mismatch too.
-func checkTagsRows[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx], except string) {
+func checkTagsRows[TTx any](ctx context.Context, t *testing.T, f PostgresFixture[TTx], d driver.Driver[TTx], except string) {
 	t.Helper()
 	const liveExpanded = `SELECT e.tag, j.id FROM hopper_jobs j, LATERAL jsonb_array_elements_text(j.tags) e(tag)`
 	const historyExpanded = `SELECT h.state, h.finalized_at, e.tag, h.id FROM hopper_job_history h, LATERAL jsonb_array_elements_text(h.tags) e(tag)`
@@ -1050,7 +1077,7 @@ func mustID(t *testing.T, s string) driver.JobID {
 // testTagsFollowTruncate truncates hopper_jobs, then history, each alone and
 // then together with every tags table, as a reset of every table does. The
 // tags tables follow, though TRUNCATE fires no delete trigger.
-func testTagsFollowTruncate[TTx any](t *testing.T, f Fixture[TTx]) {
+func testTagsFollowTruncate[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()

@@ -47,7 +47,8 @@ func (c *Client[TTx]) JobCancel(ctx context.Context, id JobID) (*JobRow, error) 
 //
 // Until tx ends it holds the job's row, so a running job that finishes
 // meanwhile has its result wait for tx; its client's other results do not.
-// Call it late in tx, as CompleteTx.
+// Call it late in tx, as CompleteTx. On an engine that runs one writer at a
+// time, tx holds every write in the database up until it ends.
 func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, id JobID) (*JobRow, error) {
 	return c.driver.UnwrapTx(tx).JobCancel(ctx, id)
 }
@@ -114,7 +115,8 @@ func (c *Client[TTx]) JobDelete(ctx context.Context, id JobID) (*JobRow, error) 
 
 // JobDeleteTx is JobDelete inside the caller's transaction. Until tx ends
 // it holds the job's row and, for a waiting job, those of the workflow
-// dependents it cancels or promotes.
+// dependents it cancels or promotes; on an engine that runs one writer at a
+// time, every write in the database.
 func (c *Client[TTx]) JobDeleteTx(ctx context.Context, tx TTx, id JobID) (*JobRow, error) {
 	return c.driver.UnwrapTx(tx).JobDelete(ctx, id)
 }
@@ -144,7 +146,8 @@ func (c *Client[TTx]) JobRetryOrderingKey(ctx context.Context, queue, orderingKe
 //
 // Until tx ends it holds the rows of the jobs it woke and of the key's
 // running job, whose result waits for tx; its client's other results do
-// not. Call it late in tx, as CompleteTx.
+// not. Call it late in tx, as CompleteTx. On an engine that runs one writer
+// at a time, tx holds every write in the database up until it ends.
 func (c *Client[TTx]) JobRetryOrderingKeyTx(ctx context.Context, tx TTx, queue, orderingKey string) (int, error) {
 	queue = cmp.Or(queue, QueueDefault)
 	exec := c.driver.UnwrapTx(tx)

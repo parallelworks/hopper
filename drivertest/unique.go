@@ -178,7 +178,7 @@ func testInsertUniqueFinishedRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]
 			}
 			done <- res[0]
 		}()
-		waitForLockWait(ctx, t, f, d)
+		f.WaitForLockWait(ctx, t, d)
 		if err := commit(); err != nil {
 			t.Fatal(err)
 		}
