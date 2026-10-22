@@ -71,8 +71,9 @@ bench-sqlite: ## Run the benchmark harness on a SQLite database in a temporary d
 
 .PHONY: cgo-check
 cgo-check: ## Check that hoppersqlite, its tests and every module they import use no cgo
-	@cd driver/hoppersqlite && for os in linux darwin windows freebsd openbsd netbsd; do \
-		GOOS=$$os CGO_ENABLED=0 go vet ./... || exit 1; \
-		pkgs=$$(GOOS=$$os CGO_ENABLED=1 go list -deps -test -f '{{if and .CgoFiles (not .Standard)}}{{.ImportPath}}{{end}}' ./...) || exit 1; \
-		if [ -n "$$pkgs" ]; then echo "cgo is not allowed, but these packages use it on $$os:"; echo "$$pkgs"; exit 1; fi; \
+	@cd driver/hoppersqlite && for target in linux/amd64 linux/386 linux/arm darwin/arm64 windows/amd64 freebsd/amd64 openbsd/amd64 netbsd/amd64; do \
+		export GOOS=$${target%/*} GOARCH=$${target#*/}; \
+		CGO_ENABLED=0 go vet ./... || exit 1; \
+		pkgs=$$(CGO_ENABLED=1 go list -deps -test -f '{{if and .CgoFiles (not .Standard)}}{{.ImportPath}}{{end}}' ./...) || exit 1; \
+		if [ -n "$$pkgs" ]; then echo "cgo is not allowed, but these packages use it on $$target:"; echo "$$pkgs"; exit 1; fi; \
 	done
