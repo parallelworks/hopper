@@ -451,8 +451,36 @@ defined as operations rather than SQL:
   another connection committed. Retention is a batched `DELETE`; stream events commit
   in append order, so a position is an event's sequence number. The database must be on
   a local filesystem, where SQLite's locks hold: `Open` refuses one on NFS, SMB, Lustre,
-  GPFS, FUSE and the like. Its migrations follow `hoppermigrate`'s versions one for one
-  (`driver.MigrationScripts`).
+  GPFS, FUSE, a virtual machine's shared folders and the like, checking where symbolic
+  links in the path lead, since SQLite follows them. Its migrations follow
+  `hoppermigrate`'s versions one for one (`driver.MigrationScripts`), and
+  `hoppersqlite.Migrations` returns them for other tools.
+
+  What a single writer costs, and how the driver keeps it from failing silently:
+  - A transaction held open holds up every client that shares the database, their
+    lease renewals included. A renewal waits until the lease it renews would expire,
+    then logs who holds the lock and tries again; a transaction held for longer than
+    about the lease therefore costs every client its lease, and their running jobs are
+    rescued.
+  - A worker that writes on the pool while its own transaction holds the lock would
+    wait for itself until its context ended. The core marks each attempt's context with
+    its owner (`driver.WithOwner`), and the driver refuses at once such a write
+    (`ErrLockHeldByOwner`).
+  - After some errors (an interrupted write, a full disk, an I/O error) SQLite rolls the
+    whole transaction back itself and would run its later statements on their own. The
+    driver learns of it from SQLite's rollback hook and refuses the transaction's later
+    statements and its commit (`ErrTransactionAborted`), as Postgres refuses those of an
+    aborted transaction, so `CompleteTx` stays all or nothing.
+  - JSON is stored as given rather than normalized as jsonb is, and refused for what
+    jsonb refuses (a `\u0000` escape, text that is not UTF-8, a number beyond numeric's
+    range); a metadata filter's `@>` is a SQL function that matches as jsonb's does.
+  - There is no `COPY`, so bulk inserts take the one insert path, and there are no SQL
+    functions for producers outside Go. Job IDs are minted in Go (§6.1).
+  - `JobsMaintain` refreshes statistics but never vacuums, so the file keeps the space
+    of deleted rows for SQLite to reuse; it truncates the write-ahead log once a reader
+    that held up checkpoints is done, and each connection cuts the log back to 32MiB
+    whenever a checkpoint empties it.
+  - `Open` waits for the database at most 30 seconds; `OpenContext` takes a context.
 - **MongoDB** claims with atomic `findOneAndUpdate` or `updateMany` (tagging a batch
   with a claim token, then reading it back). It uses `$$NOW` for server time, change
   streams for notifications, and TTL indexes or dropped collections for retention.
@@ -653,9 +681,10 @@ index inserts stay local like a sequence.
   On Postgres 18 and later it calls the built-in `uuidv7()`. On 14–17 it is a SQL
   function that builds a v7 UUID from `clock_timestamp()` and the built-in
   `gen_random_uuid()`. Generation therefore works the same for Go inserts, `COPY`
-  and the SQL contract, and hopper's Go code needs no random number generator or
-  cryptography. Engines without a database-side generator (MongoDB) generate IDs in
-  the driver.
+  and the SQL contract, and the core's Go code needs no random number generator or
+  cryptography. Engines without a database-side generator generate IDs in the driver:
+  hoppersqlite mints UUIDv7s in Go, from the database's clock and `crypto/rand`, and
+  MongoDB's driver will too.
 - **Ordering uses `seq`, not the ID.** Several IDs created in the same millisecond
   are not guaranteed to sort in insertion order on every Postgres version. An
   internal identity column, `seq`, provides the tie-break for claim order and for
@@ -690,8 +719,11 @@ there is **no scheduler loop** moving jobs between states.
 All time comparisons use the database's `now()`, never the application clock, so clock
 skew between pods cannot cause early or duplicate execution. SQLite's clock is the host's,
 which every process that opens the database shares, since it must be on a local
-filesystem: hoppersqlite reads it once a transaction holds the write lock, so each write's
-time is no earlier than the writes before it.
+filesystem: hoppersqlite reads it once a transaction holds the write lock, and never
+returns a time earlier than one it returned before in the process, so each write's time
+is no earlier than the writes before it even when the host's clock is stepped back. A
+host that sleeps finds its clock moved on when it wakes, as a server's would, and its
+clients' leases expired.
 
 ### 7.2 Insert
 - **Single and small batches:** one `INSERT … SELECT FROM unnest($kinds, $args, …)
