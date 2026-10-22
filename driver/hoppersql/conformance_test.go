@@ -22,8 +22,11 @@ import (
 )
 
 // sqlFixture runs the conformance suite against hoppersql, through pgx's
-// database/sql adapter.
-type sqlFixture struct{}
+// database/sql adapter. Its hooks are statements on hopper's schema
+// (drivertest.Postgres), which sqlSQL runs on the driver's database handle.
+type sqlFixture struct{ drivertest.Postgres[*sql.Tx] }
+
+func newFixture() sqlFixture { return sqlFixture{drivertest.Postgres[*sql.Tx]{SQL: sqlSQL{}}} }
 
 // open returns a database/sql handle on the pool's schema.
 func open(t *testing.T, pool *pgxpool.Pool) *sql.DB {
@@ -47,45 +50,17 @@ func (sqlFixture) Begin(ctx context.Context, t *testing.T, d driver.Driver[*sql.
 	return tx, tx.Commit, tx.Rollback
 }
 
-func exec(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) {
-	t.Helper()
-	if _, err := d.(*hoppersql.Driver).DB().ExecContext(ctx, query, args...); err != nil {
-		t.Fatal(err)
-	}
-}
+// sqlSQL runs the suite's statements on a driver's database handle.
+type sqlSQL struct{}
 
-func (sqlFixture) ExpireLease(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], clientID int64) {
-	exec(ctx, t, d, "UPDATE hopper_clients SET expires_at = now() - interval '1s' WHERE id = $1", clientID)
-}
-
-func (sqlFixture) ExpireLeader(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) {
-	exec(ctx, t, d, "UPDATE hopper_leader SET expires_at = now() - interval '1s'")
-}
-
-func (sqlFixture) MakeClaimable(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET scheduled_at = now() WHERE id = $1", id)
-}
-
-func (sqlFixture) AgeAttempt(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID, age time.Duration) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET attempted_at = now() - make_interval(secs => $2) WHERE id = $1", id, age.Seconds())
-}
-
-func (sqlFixture) CountLive(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
-	return count(ctx, t, d, "hopper_jobs")
-}
-
-func (sqlFixture) CountHistory(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
-	return count(ctx, t, d, "hopper_job_history")
-}
-
-func (sqlFixture) Exec(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) {
+func (sqlSQL) Exec(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) {
 	t.Helper()
 	if _, err := d.(*hoppersql.Driver).DB().ExecContext(ctx, query, args...); err != nil {
 		t.Error(err)
 	}
 }
 
-func (sqlFixture) QueryText(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) string {
+func (sqlSQL) QueryText(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) string {
 	t.Helper()
 	var s string
 	if err := d.(*hoppersql.Driver).DB().QueryRowContext(ctx, query, args...).Scan(&s); err != nil {
@@ -94,18 +69,14 @@ func (sqlFixture) QueryText(ctx context.Context, t *testing.T, d driver.Driver[*
 	return s
 }
 
-func count(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], table string) int {
-	t.Helper()
-	var n int
-	if err := d.(*hoppersql.Driver).DB().QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	return n
-}
-
 func TestConformance(t *testing.T) {
 	t.Parallel()
-	drivertest.Run(t, sqlFixture{})
+	drivertest.Run(t, newFixture())
+}
+
+func TestConformancePostgres(t *testing.T) {
+	t.Parallel()
+	drivertest.RunPostgres(t, newFixture())
 }
 
 // TestMigrate applies and reverts the schema through the database/sql

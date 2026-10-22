@@ -380,7 +380,7 @@ func indexOf(s, sub string) int {
 // partition, including ones a canceled build left invalid, while leaders
 // overlap and history is read throughout: no attach may deadlock with a
 // reader.
-func testHistoryIndexes[TTx any](t *testing.T, f Fixture[TTx]) {
+func testHistoryIndexes[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -601,7 +601,7 @@ var onceAgain = driver.JobInsertParams{
 }
 
 // reattachRevalidates runs ReattachRevalidates on the fixture's database.
-func reattachRevalidates[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx]) bool {
+func reattachRevalidates[TTx any](ctx context.Context, t *testing.T, f PostgresFixture[TTx], d driver.Driver[TTx]) bool {
 	t.Helper()
 	return ReattachRevalidates(
 		func(query string) { f.Exec(ctx, t, d, query) },
@@ -634,7 +634,7 @@ func ReattachRevalidates(exec func(query string), queryText func(query string) s
 // partitions an outcome table's index lacks, after a schema upgrade
 // declared it: the index must end valid, which nothing can do afterwards on
 // releases before May 2026.
-func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f Fixture[TTx]) {
+func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -1116,7 +1116,7 @@ func testMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 // the table has statistics, the planner takes each lookup of a job's edges
 // for a two-hundredth of the table, and finalizes and the promotion sweep
 // scan it instead.
-func testDepsTableMaintained[TTx any](t *testing.T, f Fixture[TTx]) {
+func testDepsTableMaintained[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
@@ -1209,7 +1209,7 @@ func waitMaintain(ctx context.Context, t *testing.T, exec driver.Executor, done 
 // past retention needs that transaction to end; maintenance puts the drop
 // off instead of waiting for it, which would queue every other history
 // write behind the drop, and drops it once the transaction is over.
-func testHistoryMaintainWhileInUse[TTx any](t *testing.T, f Fixture[TTx]) {
+func testHistoryMaintainWhileInUse[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()

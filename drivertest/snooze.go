@@ -12,11 +12,11 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
-// storedReason reads the snooze_reason column itself, which the driver's
+// storedReason reads the stored snooze reason itself, which the driver's
 // reads show only for a scheduled job.
 func storedReason[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx], id driver.JobID) string {
 	t.Helper()
-	return f.QueryText(ctx, t, d, "SELECT coalesce(snooze_reason, '') FROM hopper_jobs WHERE id = $1::uuid", id.String())
+	return f.SnoozeReason(ctx, t, d, id)
 }
 
 // leaveReason writes a reason on a job directly, as a client of the
@@ -24,7 +24,7 @@ func storedReason[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d 
 // leaves one on a running or retrying job.
 func leaveReason[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx], id driver.JobID) {
 	t.Helper()
-	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET snooze_reason = 'left behind' WHERE id = $1::uuid", id.String())
+	f.SetSnoozeReason(ctx, t, d, id, "left behind")
 }
 
 func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
@@ -155,7 +155,7 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 		t.Fatal(err)
 	}
 	snooze("fifth")
-	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = now() - interval '1s' WHERE id = $1::uuid", id.String())
+	f.ExpireJob(ctx, t, d, id)
 	expired, err := exec.JobDiscardExpired(ctx, 10)
 	if err != nil || len(expired) != 1 || expired[0].Errors[len(expired[0].Errors)-1].Error != "hopper: expired while snoozed: fifth" {
 		t.Errorf("expired = %+v, %v", expired, err)
@@ -200,13 +200,14 @@ func testSnoozeReasonConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				}
 				// Only this client finalizes the jobs it holds, so what the
 				// claim cleared stays cleared until then.
-				ids := make([]string, len(res.Jobs))
-				for i, j := range res.Jobs {
-					ids[i] = j.ID.String()
+				left := 0
+				for _, j := range res.Jobs {
+					if f.SnoozeReason(ctx, t, d, j.ID) != "" {
+						left++
+					}
 				}
-				if left := f.QueryText(ctx, t, d, "SELECT count(snooze_reason)::text FROM hopper_jobs WHERE id = ANY($1::text[]::uuid[])",
-					"{"+strings.Join(ids, ",")+"}"); left != "0" {
-					t.Errorf("claim left snooze reasons on %s of the jobs it took", left)
+				if left != 0 {
+					t.Errorf("claim left snooze reasons on %d of the jobs it took", left)
 				}
 				results := make([]driver.JobFinalize, 0, 2*len(res.Jobs))
 				for i, j := range res.Jobs {

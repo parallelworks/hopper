@@ -13,8 +13,11 @@
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
 // fencing to the claim (also inside a caller's transaction), snooze reasons, leases, leader election, rescue candidates,
 // cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
-// notifications and history maintenance. Engine-specific behavior, such as how partitions are managed,
-// belongs in the driver's own tests.
+// notifications and history maintenance. What depends on whether the engine
+// locks rows or runs one writer at a time (driver.Capabilities.SingleWriter)
+// is tested either way. Engine-specific behavior, such as how partitions are
+// managed, belongs in the driver's own tests; RunPostgres has the tests of
+// what hopper's Postgres drivers share.
 package drivertest
 
 import (
@@ -23,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +34,9 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
-// Fixture gives the suite a database per test and the hooks it needs.
+// Fixture gives the suite a database per test and the hooks it needs. The
+// hooks report a failure with t.Error rather than t.Fatal when the suite may
+// call them from another goroutine, as SnoozeReason says.
 type Fixture[TTx any] interface {
 	// NewDriver returns a driver on a fresh database with hopper's schema
 	// installed, torn down when the test ends.
@@ -49,14 +55,31 @@ type Fixture[TTx any] interface {
 	// CountLive and CountHistory count jobs in the live table and in history.
 	CountLive(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
 	CountHistory(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
-	// Exec runs a SQL statement with hopper's tables on the search path, for
-	// rows the suite writes directly, such as those a client of the previous
-	// release leaves behind. QueryText returns the single text value a query
-	// selects, for what the driver's reads do not show. Both report a failure
-	// with t.Error rather than t.Fatal, so the suite may call them from any
-	// goroutine.
-	Exec(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any)
-	QueryText(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any) string
+	// ExpireJob moves a live job's TTL deadline a second into the past.
+	ExpireJob(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
+	// StaleWake marks a running job as woken by JobRetryOrderingKey a second
+	// before its attempt began, as a wake during an earlier attempt would.
+	StaleWake(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
+	// MakePending puts a live job back in the pending state, as a client
+	// that stopped before promoting it would leave it.
+	MakePending(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
+	// SnoozeReason reads a live job's stored snooze reason, or "" for none,
+	// which the driver's reads show only for a scheduled job. The suite
+	// calls it from any goroutine. SetSnoozeReason stores one, as a client
+	// of an earlier release, which cleared it neither on claim nor on
+	// finalize, can leave it on a job that is not snoozed.
+	SnoozeReason(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) string
+	SetSnoozeReason(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID, reason string)
+	// SetProgress stores a JSON value as a live job's progress as it is, as
+	// a direct SQL write could.
+	SetProgress(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID, value string)
+	// CountEdges counts the dependency edges the engine keeps for workflow
+	// jobs that have not finished.
+	CountEdges(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
+	// WaitForLockWait waits until a statement on the driver's database
+	// waits for a lock another transaction holds, so that a test knows its
+	// competing statement is blocked rather than not yet started.
+	WaitForLockWait(ctx context.Context, t *testing.T, d driver.Driver[TTx])
 }
 
 // Run runs the suite.
@@ -73,17 +96,6 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"InsertCopy", testInsertCopy[TTx]},
 		{"JobTags", testJobTags[TTx]},
 		{"JobListFilters", testJobListFilters[TTx]},
-		{"TagsRowsFollowJobs", testTagsRowsFollowJobs[TTx]},
-		{"TagsTableMaintained", testTagsTableMaintained[TTx]},
-		{"TagsTableMaintainedPastJobsError", testTagsTableMaintainedPastJobsError[TTx]},
-		{"TagsFollowHistoryRetention", testTagsFollowHistoryRetention[TTx]},
-		{"TagsPartitionWaitsForHistory", testTagsPartitionWaitsForHistory[TTx]},
-		{"TagsLeaveWithTheirHour", testTagsLeaveWithTheirHour[TTx]},
-		{"TagsHourOutlastsItsDelete", testTagsHourOutlastsItsDelete[TTx]},
-		{"TagsHourDroppedMeanwhile", testTagsHourDroppedMeanwhile[TTx]},
-		{"TagsDayGoesWithItsLastHour", testTagsDayGoesWithItsLastHour[TTx]},
-		{"TagsFollowDirectUpdates", testTagsFollowDirectUpdates[TTx]},
-		{"TagsFollowTruncate", testTagsFollowTruncate[TTx]},
 		{"TagsPagePastFilteredHistory", testTagsPagePastFilteredHistory[TTx]},
 		{"InsertTx", testInsertTx[TTx]},
 		{"Claim", testClaim[TTx]},
@@ -128,9 +140,6 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Stats", testStats[TTx]},
 		{"Notify", testNotify[TTx]},
 		{"HistoryMaintain", testHistoryMaintain[TTx]},
-		{"HistoryMaintainWhileInUse", testHistoryMaintainWhileInUse[TTx]},
-		{"HistoryIndexes", testHistoryIndexes[TTx]},
-		{"HistoryRetentionCompletesIndex", testHistoryRetentionCompletesIndex[TTx]},
 		{"Now", testNow[TTx]},
 		{"Subscriptions", testSubscriptions[TTx]},
 		{"Publish", testPublish[TTx]},
@@ -146,7 +155,62 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"WorkflowFanInConcurrent", testWorkflowFanInConcurrent[TTx]},
 		{"WorkflowsConcurrent", testWorkflowsConcurrent[TTx]},
 		{"Streams", testStreams[TTx]},
+		{"StreamsRetention", testStreamsRetention[TTx]},
 		{"Maintain", testMaintain[TTx]},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tc.fn(t, f)
+		})
+	}
+}
+
+// PostgresFixture is the Fixture of one of hopper's Postgres drivers, which
+// can also run SQL on hopper's schema. RunPostgres runs, with it, the tests
+// of what those drivers share beyond the driver interface: history's
+// partitions and their indexes, the tags tables and their triggers, the rows
+// clients of earlier releases leave, and the planner statistics the leader
+// keeps.
+type PostgresFixture[TTx any] interface {
+	Fixture[TTx]
+	// Exec runs a SQL statement with hopper's tables on the search path, for
+	// rows the suite writes directly, such as those a client of the previous
+	// release leaves behind. QueryText returns the single text value a query
+	// selects, for what the driver's reads do not show. Both report a
+	// failure with t.Error rather than t.Fatal, so the suite may call them
+	// from any goroutine.
+	Exec(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any)
+	QueryText(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any) string
+}
+
+// RunPostgres runs the tests of what hopper's Postgres drivers share, which
+// a Postgres driver passes besides Run's.
+func RunPostgres[TTx any](t *testing.T, f PostgresFixture[TTx]) {
+	t.Helper()
+	tests := []struct {
+		name string
+		fn   func(*testing.T, PostgresFixture[TTx])
+	}{
+		{"JobTagsStored", testJobTagsStored[TTx]},
+		{"TagsRowsFollowJobs", testTagsRowsFollowJobs[TTx]},
+		{"TagsTableMaintained", testTagsTableMaintained[TTx]},
+		{"TagsTableMaintainedPastJobsError", testTagsTableMaintainedPastJobsError[TTx]},
+		{"TagsFollowHistoryRetention", testTagsFollowHistoryRetention[TTx]},
+		{"TagsPartitionWaitsForHistory", testTagsPartitionWaitsForHistory[TTx]},
+		{"TagsLeaveWithTheirHour", testTagsLeaveWithTheirHour[TTx]},
+		{"TagsHourOutlastsItsDelete", testTagsHourOutlastsItsDelete[TTx]},
+		{"TagsHourDroppedMeanwhile", testTagsHourDroppedMeanwhile[TTx]},
+		{"TagsDayGoesWithItsLastHour", testTagsDayGoesWithItsLastHour[TTx]},
+		{"TagsFollowDirectUpdates", testTagsFollowDirectUpdates[TTx]},
+		{"TagsFollowTruncate", testTagsFollowTruncate[TTx]},
+		{"JobLogsStored", testJobLogsStored[TTx]},
+		{"RetryOrderingKeyAgingOrder", testRetryOrderingKeyAgingOrder[TTx]},
+		{"BatchProgressRaces", testBatchProgressRaces[TTx]},
+		{"StreamsPartitioned", testStreamsPartitioned[TTx]},
+		{"HistoryMaintainWhileInUse", testHistoryMaintainWhileInUse[TTx]},
+		{"HistoryIndexes", testHistoryIndexes[TTx]},
+		{"HistoryRetentionCompletesIndex", testHistoryRetentionCompletesIndex[TTx]},
 		{"DepsTableMaintained", testDepsTableMaintained[TTx]},
 	}
 	for _, tc := range tests {
@@ -154,6 +218,174 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 			t.Parallel()
 			tc.fn(t, f)
 		})
+	}
+}
+
+// Postgres implements a PostgresFixture's hooks that are statements on
+// hopper's Postgres schema, for the fixtures of hopper's Postgres drivers to
+// embed, which then implement only NewDriver, Begin and SQL.
+type Postgres[TTx any] struct {
+	// SQL runs statements on a driver's database, as PostgresFixture's Exec
+	// and QueryText describe.
+	SQL interface {
+		Exec(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any)
+		QueryText(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any) string
+	}
+}
+
+// Exec implements PostgresFixture.
+func (p Postgres[TTx]) Exec(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, query, args...)
+}
+
+// QueryText implements PostgresFixture.
+func (p Postgres[TTx]) QueryText(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string, args ...any) string {
+	t.Helper()
+	return p.SQL.QueryText(ctx, t, d, query, args...)
+}
+
+// ExpireLease implements Fixture.
+func (p Postgres[TTx]) ExpireLease(ctx context.Context, t *testing.T, d driver.Driver[TTx], clientID int64) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_clients SET expires_at = now() - interval '1s' WHERE id = $1", clientID)
+}
+
+// ExpireLeader implements Fixture.
+func (p Postgres[TTx]) ExpireLeader(ctx context.Context, t *testing.T, d driver.Driver[TTx]) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_leader SET expires_at = now() - interval '1s'")
+}
+
+// MakeClaimable implements Fixture.
+func (p Postgres[TTx]) MakeClaimable(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_jobs SET scheduled_at = now() WHERE id = $1::uuid", id.String())
+}
+
+// AgeAttempt implements Fixture.
+func (p Postgres[TTx]) AgeAttempt(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID, age time.Duration) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_jobs SET attempted_at = now() - make_interval(secs => $2::float8) WHERE id = $1::uuid", id.String(), age.Seconds())
+}
+
+// CountLive implements Fixture.
+func (p Postgres[TTx]) CountLive(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int {
+	t.Helper()
+	return p.count(ctx, t, d, "SELECT count(*)::text FROM hopper_jobs")
+}
+
+// CountHistory implements Fixture.
+func (p Postgres[TTx]) CountHistory(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int {
+	t.Helper()
+	return p.count(ctx, t, d, "SELECT count(*)::text FROM hopper_job_history")
+}
+
+// ExpireJob implements Fixture.
+func (p Postgres[TTx]) ExpireJob(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = now() - interval '1s' WHERE id = $1::uuid", id.String())
+}
+
+// StaleWake implements Fixture.
+func (p Postgres[TTx]) StaleWake(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_jobs SET wake_requested_at = attempted_at - interval '1s' WHERE id = $1::uuid", id.String())
+}
+
+// MakePending implements Fixture.
+func (p Postgres[TTx]) MakePending(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_jobs SET state = 'pending' WHERE id = $1::uuid", id.String())
+}
+
+// SnoozeReason implements Fixture.
+func (p Postgres[TTx]) SnoozeReason(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) string {
+	t.Helper()
+	return p.SQL.QueryText(ctx, t, d, "SELECT coalesce(snooze_reason, '') FROM hopper_jobs WHERE id = $1::uuid", id.String())
+}
+
+// SetSnoozeReason implements Fixture.
+func (p Postgres[TTx]) SetSnoozeReason(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID, reason string) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_jobs SET snooze_reason = $2 WHERE id = $1::uuid", id.String(), reason)
+}
+
+// SetProgress implements Fixture.
+func (p Postgres[TTx]) SetProgress(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID, value string) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_jobs SET progress = $2::jsonb WHERE id = $1::uuid", id.String(), value)
+}
+
+// CountEdges implements Fixture.
+func (p Postgres[TTx]) CountEdges(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int {
+	t.Helper()
+	return p.count(ctx, t, d, "SELECT count(*)::text FROM hopper_job_deps")
+}
+
+// WaitForLockWait implements Fixture: a statement on the driver's schema,
+// whose name is in every statement's text, waits for a lock.
+func (p Postgres[TTx]) WaitForLockWait(ctx context.Context, t *testing.T, d driver.Driver[TTx]) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for p.SQL.QueryText(ctx, t, d, `SELECT count(*)::text FROM pg_stat_activity
+		WHERE wait_event_type = 'Lock' AND position(current_schema() IN query) > 0 AND pid <> pg_backend_pid()`) == "0" {
+		if time.Now().After(deadline) {
+			t.Fatal("no statement started waiting for a lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (p Postgres[TTx]) count(ctx context.Context, t *testing.T, d driver.Driver[TTx], query string) int {
+	t.Helper()
+	n, err := strconv.Atoi(p.SQL.QueryText(ctx, t, d, query))
+	if err != nil {
+		t.Error(err)
+	}
+	return n
+}
+
+// singleWriter reports whether d's engine runs one writing transaction at a
+// time.
+func singleWriter[TTx any](d driver.Driver[TTx]) bool { return d.Capabilities().SingleWriter }
+
+// jsonEqual reports whether two JSON texts hold the same value: an engine
+// need not keep the text as given (Postgres's jsonb orders an object's keys
+// and spaces them), only the value.
+func jsonEqual(got []byte, want string) bool {
+	var a, b any
+	if json.Unmarshal(got, &a) != nil || json.Unmarshal([]byte(want), &b) != nil {
+		return false
+	}
+	return fmt.Sprint(normalizeJSON(a)) == fmt.Sprint(normalizeJSON(b))
+}
+
+// normalizeJSON gives a decoded JSON value a printed form that does not
+// depend on its object's key order.
+func normalizeJSON(v any) any {
+	switch v := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		out := make([]string, len(keys))
+		for i, k := range keys {
+			out[i] = strconv.Quote(k) + ":" + fmt.Sprint(normalizeJSON(v[k]))
+		}
+		return "{" + strings.Join(out, ",") + "}"
+	case []any:
+		out := make([]string, len(v))
+		for i, e := range v {
+			out[i] = fmt.Sprint(normalizeJSON(e))
+		}
+		return "[" + strings.Join(out, ",") + "]"
+	case string:
+		return strconv.Quote(v)
+	default:
+		return v
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -111,25 +110,16 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 
 	// A snooze that logs nothing leaves a job without logs as it is, and
 	// takes one whose only log is a snooze's back to none.
-	noLogs := func(what string) {
-		t.Helper()
-		if got := f.QueryText(ctx, t, d, "SELECT coalesce(logs::text, 'NULL') FROM hopper_jobs WHERE id = $1::uuid", other.String()); got != "NULL" {
-			t.Errorf("logs %s = %s, want NULL", what, got)
-		}
-	}
 	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
-	noLogs("after a snooze that logged nothing")
-	attempt, err := strconv.Atoi(f.QueryText(ctx, t, d, "SELECT attempt::text FROM hopper_jobs WHERE id = $1::uuid", other.String()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	check("after a snooze that logged nothing", logs(other))
+	attempt := get(ctx, t, exec, other).Attempt
 	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: &driver.AttemptLog{Attempt: attempt + 1, Log: "x\n"}}, 2, false)
 	run(other, driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true}, 2, false)
-	noLogs("after a snooze that logged nothing removed the only log")
+	check("after a snooze that logged nothing removed the only log", logs(other))
 
 	// An expired job takes its logs to history too.
 	run(other, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "x"}, Log: &a1}, 2, false)
-	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = now() - interval '1s' WHERE id = $1::uuid", other.String())
+	f.ExpireJob(ctx, t, d, other)
 	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 1 || expired[0].ID != other {
 		t.Fatalf("expired = %v, %v", expired, err)
 	}
@@ -138,6 +128,34 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	if _, err := exec.JobLogs(ctx, driver.JobID{9}); !errors.Is(err, driver.ErrNotFound) {
 		t.Errorf("JobLogs of an unknown job = %v", err)
 	}
+}
+
+// testJobLogsStored checks how the logs column is kept: a snooze that logs
+// nothing leaves a job without logs as it is, stored as NULL rather than
+// rewritten, and takes one whose only log is a snooze's back to NULL.
+func testJobLogsStored[TTx any](t *testing.T, f PostgresFixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+	clientID := register(ctx, t, exec)
+	snooze := func(log *driver.AttemptLog) {
+		t.Helper()
+		f.MakeClaimable(ctx, t, d, id)
+		j := claimOne(ctx, t, exec, clientID, id)
+		finalize(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateScheduled, Snooze: true, Log: log})
+	}
+	noLogs := func(what string) {
+		t.Helper()
+		if got := f.QueryText(ctx, t, d, "SELECT coalesce(logs::text, 'NULL') FROM hopper_jobs WHERE id = $1::uuid", id.String()); got != "NULL" {
+			t.Errorf("logs %s = %s, want NULL", what, got)
+		}
+	}
+	snooze(nil)
+	noLogs("after a snooze that logged nothing")
+	snooze(&driver.AttemptLog{Attempt: 1, Log: "x\n"})
+	snooze(nil)
+	noLogs("after a snooze that logged nothing removed the only log")
 }
 
 // testJobLogsFenced finalizes a job from its attempt and, concurrently,
