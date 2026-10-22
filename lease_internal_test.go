@@ -81,3 +81,34 @@ func TestRenewalWaitsUntilTheLeaseExpires(t *testing.T) {
 		}
 	})
 }
+
+// TestRenewalBoundMovesWithRenewals checks the common case: each renewal
+// that succeeds moves the bound, so a renewal held up after two that
+// succeeded is given until the lease the last of them took expires.
+func TestRenewalBoundMovesWithRenewals(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		exec := &leaseExec{renew: true}
+		tun := defaultTuning.withLease(15 * time.Second) // renewals every 5s
+		c := &Client[struct{}]{exec: exec, logger: slog.New(slog.DiscardHandler), tuning: tun}
+		if _, err := c.register(ctx); err != nil { // the lease from 0s
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() { defer close(done); c.leaseLoop(ctx) }()
+
+		time.Sleep(12 * time.Second) // renewed at 5s and 10s
+		exec.setRenew(false)
+		// The renewal at 15s is held, and given until 25s, when the lease
+		// renewed at 10s expires.
+		time.Sleep(5 * time.Second)
+		cancel()
+		<-done
+		exec.mu.Lock()
+		defer exec.mu.Unlock()
+		if want := []time.Duration{10 * time.Second, 10 * time.Second, 10 * time.Second}; !slices.Equal(exec.waits, want) {
+			t.Errorf("renewals were given %v, want %v", exec.waits, want)
+		}
+	})
+}

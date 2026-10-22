@@ -46,6 +46,10 @@ func TestMayWrite(t *testing.T) {
 		"VALUES (1)":                                                                       false,
 		"EXPLAIN DELETE FROM t":                                                            false,
 		"SELECT :update, ?1, $delete":                                                      false,
+		"\fDELETE FROM t":                                                                  true,
+		"SELECT 1;\f\fUPDATE t SET x = 1":                                                  true,
+		"WITH d AS (SELECT 1)\fINSERT INTO t SELECT * FROM d":                              true,
+		"\f-- note\n\fREPLACE INTO t VALUES (1)":                                           true,
 	} {
 		if got := mayWrite(query); got != want {
 			t.Errorf("mayWrite(%q) = %v, want %v", query, got, want)

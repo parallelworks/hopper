@@ -48,7 +48,9 @@
 //     on Postgres. An error that SQLite undoes only the statement of, such
 //     as a constraint's, leaves the transaction open, where Postgres would
 //     abort it. A COMMIT, END or ROLLBACK statement run in a transaction
-//     ends it: its later statements fail with sql.ErrTxDone.
+//     ends it: its later statements fail with sql.ErrTxDone. In a read-only
+//     transaction SQLite tells nothing of a COMMIT, and the statements
+//     after it, reads all, run on their own.
 //   - The database must be on a local filesystem: Open refuses one on a
 //     network filesystem, or a virtual machine's shared folder, with
 //     ErrNetworkFilesystem, checking where symbolic links in the path

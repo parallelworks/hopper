@@ -536,7 +536,7 @@ func (c *conn) leave(err error) {
 		t.aborted = err
 	case c.rolledBack:
 		t.endedBy = "a ROLLBACK statement"
-	case c.committed:
+	case c.committed && err == nil:
 		t.endedBy, t.committed = "a COMMIT statement", true
 	}
 }
@@ -709,7 +709,8 @@ func sqlTokens(q string) [][]string {
 			}
 			cur = append(cur, strings.ToUpper(q[i:j]))
 			i = j
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+		case c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r':
+			// SQLite's whitespace; a vertical tab is not, and fails to prepare.
 			i++
 		default:
 			cur = append(cur, string(c))
