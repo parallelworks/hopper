@@ -56,7 +56,8 @@ func RecordStep[T JobArgs](ctx context.Context, job *Job[T], step string, cursor
 // (driver.Capabilities.SingleWriter, SQLite), tx holds the whole database
 // for writes from its first statement until it ends: every other write
 // waits for it, lease renewals included, and a write of the worker's own
-// on the pool fails rather than wait for tx.
+// on the pool fails rather than wait for tx, provided tx was begun with the
+// worker's ctx.
 func RecordStepTx[TTx any, T JobArgs](ctx context.Context, tx TTx, job *Job[T], step string, cursor any) error {
 	return record(ctx, job, func() (driver.Executor, error) { return txExecutor(ctx, tx, job.ID) }, step, false, cursor)
 }

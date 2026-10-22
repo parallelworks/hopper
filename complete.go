@@ -42,7 +42,9 @@ var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt"
 // (driver.Capabilities.SingleWriter, SQLite), tx holds the whole database
 // for writes from its first statement until it ends: every other write
 // waits for it, the results of other jobs and lease renewals included, and
-// a write of the worker's own on the pool fails rather than wait for tx.
+// a write of the worker's own on the pool fails rather than wait for tx,
+// provided tx was begun with the worker's ctx (or one derived from it),
+// which names the job's attempt.
 //
 //	func (w *Worker) Work(ctx context.Context, job *hopper.Job[Args]) error {
 //		tx, err := w.pool.Begin(ctx)

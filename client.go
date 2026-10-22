@@ -35,6 +35,10 @@ type Client[TTx any] struct {
 	// clientID is the lease row ID while running. It changes if the lease is
 	// lost and re-registered.
 	clientID atomic.Int64
+	// leaseFrom is when the current lease was last taken or renewed, as
+	// register and the lease loop saw it: its expiry bounds a renewal's
+	// wait.
+	leaseFrom atomic.Pointer[time.Time]
 
 	mu    sync.Mutex
 	state clientState
@@ -330,6 +334,7 @@ func (c *Client[TTx]) declare(ctx context.Context) error {
 }
 
 func (c *Client[TTx]) register(ctx context.Context) (int64, error) {
+	start := time.Now()
 	info, _ := json.Marshal(map[string]any{
 		"pid":    os.Getpid(),
 		"queues": slices.Sorted(maps.Keys(c.cfg.Queues)),
@@ -342,6 +347,7 @@ func (c *Client[TTx]) register(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("hopper: register client: %w", err)
 	}
+	c.leaseFrom.Store(&start)
 	return id, nil
 }
 
@@ -504,7 +510,6 @@ func (c *Client[TTx]) wakeQueue(queue string) {
 func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaseRenew)
 	defer ticker.Stop()
-	renewed := time.Now() // the lease was taken just before the loop starts
 	for {
 		select {
 		case <-ctx.Done():
@@ -513,7 +518,7 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		}
 		id := c.clientID.Load()
 		start := time.Now()
-		rctx, cancel := context.WithTimeout(ctx, max(time.Until(renewed.Add(c.tuning.leaseTTL)), c.tuning.leaseRenew))
+		rctx, cancel := context.WithTimeout(ctx, c.renewalWait())
 		res, err := c.exec.ClientRenew(rctx, driver.ClientRenewParams{ClientID: id, TTL: c.tuning.leaseTTL})
 		cancel()
 		if err != nil {
@@ -523,11 +528,10 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 			continue
 		}
 		if !res.Renewed {
-			c.fence(ctx, id)
-			renewed = time.Now()
+			c.fence(ctx, id) // which registers again, and so records the new lease
 			continue
 		}
-		renewed = start
+		c.leaseFrom.Store(&start)
 		// Control state rides along with every renewal, in case a
 		// notification was missed.
 		for _, jobID := range res.CancelRequested {
@@ -536,6 +540,16 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		c.applyPaused(res.PausedQueues)
 		c.applyLimited(res.LimitedQueues)
 	}
+}
+
+// renewalWait is how long a renewal may wait: until the lease would expire,
+// and at least one renewal interval.
+func (c *Client[TTx]) renewalWait() time.Duration {
+	wait := c.tuning.leaseRenew
+	if from := c.leaseFrom.Load(); from != nil {
+		wait = max(wait, time.Until(from.Add(c.tuning.leaseTTL)))
+	}
+	return wait
 }
 
 // limitedQueues reads which queues have limits.
