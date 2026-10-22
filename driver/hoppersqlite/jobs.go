@@ -651,7 +651,7 @@ func (e *executor) JobCancel(ctx context.Context, id driver.JobID) (*driver.JobR
 
 // txOf returns the transaction a write runs in, for a read within it.
 func txOf(x *w) *sql.Tx {
-	tx, _ := x.querier.(*sql.Tx)
+	tx, _ := x.q.(*sql.Tx)
 	return tx
 }
 

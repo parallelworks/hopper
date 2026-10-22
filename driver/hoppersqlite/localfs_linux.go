@@ -33,9 +33,12 @@ var networkMagic = map[int64]string{
 	0x65735546: "FUSE",
 }
 
+// statfs is unix.Statfs, which tests replace.
+var statfs = unix.Statfs
+
 func networkFilesystem(dir string) (string, error) {
 	var st unix.Statfs_t
-	if err := unix.Statfs(dir, &st); err != nil {
+	if err := statfs(dir, &st); err != nil {
 		return "", err
 	}
 	if name, ok := networkMagic[int64(st.Type)&0xffffffff]; ok { //nolint:unconvert // st.Type is an int32 or a uint32 on some architectures

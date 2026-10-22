@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -42,8 +43,115 @@ func clock() time.Time { return time.Now().UTC().Truncate(time.Microsecond) }
 // its time, read once the lock was taken, so that every write sees a time
 // no earlier than the writes before it.
 type w struct {
-	querier
+	cached
 	now time.Time
+}
+
+// maxStatements bounds the statements a Driver keeps prepared. Listings,
+// whose text varies with their filters, may otherwise add one for each
+// shape of filter.
+const maxStatements = 256
+
+// statements holds a Driver's prepared statements by text. database/sql
+// keeps each prepared on every connection it has run on, and binds it to a
+// transaction's connection with Tx.StmtContext, so SQLite parses each text
+// once a connection, rather than once a run, which cost most of a
+// finalize's time.
+type statements struct {
+	mu sync.Mutex
+	m  map[string]*sql.Stmt
+}
+
+// prepared returns the prepared statement of a query, preparing it on db
+// the first time, or nil for a script of several statements, or once
+// maxStatements are kept.
+func (s *statements) prepared(ctx context.Context, db *sql.DB, query string) (*sql.Stmt, error) {
+	if strings.Contains(query, ";") {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.m[query]; ok {
+		return st, nil
+	}
+	if len(s.m) >= maxStatements {
+		return nil, nil
+	}
+	st, err := db.PrepareContext(ctx, query) //nolint:sqlclosecheck // kept for the Driver's life; Close closes it
+	if err != nil {
+		return nil, err
+	}
+	if s.m == nil {
+		s.m = map[string]*sql.Stmt{}
+	}
+	s.m[query] = st
+	return st, nil
+}
+
+func (s *statements) close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var errs []error
+	for _, st := range s.m {
+		errs = append(errs, st.Close())
+	}
+	s.m = nil
+	return errors.Join(errs...)
+}
+
+// cached runs statements on a querier, the pool or a transaction, through
+// the Driver's prepared statements.
+type cached struct {
+	q querier
+	d *Driver
+}
+
+var _ querier = cached{}
+
+// stmt returns the prepared statement of query bound to the querier, or
+// nil to run the text as it is.
+func (c cached) stmt(ctx context.Context, query string) (*sql.Stmt, error) {
+	st, err := c.d.statements.prepared(ctx, c.d.sqlDB, query)
+	if err != nil || st == nil {
+		return nil, err
+	}
+	if tx, ok := c.q.(*sql.Tx); ok {
+		return tx.StmtContext(ctx, st), nil
+	}
+	return st, nil
+}
+
+func (c cached) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	st, err := c.stmt(ctx, query) //nolint:sqlclosecheck // the cache's, or bound to a transaction that closes it
+	if err != nil {
+		return nil, err
+	}
+	if st == nil {
+		return c.q.ExecContext(ctx, query, args...)
+	}
+	return st.ExecContext(ctx, args...)
+}
+
+func (c cached) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	st, err := c.stmt(ctx, query) //nolint:sqlclosecheck // the cache's, or bound to a transaction that closes it
+	if err != nil {
+		return nil, err
+	}
+	if st == nil {
+		return c.q.QueryContext(ctx, query, args...)
+	}
+	return st.QueryContext(ctx, args...)
+}
+
+// QueryRowContext runs a query that returns at most one row. A statement
+// that fails to prepare reports its error through Scan, as the query's
+// would.
+func (c cached) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	st, err := c.stmt(ctx, query) //nolint:sqlclosecheck // the cache's, or bound to a transaction that closes it
+	if err != nil || st == nil {
+		return c.q.QueryRowContext(ctx, query, args...)
+	}
+	return st.QueryRowContext(ctx, args...)
 }
 
 // us is the write's time in the unit the schema keeps times in.
@@ -67,7 +175,7 @@ func (e *executor) writeBrief(ctx context.Context, fn func(*w) error) error {
 func (e *executor) writeLocking(ctx context.Context, wait time.Duration, fn func(*w) error) (err error) {
 	// The first statement takes the lock, under its own deadline when the
 	// wait is bounded.
-	lock := func(q querier, statement string) error {
+	lock := func(q cached, statement string) error {
 		lctx := ctx
 		if wait > 0 {
 			var cancel context.CancelFunc
@@ -81,7 +189,8 @@ func (e *executor) writeLocking(ctx context.Context, wait time.Duration, fn func
 		return err
 	}
 	if e.tx != nil {
-		if err := lock(e.tx, "SAVEPOINT hopper"); err != nil {
+		q := cached{q: e.tx, d: e.d}
+		if err := lock(q, "SAVEPOINT hopper"); err != nil {
 			return err
 		}
 		defer func() {
@@ -90,10 +199,10 @@ func (e *executor) writeLocking(ctx context.Context, wait time.Duration, fn func
 				err = errors.Join(err, rerr)
 			}
 		}()
-		if err := fn(&w{querier: e.tx, now: clock()}); err != nil {
+		if err := fn(&w{cached: q, now: clock()}); err != nil {
 			return err
 		}
-		_, err := e.tx.ExecContext(ctx, "RELEASE hopper")
+		_, err := q.ExecContext(ctx, "RELEASE hopper")
 		return err
 	}
 	tx, err := e.d.sqlDB.BeginTx(ctx, nil)
@@ -105,10 +214,11 @@ func (e *executor) writeLocking(ctx context.Context, wait time.Duration, fn func
 			err = errors.Join(err, ignoreDone(tx.Rollback()))
 		}
 	}()
-	if err := lock(tx, "SELECT 1"); err != nil {
+	q := cached{q: tx, d: e.d}
+	if err := lock(q, "SELECT 1"); err != nil {
 		return err
 	}
-	if err := fn(&w{querier: tx, now: clock()}); err != nil {
+	if err := fn(&w{cached: q, now: clock()}); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -125,23 +235,23 @@ func ignoreDone(err error) error {
 // on which each statement reads the latest committed state.
 func (e *executor) read() querier {
 	if e.tx != nil {
-		return e.tx
+		return cached{q: e.tx, d: e.d}
 	}
-	return e.d.sqlDB
+	return cached{q: e.d.sqlDB, d: e.d}
 }
 
 // readTx runs fn on one snapshot of the database: the caller's
 // transaction, or a read-only one.
 func (e *executor) readTx(ctx context.Context, fn func(querier) error) (err error) {
 	if e.tx != nil {
-		return fn(e.tx)
+		return fn(cached{q: e.tx, d: e.d})
 	}
 	tx, err := e.d.sqlDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, ignoreDone(tx.Rollback())) }()
-	return fn(tx)
+	return fn(cached{q: tx, d: e.d})
 }
 
 // notifySQL writes a notification. conn.go recognizes the statement by its

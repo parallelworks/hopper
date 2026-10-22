@@ -4,7 +4,9 @@ import (
 	"bytes"
 	sqldriver "database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -279,6 +281,9 @@ func checkJSONFilter(s string) error {
 	if !utf8.ValidString(s) {
 		return fmt.Errorf("the metadata filter is not UTF-8")
 	}
+	if !json.Valid([]byte(s)) {
+		return fmt.Errorf("the metadata filter is not JSON")
+	}
 	if err := checkEscapes(s); err != nil {
 		return err
 	}
@@ -286,10 +291,10 @@ func checkJSONFilter(s string) error {
 	dec.UseNumber()
 	for {
 		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
 		if err != nil {
-			if err.Error() == "EOF" {
-				return nil
-			}
 			return fmt.Errorf("the metadata filter is not JSON: %w", err)
 		}
 		n, ok := tok.(json.Number)

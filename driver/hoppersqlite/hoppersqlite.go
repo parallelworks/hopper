@@ -19,16 +19,15 @@
 //     through SQLite's busy handler. A claim is exclusive without SKIP
 //     LOCKED, and the transaction that finalizes a job settles its batch
 //     and promotes its dependents itself. A finalize with SkipLocked, or a
-//     progress write with NoWait, waits briefly (lockWaitBrief) for a write
-//     lock held elsewhere, and then skips every job, or returns
-//     driver.ErrJobLocked.
+//     progress write with NoWait, waits 100ms for a write lock held
+//     elsewhere, and then skips every job, or returns driver.ErrJobLocked.
 //   - Transactions come from DB, whose connections take the write lock
 //     when a transaction runs its first statement, not when it begins, so
-//     that what it reads is never stale by the time it writes (see
-//     conn.go). A transaction begun read-only takes no lock and may not
-//     write. Within a transaction, write through it (InsertTx and the
-//     like), not through the client: a write on the pool would wait for
-//     the transaction's own lock.
+//     that what it reads is never stale by the time it writes, and so that
+//     beginning one never blocks. A transaction begun read-only takes no
+//     lock and may not write. Within a transaction, write through it
+//     (InsertTx and the like), not through the client: a write on the pool
+//     would wait for the transaction's own lock.
 //   - The database must be on a local filesystem: Open refuses one on a
 //     network filesystem with ErrNetworkFilesystem. Its clock is therefore
 //     the host's, which every process that opens it shares, and the driver
@@ -91,6 +90,7 @@ type Driver struct {
 	sqlDB          *sql.DB
 	db             *database
 	listenInterval time.Duration
+	statements     statements
 }
 
 var _ driver.Driver[*sql.Tx] = (*Driver)(nil)
@@ -160,7 +160,7 @@ func (d *Driver) DB() *sql.DB { return d.sqlDB }
 
 // Close closes the database.
 func (d *Driver) Close() error {
-	err := d.sqlDB.Close()
+	err := errors.Join(d.statements.close(), d.sqlDB.Close())
 	d.db.close()
 	return err
 }

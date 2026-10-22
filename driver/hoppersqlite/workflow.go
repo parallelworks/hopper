@@ -140,39 +140,55 @@ func (e *executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 	return &w, nil
 }
 
+// readySQL selects, of the IDs it is given, the pending jobs none of whose
+// dependencies is still live.
+const readySQL = `SELECT j.id FROM hopper_jobs j
+WHERE j.id IN (%s) AND j.state = 'pending'
+  AND NOT EXISTS (SELECT 1 FROM hopper_job_deps d JOIN hopper_jobs x ON x.id = d.depends_on WHERE d.job_id = j.id)`
+
 // WorkflowPromoteReady implements driver.Executor. The transaction that
-// finalizes a job promotes its dependents itself, so this finds only what
-// a direct write left pending.
+// finalizes a job promotes its dependents itself, so a pass finds only
+// what a direct write left pending: it looks without the write lock, and
+// takes the lock only to promote what it found.
 func (e *executor) WorkflowPromoteReady(ctx context.Context, params driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
 	if params.DependsOn != nil && len(params.DependsOn) == 0 {
 		return driver.WorkflowPromoteResult{}, nil
 	}
-	var res driver.WorkflowPromoteResult
-	err := e.write(ctx, func(x *w) error {
-		res = driver.WorkflowPromoteResult{}
-		var (
-			candidates []driver.JobID
-			err        error
-		)
-		if params.DependsOn == nil {
-			candidates, err = x.ids(ctx, `SELECT DISTINCT job_id FROM hopper_job_deps WHERE job_id > ? ORDER BY job_id LIMIT ?`,
-				idParam(params.After), max(params.Limit, 1))
-		} else {
-			ids := make([]any, len(params.DependsOn))
-			for i, id := range params.DependsOn {
-				ids[i] = idParam(id)
-			}
-			candidates, err = x.ids(ctx, `SELECT DISTINCT job_id FROM hopper_job_deps WHERE depends_on IN (`+placeholders(len(ids))+`)`, ids...)
+	var (
+		res        driver.WorkflowPromoteResult
+		candidates []driver.JobID
+		err        error
+	)
+	if params.DependsOn == nil {
+		candidates, err = queryIDs(ctx, e.read(), `SELECT DISTINCT job_id FROM hopper_job_deps WHERE job_id > ? ORDER BY job_id LIMIT ?`,
+			idParam(params.After), max(params.Limit, 1))
+	} else {
+		ids := make([]any, len(params.DependsOn))
+		for i, id := range params.DependsOn {
+			ids[i] = idParam(id)
 		}
-		if err != nil {
-			return err
-		}
-		sortIDs(candidates)
-		res.Scanned = int64(len(candidates))
-		if len(candidates) > 0 {
-			res.Last = candidates[len(candidates)-1]
-		}
-		for _, id := range candidates {
+		candidates, err = queryIDs(ctx, e.read(), `SELECT DISTINCT job_id FROM hopper_job_deps WHERE depends_on IN (`+placeholders(len(ids))+`)`, ids...)
+	}
+	if err != nil {
+		return res, fmt.Errorf("hopper: promote ready workflow jobs: %w", err)
+	}
+	sortIDs(candidates)
+	res.Scanned = int64(len(candidates))
+	if len(candidates) == 0 {
+		return res, nil
+	}
+	res.Last = candidates[len(candidates)-1]
+	ids := make([]any, len(candidates))
+	for i, id := range candidates {
+		ids[i] = idParam(id)
+	}
+	ready, err := queryIDs(ctx, e.read(), fmt.Sprintf(readySQL, placeholders(len(ids))), ids...)
+	if err != nil || len(ready) == 0 {
+		return res, err
+	}
+	err = e.write(ctx, func(x *w) error {
+		res.Promoted = 0
+		for _, id := range ready {
 			promoted, err := x.promoteIfReady(ctx, id)
 			if err != nil {
 				return err

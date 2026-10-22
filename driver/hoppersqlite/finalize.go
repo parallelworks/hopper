@@ -438,7 +438,11 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 
 // ids returns the IDs a query selects.
 func (x *w) ids(ctx context.Context, query string, args ...any) ([]driver.JobID, error) {
-	return queryAll(ctx, x, func(r scanner) (driver.JobID, error) {
+	return queryIDs(ctx, x, query, args...)
+}
+
+func queryIDs(ctx context.Context, q querier, query string, args ...any) ([]driver.JobID, error) {
+	return queryAll(ctx, q, func(r scanner) (driver.JobID, error) {
 		var b []byte
 		if err := r.Scan(&b); err != nil {
 			return driver.JobID{}, err
