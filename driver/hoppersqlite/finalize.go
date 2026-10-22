@@ -226,13 +226,11 @@ func encodeResults(jobs []driver.JobFinalize) ([]result, error) {
 			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
 		}
 		r := result{JobFinalize: f, err: f.Error, reason: nullable(jobcodec.StorableText(f.SnoozeReason))}
-		if f.Log != nil && f.KeepsLog() {
-			b, err := json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Log: jobcodec.StorableText(f.Log.Log)})
-			if err != nil {
-				return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
-			}
-			r.log = b
+		log, err := jobcodec.MarshalAttemptLog(f)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 		}
+		r.log = log
 		if len(f.Output) > 0 {
 			out, err := jsonValue(f.Output, "", "output")
 			if err != nil {

@@ -5,7 +5,6 @@ import (
 	"cmp"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -91,7 +90,7 @@ func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 		j.BatchID = batchID.ID
 	}
 	if progress != "" {
-		j.Progress = decodeProgress(string(progress))
+		j.Progress = jobcodec.DecodeProgress(string(progress))
 	}
 	return &j, nil
 }
@@ -696,9 +695,9 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
 		}
 		ids[i], attemptedBy[i], fences[i], states[i] = f.ID, f.AttemptedBy, f.Fence, string(f.State)
-		delays[i], snoozes[i], reasons[i] = max(f.Delay, 0).Seconds(), f.Snooze, storableText(f.SnoozeReason)
+		delays[i], snoozes[i], reasons[i] = max(f.Delay, 0).Seconds(), f.Snooze, jobcodec.StorableText(f.SnoozeReason)
 		if f.Error != nil {
-			b, err := marshalAttemptError(f.Error)
+			b, err := jobcodec.MarshalAttemptError(f.Error)
 			if err != nil {
 				return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 			}
@@ -708,13 +707,11 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		// Only completed jobs may skip history; the failed partitions are the
 		// dead-letter queue.
 		archives[i] = f.Archived()
-		if f.Log != nil && f.KeepsLog() {
-			b, err := json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Log: storableText(f.Log.Log)})
-			if err != nil {
-				return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
-			}
-			logs[i] = b
+		b, err := jobcodec.MarshalAttemptLog(f)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 		}
+		logs[i] = b
 	}
 	args := []any{
 		uuidArray(ids), int64Array(attemptedBy), textArray(states), floatArray(delays), boolArray(snoozes),
@@ -744,12 +741,6 @@ func keepLogs(keep int) int32 {
 		return math.MaxInt32
 	}
 	return int32(keep)
-}
-
-// marshalAttemptError encodes an error record without its timestamp, which
-// the finalize statement fills in from database time.
-func marshalAttemptError(e *driver.AttemptError) ([]byte, error) {
-	return jobcodec.MarshalAttemptError(e)
 }
 
 var jobGetQuery = fmt.Sprintf(`
@@ -807,14 +798,8 @@ func (e *Executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 	if err != nil {
 		return nil, fmt.Errorf("hopper: record job progress: %w", err)
 	}
-	return decodeProgress(stored), nil
+	return jobcodec.DecodeProgress(stored), nil
 }
-
-// decodeProgress reads a progress value, keeping what it can of one that
-// is not in the form JobRecordProgress writes, such as one written by hand:
-// a row must still scan, or a claim that took it would fail with the claim
-// already applied. A value that is not an object reads as none.
-func decodeProgress(stored string) *driver.Progress { return jobcodec.DecodeProgress(stored) }
 
 // JobGet implements driver.Executor.
 func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
@@ -844,12 +829,8 @@ func (e *Executor) JobLogs(ctx context.Context, id driver.JobID) ([]driver.Attem
 	if err != nil {
 		return nil, fmt.Errorf("hopper: get job logs: %w", err)
 	}
-	return decodeLogs(string(logs)), nil
+	return jobcodec.DecodeLogs(string(logs)), nil
 }
-
-// decodeLogs reads a job's logs, skipping entries that are not in the form
-// the finalize writes, such as ones written by hand.
-func decodeLogs(stored string) []driver.AttemptLog { return jobcodec.DecodeLogs(stored) }
 
 var (
 	jobListLiveSQL    = fmt.Sprintf(`SELECT %s, NULL::timestamptz, NULL::jsonb FROM {{schema}}.hopper_jobs`, JobColumns(""))
