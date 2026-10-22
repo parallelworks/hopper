@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"slices"
 	"strconv"
@@ -362,7 +363,11 @@ func jsonEqual(got []byte, want string) bool {
 		dec := json.NewDecoder(bytes.NewReader(b))
 		dec.UseNumber()
 		var v any
-		return v, dec.Decode(&v) == nil
+		if dec.Decode(&v) != nil {
+			return nil, false
+		}
+		_, err := dec.Token() // one value, and nothing after it
+		return v, errors.Is(err, io.EOF)
 	}
 	a, ok := decode(got)
 	b, ok2 := decode([]byte(want))
