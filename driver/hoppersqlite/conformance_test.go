@@ -19,7 +19,13 @@ import (
 // directory, migrated to the latest schema.
 func open(t testing.TB) *hoppersqlite.Driver {
 	t.Helper()
-	d, err := hoppersqlite.Open(filepath.Join(t.TempDir(), "hopper.db"), nil)
+	return openAt(t, filepath.Join(t.TempDir(), "hopper.db"))
+}
+
+// openAt is open on the database at path.
+func openAt(t testing.TB, path string) *hoppersqlite.Driver {
+	t.Helper()
+	d, err := hoppersqlite.Open(path, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +45,7 @@ func db(d driver.Driver[*sql.Tx]) *sql.DB { return d.(*hoppersqlite.Driver).DB()
 
 func now() int64 { return time.Now().UnixMicro() }
 
-func exec(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) {
+func execSQL(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], query string, args ...any) {
 	t.Helper()
 	if _, err := db(d).ExecContext(ctx, query, args...); err != nil {
 		t.Error(err)
@@ -76,19 +82,19 @@ func (fixture) Begin(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]
 }
 
 func (fixture) ExpireLease(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], clientID int64) {
-	exec(ctx, t, d, "UPDATE hopper_clients SET expires_at = ? WHERE id = ?", now()-1e6, clientID)
+	execSQL(ctx, t, d, "UPDATE hopper_clients SET expires_at = ? WHERE id = ?", now()-1e6, clientID)
 }
 
 func (fixture) ExpireLeader(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) {
-	exec(ctx, t, d, "UPDATE hopper_leader SET expires_at = ?", now()-1e6)
+	execSQL(ctx, t, d, "UPDATE hopper_leader SET expires_at = ?", now()-1e6)
 }
 
 func (fixture) MakeClaimable(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET scheduled_at = ? WHERE id = ?", now(), id[:])
+	execSQL(ctx, t, d, "UPDATE hopper_jobs SET scheduled_at = ? WHERE id = ?", now(), id[:])
 }
 
 func (fixture) AgeAttempt(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID, age time.Duration) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET attempted_at = ? WHERE id = ? AND attempted_at IS NOT NULL", now()-age.Microseconds(), id[:])
+	execSQL(ctx, t, d, "UPDATE hopper_jobs SET attempted_at = ? WHERE id = ? AND attempted_at IS NOT NULL", now()-age.Microseconds(), id[:])
 }
 
 func (fixture) CountLive(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
@@ -100,15 +106,15 @@ func (fixture) CountHistory(ctx context.Context, t *testing.T, d driver.Driver[*
 }
 
 func (fixture) ExpireJob(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = ? WHERE id = ?", now()-1e6, id[:])
+	execSQL(ctx, t, d, "UPDATE hopper_jobs SET expires_at = ? WHERE id = ?", now()-1e6, id[:])
 }
 
 func (fixture) StaleWake(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET wake_requested_at = attempted_at - 1000000 WHERE id = ?", id[:])
+	execSQL(ctx, t, d, "UPDATE hopper_jobs SET wake_requested_at = attempted_at - 1000000 WHERE id = ?", id[:])
 }
 
 func (fixture) MakePending(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET state = 'pending' WHERE id = ?", id[:])
+	execSQL(ctx, t, d, "UPDATE hopper_jobs SET state = 'pending' WHERE id = ?", id[:])
 }
 
 func (fixture) SnoozeReason(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) string {
@@ -116,11 +122,11 @@ func (fixture) SnoozeReason(ctx context.Context, t *testing.T, d driver.Driver[*
 }
 
 func (fixture) SetSnoozeReason(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID, reason string) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET snooze_reason = ? WHERE id = ?", reason, id[:])
+	execSQL(ctx, t, d, "UPDATE hopper_jobs SET snooze_reason = ? WHERE id = ?", reason, id[:])
 }
 
 func (fixture) SetProgress(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID, value string) {
-	exec(ctx, t, d, "UPDATE hopper_jobs SET progress = ? WHERE id = ?", value, id[:])
+	execSQL(ctx, t, d, "UPDATE hopper_jobs SET progress = ? WHERE id = ?", value, id[:])
 }
 
 func (fixture) CountEdges(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
