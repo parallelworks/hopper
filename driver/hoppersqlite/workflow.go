@@ -1,0 +1,190 @@
+package hoppersqlite
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+
+	"github.com/parallelworks/hopper/driver"
+)
+
+// WorkflowInsert implements driver.Executor.
+func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowInsertParams) (*driver.WorkflowInsertResult, error) {
+	n := len(params.Jobs)
+	if n == 0 {
+		return nil, errors.New("hopper: insert workflow: no jobs")
+	}
+	pending := make([]bool, n)
+	for _, d := range params.Deps {
+		if d.Job < 0 || d.Job >= n || d.DependsOn < 0 || d.DependsOn >= n || d.Job == d.DependsOn {
+			return nil, fmt.Errorf("hopper: insert workflow: dependency %d -> %d is out of range", d.Job, d.DependsOn)
+		}
+		pending[d.Job] = true
+	}
+	jobs := make([]jobInsert, n)
+	var notifyQueues []string
+	for i, p := range params.Jobs {
+		if p.UniqueKey != "" {
+			return nil, fmt.Errorf("hopper: insert workflow: job %d has a unique key", i)
+		}
+		var err error
+		if jobs[i], err = encodeInsert(p); err != nil {
+			return nil, err
+		}
+		jobs[i].pending = pending[i]
+		if !pending[i] && !slices.Contains(notifyQueues, p.Queue) {
+			notifyQueues = append(notifyQueues, p.Queue)
+		}
+	}
+	batch, err := encodeBatch(params.OnSuccess, params.OnFailure, params.OnComplete, params.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	res := &driver.WorkflowInsertResult{}
+	err = e.write(ctx, func(x *w) error {
+		for i := range jobs {
+			jobs[i].id = newID(x.now)
+		}
+		// The graph, for inspection, and the working set of edges.
+		edges := make([][2]string, len(params.Deps))
+		for i, d := range params.Deps {
+			edges[i] = [2]string{jobs[d.Job].id.String(), jobs[d.DependsOn].id.String()}
+		}
+		edgesJSON, err := json.Marshal(edges)
+		if err != nil {
+			return err
+		}
+		res.ID = newID(x.now)
+		for i := range jobs {
+			jobs[i].batchID = res.ID
+		}
+		if err := x.insertBatch(ctx, res.ID, params.Name, n, batch, string(edgesJSON)); err != nil {
+			return fmt.Errorf("insert batch: %w", err)
+		}
+		res.Jobs = make([]driver.JobInsertResult, n)
+		for i, j := range jobs {
+			job, err := x.insertJob(ctx, j)
+			if err != nil {
+				return fmt.Errorf("insert jobs: %w", err)
+			}
+			res.Jobs[i] = driver.JobInsertResult{Job: job}
+		}
+		for _, d := range params.Deps {
+			policy := d.OnFailure
+			if policy == "" {
+				policy = driver.DependencyCancel
+			}
+			if _, err := x.ExecContext(ctx, `INSERT OR IGNORE INTO hopper_job_deps (job_id, depends_on, on_failure) VALUES (?, ?, ?)`,
+				idParam(jobs[d.Job].id), idParam(jobs[d.DependsOn].id), string(policy)); err != nil {
+				return fmt.Errorf("insert dependencies: %w", err)
+			}
+		}
+		if params.Notify {
+			return x.notify(ctx, driver.ChannelInsert, notifyQueues...)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hopper: insert workflow: %w", err)
+	}
+	return res, nil
+}
+
+// WorkflowGet implements driver.Executor.
+func (e *executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.WorkflowRow, error) {
+	var w driver.WorkflowRow
+	err := e.readTx(ctx, func(q querier) error {
+		var (
+			name  sql.NullString
+			edges sql.NullString
+		)
+		b, err := scanBatch(q.QueryRowContext(ctx, `SELECT `+batchColumns+`, name, edges FROM hopper_batches WHERE id = ?`, idParam(id)), &name, &edges)
+		if errors.Is(err, sql.ErrNoRows) {
+			return driver.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		w.Batch = *b
+		w.Batch.Name = name.String
+		if edges.Valid {
+			var pairs [][2]driver.JobID
+			if err := json.Unmarshal([]byte(edges.String), &pairs); err != nil {
+				return fmt.Errorf("edges: %w", err)
+			}
+			w.Edges = make([]driver.JobEdge, len(pairs))
+			for i, p := range pairs {
+				w.Edges[i] = driver.JobEdge{Job: p[0], DependsOn: p[1]}
+			}
+		}
+		// Jobs in insertion order, live and finished alike.
+		w.Jobs, err = queryAll(ctx, q, func(r scanner) (*driver.JobRow, error) {
+			var seq int64
+			return scanJob(r, true, &seq)
+		}, `SELECT * FROM (
+			  SELECT `+liveAsHistory+`, seq FROM hopper_jobs WHERE batch_id = ?1
+			  UNION ALL
+			  SELECT `+historyColumns+`, seq FROM hopper_job_history WHERE batch_id = ?1
+			) ORDER BY seq`, idParam(id))
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, driver.ErrNotFound) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("hopper: get workflow: %w", err)
+	}
+	return &w, nil
+}
+
+// WorkflowPromoteReady implements driver.Executor. The transaction that
+// finalizes a job promotes its dependents itself, so this finds only what
+// a direct write left pending.
+func (e *executor) WorkflowPromoteReady(ctx context.Context, params driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
+	if params.DependsOn != nil && len(params.DependsOn) == 0 {
+		return driver.WorkflowPromoteResult{}, nil
+	}
+	var res driver.WorkflowPromoteResult
+	err := e.write(ctx, func(x *w) error {
+		res = driver.WorkflowPromoteResult{}
+		var (
+			candidates []driver.JobID
+			err        error
+		)
+		if params.DependsOn == nil {
+			candidates, err = x.ids(ctx, `SELECT DISTINCT job_id FROM hopper_job_deps WHERE job_id > ? ORDER BY job_id LIMIT ?`,
+				idParam(params.After), max(params.Limit, 1))
+		} else {
+			ids := make([]any, len(params.DependsOn))
+			for i, id := range params.DependsOn {
+				ids[i] = idParam(id)
+			}
+			candidates, err = x.ids(ctx, `SELECT DISTINCT job_id FROM hopper_job_deps WHERE depends_on IN (`+placeholders(len(ids))+`)`, ids...)
+		}
+		if err != nil {
+			return err
+		}
+		sortIDs(candidates)
+		res.Scanned = int64(len(candidates))
+		if len(candidates) > 0 {
+			res.Last = candidates[len(candidates)-1]
+		}
+		for _, id := range candidates {
+			promoted, err := x.promoteIfReady(ctx, id)
+			if err != nil {
+				return err
+			}
+			if promoted {
+				res.Promoted++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return driver.WorkflowPromoteResult{}, fmt.Errorf("hopper: promote ready workflow jobs: %w", err)
+	}
+	return res, nil
+}

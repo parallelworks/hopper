@@ -1,0 +1,3 @@
+-- hopper schema v6: autovacuum settings for Postgres's live table. SQLite
+-- has no autovacuum to tune: the leader refreshes the planner's statistics
+-- when the live table's size changes (JobsMaintain).

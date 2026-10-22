@@ -1,0 +1,9 @@
+DROP TABLE hopper_schema;
+DROP TABLE hopper_notifications;
+DROP TABLE hopper_subscriptions;
+DROP TABLE hopper_periodic;
+DROP TABLE hopper_queues;
+DROP TABLE hopper_leader;
+DROP TABLE hopper_clients;
+DROP TABLE hopper_job_history;
+DROP TABLE hopper_jobs;
