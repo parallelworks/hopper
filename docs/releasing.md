@@ -76,8 +76,11 @@ the ruleset's commit-message pattern.
 
 ## Steering a release
 
-- **Force a version:** add a footer `Release-As: X.Y.Z` to a squash commit's
-  body (the PR description), and the release PR proposes that version.
+- **Force a version, or mark a breaking change:** the repository squashes a PR
+  with its title and a blank body, so nothing in the PR description reaches the
+  commit. Give the footer when merging, and the release PR reads it:
+  `gh pr merge N --squash --admin --body 'Release-As: X.Y.Z'`, or
+  `--body 'BREAKING CHANGE: …'` to say what a `!` in the title breaks.
 - **Hold a change out of the changelog:** only `feat`, `fix`, `perf` and
   `revert` appear; `docs`, `test`, `ci`, `build`, `chore` and `refactor`
   are hidden.

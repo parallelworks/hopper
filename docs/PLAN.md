@@ -458,19 +458,26 @@ defined as operations rather than SQL:
 
   What a single writer costs, and how the driver keeps it from failing silently:
   - A transaction held open holds up every client that shares the database, their
-    lease renewals included. A renewal waits until the lease it renews would expire,
-    then logs who holds the lock and tries again; a transaction held for longer than
-    about the lease therefore costs every client its lease, and their running jobs are
-    rescued.
+    lease renewals included. A renewal waits until the lease it renews would expire
+    (§7.6), then logs who holds the lock and tries again; a transaction held for longer
+    than about the lease therefore costs every client its lease, and their running jobs
+    are rescued.
   - A worker that writes on the pool while its own transaction holds the lock would
     wait for itself until its context ended. The core marks each attempt's context with
-    its owner (`driver.WithOwner`), and the driver refuses at once such a write
-    (`ErrLockHeldByOwner`).
+    its owner (`driver.WithOwner`); the driver records the owner of a transaction its
+    caller began with that context, and refuses at once a write of the same owner that
+    would wait for it (`ErrLockHeldByOwner`). The driver's own transactions, each for one
+    operation, record none, so writes of one attempt from several goroutines, with no
+    transaction of its own open, wait their turn as on Postgres. A worker's transaction
+    begun with another context is not recognised, and its pool write waits as before.
   - After some errors (an interrupted write, a full disk, an I/O error) SQLite rolls the
     whole transaction back itself and would run its later statements on their own. The
     driver learns of it from SQLite's rollback hook and refuses the transaction's later
     statements and its commit (`ErrTransactionAborted`), as Postgres refuses those of an
-    aborted transaction, so `CompleteTx` stays all or nothing.
+    aborted transaction, so `CompleteTx` stays all or nothing. A `COMMIT`, `END` or
+    `ROLLBACK` statement the caller runs in the transaction ends it too, which the commit
+    and rollback hooks tell; its later statements fail with `sql.ErrTxDone` rather than
+    run on their own.
   - JSON is stored as given rather than normalized as jsonb is, and refused for what
     jsonb refuses (a `\u0000` escape, text that is not UTF-8, a number beyond numeric's
     range); a metadata filter's `@>` is a SQL function that matches as jsonb's does.
@@ -720,10 +727,11 @@ All time comparisons use the database's `now()`, never the application clock, so
 skew between pods cannot cause early or duplicate execution. SQLite's clock is the host's,
 which every process that opens the database shares, since it must be on a local
 filesystem: hoppersqlite reads it once a transaction holds the write lock, and never
-returns a time earlier than one it returned before in the process, so each write's time
-is no earlier than the writes before it even when the host's clock is stepped back. A
-host that sleeps finds its clock moved on when it wakes, as a server's would, and its
-clients' leases expired.
+returns a time earlier than one it returned before in the same process, so within one
+process each write's time is no earlier than the writes before it even when the host's
+clock is stepped back. Across processes the floor does not hold: a clock stepped back
+can date one process's write before another's earlier one. A host that sleeps finds its
+clock moved on when it wakes, as a server's would, and its clients' leases expired.
 
 ### 7.2 Insert
 - **Single and small batches:** one `INSERT … SELECT FROM unnest($kinds, $args, …)
@@ -1396,6 +1404,14 @@ UPDATE hopper_clients SET expires_at = now() + $ttl WHERE id = $me AND expires_a
 A heartbeat therefore costs one row per process regardless of how many jobs it is
 running. Running jobs are never rewritten just to prove they are alive, which removes
 the largest source of write amplification in heartbeat-based designs.
+
+A renewal waits at most until the lease it renews would expire, counted from when the
+lease was last taken or renewed (registering again after fencing takes a new one), and
+at least one renewal interval. On Postgres a renewal locks only its own client's row and
+is seldom held up; on an engine that runs one writer at a time, any open transaction
+holds it up. A renewal that gives up is logged, with what the engine says of who holds
+the lock, and tried again at once, rather than left waiting past the lease without a
+word.
 
 - **Rescue.** The leader's rescuer finds `running` jobs whose `attempted_by` has no
   unexpired lease and moves them to `retryable` with the error `client lost` (or to

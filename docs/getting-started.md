@@ -103,8 +103,9 @@ statement. SQLite runs one writing transaction at a time, so keep them short:
 one held open holds up every client sharing the file, lease renewals
 included, and one held longer than the lease costs them their running jobs.
 Write through the transaction (`InsertTx`, `CompleteTx`) rather than the pool
-while one is open; in a worker, a write on the pool then fails at once with
-`hoppersqlite.ErrLockHeldByOwner`. After an error that makes SQLite roll a
+while one is open. In a worker, begin it with the job's context: a write on
+the pool then fails at once with `hoppersqlite.ErrLockHeldByOwner`, rather
+than wait for the worker's own transaction until the context ends. After an error that makes SQLite roll a
 transaction back (an interrupted write, a full disk), its later statements
 fail with `hoppersqlite.ErrTransactionAborted`; roll it back.
 
