@@ -1,0 +1,2 @@
+-- hopper schema v8: binds Postgres's SQL producer functions to their
+-- schema. SQLite has no such functions.

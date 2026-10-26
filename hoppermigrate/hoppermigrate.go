@@ -5,6 +5,12 @@
 // so any number of replicas can call Up at startup. The raw files are also
 // available through Migrations for teams that run migrations with their own
 // tool; hopper_schema records the applied versions either way.
+//
+// The embedded scripts are Postgres's. A driver for another engine supplies
+// its own script for each version (driver.MigrationScripts), and Up and Down
+// apply those, at the same versions; such a driver also returns its scripts
+// for other tools, as hoppersqlite.Migrations does. A new schema version
+// therefore needs a script for each engine.
 package hoppermigrate
 
 import (
@@ -33,7 +39,9 @@ type Migration struct {
 
 var migrations = mustLoad()
 
-// Migrations returns every known migration in ascending version order.
+// Migrations returns every known migration in ascending version order,
+// with Postgres's scripts. A driver for another engine has its own
+// (hoppersqlite.Migrations, for SQLite).
 func Migrations() []Migration { return slices.Clone(migrations) }
 
 // Latest returns the newest schema version this package knows.
@@ -122,7 +130,11 @@ func run[TTx any](ctx context.Context, d driver.Driver[TTx], opts *Options, up b
 			if m.Version > target || slices.Contains(applied, m.Version) {
 				continue
 			}
-			if err := exec.Apply(ctx, m.Version, m.Up, true); err != nil {
+			script, err := scriptFor(exec, m, true)
+			if err != nil {
+				return nil, err
+			}
+			if err := exec.Apply(ctx, m.Version, script, true); err != nil {
 				return nil, fmt.Errorf("hoppermigrate: apply %03d_%s: %w", m.Version, m.Name, err)
 			}
 			logger.InfoContext(ctx, "hopper: applied migration", "version", m.Version, "name", m.Name)
@@ -136,7 +148,11 @@ func run[TTx any](ctx context.Context, d driver.Driver[TTx], opts *Options, up b
 		if m.Version <= target || !slices.Contains(applied, m.Version) {
 			continue
 		}
-		if err := exec.Apply(ctx, m.Version, m.Down, false); err != nil {
+		script, err := scriptFor(exec, m, false)
+		if err != nil {
+			return nil, err
+		}
+		if err := exec.Apply(ctx, m.Version, script, false); err != nil {
 			return nil, fmt.Errorf("hoppermigrate: revert %03d_%s: %w", m.Version, m.Name, err)
 		}
 		logger.InfoContext(ctx, "hopper: reverted migration", "version", m.Version, "name", m.Name)
@@ -144,6 +160,23 @@ func run[TTx any](ctx context.Context, d driver.Driver[TTx], opts *Options, up b
 		res.Version = m.Version - 1
 	}
 	return res, nil
+}
+
+// scriptFor returns m's up or down script for the engine exec migrates: its
+// own, if it has scripts of its own, or the embedded Postgres one.
+func scriptFor(exec driver.MigrationExecutor, m Migration, up bool) (string, error) {
+	scripts, ok := exec.(driver.MigrationScripts)
+	if !ok {
+		if up {
+			return m.Up, nil
+		}
+		return m.Down, nil
+	}
+	script, err := scripts.Script(m.Version, up)
+	if err != nil {
+		return "", fmt.Errorf("hoppermigrate: the engine's script for %03d_%s: %w", m.Version, m.Name, err)
+	}
+	return script, nil
 }
 
 func current(applied []int) int {

@@ -129,6 +129,10 @@ func testClaim[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+// testClaimSkipsLocked claims while another client's claim is held open in
+// a transaction. An engine that locks rows skips the held jobs and claims
+// the rest at once; one that runs one writer at a time waits for the
+// transaction, and then claims the rest.
 func testClaimSkipsLocked[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -136,7 +140,7 @@ func testClaimSkipsLocked[TTx any](t *testing.T, f Fixture[TTx]) {
 	insert(ctx, t, exec, params("k", 4))
 	a, b := register(ctx, t, exec), register(ctx, t, exec)
 
-	tx, _, rollback := f.Begin(ctx, t, d)
+	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // cleanup
 	heldRes, err := d.UnwrapTx(tx).JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: a, Limit: 2})
 	held := heldRes.Jobs
@@ -151,6 +155,17 @@ func testClaimSkipsLocked[TTx any](t *testing.T, f Fixture[TTx]) {
 		}
 		done <- res.Jobs
 	}()
+	if singleWriter(d) {
+		f.WaitForLockWait(ctx, t, d)
+		select {
+		case jobs := <-done:
+			t.Fatalf("B claimed %d jobs while A's transaction wrote", len(jobs))
+		case <-time.After(100 * time.Millisecond):
+		}
+		if err := commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	select {
 	case jobs := <-done:
 		if len(jobs) != 2 {
@@ -247,8 +262,9 @@ func testFinalize[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 
 // testFinalizeSkipLocked finalizes with SkipLocked while another
 // transaction holds one of the rows, as a worker's CompleteTx that has not
-// ended does: the statement returns at once, without that job, and applies
-// it once the row is free.
+// ended does: the statement returns at once, without that job (on an engine
+// with one writer at a time, without any job), and applies it once the row
+// is free.
 func testFinalizeSkipLocked[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -269,14 +285,25 @@ func testFinalizeSkipLocked[TTx any](t *testing.T, f Fixture[TTx], noBatches boo
 	applied, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: []driver.JobFinalize{
 		failed, {ID: free, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true},
 	}})
-	if err != nil || !slices.Equal(applied, []driver.JobID{free}) {
-		t.Fatalf("finalize with a held row = %v, %v; want only %s", applied, err, free)
+	want := []driver.JobID{free}
+	if singleWriter(d) {
+		want = nil
+	}
+	if err != nil || !slices.Equal(applied, want) {
+		t.Fatalf("finalize with a held row = %v, %v; want %v", applied, err, want)
 	}
 	if err := rollback(); err != nil {
 		t.Fatal(err)
 	}
-	applied, err = exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: []driver.JobFinalize{failed}})
-	if err != nil || !slices.Equal(applied, []driver.JobID{held}) {
+	results := []driver.JobFinalize{failed}
+	want = []driver.JobID{held}
+	if singleWriter(d) {
+		results = append(results, driver.JobFinalize{ID: free, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true})
+		want = append(want, free)
+	}
+	applied, err = exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: results})
+	slices.SortFunc(applied, func(a, b driver.JobID) int { return slices.Index(want, a) - slices.Index(want, b) })
+	if err != nil || !slices.Equal(applied, want) {
 		t.Fatalf("finalize once the row is free = %v, %v", applied, err)
 	}
 	if j, err := exec.JobGet(ctx, held); err != nil || j.State != driver.JobStateRetryable {
@@ -365,7 +392,7 @@ func testFinalizeTx[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	j, err := exec.JobGet(ctx, id)
-	if err != nil || j.State != driver.JobStateCompleted || j.FinalizedAt.IsZero() || string(j.Output) != `{"ok": true}` {
+	if err != nil || j.State != driver.JobStateCompleted || j.FinalizedAt.IsZero() || !jsonEqual(j.Output, `{"ok": true}`) {
 		t.Errorf("job after commit = %+v, %v", j, err)
 	}
 	if live, hist := f.CountLive(ctx, t, d), f.CountHistory(ctx, t, d); live != 0 || hist != 1 {
@@ -406,7 +433,7 @@ func testFinalizeTxConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			}
 			done <- applied
 		}()
-		waitForLockWait(ctx, t, f, d)
+		f.WaitForLockWait(ctx, t, d)
 		end := rollback
 		if commitTx {
 			end = commit
@@ -426,21 +453,6 @@ func testFinalizeTxConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		} else if competing != 1 || j.State != driver.JobStateRetryable {
 			t.Errorf("job %d: rolled back, competing finalize applied %d, state %s", i, competing, j.State)
 		}
-	}
-}
-
-// waitForLockWait waits until a statement on the driver's schema is waiting
-// for a lock, so a test knows its competing statement is blocked rather
-// than not yet started. The schema's name is in every statement's text.
-func waitForLockWait[TTx any](ctx context.Context, t *testing.T, f Fixture[TTx], d driver.Driver[TTx]) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for f.QueryText(ctx, t, d, `SELECT count(*)::text FROM pg_stat_activity
-		WHERE wait_event_type = 'Lock' AND position(current_schema() IN query) > 0 AND pid <> pg_backend_pid()`) == "0" {
-		if time.Now().After(deadline) {
-			t.Fatal("no statement started waiting for a lock")
-		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -555,7 +567,7 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.JobCancel(ctx, id(4)); err != nil {
 		t.Fatal(err)
 	}
-	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET expires_at = now() - interval '1s' WHERE id = $1::uuid", id(6).String())
+	f.ExpireJob(ctx, t, d, id(6))
 	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Name: "w", Jobs: []driver.JobInsertParams{{Kind: "w", Queue: "wf", Priority: 2, MaxAttempts: 1}, {Kind: "w", Queue: "wf", Priority: 2, MaxAttempts: 1, OrderingKey: "a"}},
 		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
@@ -620,7 +632,7 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
 	claimed()
 	wake("default", 10, 1)
-	if r := storedReason(ctx, t, f, d, id(0)); r != "" {
+	if r := f.SnoozeReason(ctx, t, d, id(0)); r != "" {
 		t.Errorf("woken job kept reason %q", r)
 	}
 	claimed(id(0))
@@ -628,13 +640,13 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 	// A wake during the attempt makes its snooze run at once, without a reason.
 	wake("default", 10, 0)
 	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true, SnoozeReason: "waiting"})
-	if r := storedReason(ctx, t, f, d, id(0)); r != "" {
+	if r := f.SnoozeReason(ctx, t, d, id(0)); r != "" {
 		t.Errorf("snooze after a wake kept reason %q", r)
 	}
 	claimed(id(0))
 
 	// A mark from before the attempt started does not count.
-	f.Exec(ctx, t, d, "UPDATE hopper_jobs SET wake_requested_at = attempted_at - interval '1s' WHERE id = $1::uuid", id(0).String())
+	f.StaleWake(ctx, t, d, id(0))
 	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
 	claimed()
 	if n, err := exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: "default", OrderingKey: "none", Limit: 10}); err != nil || n != 0 {
@@ -643,8 +655,7 @@ func testRetryOrderingKey[TTx any](t *testing.T, f Fixture[TTx]) {
 }
 
 // testRetryOrderingKeyConcurrent checks that a wake racing the end of an
-// attempt is never lost, and that a wake and the leader's aging, which lock
-// the same rows, never deadlock.
+// attempt is never lost.
 func testRetryOrderingKeyConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -673,16 +684,44 @@ func testRetryOrderingKeyConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			}
 		})
 		wg.Wait()
-		if due := f.QueryText(ctx, t, d, "SELECT (scheduled_at <= now())::text FROM hopper_jobs WHERE id = $1::uuid", job.String()); due != "true" {
+		if !due(ctx, t, exec, job) {
 			t.Fatalf("round %d: a wake racing the snooze was lost", round)
 		}
-		f.Exec(ctx, t, d, "DELETE FROM hopper_jobs WHERE id = $1::uuid", job.String())
+		if _, err := exec.JobDelete(ctx, job); err != nil {
+			t.Fatal(err)
+		}
 	}
+}
 
-	// Rows laid out in the heap in the reverse of their seq order: the
-	// aging pass meets them in one order and the wake locks them in the
-	// other. Each round rewrites them one by one, newest first, which
-	// appends their new versions in that order.
+// due reports whether a live job's scheduled time has come, by the
+// database's clock.
+func due(ctx context.Context, t *testing.T, exec driver.Executor, id driver.JobID) bool {
+	t.Helper()
+	now, err := exec.Now(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := exec.JobGet(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return !j.ScheduledAt.After(now)
+}
+
+// testRetryOrderingKeyAgingOrder checks that a wake and the leader's aging,
+// which lock the same rows, never deadlock, with rows laid out in the heap
+// in the reverse of their seq order: the aging pass meets them in one order
+// and the wake locks them in the other. Each round rewrites them one by
+// one, newest first, which appends their new versions in that order.
+func testRetryOrderingKeyAgingOrder[TTx any](t *testing.T, f PostgresFixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	wakeKey := func(key string) {
+		if _, err := exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: "default", OrderingKey: key, Limit: 1000}); err != nil {
+			t.Error(err)
+		}
+	}
 	p := params("k", 300)
 	for i := range p {
 		p[i].OrderingKey, p[i].Priority, p[i].ScheduledAt = "aging", 3, time.Now().Add(time.Hour)
@@ -1032,7 +1071,7 @@ func testJobDeleteRacesRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 		deleted, err = exec.JobDelete(ctx, id)
 		done <- err
 	}()
-	waitForLockWait(ctx, t, f, d)
+	f.WaitForLockWait(ctx, t, d)
 	if err := commit(); err != nil {
 		t.Fatal(err)
 	}
@@ -1071,7 +1110,7 @@ func testRetryOrderingKeyTx[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: job, AttemptedBy: clientID, State: driver.JobStateScheduled, Delay: time.Hour, Snooze: true})
-	if due := f.QueryText(ctx, t, d, "SELECT (scheduled_at <= now())::text FROM hopper_jobs WHERE id = $1::uuid", job.String()); due != "true" {
+	if !due(ctx, t, exec, job) {
 		t.Error("a wake in a transaction older than the attempt was lost")
 	}
 }

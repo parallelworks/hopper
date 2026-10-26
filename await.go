@@ -50,6 +50,12 @@ type attempt struct {
 	logEnded bool
 }
 
+// String names the attempt, as the owner of its worker's writes
+// (driver.WithOwner).
+func (a *attempt) String() string {
+	return fmt.Sprintf("job %s (%s), attempt %d", a.row.ID, a.row.Kind, a.attempt)
+}
+
 func (a *attempt) markHeldByTx() {
 	a.mu.Lock()
 	a.heldByTx = true

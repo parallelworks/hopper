@@ -1,0 +1,10 @@
+DROP TRIGGER hopper_job_history_tags_update;
+DROP TRIGGER hopper_job_history_tags_delete;
+DROP TRIGGER hopper_job_history_tags_insert;
+DROP TRIGGER hopper_jobs_tags_update;
+DROP TRIGGER hopper_jobs_tags_delete;
+DROP TRIGGER hopper_jobs_tags_insert;
+DROP TABLE hopper_job_history_tags;
+DROP TABLE hopper_job_tags;
+ALTER TABLE hopper_jobs DROP COLUMN tags;
+ALTER TABLE hopper_job_history DROP COLUMN tags;

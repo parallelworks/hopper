@@ -1,0 +1,1 @@
+-- Nothing to revert: v8 changes nothing on SQLite.

@@ -1,0 +1,1 @@
+-- Nothing to revert: v12 changes nothing on SQLite.

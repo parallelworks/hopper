@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
-	"github.com/parallelworks/hopper/internal/jobtags"
+	"github.com/parallelworks/hopper/driver/internal/jobcodec"
 )
 
 // Array parameters cross the transport as plain slices, which pgx encodes
@@ -19,13 +19,6 @@ import (
 // NULL, so that filters can compare against '{}'.
 
 func textArray(values []string) []string { return orEmpty(values) }
-
-// storableText replaces what PostgreSQL refuses in text and jsonb strings,
-// NUL and invalid UTF-8, so that one worker's text cannot fail the
-// statement that finalizes a whole batch.
-func storableText(s string) string {
-	return strings.ReplaceAll(strings.ToValidUTF8(s, "�"), "\x00", "�")
-}
 
 // nullableTextArray sends empty strings as NULL.
 func nullableTextArray(values []string) []*string {
@@ -261,11 +254,12 @@ func (a *attemptErrors) Scan(src any) error {
 	if err := text.Scan(src); err != nil {
 		return err
 	}
-	*a = attemptErrors{}
-	if text == "" {
-		return nil
+	errs, err := jobcodec.DecodeErrors(string(text))
+	if err != nil {
+		return err
 	}
-	return json.Unmarshal([]byte(text), (*[]driver.AttemptError)(a))
+	*a = errs
+	return nil
 }
 
 // tagList scans a tags column, a JSON array of strings or NULL. hopper
@@ -281,20 +275,7 @@ func (l *tagList) Scan(src any) error {
 	if err := text.Scan(src); err != nil {
 		return err
 	}
-	*l = nil
-	if text == "" {
-		return nil
-	}
-	var elems []json.RawMessage
-	_ = json.Unmarshal([]byte(text), &elems) // anything but an array reads as no tags
-	var tags []string
-	for _, e := range elems {
-		var s string
-		if len(e) > 0 && e[0] == '"' && json.Unmarshal(e, &s) == nil && s != "" {
-			tags = append(tags, s)
-		}
-	}
-	*l = jobtags.Distinct(tags)
+	*l = jobcodec.DecodeTags(string(text))
 	return nil
 }
 

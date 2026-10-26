@@ -30,12 +30,21 @@ var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt"
 // whatever the worker returned, and the job.completed event fires. If it did
 // not, the attempt fails with the worker's error, or with a failure if the
 // worker returned nil, and the job is retried. A worker that returns before
-// tx ends holds up only its own job's result, until tx ends.
+// tx ends holds up only its own job's result, until tx ends, on an engine
+// that locks rows.
 //
 // Call it last, just before the commit. From CompleteTx until tx ends, tx
 // holds the job's row and those of workflow dependents it promotes or
 // cancels, and holds off the creation and drop of history partitions. The
 // job's siblings in its batch finalize without waiting for it.
+//
+// On an engine that runs one writer at a time
+// (driver.Capabilities.SingleWriter, SQLite), tx holds the whole database
+// for writes from its first statement until it ends: every other write
+// waits for it, the results of other jobs and lease renewals included, and
+// a write of the worker's own on the pool fails rather than wait for tx,
+// provided tx was begun with the worker's ctx (or one derived from it),
+// which names the job's attempt.
 //
 //	func (w *Worker) Work(ctx context.Context, job *hopper.Job[Args]) error {
 //		tx, err := w.pool.Begin(ctx)

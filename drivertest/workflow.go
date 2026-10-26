@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -168,9 +167,12 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("chain completed = %+v", row.Batch)
 	}
 	cbs := callbacks()
+	var alert struct {
+		BatchFailed int `json:"batch_failed"`
+	}
 	if cbs["wf-alert2"] == nil || cbs["wf-done2"] != nil {
 		t.Errorf("chain callbacks = %v", cbs)
-	} else if !strings.Contains(string(cbs["wf-alert2"].Metadata), `"batch_failed": 3`) {
+	} else if err := json.Unmarshal(cbs["wf-alert2"].Metadata, &alert); err != nil || alert.BatchFailed != 3 {
 		t.Errorf("alert metadata = %s", cbs["wf-alert2"].Metadata)
 	}
 
@@ -212,10 +214,12 @@ func testWorkflows[TTx any](t *testing.T, f Fixture[TTx]) {
 }
 
 // testWorkflowFanInConcurrent finalizes a job's two dependencies in
-// concurrent transactions. Each statement still sees the other dependency
-// live, so neither promotes the dependent; WorkflowPromoteReady, run by
-// each finalizing client after its statement commits, does once both have
-// committed, and the leader's sweep finds what clients left.
+// concurrent transactions. On an engine that locks rows, each statement
+// still sees the other dependency live, so neither promotes the dependent;
+// WorkflowPromoteReady, run by each finalizing client after its statement
+// commits, does once both have committed. On an engine that runs one writer
+// at a time, the second finalize waits for the first and promotes the
+// dependent itself. Either way, the leader's sweep finds what clients left.
 func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -249,23 +253,44 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if applied := finalizeCurrent(ctx, t, d.UnwrapTx(tx), completed(x)); len(applied) != 1 {
 		t.Fatalf("finalize in tx applied %v", applied)
 	}
-	// The other dependency's finalize does not wait for the transaction.
-	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(y)}}); err != nil || len(applied) != 1 {
-		t.Fatalf("concurrent finalize = %v, %v", applied, err)
-	}
-	if n := promote(y); n != 0 {
-		t.Errorf("promoted %d while a dependency's finalize was uncommitted", n)
-	}
-	if err := commit(); err != nil {
-		t.Fatal(err)
-	}
-	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStatePending {
-		t.Fatalf("dependent after both finalizes = %+v, %v; the race should leave it pending", j, err)
-	}
-	if n := promote(x); n != 1 {
-		t.Errorf("promoted %d, want 1", n)
+	if singleWriter(d) {
+		done := make(chan []driver.JobID, 1)
+		go func() {
+			applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(y)}})
+			if err != nil {
+				t.Error(err)
+			}
+			done <- applied
+		}()
+		f.WaitForLockWait(ctx, t, d)
+		if err := commit(); err != nil {
+			t.Fatal(err)
+		}
+		if applied := <-done; len(applied) != 1 {
+			t.Fatalf("finalize after the transaction applied %v", applied)
+		}
+		if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateAvailable {
+			t.Fatalf("dependent after both finalizes = %+v, %v; the second should promote it", j, err)
+		}
+	} else {
+		// The other dependency's finalize does not wait for the transaction.
+		fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{completed(y)}}); err != nil || len(applied) != 1 {
+			t.Fatalf("concurrent finalize = %v, %v", applied, err)
+		}
+		if n := promote(y); n != 0 {
+			t.Errorf("promoted %d while a dependency's finalize was uncommitted", n)
+		}
+		if err := commit(); err != nil {
+			t.Fatal(err)
+		}
+		if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStatePending {
+			t.Fatalf("dependent after both finalizes = %+v, %v; the race should leave it pending", j, err)
+		}
+		if n := promote(x); n != 1 {
+			t.Errorf("promoted %d, want 1", n)
+		}
 	}
 	if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateAvailable {
 		t.Errorf("dependent after promote = %+v, %v", j, err)
@@ -298,7 +323,7 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			t.Fatalf("claimed %+v", jobs)
 		}
 		finalizeCurrent(ctx, t, exec, completed(jobs[0].ID))
-		f.Exec(ctx, t, d, `UPDATE hopper_jobs SET state = 'pending' WHERE id = $1::uuid`, wf.Jobs[1].Job.ID.String())
+		f.MakePending(ctx, t, d, wf.Jobs[1].Job.ID)
 		steps = append(steps, wf.Jobs[1].Job.ID)
 	}
 	sweep := func(after driver.JobID) driver.WorkflowPromoteResult {
@@ -340,6 +365,10 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	exec := d.Executor()
 	const workflows, middles = 100, 4
 	cb := &driver.JobInsertParams{Kind: "done", Queue: "callbacks", Priority: 2, MaxAttempts: 3, Args: json.RawMessage(`{}`)}
+	var (
+		batchIDs  []driver.JobID
+		dependsOn = map[driver.JobID][]driver.JobID{}
+	)
 	for w := range workflows {
 		jobs := params("root", 1)
 		mids := params("mid", middles)
@@ -351,10 +380,38 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		for m := 1; m <= middles; m++ {
 			deps = append(deps, driver.JobDependency{Job: m, DependsOn: 0}, driver.JobDependency{Job: middles + 1, DependsOn: m})
 		}
-		if _, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Name: "chaos", Jobs: jobs, Deps: deps, OnComplete: cb}); err != nil {
+		wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Name: "chaos", Jobs: jobs, Deps: deps, OnComplete: cb})
+		if err != nil {
 			t.Fatal(err)
 		}
+		batchIDs = append(batchIDs, wf.ID)
+		for _, dep := range deps {
+			job := wf.Jobs[dep.Job].Job.ID
+			dependsOn[job] = append(dependsOn[job], wf.Jobs[dep.DependsOn].Job.ID)
+		}
 	}
+	// live reports whether a job is still in the live table.
+	live := func(id driver.JobID) (bool, error) {
+		j, err := exec.JobGet(ctx, id)
+		if errors.Is(err, driver.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return j.FinalizedAt.IsZero(), nil
+	}
+	list := func(p driver.JobListParams) []*driver.JobRow {
+		t.Helper()
+		p.Limit = 10000
+		jobs, err := exec.JobList(ctx, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return jobs
+	}
+	liveStates := []driver.JobState{driver.JobStatePending, driver.JobStateAvailable, driver.JobStateScheduled, driver.JobStateRunning, driver.JobStateRetryable}
+	finished := []driver.JobState{driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded}
 
 	wctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
@@ -418,22 +475,26 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 				}
 				fin := make([]driver.JobFinalize, len(res.Jobs))
 				batches := make([]driver.JobID, len(res.Jobs))
-				ids := make([]string, len(res.Jobs))
 				for i, j := range res.Jobs {
 					fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true}
 					if j.Kind == "fail" {
 						fin[i].State = driver.JobStateDiscarded
 					}
 					batches[i] = j.BatchID
-					ids[i] = j.ID.String()
-				}
-				// A dependency leaves the live table when its finalize
-				// commits, and never returns: one still there ran after
-				// its dependent was claimed.
-				if n := f.QueryText(ctx, t, d, `SELECT count(*)::text FROM hopper_job_deps e
-					JOIN hopper_jobs x ON x.id = e.depends_on WHERE e.job_id = ANY($1::uuid[])`, "{"+strings.Join(ids, ",")+"}"); n != "0" {
-					fail(fmt.Errorf("claimed %d jobs with %s dependencies still live", len(ids), n))
-					return
+					// A dependency leaves the live table when its finalize
+					// commits, and never returns: one still there ran after
+					// its dependent was claimed.
+					for _, dep := range dependsOn[j.ID] {
+						isLive, err := live(dep)
+						if err != nil {
+							fail(err)
+							return
+						}
+						if isLive {
+							fail(fmt.Errorf("claimed job %s with dependency %s still live", j.ID, dep))
+							return
+						}
+					}
 				}
 				finished := finalizeRetrying(fin)
 				record(finished)
@@ -482,8 +543,22 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	})
-	for wctx.Err() == nil && f.QueryText(ctx, t, d, `SELECT ((SELECT count(*) FROM hopper_jobs WHERE queue = 'default') = 0
-		AND (SELECT count(*) FROM hopper_batches WHERE completed_at IS NULL) = 0)::text`) != "true" {
+	done := func() bool {
+		if len(list(driver.JobListParams{Queue: "default", States: liveStates})) > 0 {
+			return false
+		}
+		for _, id := range batchIDs {
+			b, err := exec.BatchGet(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if b.CompletedAt.IsZero() {
+				return false
+			}
+		}
+		return true
+	}
+	for wctx.Err() == nil && !done() {
 		time.Sleep(20 * time.Millisecond)
 	}
 	timedOut := wctx.Err() != nil
@@ -494,8 +569,11 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	if timedOut {
-		t.Fatalf("not finished in a minute (last finalize error: %v): %s", lastErr, f.QueryText(ctx, t, d,
-			"SELECT coalesce(string_agg(state || ' ' || n, ', '), 'none') FROM (SELECT state::text, count(*) AS n FROM hopper_jobs GROUP BY state) s"))
+		states := map[driver.JobState]int{}
+		for _, j := range list(driver.JobListParams{Queue: "default", States: liveStates}) {
+			states[j.State]++
+		}
+		t.Fatalf("not finished in a minute (last finalize error: %v): %v", lastErr, states)
 	}
 
 	failing := workflows / 5
@@ -509,26 +587,50 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if len(applied) != want || twice != 0 {
 		t.Errorf("results applied for %d jobs, %d of them more than once; want %d jobs, once each", len(applied), twice, want)
 	}
-	checks := []struct{ what, query, want string }{
-		{
-			"history rows, distinct jobs", `SELECT count(*) || ' ' || count(DISTINCT id) FROM hopper_job_history WHERE queue = 'default'`,
-			fmt.Sprintf("%d %d", workflows*(middles+2), workflows*(middles+2)),
-		},
-		{
-			"last steps by state", `SELECT string_agg(state || ' ' || n, ', ' ORDER BY state) FROM (
-			SELECT state::text, count(*) AS n FROM hopper_job_history WHERE kind = 'last' GROUP BY state) s`,
-			fmt.Sprintf("canceled %d, completed %d", failing, workflows-failing),
-		},
-		{"canceled last steps that ran", `SELECT count(*) FROM hopper_job_history WHERE kind = 'last' AND state = 'canceled' AND attempted_at IS NOT NULL`, "0"},
-		{"workflows whose failures miscount", `SELECT count(*) FROM hopper_batches b
-			WHERE b.failed <> (SELECT count(*) FROM hopper_job_history h WHERE h.batch_id = b.id AND h.state <> 'completed')`, "0"},
-		{"failures", `SELECT sum(failed) FROM hopper_batches`, strconv.Itoa(2 * failing)},
-		{"completion callbacks", `SELECT count(*) FROM hopper_jobs WHERE queue = 'callbacks'`, strconv.Itoa(workflows)},
-		{"edges left", `SELECT count(*) FROM hopper_job_deps`, "0"},
-	}
-	for _, c := range checks {
-		if got := f.QueryText(ctx, t, d, "SELECT ("+c.query+")::text"); got != c.want {
-			t.Errorf("%s = %s, want %s", c.what, got, c.want)
+	history := list(driver.JobListParams{Queue: "default", States: finished})
+	distinct := map[driver.JobID]bool{}
+	lastByState := map[driver.JobState]int{}
+	ranCanceled := 0
+	failedByBatch := map[driver.JobID]int{}
+	for _, j := range history {
+		distinct[j.ID] = true
+		if j.Kind == "last" {
+			lastByState[j.State]++
+			if j.State == driver.JobStateCanceled && !j.AttemptedAt.IsZero() {
+				ranCanceled++
+			}
 		}
+		if j.State != driver.JobStateCompleted {
+			failedByBatch[j.BatchID]++
+		}
+	}
+	if len(history) != workflows*(middles+2) || len(distinct) != len(history) {
+		t.Errorf("history has %d rows of %d distinct jobs, want %d of as many", len(history), len(distinct), workflows*(middles+2))
+	}
+	if lastByState[driver.JobStateCanceled] != failing || lastByState[driver.JobStateCompleted] != workflows-failing || len(lastByState) != 2 {
+		t.Errorf("last steps by state = %v, want %d canceled and %d completed", lastByState, failing, workflows-failing)
+	}
+	if ranCanceled != 0 {
+		t.Errorf("%d canceled last steps ran", ranCanceled)
+	}
+	failures := 0
+	for _, id := range batchIDs {
+		b, err := exec.BatchGet(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		failures += b.Failed
+		if b.Failed != failedByBatch[id] {
+			t.Errorf("workflow %s counts %d failures, its history %d", id, b.Failed, failedByBatch[id])
+		}
+	}
+	if failures != 2*failing {
+		t.Errorf("failures = %d, want %d", failures, 2*failing)
+	}
+	if n := len(list(driver.JobListParams{Queue: "callbacks"})); n != workflows {
+		t.Errorf("completion callbacks = %d, want %d", n, workflows)
+	}
+	if n := f.CountEdges(ctx, t, d); n != 0 {
+		t.Errorf("edges left = %d, want 0", n)
 	}
 }

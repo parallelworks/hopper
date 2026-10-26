@@ -59,7 +59,7 @@ func testStreams[TTx any](t *testing.T, f Fixture[TTx]) {
 	if e1.Position.IsZero() || !e1.Position.Less(e2.Position) || !e2.Position.Less(e3.Position) {
 		t.Errorf("positions not ascending: %v %v %v", e1.Position, e2.Position, e3.Position)
 	}
-	if e1.Key != "o1" || e1.Headers["n"] != "1" || e1.MessageID == "" || e1.CreatedAt.IsZero() || string(e1.Payload) != `{"i": 1}` {
+	if e1.Key != "o1" || e1.Headers["n"] != "1" || e1.MessageID == "" || e1.CreatedAt.IsZero() || !jsonEqual(e1.Payload, `{"i": 1}`) {
 		t.Errorf("event = %+v", e1)
 	}
 	if got := read("", driver.StreamPosition{}); len(got) != 3 || got[0].Position != e1.Position || got[2].Position != e3.Position {
@@ -89,7 +89,7 @@ func testStreams[TTx any](t *testing.T, f Fixture[TTx]) {
 	if err != nil || len(consumers) != 2 || consumers[0].Name != "audit" || consumers[1].Name != "orders" {
 		t.Fatalf("consumers = %v, %v", consumers, err)
 	}
-	if c := consumers[1]; !c.Position.IsZero() || c.Queue != "orders" || string(c.Metadata) != `{"c": 1}` || c.CreatedAt.IsZero() || c.Snapshot == "" {
+	if c := consumers[1]; !c.Position.IsZero() || c.Queue != "orders" || !jsonEqual(c.Metadata, `{"c": 1}`) || c.CreatedAt.IsZero() || c.Snapshot == "" {
 		t.Errorf("orders consumer = %+v", c)
 	}
 	if c := consumers[0]; c.MaxAttempts != 3 || c.Snapshot == consumers[1].Snapshot {
@@ -107,7 +107,7 @@ func testStreams[TTx any](t *testing.T, f Fixture[TTx]) {
 	if argsN(j) != 1 {
 		j = jobs[1]
 	}
-	if j.Kind != "stream:orders" || j.OrderingKey != "o1" || j.MaxAttempts != 10 || string(j.Args) != `{"i": 1}` {
+	if j.Kind != "stream:orders" || j.OrderingKey != "o1" || j.MaxAttempts != 10 || !jsonEqual(j.Args, `{"i": 1}`) {
 		t.Errorf("delivery = %+v", j)
 	}
 	var meta struct {
@@ -194,7 +194,12 @@ func testStreams[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 
 	// A transaction that commits late is delivered when it commits, and
-	// does not hold up the events of younger transactions meanwhile.
+	// does not hold up the events of younger transactions meanwhile. An
+	// engine that runs one writer at a time has no younger transaction to
+	// commit first: events commit in the order they are appended.
+	if singleWriter(d) {
+		return
+	}
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
 	old, err := d.UnwrapTx(tx).StreamAppend(ctx, driver.StreamAppendParams{Topic: "order.held", Payload: json.RawMessage(`{}`)})
@@ -220,17 +225,36 @@ func testStreams[TTx any](t *testing.T, f Fixture[TTx]) {
 	if res := pump("orders"); res.Delivered != 0 {
 		t.Errorf("late commit delivered twice: %+v", res)
 	}
+}
 
-	// Retention keeps a partition ahead and drops nothing young.
+// testStreamsRetention checks that retention drops no young event.
+func testStreamsRetention[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	exec := f.NewDriver(t).Executor()
+	for i := range 3 {
+		if _, err := exec.StreamAppend(ctx, driver.StreamAppendParams{Topic: "t", Payload: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: time.Hour, StreamRetention: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := exec.StreamRead(ctx, driver.StreamReadParams{Limit: 10}); err != nil || len(got) != 3 {
+		t.Errorf("events after maintenance = %d, %v; want 3", len(got), err)
+	}
+}
+
+// testStreamsPartitioned checks that retention keeps a partition of the
+// stream log ahead.
+func testStreamsPartitioned[TTx any](t *testing.T, f PostgresFixture[TTx]) {
+	ctx := context.Background()
+	exec := f.NewDriver(t).Executor()
 	m, err := exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: time.Hour, StreamRetention: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !containsPrefix(m.Created, "hopper_stream_events_") {
 		t.Errorf("no stream partition created: %v", m.Created)
-	}
-	if got := read("", driver.StreamPosition{}); len(got) != 7 {
-		t.Errorf("events after maintenance = %d, want 7", len(got))
 	}
 }
 
