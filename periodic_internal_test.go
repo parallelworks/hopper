@@ -36,6 +36,8 @@ type periodicExec struct {
 	nowReads       int
 	inserts        []driver.PeriodicInsertParams
 	registrations  []driver.PeriodicRegistrationRow
+	// onInsert, if set, is called after each insert.
+	onInsert func()
 }
 
 func (e *periodicExec) PeriodicRegistrations(context.Context) ([]driver.PeriodicRegistrationRow, error) {
@@ -78,6 +80,9 @@ func (e *periodicExec) PeriodicInsert(_ context.Context, p driver.PeriodicInsert
 		return nil, false, errors.New("connection reset")
 	}
 	e.inserts = append(e.inserts, p)
+	if e.onInsert != nil {
+		defer e.onInsert()
+	}
 	return &driver.JobRow{Queue: p.Job.Queue}, true, nil
 }
 

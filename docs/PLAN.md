@@ -647,7 +647,7 @@ CREATE TABLE hopper_periodic (          -- last inserted slot per periodic job
 CREATE TABLE hopper_periodic_registrations (  -- v19: each live client's periodic jobs
   client_id  bigint NOT NULL,
   name       text   NOT NULL,
-  definition jsonb  NOT NULL,           -- see §7.9
+  definition text   NOT NULL,           -- JSON, compared byte for byte; see §7.9
   PRIMARY KEY (client_id, name)
 );
 
@@ -1656,8 +1656,9 @@ holding the job's definition, the slot-independent part of its insert as the cli
 built it (kind, encoded args, queue, priority, attempts, metadata, tags, TTL, ordering
 and partition keys, and the unique key without its period), with its schedule,
 `RunOnStart` and `CatchUp`. The client writes its whole set in one transaction when it
-starts, on every change, and when it registers a new lease after losing one, and
-retries a failed write each lease renewal interval. The leader schedules the jobs of
+starts, when what it records changes, which it checks on every change and every lease
+renewal interval, and when it registers a new lease after losing one, and retries a
+failed write each lease renewal interval. The leader schedules the jobs of
 **every live client**, so a job is registered only by the programs that should run it,
 and the leader needs none of its Go types: it inserts the stored args and options, and
 the job is worked by whichever client works its queue. For each name the leader takes
@@ -1671,13 +1672,16 @@ unchanged, whichever client it comes from, so a job whose registering client sto
 another still registers it is not started again; a changed definition is started again
 as an added job. A registration lasts as long as its client's lease: the leader reads
 only live clients' rows, and deleting a client's row, when it stops or when the leader
-prunes it, deletes its registrations in the same statement or transaction. A write for a
+prunes it, deletes its registrations in the same statement or transaction. A write that
+races a prune, or a prune by a release from before v19, can leave rows behind; each
+write deletes the rows of clients whose row is gone. A write for a
 client whose lease has expired records nothing. A job therefore runs while any live
 client registers it, and stops within a leader interval of the last one removing it or
 stopping. Only `Cron` schedules (stored as their expression and time zone) and `Every`
 schedules (their interval) can be recorded; a job with another `Schedule`, or a `Cron`
-in `time.Local`, which names a different zone in each process, is scheduled only from
-its own client's set, while that client leads, as before v19. A definition the leader
+in `time.Local`, which names a different zone in each process, or in a zone that does
+not load by its name to the same offsets, such as a `time.FixedZone`, is scheduled only
+from its own client's set, while that client leads, as before v19. A definition the leader
 cannot read, such as one of a later definition version, is skipped with a log, and the
 leader schedules its own job of that name if it has one. A leader from before v19
 schedules only its own set. A client with no queues holds no lease and records nothing,
@@ -1712,8 +1716,12 @@ inserted, and the jobs already scheduled insert their due slots before added job
 start. `NewClient`, for
 `Config.Periodic`, and `Add` build each job's insert as `Insert` would and fail if it
 cannot be built, such as for invalid `InsertOpts`. `Add` also applies `StrictKinds`, as
-an `Insert` at that moment would; `NewClient` leaves it to each insert, since workers may
-be registered after it. A periodic job's `UniqueReplace` acts as `UniqueSkip`. A job's `UniqueOpts.ByPeriod` key is computed from its slot, so each
+an `Insert` at that moment would; `NewClient` leaves it until later, since workers may
+be registered after it. A `StrictKinds` client records only the jobs of kinds it has a
+worker for, comparing what it would record with what it last wrote every lease renewal
+interval, so a job is recorded once its worker is registered; until then the job is
+scheduled only from the client's own set while it leads, where each insert fails as
+an `Insert` would. A periodic job's `UniqueReplace` acts as `UniqueSkip`. A job's `UniqueOpts.ByPeriod` key is computed from its slot, so each
 back-filled or retried slot keys its own period. A `RunOnStart` insert whose reply is
 lost after it committed is inserted again when retried, since its slot is the database
 time of the try. A client that never leads (`NeverLead`, or one with no queues) never

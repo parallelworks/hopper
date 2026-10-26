@@ -342,13 +342,18 @@ func (e *executor) PeriodicLastSlots(ctx context.Context) (map[string]time.Time,
 // PeriodicRegister implements driver.Executor.
 func (e *executor) PeriodicRegister(ctx context.Context, params driver.PeriodicRegisterParams) error {
 	err := e.write(ctx, func(x *w) error {
-		if _, err := x.ExecContext(ctx, `DELETE FROM hopper_periodic_registrations WHERE client_id = ?`, params.ClientID); err != nil {
+		if _, err := x.ExecContext(ctx, `DELETE FROM hopper_periodic_registrations
+			WHERE client_id = ? OR client_id NOT IN (SELECT id FROM hopper_clients)`, params.ClientID); err != nil {
+			return err
+		}
+		var live bool
+		if err := x.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM hopper_clients WHERE id = ? AND expires_at > ?)`,
+			params.ClientID, x.us()).Scan(&live); err != nil || !live {
 			return err
 		}
 		for _, r := range params.Registrations {
-			if _, err := x.ExecContext(ctx, `INSERT INTO hopper_periodic_registrations (client_id, name, definition)
-				SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM hopper_clients WHERE id = ? AND expires_at > ?)`,
-				params.ClientID, r.Name, string(r.Definition), params.ClientID, x.us()); err != nil {
+			if _, err := x.ExecContext(ctx, `INSERT INTO hopper_periodic_registrations (client_id, name, definition) VALUES (?, ?, ?)`,
+				params.ClientID, r.Name, string(r.Definition)); err != nil {
 				return err
 			}
 		}

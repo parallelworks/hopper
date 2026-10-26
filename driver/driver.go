@@ -304,7 +304,9 @@ type Executor interface {
 	// PeriodicRegister replaces the periodic jobs a client has registered
 	// with params.Registrations, atomically. It records none for a client
 	// whose lease has expired or been deleted. Deleting the client's row
-	// (ClientDelete, ClientPruneExpired) deletes them too.
+	// (ClientDelete, ClientPruneExpired) deletes them too, and each call
+	// deletes the rows of clients whose row is gone, which a prune racing a
+	// write, or a prune by a release without the table, leaves behind.
 	PeriodicRegister(ctx context.Context, params PeriodicRegisterParams) error
 	// PeriodicRegistrations returns the periodic jobs registered by clients
 	// whose lease has not expired, by database time.

@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -110,6 +111,8 @@ func TestPeriodicDefinitionLeavesOutWhatCannotBeStored(t *testing.T) {
 	for name, job := range map[string]PeriodicJob{
 		"custom schedule": {Name: "custom", Schedule: onStartOnly{}, Args: tickArgs{}},
 		"local time zone": Cron("0 9 * * *", tickArgs{}, &PeriodicOpts{Location: time.Local}),
+		"fixed zone":      Cron("0 9 * * *", tickArgs{}, &PeriodicOpts{Location: time.FixedZone("UTC+3", 3*3600)}),
+		"fixed zone named like one with daylight saving": Cron("0 9 * * *", tickArgs{}, &PeriodicOpts{Location: time.FixedZone("CET", 3600)}),
 	} {
 		if err := job.resolve(); err != nil {
 			t.Fatal(err)
@@ -230,5 +233,35 @@ func TestPeriodicLoopFallsBackFromUnreadableDefinition(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if n := exec.inserted("tick"); n != 1 {
 		t.Errorf("the fallback started %d times", n)
+	}
+}
+
+// Removing the leader's own job stops it at once, even within a pass that
+// is back-filling its missed slots.
+func TestPeriodicLoopOwnRemovalStopsBackFill(t *testing.T) {
+	exec := &periodicExec{}
+	job := Every(time.Minute, tickArgs{}, &PeriodicOpts{CatchUp: 100})
+	c := newPeriodicTestClient(t, exec, job)
+	c.clientID.Store(1)
+	c.periodic.define = c.periodicDefinition
+	r := c.periodic.jobs[0]
+	def, err := c.periodicDefinition(&r.job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.def = string(def)
+	exec.set(func(e *periodicExec) {
+		e.last = map[string]time.Time{"tick": time.Now().Add(-3 * time.Hour)}
+		e.onInsert = func() {
+			if err := c.periodic.Remove("tick"); err != nil && !errors.Is(err, ErrNotFound) {
+				t.Error(err)
+			}
+		}
+	})
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool { return exec.inserted("tick") >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	if n := exec.inserted("tick"); n != 1 {
+		t.Errorf("a job removed during its back-fill inserted %d slots, want 1", n)
 	}
 }

@@ -396,4 +396,91 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 	if n := rows(deleted); n != 0 {
 		t.Errorf("%d registrations recorded for a deleted client", n)
 	}
+
+	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_periodic_registrations (client_id, name, definition) VALUES (-1, 'left', '{}')`); err != nil {
+		t.Fatal(err)
+	}
+	register()
+	if n := rows(-1); n != 0 {
+		t.Errorf("%d registrations of a client with no row survived another client's write", n)
+	}
+}
+
+type strictOther struct{}
+
+func (strictOther) Kind() string { return "strict-other" }
+
+// A StrictKinds client records only the periodic jobs of kinds it has a
+// worker for, and records a job once its worker is registered.
+func TestPeriodicStrictKindsRecordsOnlyWorkedKinds(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	leader := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: noopWorkers()})
+	if err := leader.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, leader.IsLeader)
+
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[strictOther]) error { return nil })
+	strict := h.client(&hopper.Config{
+		Queues:      map[string]hopper.QueueConfig{"strict": {MaxWorkers: 1}},
+		Workers:     workers,
+		StrictKinds: true,
+		NeverLead:   true,
+		Periodic:    []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: 8}, &hopper.PeriodicOpts{RunOnStart: true})},
+	})
+	if err := strict.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	if n := h.count("SELECT count(*) FROM hopper_periodic_registrations"); n != 0 {
+		t.Errorf("%d registrations of a kind the StrictKinds client has no worker for", n)
+	}
+	if n := h.countN("8"); n != 0 {
+		t.Errorf("%d jobs of a kind the StrictKinds client has no worker for", n)
+	}
+
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[noop]) error { return nil })
+	waitFor(t, func() bool { return h.countN("8") == 1 })
+}
+
+// Replicas registering the same job do not start it again as clients come
+// and go: the leader's own definition and another client's stored one are
+// the same definition.
+func TestPeriodicRunOnStartOnceAcrossReplicas(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	tun := fastTuning
+	tun.LeaseTTL, tun.LeaseRenew, tun.LeaderTTL = 30*time.Second, time.Second, 30*time.Second
+	start := func() *hopper.Client[pgxTx] {
+		c := h.client(&hopper.Config{
+			Queues:   map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+			Workers:  noopWorkers(),
+			Periodic: []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: 7}, &hopper.PeriodicOpts{RunOnStart: true})},
+		})
+		c.SetTuning(tun)
+		if err := c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	jobs := h.countN
+	leader := start()
+	waitFor(t, leader.IsLeader)
+	waitFor(t, func() bool { return jobs("7") == 1 })
+	follower := start()
+	time.Sleep(time.Second)
+	if err := follower.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	if !leader.IsLeader() {
+		t.Fatal("leadership moved, which runs RunOnStart again")
+	}
+	if n := jobs("7"); n != 1 {
+		t.Errorf("RunOnStart inserted %d jobs as a replica started and stopped, want 1", n)
+	}
 }

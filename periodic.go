@@ -166,7 +166,8 @@ func resolvePeriodic(jobs []PeriodicJob) ([]PeriodicJob, error) {
 // client's definition: a job runs while any live client registers it. A
 // change applies at once on the leader, and within a leader interval on
 // another client. A job whose schedule cannot be recorded, one other than
-// Cron's or Every's or a Cron in time.Local, is scheduled only from its own
+// Cron's or Every's, or a Cron in time.Local or in a zone that does not load
+// by its name, such as a time.FixedZone, is scheduled only from its own
 // client, while that client leads. A client with no queues holds no lease
 // and records nothing. It is safe for concurrent use.
 type PeriodicJobs struct {
@@ -182,10 +183,13 @@ type PeriodicJobs struct {
 	// it.
 	registered chan struct{}
 
+	// recordable, if set, reports whether the client records a job with a
+	// definition; a client with StrictKinds records only kinds it works.
+	recordable func(*registeredPeriodic) bool
+
 	mu      sync.Mutex
 	jobs    []*registeredPeriodic
 	byName  map[string]*registeredPeriodic
-	version uint64
 	changed chan struct{}
 }
 
@@ -200,6 +204,10 @@ type registeredPeriodic struct {
 	// params builds the insert for a slot of a job defined by its stored
 	// definition; nil for the client's own job, built from its args.
 	params func(slot time.Time) (driver.JobInsertParams, error)
+	// owner is, for a job defined by its stored definition, the leader's
+	// own job of that definition, if the leader has one, so that removing
+	// it stops the job at once rather than at the next pass.
+	owner *registeredPeriodic
 }
 
 // newPeriodicJobs returns a set that starts as jobs, which resolvePeriodic
@@ -226,7 +234,8 @@ func (c *Client[TTx]) PeriodicJobs() *PeriodicJobs {
 // again. The leader starts scheduling an added job at once when it is added
 // on the leader, and within a leader interval when added on another client,
 // as if its term had just started: RunOnStart inserts a job and CatchUp
-// back-fills missed slots.
+// back-fills missed slots. A job the leader already schedules with the same
+// definition, from this client or another, goes on as it was.
 func (p *PeriodicJobs) Add(job PeriodicJob) error {
 	return p.AddMany([]PeriodicJob{job})
 }
@@ -260,7 +269,6 @@ func (p *PeriodicJobs) AddMany(jobs []PeriodicJob) error {
 		p.jobs = append(p.jobs, r)
 		p.byName[r.job.Name] = r
 	}
-	p.version++
 	p.mu.Unlock()
 	if p.insertOnly && len(regs) > 0 {
 		p.logger.Debug("hopper: periodic jobs added on a client with no queues are never scheduled; it holds no lease to record them under", "count", len(regs))
@@ -283,7 +291,6 @@ func (p *PeriodicJobs) Remove(name string) error {
 	r.removed.Store(true)
 	delete(p.byName, name)
 	p.jobs = slices.DeleteFunc(p.jobs, func(j *registeredPeriodic) bool { return j == r })
-	p.version++
 	p.mu.Unlock()
 	p.notify()
 	return nil
@@ -296,7 +303,6 @@ func (p *PeriodicJobs) Clear() {
 		r.removed.Store(true)
 	}
 	p.jobs, p.byName = nil, map[string]*registeredPeriodic{}
-	p.version++
 	p.mu.Unlock()
 	p.notify()
 }
@@ -352,18 +358,23 @@ func (p *PeriodicJobs) definition(job *PeriodicJob) (string, error) {
 	return string(def), nil
 }
 
-// registrations returns the set's version and the definitions of the jobs
-// that can be stored.
-func (p *PeriodicJobs) registrations() (uint64, []driver.PeriodicRegistration) {
+// registrations returns the definitions of the jobs the client records.
+func (p *PeriodicJobs) registrations() []driver.PeriodicRegistration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	regs := []driver.PeriodicRegistration{}
 	for _, r := range p.jobs {
-		if r.def != "" {
+		if p.records(r) {
 			regs = append(regs, driver.PeriodicRegistration{Name: r.job.Name, Definition: json.RawMessage(r.def)})
 		}
 	}
-	return p.version, regs
+	return regs
+}
+
+// records reports whether the client records r, rather than only scheduling
+// it from its own set while it leads.
+func (p *PeriodicJobs) records(r *registeredPeriodic) bool {
+	return r.def != "" && (p.recordable == nil || p.recordable(r))
 }
 
 // periodicLoop runs on the leader. It inserts each periodic job's slots as
@@ -659,12 +670,21 @@ func (c *Client[TTx]) insertPeriodic(ctx context.Context, r *registeredPeriodic,
 	if r.removed.Load() {
 		return true
 	}
-	p := &r.job
-	build := r.params
-	if build == nil {
-		build = func(slot time.Time) (driver.JobInsertParams, error) { return c.periodicParams(p, slot) }
+	if r.owner != nil && r.owner.removed.Load() {
+		// The next pass drops the job, or goes on from this slot if another
+		// client registers it too.
+		return false
 	}
-	params, err := build(slot)
+	p := &r.job
+	var (
+		params driver.JobInsertParams
+		err    error
+	)
+	if r.params != nil {
+		params, err = r.params(slot)
+	} else {
+		params, err = c.periodicParams(p, slot)
+	}
 	if err != nil {
 		c.logger.ErrorContext(ctx, "hopper: periodic: build job", "periodic", p.Name, "error", err)
 		return true

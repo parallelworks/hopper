@@ -184,4 +184,10 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 	if n := rows(); n != 0 {
 		t.Errorf("%d registrations after both clients were gone", n)
 	}
+
+	execSQL(ctx, t, d, `INSERT INTO hopper_periodic_registrations (client_id, name, definition) VALUES (-1, 'left', '{}')`)
+	register()
+	if n := rows(); n != 1 {
+		t.Errorf("%d registrations, want only the live client's: a gone client's survived another client's write", n)
+	}
 }

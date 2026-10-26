@@ -59,8 +59,7 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 	d := periodicDefinition{Version: periodicDefinitionVersion}
 	switch s := p.Schedule.(type) {
 	case *CronSchedule:
-		// time.Local names the zone of whichever process reads it.
-		if s.loc == time.Local {
+		if !loadsByName(s.loc) {
 			return nil, nil
 		}
 		d.Cron, d.Location = s.spec, s.loc.String()
@@ -105,6 +104,32 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 		d.Job.Unique = &definedUnique{Key: job.UniqueKey, ByPeriod: byPeriod, Finished: job.UniqueFinished}
 	}
 	return json.Marshal(d)
+}
+
+// loadsByName reports whether the leader, loading loc by its name, gets the
+// same zone, as far as its offsets over the next two years show. time.Local
+// names the zone of whichever process reads it, and a time.FixedZone's name
+// may load as no zone or as one with other offsets, such as "CET".
+func loadsByName(loc *time.Location) bool {
+	if loc == nil || loc == time.UTC {
+		return true
+	}
+	if loc == time.Local {
+		return false
+	}
+	named, err := time.LoadLocation(loc.String())
+	if err != nil {
+		return false
+	}
+	t := time.Now()
+	for range 25 {
+		_, want := t.In(loc).Zone()
+		if _, got := t.In(named).Zone(); got != want {
+			return false
+		}
+		t = t.AddDate(0, 1, 0)
+	}
+	return true
 }
 
 // definedPeriodic decodes a definition another client stored into a
@@ -163,15 +188,15 @@ func (j definedJob) params(slot time.Time) (driver.JobInsertParams, error) {
 	if u := j.Unique; u != nil {
 		p.UniqueKey, p.UniqueFinished = u.Key, u.Finished
 		if u.ByPeriod > 0 {
-			period := "p=" + slot.UTC().Truncate(u.ByPeriod).Format(time.RFC3339)
+			period := periodPart(slot, u.ByPeriod)
 			if p.UniqueKey == "*" {
 				p.UniqueKey = period
 			} else {
 				p.UniqueKey += uniqueKeySeparator + period
 			}
 		}
-		if len(p.UniqueKey) > maxUniqueKey {
-			return driver.JobInsertParams{}, fmt.Errorf("hopper: unique key of %d bytes exceeds the %d byte limit", len(p.UniqueKey), maxUniqueKey)
+		if err := checkUniqueKey(p.UniqueKey); err != nil {
+			return driver.JobInsertParams{}, err
 		}
 	}
 	return p, nil
@@ -185,18 +210,20 @@ func (c *Client[TTx]) registrationLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaseRenew)
 	defer ticker.Stop()
 	var (
-		writtenID      int64
-		writtenVersion uint64
-		lastErr        string
+		writtenID int64
+		written   []driver.PeriodicRegistration
+		lastErr   string
 	)
 	for {
 		id := c.clientID.Load()
-		version, regs := c.periodic.registrations()
-		if id != writtenID || version != writtenVersion {
+		// Compared each time rather than on change alone, since a worker
+		// registered later changes what a StrictKinds client records.
+		regs := c.periodic.registrations()
+		if id != writtenID || !slices.EqualFunc(regs, written, sameRegistration) {
 			err := c.exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: id, Registrations: regs})
 			switch {
 			case err == nil:
-				writtenID, writtenVersion, lastErr = id, version, ""
+				writtenID, written, lastErr = id, regs, ""
 				c.logger.DebugContext(ctx, "hopper: recorded periodic jobs", "client_id", id, "count", len(regs))
 			case ctx.Err() != nil:
 				return
@@ -212,6 +239,10 @@ func (c *Client[TTx]) registrationLoop(ctx context.Context) {
 		case <-c.periodic.registered:
 		}
 	}
+}
+
+func sameRegistration(a, b driver.PeriodicRegistration) bool {
+	return a.Name == b.Name && string(a.Definition) == string(b.Definition)
 }
 
 // storedPeriodic is the leader's view of the definitions clients recorded.
@@ -287,18 +318,19 @@ func (c *Client[TTx]) watchStored(ctx context.Context, last map[string][]storedD
 // job moving between clients is not started again.
 func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) []*registeredPeriodic {
 	self := c.clientID.Load()
-	own := map[string]*registeredPeriodic{}
-	for _, r := range c.periodic.snapshot() {
-		own[r.job.Name] = r
-	}
-	wanted := map[string]string{}
-	var out []*registeredPeriodic
+	snapshot := c.periodic.snapshot()
+	own := make(map[string]*registeredPeriodic, len(snapshot))
 	names := slices.Sorted(maps.Keys(st.stored.byName))
-	for name := range own {
-		if _, stored := st.stored.byName[name]; !stored {
-			names = append(names, name)
+	for _, r := range snapshot {
+		own[r.job.Name] = r
+		if _, stored := st.stored.byName[r.job.Name]; !stored {
+			names = append(names, r.job.Name)
 		}
 	}
+	wanted := map[string]string{}
+	// owner holds the leader's own jobs whose definitions are wanted.
+	owner := map[string]*registeredPeriodic{}
+	var out []*registeredPeriodic
 	for _, name := range names {
 		var source *registeredPeriodic
 		for _, d := range st.stored.byName[name] {
@@ -319,10 +351,10 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 		}
 		switch {
 		case source == nil:
-		case source.def == "":
+		case !c.periodic.records(source):
 			out = append(out, source)
 		default:
-			wanted[name] = source.def
+			wanted[name], owner[name] = source.def, source
 		}
 	}
 	added := map[string]*registeredPeriodic{}
@@ -331,27 +363,32 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 		if r, ok := st.defined[name]; ok && r.def == def {
 			continue
 		}
-		r, err := definedPeriodic(name, json.RawMessage(def))
-		if err == nil {
-			added[name] = r
-			continue
-		}
 		if st.stored.rejected[name] != def {
+			r, err := definedPeriodic(name, json.RawMessage(def))
+			if err == nil {
+				added[name] = r
+				continue
+			}
 			st.stored.rejected[name] = def
 			c.logger.ErrorContext(ctx, "hopper: periodic: a stored definition cannot be read; scheduling this client's own, if it has one", "periodic", name, "error", err)
 		}
 		delete(wanted, name)
+		delete(owner, name)
 		fallback := own[name]
 		switch {
 		case fallback == nil:
-		case fallback.def == "":
+		case !c.periodic.records(fallback):
 			out = append(out, fallback)
 		case st.defined[name] != nil && st.defined[name].def == fallback.def:
-			wanted[name] = fallback.def
+			wanted[name], owner[name] = fallback.def, fallback
 		default:
-			if r, err := definedPeriodic(name, json.RawMessage(fallback.def)); err == nil {
-				wanted[name], added[name] = fallback.def, r
+			if st.stored.rejected[name] != fallback.def {
+				if r, err := definedPeriodic(name, json.RawMessage(fallback.def)); err == nil {
+					wanted[name], owner[name], added[name] = fallback.def, fallback, r
+					continue
+				}
 			}
+			out = append(out, fallback)
 		}
 	}
 	for name, r := range st.defined {
@@ -362,7 +399,9 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 	}
 	maps.Copy(st.defined, added)
 	for _, name := range slices.Sorted(maps.Keys(wanted)) {
-		out = append(out, st.defined[name])
+		r := st.defined[name]
+		r.owner = owner[name]
+		out = append(out, r)
 	}
 	return out
 }

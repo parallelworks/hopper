@@ -301,7 +301,9 @@ func (e *Executor) PeriodicRegister(ctx context.Context, params driver.PeriodicR
 		names[i], definitions[i] = r.Name, string(r.Definition)
 	}
 	err := e.withTx(ctx, func(tx Tx) error {
-		if _, err := tx.Exec(ctx, `DELETE FROM {{schema}}.hopper_periodic_registrations WHERE client_id = $1`, params.ClientID); err != nil {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM {{schema}}.hopper_periodic_registrations r
+			WHERE r.client_id = $1 OR NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_clients c WHERE c.id = r.client_id)`, params.ClientID); err != nil {
 			return err
 		}
 		if len(names) == 0 {
@@ -309,7 +311,7 @@ func (e *Executor) PeriodicRegister(ctx context.Context, params driver.PeriodicR
 		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO {{schema}}.hopper_periodic_registrations (client_id, name, definition)
-			SELECT $1, n, d::jsonb FROM unnest($2::text[], $3::text[]) AS r(n, d)
+			SELECT $1, n, d FROM unnest($2::text[], $3::text[]) AS r(n, d)
 			WHERE EXISTS (SELECT 1 FROM {{schema}}.hopper_clients WHERE id = $1 AND expires_at > now())`,
 			params.ClientID, textArray(names), textArray(definitions))
 		return err

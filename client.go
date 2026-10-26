@@ -143,6 +143,13 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 	}
 	c.cfg.StrictKinds = strict
 	c.periodic.define = c.periodicDefinition
+	c.periodic.recordable = func(r *registeredPeriodic) bool {
+		if !c.cfg.StrictKinds {
+			return true
+		}
+		_, ok := c.workers.lookup(r.job.Args.Kind())
+		return ok
+	}
 	c.notifier = newNotifier(c.exec, c.logger, c.tuning.notifyInterval)
 	return c, nil
 }
