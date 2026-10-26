@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/parallelworks/hopper"
 	"github.com/parallelworks/hopper/driver"
 	"github.com/parallelworks/hopper/driver/hoppersqlite"
+	"github.com/parallelworks/hopper/hoppermigrate"
 )
 
 func TestOpenRefuses(t *testing.T) {
@@ -330,6 +332,10 @@ func TestHelperProcess(t *testing.T) {
 	defer d.Close()
 	x := d.Executor()
 	switch role {
+	case "open":
+		if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}); err != nil {
+			t.Fatal(err)
+		}
 	case "claim":
 		if err := claimAll(ctx, x, os.Stdout); err != nil {
 			t.Fatal(err)
@@ -422,6 +428,114 @@ func helper(t *testing.T, path, role string) (*exec.Cmd, *output) {
 		t.Fatal(err)
 	}
 	return cmd, out
+}
+
+// openers is how many processes, and goroutines, open a new database at
+// once in TestOpenAcrossProcesses and TestOpenConcurrently.
+const openers = 12
+
+// TestOpenAcrossProcesses opens a new database from several processes at
+// once, each migrating it, as a caller that opens a new database from
+// several processes at once does. Each opens it, though it sets up a new
+// connection while another process holds the database, as one does while it
+// turns the database's write-ahead log on or migrates it.
+func TestOpenAcrossProcesses(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hopper.db")
+	cmds := make([]*exec.Cmd, openers)
+	outs := make([]*output, openers)
+	for i := range cmds {
+		cmds[i], outs[i] = helper(t, path, "open")
+	}
+	for i, cmd := range cmds {
+		if err := cmd.Wait(); err != nil {
+			t.Errorf("an opening process: %v\n%s", err, outs[i])
+		}
+	}
+}
+
+// TestOpenConcurrently opens a new database from several goroutines at
+// once, each with a Driver of its own, each migrating it.
+func TestOpenConcurrently(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "hopper.db")
+	var wg sync.WaitGroup
+	for range openers {
+		wg.Go(func() {
+			d, err := hoppersqlite.Open(path, nil)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer d.Close()
+			if _, err := hoppermigrate.Up(context.Background(), d, &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// hold holds the database at path with another connection's exclusive
+// lock, which it takes on a database it makes, until the function it
+// returns is called.
+func hold(t *testing.T, path string) func() {
+	t.Helper()
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE held (a); BEGIN EXCLUSIVE; INSERT INTO held VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		_, _ = conn.ExecContext(ctx, "COMMIT")
+		_ = conn.Close()
+		_ = db.Close()
+	}
+}
+
+// TestOpenWhileHeld opens a database another connection holds for longer
+// than the busy timeout: Open waits for it, as its connections' setup
+// does, and OpenContext gives up once its context ends.
+func TestOpenWhileHeld(t *testing.T) {
+	t.Parallel()
+	t.Run("waits", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "hopper.db")
+		const held = 300 * time.Millisecond
+		timer := time.AfterFunc(held, hold(t, path))
+		defer timer.Stop()
+		start := time.Now()
+		d, err := hoppersqlite.Open(path, nil)
+		if err != nil {
+			t.Fatalf("Open while another connection held the database: %v", err)
+		}
+		defer d.Close()
+		if took := time.Since(start); took < held {
+			t.Errorf("Open returned after %v, before the other connection let the database go", took)
+		}
+	})
+	t.Run("gives up", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "hopper.db")
+		defer hold(t, path)()
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		d, err := hoppersqlite.OpenContext(ctx, path, nil)
+		if err == nil {
+			_ = d.Close()
+			t.Fatal("OpenContext opened a database another connection held")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("OpenContext while another connection held the database = %v, not its context's end", err)
+		}
+	})
 }
 
 // TestAcrossProcesses shares one database among processes: claims by four
