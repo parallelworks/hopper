@@ -441,7 +441,9 @@ defined as operations rather than SQL:
   writes; the driver's `database/sql` connections do that lazily, on a transaction's
   first statement, so that beginning one never blocks. Within a process, writers queue
   for the lock in turn, for as long as their context allows; across processes, SQLite's
-  busy handler polls for it. With no other writer in between, the finalizing transaction
+  busy handler polls for it, for as long as the context allows, as it does for the
+  pragmas that set up each new connection, some of which read the schema and so wait
+  for another connection's lock. With no other writer in between, the finalizing transaction
   reads each job, checks it in Go and writes it back, settles the job's batch and promotes
   its dependents itself, so `BatchSettle` and `WorkflowPromoteReady` find nothing a race
   left; `SkipLocked` and `NoWait` wait briefly for another transaction's writes and then
