@@ -208,7 +208,11 @@ func (x *w) insertJobs(ctx context.Context, jobs []jobInsert, onConflict driver.
 }
 
 // finishedDuplicate returns the latest job in history with an insert's
-// kind and unique key in one of its UniqueFinished states, or nil.
+// kind and unique key in one of its UniqueFinished states, or nil. Of jobs
+// finalized at one time, as jobs of one process are while its clock holds
+// the time (clock), the latest is the one inserted last, which is the one
+// finalized last: a job with the key can only be inserted once the one
+// before it has finished.
 func (x *w) finishedDuplicate(ctx context.Context, j jobInsert) (*driver.JobRow, error) {
 	args := []any{j.kind, j.uniqueKey}
 	for _, s := range j.uniqueFinished {
@@ -216,7 +220,7 @@ func (x *w) finishedDuplicate(ctx context.Context, j jobInsert) (*driver.JobRow,
 	}
 	found, err := scanJob(x.QueryRowContext(ctx, "SELECT "+historyColumns+` FROM hopper_job_history
 		WHERE kind = ? AND unique_key = ? AND state IN (`+placeholders(len(j.uniqueFinished))+`)
-		ORDER BY finalized_at DESC LIMIT 1`, args...), true)
+		ORDER BY finalized_at DESC, seq DESC LIMIT 1`, args...), true)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

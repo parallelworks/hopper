@@ -728,11 +728,18 @@ there is **no scheduler loop** moving jobs between states.
 All time comparisons use the database's `now()`, never the application clock, so clock
 skew between pods cannot cause early or duplicate execution. SQLite's clock is the host's,
 which every process that opens the database shares, since it must be on a local
-filesystem: hoppersqlite reads it once a transaction holds the write lock, and never
-returns a time earlier than one it returned before in the same process, so within one
-process each write's time is no earlier than the writes before it even when the host's
-clock is stepped back. Across processes the floor does not hold: a clock stepped back
-can date one process's write before another's earlier one. A host that sleeps finds its
+filesystem: hoppersqlite reads it once a transaction holds the write lock, and does not
+return a time earlier than one it returned before in the same process while the host's
+clock is behind that time by at most 500ms. So within one process each write's time is
+no earlier than the writes before it when the host's clock is stepped back a little, as
+NTP steps it for an offset over 128ms (it slews smaller ones). A client renews its lease
+every third of its TTL, so a lease renewed on time has two thirds of its TTL left, 666ms
+at the shortest `LeaseTTL`, 1s: a clock that leads by 500ms never makes it look expired
+to a leader in that process. A host's clock behind by more, as one set far ahead and
+then corrected is, hoppersqlite follows again, and logs that it did (`Config.Logger`),
+rather than date every write, lease and snooze in the process ahead until the host's
+clock catches up. Across processes the floor does not hold: a clock stepped back can
+date one process's write before another's earlier one. A host that sleeps finds its
 clock moved on when it wakes, as a server's would, and its clients' leases expired.
 
 ### 7.2 Insert
