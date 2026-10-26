@@ -35,7 +35,7 @@ func (e *executor) claimLimited(ctx context.Context, params driver.JobClaimParam
 		if err != nil {
 			return fmt.Errorf("hopper: read queue limits: %w", err)
 		}
-		if err := x.QueryRowContext(ctx, `SELECT count(*) FROM hopper_jobs WHERE queue = ? AND state = 'running'`, params.Queue).Scan(&running); err != nil {
+		if err := x.QueryRowContext(ctx, `SELECT count(*) FROM hopper_jobs WHERE queue = ? AND state = 'running' AND attempted_by IS NOT NULL`, params.Queue).Scan(&running); err != nil {
 			return fmt.Errorf("hopper: count running: %w", err)
 		}
 		budget := params.Limit

@@ -257,6 +257,18 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 	if err != nil {
 		return nil, err
 	}
+	leased := params.Jobs[0].Lease != nil
+	if leased && params.SkipLocked {
+		return nil, errors.New("hopper: finalize jobs: SkipLocked with results of leased jobs")
+	}
+	for i, r := range results {
+		if (r.Lease != nil) != leased {
+			return nil, errors.New("hopper: finalize jobs: results of leased jobs and of others in one call")
+		}
+		if leased {
+			results[i].Fence = r.Lease.Fence
+		}
+	}
 	keep := keepLogs(params.KeepLogs)
 	var applied []driver.JobFinalized
 	write := e.write
@@ -275,7 +287,18 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 				continue
 			}
 			j := row.job
-			if j.State != driver.JobStateRunning || j.AttemptedBy == 0 || j.AttemptedBy != r.AttemptedBy || j.Fence != r.Fence {
+			if leased {
+				owns, err := x.leaseOwns(ctx, row, r.Lease)
+				if err != nil {
+					return err
+				}
+				if !owns {
+					continue
+				}
+				if err := x.releaseLease(ctx, j.ID); err != nil {
+					return err
+				}
+			} else if j.State != driver.JobStateRunning || j.AttemptedBy == 0 || j.AttemptedBy != r.AttemptedBy || j.Fence != r.Fence {
 				continue
 			}
 			errs := row.errors
