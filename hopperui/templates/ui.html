@@ -130,7 +130,7 @@
   <dt>scheduled</dt><dd>{{ts .ScheduledAt}}</dd>
   {{if .SnoozeReason}}<dt>snooze reason</dt><dd>{{.SnoozeReason}}</dd>{{end}}
   {{with .Progress}}<dt>progress</dt><dd>{{if .Step}}finished <code>{{.Step}}</code>{{else}}no step finished{{end}}{{with .Cursor}}, cursor <code>{{printf "%s" .}}</code>{{end}} ({{ts .RecordedAt}})</dd>{{end}}
-  {{if not .AttemptedAt.IsZero}}<dt>attempted</dt><dd>{{ts .AttemptedAt}} by client {{.AttemptedBy}}</dd>{{end}}
+  {{if not .AttemptedAt.IsZero}}<dt>attempted</dt><dd>{{ts .AttemptedAt}} {{if .AttemptedBy}}by client {{.AttemptedBy}}{{else if not .LeaseExpiresAt.IsZero}}under a job lease, fence {{.Fence}}, expiring {{ts .LeaseExpiresAt}}{{end}}</dd>{{end}}
   {{if not .FinalizedAt.IsZero}}<dt>finalized</dt><dd>{{ts .FinalizedAt}}</dd>{{end}}
   {{if not .ExpiresAt.IsZero}}<dt>expires</dt><dd>{{ts .ExpiresAt}}</dd>{{end}}
   {{if not .CancelRequestedAt.IsZero}}<dt>cancel requested</dt><dd>{{ts .CancelRequestedAt}}</dd>{{end}}
