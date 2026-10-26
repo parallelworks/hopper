@@ -89,6 +89,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -114,6 +115,10 @@ type Config struct {
 	// committed by other processes. Those of this process wake it at once.
 	// Zero means 50ms.
 	ListenInterval time.Duration
+	// Logger receives the driver's warnings, such as its clock following
+	// the host's back after the host's clock was corrected. Nil means
+	// slog.Default().
+	Logger *slog.Logger
 }
 
 // DefaultListenInterval is ListenInterval's default.
@@ -132,6 +137,7 @@ type Driver struct {
 	db             *database
 	listenInterval time.Duration
 	statements     statements
+	log            *slog.Logger
 }
 
 var _ driver.Driver[*sql.Tx] = (*Driver)(nil)
@@ -173,6 +179,9 @@ func OpenContext(ctx context.Context, path string, cfg *Config) (*Driver, error)
 	if c.ListenInterval == 0 {
 		c.ListenInterval = DefaultListenInterval
 	}
+	if c.Logger == nil {
+		c.Logger = slog.Default()
+	}
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file:") {
 		return nil, fmt.Errorf("hoppersqlite: %q is not a file path; the database must be a file, which every connection and process opens", path)
 	}
@@ -186,7 +195,7 @@ func OpenContext(ctx context.Context, path string, cfg *Config) (*Driver, error)
 	db := openDatabase(resolved)
 	sqlDB := sql.OpenDB(&connector{db: db, dsn: dsn(resolved), synchronous: sync})
 	sqlDB.SetMaxIdleConns(16)
-	d := &Driver{sqlDB: sqlDB, db: db, listenInterval: c.ListenInterval}
+	d := &Driver{sqlDB: sqlDB, db: db, listenInterval: c.ListenInterval, log: c.Logger}
 	if err := d.setUp(ctx, resolved); err != nil {
 		_ = d.Close()
 		return nil, fmt.Errorf("hoppersqlite: open %s: %w", resolved, err)
