@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -266,6 +268,41 @@ func TestPauseAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return ran.Load() == 1 })
+}
+
+// TestRemoveWhileStopping removes queues while the client stops: each call
+// returns, neither waits on the other, and under -race neither reads the
+// client's queues while the other changes them.
+func TestRemoveWhileStopping(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[noop]) error { return nil })
+	c := h.started(workers, 1)
+	names := make([]string, 8)
+	for i := range names {
+		names[i] = "tenant_" + strconv.Itoa(i)
+		if err := c.Queues().Add(ctx, names[i], hopper.QueueConfig{MaxWorkers: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := c.Stop(stopCtx); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	})
+	for _, name := range names {
+		wg.Go(func() {
+			if err := c.Queues().Remove(stopCtx, name); err != nil {
+				t.Errorf("Remove(%s): %v", name, err)
+			}
+		})
+	}
+	wg.Wait()
 }
 
 func TestRuntimeQueues(t *testing.T) {
