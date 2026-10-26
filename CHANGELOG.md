@@ -6,6 +6,36 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.8.0](https://github.com/parallelworks/hopper/compare/v0.7.0...v0.8.0) (2026-10-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* hoppersqlite, a pure-Go SQLite driver, and a drivertest suite any engine can pass ([#79](https://github.com/parallelworks/hopper/issues/79))
+
+### Features
+
+* **client:** a unique job can count finished jobs as duplicates ([#63](https://github.com/parallelworks/hopper/issues/63)) ([6c6c060](https://github.com/parallelworks/hopper/commit/6c6c060a50598d6c21bd9f2f9f0e6a30891abf7f))
+* **client:** add and remove periodic jobs at runtime ([#73](https://github.com/parallelworks/hopper/issues/73)) ([627fbea](https://github.com/parallelworks/hopper/commit/627fbea2205d18c8988661aa25ce7b5d2fc94d2d))
+* **client:** give every claim a fencing number ([#76](https://github.com/parallelworks/hopper/issues/76)) ([8822336](https://github.com/parallelworks/hopper/commit/88223361db63e42369d498d4b111d48e5dfc4b16))
+* **client:** kind aliases, so a renamed kind still works its old jobs ([#74](https://github.com/parallelworks/hopper/issues/74)) ([b1693ec](https://github.com/parallelworks/hopper/commit/b1693ecee3dd958cfb09fdf1de738cbd1b7a5aa4))
+* **client:** tag jobs, and filter listings by tags, metadata, IDs and priorities ([#68](https://github.com/parallelworks/hopper/issues/68)) ([a447031](https://github.com/parallelworks/hopper/commit/a4470316bac7f56e53af2ba7ee17f12920420c87))
+* **control:** delete a job, and cancel, retry and delete in the caller's transaction ([#62](https://github.com/parallelworks/hopper/issues/62)) ([4051678](https://github.com/parallelworks/hopper/commit/40516780c360d9157fd6d78e677a802cae63198a))
+* **core:** a client-wide error hook and retry policy ([#59](https://github.com/parallelworks/hopper/issues/59)) ([a9e15f7](https://github.com/parallelworks/hopper/commit/a9e15f7c71479717df985b4165c9d0fca289176d))
+* **hopperbench:** add a workflow scenario ([#75](https://github.com/parallelworks/hopper/issues/75)) ([a6f3b36](https://github.com/parallelworks/hopper/commit/a6f3b36c6f3d51516d46ed5cb869e4a8df786d36))
+* hoppersqlite, a pure-Go SQLite driver, and a drivertest suite any engine can pass ([#79](https://github.com/parallelworks/hopper/issues/79)) ([917327a](https://github.com/parallelworks/hopper/commit/917327a5e76b9b8a6d442011672a730d56067378))
+* **worker:** a pluggable log store for job logs ([#66](https://github.com/parallelworks/hopper/issues/66)) ([b561687](https://github.com/parallelworks/hopper/commit/b5616879ad3835c2ddad01c2024694a8b84daad2))
+* **worker:** per-attempt job logs ([#65](https://github.com/parallelworks/hopper/issues/65)) ([9b08c27](https://github.com/parallelworks/hopper/commit/9b08c278ce1060f99764e2f163040cf02b3fd63a))
+* **worker:** resumable steps ([#64](https://github.com/parallelworks/hopper/issues/64)) ([01c9118](https://github.com/parallelworks/hopper/commit/01c9118a25128503c080b82da85f6fa3eac13ab4))
+
+
+### Bug fixes
+
+* **deps:** build with Go 1.27.3, which distrusts eMudhra's compromised intermediate CAs ([#78](https://github.com/parallelworks/hopper/issues/78)) ([aafe589](https://github.com/parallelworks/hopper/commit/aafe58987f528d1306d7dc45a158d2301e8bd6a0))
+* **driver:** keep finalize plans stable under stale statistics ([#77](https://github.com/parallelworks/hopper/issues/77)) ([5c6e31b](https://github.com/parallelworks/hopper/commit/5c6e31bcf5cc2096a7f132dba73aecb7b6c7ed8a))
+* **leader:** retention no longer leaves a history index invalid ([#69](https://github.com/parallelworks/hopper/issues/69)) ([cbb8d0e](https://github.com/parallelworks/hopper/commit/cbb8d0e0b146cbf53c03b5f726d06a98f8d44655))
+* **worker:** bound a job's kept logs, and drain results waiting on them at stop ([#67](https://github.com/parallelworks/hopper/issues/67)) ([e120bef](https://github.com/parallelworks/hopper/commit/e120befa07a4775dc1b23ed020d34a9697ecbb43))
+
 ## [0.7.0](https://github.com/parallelworks/hopper/compare/v0.6.0...v0.7.0) (2026-10-14)
 
 
