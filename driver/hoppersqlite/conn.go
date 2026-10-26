@@ -336,7 +336,10 @@ var _ driver.Connector = (*connector)(nil)
 // durability of its commits, on macOS with F_FULLFSYNC, without which fsync
 // leaves the commit in the disk's cache; the size the write-ahead log is
 // cut back to; and foreign keys off, as SQLite has them by default and
-// hopper's schema has none.
+// hopper's schema has none. Some read the database's schema, which waits
+// for a lock another connection can hold, as one does while it turns a new
+// database's write-ahead log on: Connect runs each again while it fails
+// with SQLITE_BUSY and its context allows, as the package's statements do.
 func (c *connector) pragmas() []string {
 	p := []string{
 		fmt.Sprintf("PRAGMA busy_timeout = %d", busyQuantum.Milliseconds()),
@@ -361,7 +364,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		return nil, fmt.Errorf("hoppersqlite: modernc.org/sqlite's connection is a %T, which lacks a method this driver needs", opened)
 	}
 	for _, p := range c.pragmas() {
-		if _, err := inner.ExecContext(ctx, p, nil); err != nil {
+		if _, err := retryBusy(ctx, c.db, func() (driver.Result, error) { return inner.ExecContext(ctx, p, nil) }); err != nil {
 			_ = inner.Close()
 			return nil, fmt.Errorf("hoppersqlite: %s: %w", p, err)
 		}
