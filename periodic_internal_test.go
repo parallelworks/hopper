@@ -35,6 +35,13 @@ type periodicExec struct {
 	last           map[string]time.Time
 	nowReads       int
 	inserts        []driver.PeriodicInsertParams
+	registrations  []driver.PeriodicRegistrationRow
+}
+
+func (e *periodicExec) PeriodicRegistrations(context.Context) ([]driver.PeriodicRegistrationRow, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.registrations), nil
 }
 
 func (e *periodicExec) Now(context.Context) (time.Time, error) {

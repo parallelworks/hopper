@@ -301,6 +301,14 @@ type Executor interface {
 	PeriodicInsert(ctx context.Context, params PeriodicInsertParams) (*JobRow, bool, error)
 	// PeriodicLastSlots returns the last inserted slot per periodic job.
 	PeriodicLastSlots(ctx context.Context) (map[string]time.Time, error)
+	// PeriodicRegister replaces the periodic jobs a client has registered
+	// with params.Registrations, atomically. It records none for a client
+	// whose lease has expired or been deleted. Deleting the client's row
+	// (ClientDelete, ClientPruneExpired) deletes them too.
+	PeriodicRegister(ctx context.Context, params PeriodicRegisterParams) error
+	// PeriodicRegistrations returns the periodic jobs registered by clients
+	// whose lease has not expired, by database time.
+	PeriodicRegistrations(ctx context.Context) ([]PeriodicRegistrationRow, error)
 
 	// Stats returns queue depths and cluster state.
 	Stats(ctx context.Context) (*Stats, error)
@@ -797,6 +805,28 @@ type PeriodicInsertParams struct {
 	Name string
 	Slot time.Time
 	Job  JobInsertParams
+}
+
+// PeriodicRegisterParams is the full set of periodic jobs a client has
+// registered.
+type PeriodicRegisterParams struct {
+	ClientID      int64
+	Registrations []PeriodicRegistration
+}
+
+// PeriodicRegistration is one periodic job a client has registered.
+// Definition is opaque to the driver: a JSON document the client encodes.
+type PeriodicRegistration struct {
+	Name       string
+	Definition json.RawMessage
+}
+
+// PeriodicRegistrationRow is a live client's registration, with when that
+// client started, so that the newest client's definition of a name wins.
+type PeriodicRegistrationRow struct {
+	PeriodicRegistration
+	ClientID        int64
+	ClientStartedAt time.Time
 }
 
 // Stats is a snapshot of queue depths and cluster state.

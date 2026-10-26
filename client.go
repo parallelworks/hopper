@@ -114,7 +114,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		workers:     resolved.Workers,
 		leaderPoke:  make(chan struct{}, 1),
 		streamPoke:  make(chan struct{}, 1),
-		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, !resolved.leads()),
+		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
 		events:      newEventBus(),
 		running:     map[JobID]*runningJob{},
 		doneWaiters: map[JobID][]chan struct{}{},
@@ -135,8 +135,14 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		if _, err := c.periodicParams(&r.job, time.Now()); err != nil {
 			return nil, fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
 		}
+		def, err := c.periodicDefinition(&r.job)
+		if err != nil {
+			return nil, fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
+		}
+		r.def = string(def)
 	}
 	c.cfg.StrictKinds = strict
+	c.periodic.define = c.periodicDefinition
 	c.notifier = newNotifier(c.exec, c.logger, c.tuning.notifyInterval)
 	return c, nil
 }
@@ -213,6 +219,7 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
 	}
 	c.leaseWG.Go(func() { c.leaseLoop(c.bgCtx) })
+	c.leaseWG.Go(func() { c.registrationLoop(c.bgCtx) })
 
 	c.state = clientStarted
 	c.logger.InfoContext(ctx, "hopper: client started", "client_id", id, "queues", slices.Sorted(maps.Keys(c.cfg.Queues)))

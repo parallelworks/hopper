@@ -1,0 +1,1 @@
+DROP TABLE hopper_periodic_registrations;

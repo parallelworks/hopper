@@ -333,6 +333,11 @@ Periodic: []hopper.PeriodicJob{
 ```
 
 The leader inserts each slot exactly once, whichever replica is leader.
+Each client records its periodic jobs under its lease, and the leader
+schedules the jobs of every live client. So when several programs share
+an install, each registers only its own jobs, and the leader needs none of
+their types: the job goes to its queue, and whichever client works that
+queue runs it.
 
 `client.PeriodicJobs()` adds and removes periodic jobs at runtime:
 
@@ -341,9 +346,11 @@ err := client.PeriodicJobs().Add(hopper.Cron("0 * * * *", TenantReport{ID: 42}, 
 err = client.PeriodicJobs().Remove("report:42")
 ```
 
-The set is per client and kept in memory, and only the leader's set is
-scheduled. Make the same change on every replica that can lead, or the job
-stops or starts when leadership moves.
+A job runs while any live client registers it, and stops once none does.
+When clients define one name differently, as during a rolling deploy, the
+newest client's definition wins. Only `Cron` and `Every` schedules can be
+recorded; a job with a custom `Schedule` runs only while its own client
+leads.
 
 ## Batches and workflows
 

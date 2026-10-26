@@ -90,7 +90,9 @@ type Config struct {
 	// lost clients, retention, maintenance, periodic jobs and stream
 	// delivery. Use it for clients that share an install but must not run it,
 	// such as a developer's process against a shared environment. At least
-	// one client of every install must be able to lead.
+	// one client of every install must be able to lead. Its periodic jobs are
+	// still recorded, and the leader schedules them while it runs, so such a
+	// process registers none it should not run.
 	NeverLead bool
 	// LeaseTTL is how long this client's lease lasts without a renewal. It
 	// is renewed three times per TTL; when it lapses, the client's running

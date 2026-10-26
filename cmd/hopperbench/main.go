@@ -237,7 +237,7 @@ type bench struct {
 func (b *bench) reset(ctx context.Context) error {
 	// The tags tables (schema v17) are listed so that their truncate
 	// triggers find them empty, rather than truncating them one by one.
-	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic, hopper_batches, hopper_batch_progress, hopper_job_deps"); err != nil {
+	if _, err := b.pool.Exec(ctx, "TRUNCATE hopper_jobs, hopper_job_history, hopper_job_tags, hopper_job_history_tags, hopper_clients, hopper_leader, hopper_periodic, hopper_periodic_registrations, hopper_batches, hopper_batch_progress, hopper_job_deps"); err != nil {
 		return err
 	}
 	if b.opts.history > 0 {
