@@ -382,6 +382,23 @@ anyway), and the workflow is a batch, so it has the same callbacks.
 `client.WorkflowGet(ctx, res.ID)` and `hopper workflows get <id>` show its
 progress and graph.
 
+A step's claim carries its dependencies that have finished: name a step with
+`StepOpts.Name`, and a step after it finds it with `job.Dependency(name)`,
+with its final state (`completed`, `canceled` or `discarded`) and the output
+its worker passed to `hopper.SetOutput`. They are kept until the workflow
+completes, whatever the history's retention, so a step that is retried or
+snoozed gets them again.
+
+```go
+parse := wf.Add(Parse{}, &hopper.StepOpts{Name: "parse", After: []hopper.Step{fetch}})
+
+// In Index's worker:
+if dep, ok := job.Dependency("parse"); ok && dep.State == hopper.JobStateCompleted {
+	var doc ParsedDoc
+	err := json.Unmarshal(dep.Output, &doc)
+}
+```
+
 ## Streams
 
 Messaging fans out at publish time; a stream keeps the events, so a consumer
