@@ -85,8 +85,10 @@ func testDependencyResults[TTx any](t *testing.T, f Fixture[TTx]) {
 	finalizeCurrent(ctx, t, exec,
 		driver.JobFinalize{ID: id(0), AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`{"image":"img:1"}`)},
 		driver.JobFinalize{ID: id(1), AttemptedBy: clientID, State: driver.JobStateCompleted, Output: json.RawMessage(`{"warnings":2}`)},
-		driver.JobFinalize{ID: id(2), AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true, Output: json.RawMessage(`{"exit":3}`),
-			Error: &driver.AttemptError{Attempt: 1, Error: "boom"}},
+		driver.JobFinalize{
+			ID: id(2), AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true, Output: json.RawMessage(`{"exit":3}`),
+			Error: &driver.AttemptError{Attempt: 1, Error: "boom"},
+		},
 		driver.JobFinalize{ID: plain, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`{"plain":true}`)},
 	)
 	if n := f.CountJobResults(ctx, t, d); n != 3 {
@@ -111,13 +113,17 @@ func testDependencyResults[TTx any](t *testing.T, f Fixture[TTx]) {
 	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(3), AttemptedBy: clientID, State: driver.JobStateScheduled, Snooze: true, Delay: time.Hour})
 	f.MakeClaimable(ctx, t, d, id(3))
 	checkDependencies(t, claimOne(ctx, t, exec, clientID, id(3)), report...)
-	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(3), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour,
-		Error: &driver.AttemptError{Attempt: 2, Error: "retry"}})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{
+		ID: id(3), AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour,
+		Error: &driver.AttemptError{Attempt: 2, Error: "retry"},
+	})
 	f.MakeClaimable(ctx, t, d, id(3))
 	checkDependencies(t, claimOne(ctx, t, exec, clientID, id(3)), report...)
 
-	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id(3), AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true,
-		Output: json.RawMessage(`{"pages":7}`)})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{
+		ID: id(3), AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true,
+		Output: json.RawMessage(`{"pages":7}`),
+	})
 	done := leaseResult(notify, driver.JobStateCompleted)
 	done.Output = json.RawMessage(`{"sent":true}`)
 	if applied := finalize(ctx, t, exec, done); len(applied) != 1 {
@@ -205,8 +211,10 @@ func testDependencyResultsFailed[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal(err)
 	}
 	a := claimOne(ctx, t, exec, clientID, chain.Jobs[0].Job.ID)
-	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: a.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true,
-		Output: json.RawMessage(`1`)})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{
+		ID: a.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true,
+		Output: json.RawMessage(`1`),
+	})
 	f.DeleteJobResult(ctx, t, d, a.ID)
 	b := claimOne(ctx, t, exec, clientID, chain.Jobs[1].Job.ID)
 	checkDependencies(t, b, wantDependency{"a", "", ""})
@@ -232,8 +240,10 @@ func testDependencyResultsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatalf("claimed %d", len(jobs))
 	}
 	xResult := driver.JobFinalize{ID: x, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Output: json.RawMessage(`"x"`)}
-	yResult := driver.JobFinalize{ID: y, AttemptedBy: clientID, Fence: 1, State: driver.JobStateDiscarded, Archive: true,
-		Output: json.RawMessage(`"y"`), Error: &driver.AttemptError{Attempt: 1, Error: "boom"}}
+	yResult := driver.JobFinalize{
+		ID: y, AttemptedBy: clientID, Fence: 1, State: driver.JobStateDiscarded, Archive: true,
+		Output: json.RawMessage(`"y"`), Error: &driver.AttemptError{Attempt: 1, Error: "boom"},
+	}
 
 	tx, commit, rollback := f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path

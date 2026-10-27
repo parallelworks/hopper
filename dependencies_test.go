@@ -72,8 +72,10 @@ func TestWorkflowDependencies(t *testing.T) {
 	wf := hopper.NewWorkflow("deps", nil)
 	build := wf.Add(depStep{Name: "build"}, &hopper.StepOpts{Name: "build"})
 	lint := wf.Add(depStep{Name: "lint", Fail: true}, &hopper.StepOpts{Name: "lint"})
-	report := wf.Add(depStep{Name: "report"}, &hopper.StepOpts{Name: "report", After: []hopper.Step{build, lint},
-		OnDependencyFailure: hopper.DependencyIgnore})
+	report := wf.Add(depStep{Name: "report"}, &hopper.StepOpts{
+		Name: "report", After: []hopper.Step{build, lint},
+		OnDependencyFailure: hopper.DependencyIgnore,
+	})
 	wf.Add(depStep{Name: "last"}, hopper.After(report))
 	res, err := c.InsertWorkflow(ctx, wf)
 	if err != nil {
