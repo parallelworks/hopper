@@ -54,7 +54,7 @@ lease AS (
     renewed_at = EXCLUDED.renewed_at, expires_at = EXCLUDED.expires_at
   RETURNING id, token, expires_at
 )
-SELECT %s, ` + claimDependenciesSQL + `, lease.token, lease.expires_at FROM claimed JOIN lease ON lease.id = claimed.id`,
+SELECT %s, `+claimDependenciesSQL+`, lease.token, lease.expires_at FROM claimed JOIN lease ON lease.id = claimed.id`,
 	JobColumns("j."), JobColumns("claimed."))
 
 // JobClaimByID implements driver.Executor.

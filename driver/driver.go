@@ -925,7 +925,7 @@ type WorkflowInsertParams struct {
 	// Steps names the jobs, in Jobs order: empty, or one name per job,
 	// "" for an unnamed one. Names are unique.
 	Steps []string
-	Deps []JobDependency
+	Deps  []JobDependency
 	// Callbacks and Metadata are the batch's; see BatchInsertParams.
 	OnSuccess, OnFailure, OnComplete *JobInsertParams
 	Metadata                         json.RawMessage
