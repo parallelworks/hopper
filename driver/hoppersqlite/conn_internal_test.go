@@ -1,11 +1,17 @@
 package hoppersqlite
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/hoppermigrate"
 )
 
 // TestMayWrite checks which statements run on their own take the write
@@ -57,18 +63,71 @@ func TestMayWrite(t *testing.T) {
 	}
 }
 
-// TestClock checks that the database's clock never goes back, whatever
-// the host's does.
+// TestClock checks that the database's clock doesn't go back when the
+// host's goes back by up to maxClockLead, and follows the host's when it
+// goes back further, as a clock set far ahead and then corrected does,
+// saying so.
 func TestClock(t *testing.T) {
+	var logged bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logged, nil))
 	db := &database{}
-	first := db.clock()
-	if second := db.clock(); second.Before(first) {
+	first := db.clock(log)
+	if second := db.clock(log); second.Before(first) {
 		t.Errorf("the clock went back from %s to %s", first, second)
 	}
-	ahead := time.Now().Add(time.Hour).UnixMicro()
-	db.last.Store(ahead) // as if the host's clock was stepped back an hour
-	if got := db.clock(); got.UnixMicro() != ahead {
+	// As if the host's clock was stepped back by less than the lead.
+	ahead := time.Now().Add(maxClockLead / 2).UnixMicro()
+	db.last.Store(ahead)
+	if got := db.clock(log); got.UnixMicro() != ahead {
 		t.Errorf("clock = %s, want the latest time it read, %s", got, time.UnixMicro(ahead))
+	}
+	if logged.Len() != 0 {
+		t.Errorf("the clock logged %q while it held the time", logged.String())
+	}
+	// As if the host's clock was set a year ahead, read, and corrected.
+	db.last.Store(time.Now().AddDate(1, 0, 0).UnixMicro())
+	before := time.Now()
+	got := db.clock(log)
+	if got.Before(before.Add(-time.Millisecond)) || got.After(time.Now()) {
+		t.Errorf("clock = %s after the host's clock came back a year, want the host's, %s", got, before)
+	}
+	if !strings.Contains(logged.String(), "following the host's clock") {
+		t.Errorf("the clock didn't say it followed the host's back: %q", logged.String())
+	}
+	if again := db.clock(log); again.Before(got) {
+		t.Errorf("the clock went back from %s to %s once it followed the host's", got, again)
+	}
+}
+
+// TestClockLeadKeepsShortLeases checks the clock's lead at the shortest
+// lease TTL hopper allows, 1s: a lease renewed a third of its TTL ago, when
+// its next renewal is due, isn't expired to a clock that leads the host's
+// by up to maxClockLead, so a leader that reads that clock rescues none of
+// its client's jobs.
+func TestClockLeadKeepsShortLeases(t *testing.T) {
+	const ttl = time.Second
+	ctx := context.Background()
+	d, err := Open(filepath.Join(t.TempDir(), "hopper.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: slog.New(slog.DiscardHandler)}); err != nil {
+		t.Fatal(err)
+	}
+	x := d.Executor()
+	id, err := x.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: ttl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(ttl / 3)
+	// As if the host's clock read maxClockLead ahead and was stepped back.
+	d.db.last.Store(time.Now().Add(maxClockLead - time.Millisecond).UnixMicro())
+	if n, err := x.ClientPruneExpired(ctx); err != nil || n != 0 {
+		t.Fatalf("pruned %d clients, %v; the lease was renewed on time", n, err)
+	}
+	if res, err := x.ClientRenew(ctx, driver.ClientRenewParams{ClientID: id, TTL: ttl}); err != nil || !res.Renewed {
+		t.Errorf("the lease wasn't renewed: %+v, %v", res, err)
 	}
 }
 

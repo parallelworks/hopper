@@ -36,7 +36,7 @@ type querier interface {
 var errLockBusy = errors.New("hoppersqlite: another transaction holds the database's write lock")
 
 // clock returns the database's time (database.clock).
-func (e *executor) clock() time.Time { return e.d.db.clock() }
+func (e *executor) clock() time.Time { return e.d.db.clock(e.d.log) }
 
 // w is a write in progress: a transaction that holds the write lock, and
 // its time, read once the lock was taken, so that every write sees a time

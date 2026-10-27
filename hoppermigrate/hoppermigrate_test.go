@@ -33,7 +33,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 19
+	const latest = 20
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -1153,5 +1153,61 @@ func TestFenceUpgrade(t *testing.T) {
 		if j.Fence != 1 {
 			t.Errorf("job %s claimed at fence %d, want 1", j.ID, j.Fence)
 		}
+	}
+}
+
+// TestJobLeasesUpgradeTakesNoJobLock migrates to v19 while a transaction
+// that wrote hopper_jobs and history stays open, as a worker's CompleteTx
+// does: v19 creates a table and takes no lock on either, so it completes
+// at once. Down moves a leased job back to retryable before dropping the
+// table, since the previous release would see it as running with no owner.
+func TestJobLeasesUpgradeTakesNoJobLock(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 18}); err != nil {
+		t.Fatal(err)
+	}
+	var id driver.JobID
+	if err := pool.QueryRow(ctx, `SELECT hopper_insert('k', '{}')`).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // ended below
+	if _, err := tx.Exec(ctx, `UPDATE hopper_jobs SET priority = priority WHERE id = $1`, [16]byte(id)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM hopper_job_history WHERE false`); err != nil {
+		t.Fatal(err)
+	}
+	uctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := hoppermigrate.Up(uctx, d, &hoppermigrate.Options{Logger: logger, Target: 19}); err != nil {
+		t.Fatalf("v19 with a transaction open on hopper_jobs and history: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := d.Executor().JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 18}); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	var attempt int
+	var attemptedBy *int64
+	if err := pool.QueryRow(ctx, `SELECT state::text, attempt, attempted_by FROM hopper_jobs WHERE id = $1`, [16]byte(id)).Scan(&state, &attempt, &attemptedBy); err != nil {
+		t.Fatal(err)
+	}
+	if state != "retryable" || attempt != lease.Job.Attempt || attemptedBy != nil {
+		t.Errorf("leased job after down: %s, attempt %d, attempted by %v; want retryable at attempt %d", state, attempt, attemptedBy, lease.Job.Attempt)
 	}
 }

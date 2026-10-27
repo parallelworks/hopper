@@ -112,6 +112,12 @@ var scanIDs = collect(func(r Row) (driver.JobID, error) {
 	return id, err
 })
 
+var scanFinalized = collect(func(r Row) (driver.JobFinalized, error) {
+	var f driver.JobFinalized
+	err := r.Scan(&f.ID, &f.Fence)
+	return f, err
+})
+
 // jobInsertSQL inserts a batch in one statement. On a unique-key conflict a
 // DO UPDATE (rather than DO NOTHING) makes RETURNING include the existing
 // row, and xmax <> 0 marks those rows as duplicates. For ConflictSkip the
@@ -486,7 +492,8 @@ WITH ranked AS MATERIALIZED (
   SELECT cand.id, cand.partition_key,
     row_number() OVER (PARTITION BY cand.partition_key ORDER BY cand.priority, cand.scheduled_at, cand.seq)
       + coalesce((SELECT count(*) FROM {{schema}}.hopper_jobs pr
-                  WHERE pr.queue = cand.queue AND pr.partition_key = cand.partition_key AND pr.state = 'running'), 0) AS slot
+                  WHERE pr.queue = cand.queue AND pr.partition_key = cand.partition_key AND pr.state = 'running'
+                    AND pr.attempted_by IS NOT NULL), 0) AS slot
   FROM {{schema}}.hopper_jobs cand
   WHERE ` + claimEligibleSQL + `
 ),
@@ -607,7 +614,7 @@ retry AS (
   FROM r
   WHERE j.id = r.id AND ` + isRunning("j.state") + ` AND j.attempted_by = r.attempted_by AND j.fence = r.fence
     AND r.state IN ('retryable', 'scheduled')
-  RETURNING j.id
+  RETURNING j.id, j.fence
 ),
 finished AS (
   DELETE FROM {{schema}}.hopper_jobs j
@@ -625,7 +632,7 @@ finished AS (
 func isRunning(column string) string { return column + "::text = 'running'" }
 
 var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
-SELECT id FROM retry UNION ALL SELECT id FROM finished`
+SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
 
 // appendLogSQL appends an attempt's log, if it has one, to its job's logs,
 // keeping the latest $13. A snooze gives its attempt back, so a job that
@@ -650,7 +657,7 @@ const appendLogSQL = `CASE
 // no batch or workflow (driver.JobFinalizeParams.NoBatches): without the
 // insert channel, so the parameters after it move down one.
 var jobFinalizePlainSQL = strings.NewReplacer("$11", "$10", "$12", "$11", "$13", "$12", "$14", "$13").Replace(jobFinalizeHeadSQL) + plainFinalizeTailSQL + `
-SELECT id FROM retry UNION ALL SELECT id FROM finished`
+SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
 
 // skipLockedSQL makes a finalize statement skip the jobs whose rows another
 // transaction holds (driver.JobFinalizeParams.SkipLocked).
@@ -668,8 +675,48 @@ var (
 	jobFinalizePlainSkipLockedSQL = skipLockedSQL(jobFinalizePlainSQL)
 )
 
+// leaseFinalizeHeadSQL is jobFinalizeHeadSQL for the results of jobs
+// claimed by ID: each result names its job lease's token ($15), and applies
+// only while the job runs with no client in that lease, at its fence. The
+// lease rows of the jobs it moves are deleted, after the job rows are
+// locked, the order every statement on a job and its lease takes.
+var leaseFinalizeHeadSQL = func() string {
+	q := jobFinalizeHeadSQL
+	for _, r := range []struct {
+		old, new string
+		n        int
+	}{
+		{
+			"$12::jsonb[], $14::bigint[]\n  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason, log, fence)",
+			"$12::jsonb[], $14::bigint[], $15::uuid[]\n  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason, log, fence, token)", 1,
+		},
+		{
+			"j.attempted_by = r.attempted_by AND j.fence = r.fence",
+			"j.attempted_by IS NULL AND j.fence = r.fence\n    AND EXISTS (SELECT 1 FROM {{schema}}.hopper_job_leases l WHERE l.id = j.id AND l.token = r.token AND l.fence = r.fence)", 2,
+		},
+	} {
+		if strings.Count(q, r.old) != r.n {
+			panic("pgsql: finalize statement changed: " + r.old)
+		}
+		q = strings.ReplaceAll(q, r.old, r.new)
+	}
+	return q + `released AS (
+  DELETE FROM {{schema}}.hopper_job_leases l USING r
+  WHERE l.id = r.id AND l.token = r.token AND l.id IN (SELECT id FROM retry UNION ALL SELECT id FROM finished)
+),
+`
+}()
+
+var (
+	jobFinalizeLeaseSQL = leaseFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
+SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
+	jobFinalizeLeasePlainSQL = strings.NewReplacer("$11", "$10", "$12", "$11", "$13", "$12", "$14", "$13", "$15", "$14").Replace(leaseFinalizeHeadSQL) +
+		plainFinalizeTailSQL + `
+SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
+)
+
 // JobFinalizeMany implements driver.Executor.
-func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	if len(params.Jobs) == 0 {
 		return nil, nil
 	}
@@ -687,7 +734,21 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		archives    = make([]bool, n)
 		logs        = make([][]byte, n)
 	)
+	leased := params.Jobs[0].Lease != nil
+	if leased && params.SkipLocked {
+		return nil, errors.New("hopper: finalize jobs: SkipLocked with results of leased jobs")
+	}
+	var tokens []driver.JobID
+	if leased {
+		tokens = make([]driver.JobID, n)
+	}
 	for i, f := range params.Jobs {
+		if (f.Lease != nil) != leased {
+			return nil, errors.New("hopper: finalize jobs: results of leased jobs and of others in one call")
+		}
+		if leased {
+			tokens[i], f.Fence = f.Lease.Token, f.Lease.Fence
+		}
 		switch f.State {
 		case driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded,
 			driver.JobStateRetryable, driver.JobStateScheduled:
@@ -722,13 +783,19 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 	if params.SkipLocked {
 		query = jobFinalizeSkipLockedSQL
 	}
+	if leased {
+		query, args = jobFinalizeLeaseSQL, append(args, uuidArray(tokens))
+	}
 	if params.NoBatches {
 		query, args = jobFinalizePlainSQL, append(args[:9], args[10:]...)
 		if params.SkipLocked {
 			query = jobFinalizePlainSkipLockedSQL
 		}
+		if leased {
+			query = jobFinalizeLeasePlainSQL
+		}
 	}
-	applied, err := scanIDs(e.Conn.Query(ctx, query, args...))
+	applied, err := scanFinalized(e.Conn.Query(ctx, query, args...))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 	}
@@ -743,11 +810,16 @@ func keepLogs(keep int) int32 {
 	return int32(keep)
 }
 
+// jobGetQuery reads a job, and the expiry of its job lease if it is running
+// in one.
 var jobGetQuery = fmt.Sprintf(`
-SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output FROM {{schema}}.hopper_jobs WHERE id = $1
+SELECT %s, NULL::timestamptz AS finalized_at, NULL::jsonb AS output,
+  (SELECT l.expires_at FROM {{schema}}.hopper_job_leases l
+   WHERE l.id = j.id AND l.fence = j.fence AND j.attempted_by IS NULL AND `+isRunning("j.state")+`) AS lease_expires_at
+FROM {{schema}}.hopper_jobs j WHERE id = $1
 UNION ALL
-SELECT %s, finalized_at, output FROM {{schema}}.hopper_job_history WHERE id = $1
-LIMIT 1`, JobColumns(""), historyColumns(""))
+SELECT %s, finalized_at, output, NULL::timestamptz FROM {{schema}}.hopper_job_history WHERE id = $1
+LIMIT 1`, JobColumns("j."), historyColumns(""))
 
 // jobRecordProgressSQL stores a running job's progress, fenced to the
 // attempt. A cursor of NULL leaves the key out, rather than storing a JSON
@@ -762,17 +834,36 @@ SET progress = jsonb_build_object(
       'step', CASE WHEN $5 THEN coalesce(progress->>'step', '') ELSE $4::text END,
       'at', statement_timestamp())
     || CASE WHEN $6::jsonb IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('cursor', $6::jsonb) END
-WHERE id = $1 AND ` + isRunning("state") + ` AND attempted_by = $2 AND fence = $3 AND attempt = $7%s
+WHERE id = $1 AND ` + isRunning("state") + ` AND {{owner}}%s
 RETURNING progress::text`
 
-var (
-	jobRecordProgressQuery       = fmt.Sprintf(jobRecordProgressSQL, "", "")
-	jobRecordProgressNoWaitQuery = fmt.Sprintf(jobRecordProgressSQL, `
+// clientOwnerSQL and leaseOwnerSQL are the owner conditions of a progress
+// write: the client's claim, at its fence and attempt, or the job lease
+// whose token is $2, at its fence.
+const (
+	clientOwnerSQL = "attempted_by = $2 AND fence = $3 AND attempt = $7"
+	leaseOwnerSQL  = `attempted_by IS NULL AND fence = $3
+    AND EXISTS (SELECT 1 FROM {{schema}}.hopper_job_leases l WHERE l.id = $1 AND l.token = $2::uuid AND l.fence = $3)`
+)
+
+func recordProgressQuery(owner string, noWait bool) string {
+	q := fmt.Sprintf(jobRecordProgressSQL, "", "")
+	if noWait {
+		q = fmt.Sprintf(jobRecordProgressSQL, `
 WITH locked AS (
   SELECT id FROM {{schema}}.hopper_jobs
-  WHERE id = $1 AND `+isRunning("state")+` AND attempted_by = $2 AND fence = $3 AND attempt = $7
+  WHERE id = $1 AND `+isRunning("state")+` AND {{owner}}
   FOR UPDATE NOWAIT
 )`, " AND id IN (SELECT id FROM locked)")
+	}
+	return strings.ReplaceAll(q, "{{owner}}", owner)
+}
+
+var (
+	jobRecordProgressQuery            = recordProgressQuery(clientOwnerSQL, false)
+	jobRecordProgressNoWaitQuery      = recordProgressQuery(clientOwnerSQL, true)
+	jobRecordProgressLeaseQuery       = recordProgressQuery(leaseOwnerSQL, false)
+	jobRecordProgressLeaseNoWaitQuery = recordProgressQuery(leaseOwnerSQL, true)
 )
 
 // JobRecordProgress implements driver.Executor.
@@ -786,9 +877,16 @@ func (e *Executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 	if params.NoWait {
 		query = jobRecordProgressNoWaitQuery
 	}
+	args := []any{uuidParam(params.ID), params.AttemptedBy, params.Fence, params.Step, params.KeepStep, cursor, params.Attempt}
+	if params.Lease != nil {
+		query = jobRecordProgressLeaseQuery
+		if params.NoWait {
+			query = jobRecordProgressLeaseNoWaitQuery
+		}
+		args = []any{uuidParam(params.ID), uuidParam(params.Lease.Token), params.Lease.Fence, params.Step, params.KeepStep, cursor}
+	}
 	var stored string
-	err := e.Conn.QueryRow(ctx, query, uuidParam(params.ID), params.AttemptedBy, params.Fence,
-		params.Step, params.KeepStep, cursor, params.Attempt).Scan(&stored)
+	err := e.Conn.QueryRow(ctx, query, args...).Scan(&stored)
 	if errors.Is(err, ErrNoRows) {
 		return nil, nil
 	}
@@ -803,13 +901,15 @@ func (e *Executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 
 // JobGet implements driver.Executor.
 func (e *Executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
-	job, err := scanJob(e.Conn.QueryRow(ctx, jobGetQuery, uuidParam(id)), true)
+	var leaseExpiresAt sql.NullTime
+	job, err := scanJob(e.Conn.QueryRow(ctx, jobGetQuery, uuidParam(id)), true, &leaseExpiresAt)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("hopper: get job: %w", err)
 	}
+	job.LeaseExpiresAt = leaseExpiresAt.Time
 	return job, nil
 }
 
@@ -1727,14 +1827,17 @@ func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 
 // jobRescueSQL finds running jobs whose client has no live lease, plus jobs
 // running longer than a stuck threshold, which it reports as stuck by
-// database time. It walks the running index, which is bounded by total
-// concurrency. A running row without attempted_at, which only a direct SQL
+// database time. A job claimed by ID has no client: its job lease's expiry
+// ends its attempt instead (JobExpireLeases). It walks the running index,
+// which holds the running jobs: those of client attempts, bounded by total
+// concurrency, and the leased ones, whose NULL attempted_by the index
+// condition skips without reading their rows. A running row without attempted_at, which only a direct SQL
 // write leaves, is not stuck: a NULL flag would fail the scan of the batch.
 var jobRescueQuery = fmt.Sprintf(`
 SELECT * FROM (
   SELECT %s, coalesce($1::float8 > 0 AND j.attempted_at < now() - make_interval(secs => $1::float8), false) AS stuck
   FROM {{schema}}.hopper_jobs j
-  WHERE j.state = 'running'
+  WHERE j.state = 'running' AND j.attempted_by IS NOT NULL
 ) j
 WHERE stuck OR NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_clients c WHERE c.id = j.attempted_by AND c.expires_at > now())
 ORDER BY j.attempted_at

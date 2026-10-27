@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"runtime"
 	"slices"
@@ -154,18 +155,37 @@ func (db *database) close() {
 	}
 }
 
+// maxClockLead is the most the database's clock stays ahead of the host's
+// (clock). A client renews its lease every third of its TTL, so a lease
+// renewed on time has at least two thirds of its TTL left; at the shortest
+// TTL hopper allows, 1s, that is 666ms, and a clock that leads by less
+// never makes the lease look expired to a leader in this process. NTP
+// slews an offset under 128ms rather than step the clock back, so the
+// floor still holds the time across the steps it takes.
+const maxClockLead = 500 * time.Millisecond
+
 // clock returns the database's time: the host's, in Postgres's precision,
 // never earlier than a time it returned before in this process, so that a
-// wall clock stepped back (by NTP, say) cannot date a write before the
-// writes it follows.
-func (db *database) clock() time.Time {
+// wall clock stepped back a little (by NTP, say) cannot date a write before
+// the writes it follows; but once the host's clock is more than
+// maxClockLead behind the time it returned last, it follows the host's
+// clock again, and says so to log. A host whose clock was set far ahead
+// and then corrected would otherwise hold the time it read until its clock
+// caught up, and date every write, lease and snooze in the process as far
+// ahead.
+func (db *database) clock(log *slog.Logger) time.Time {
 	now := time.Now().UTC().Truncate(time.Microsecond).UnixMicro()
 	for {
 		last := db.last.Load()
-		if now <= last {
+		back := last - now
+		if back >= 0 && back <= maxClockLead.Microseconds() {
 			return time.UnixMicro(last).UTC()
 		}
 		if db.last.CompareAndSwap(last, now) {
+			if back > 0 {
+				log.Warn("hoppersqlite: the host's clock is behind the time the database last gave by more than the clock may lead it; following the host's clock",
+					"behind", time.Duration(back)*time.Microsecond, "lead", maxClockLead, "database", db.path)
+			}
 			return time.UnixMicro(now).UTC()
 		}
 	}
@@ -316,7 +336,10 @@ var _ driver.Connector = (*connector)(nil)
 // durability of its commits, on macOS with F_FULLFSYNC, without which fsync
 // leaves the commit in the disk's cache; the size the write-ahead log is
 // cut back to; and foreign keys off, as SQLite has them by default and
-// hopper's schema has none.
+// hopper's schema has none. Some read the database's schema, which waits
+// for a lock another connection can hold, as one does while it turns a new
+// database's write-ahead log on: Connect runs each again while it fails
+// with SQLITE_BUSY and its context allows, as the package's statements do.
 func (c *connector) pragmas() []string {
 	p := []string{
 		fmt.Sprintf("PRAGMA busy_timeout = %d", busyQuantum.Milliseconds()),
@@ -341,7 +364,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		return nil, fmt.Errorf("hoppersqlite: modernc.org/sqlite's connection is a %T, which lacks a method this driver needs", opened)
 	}
 	for _, p := range c.pragmas() {
-		if _, err := inner.ExecContext(ctx, p, nil); err != nil {
+		if _, err := retryBusy(ctx, c.db, func() (driver.Result, error) { return inner.ExecContext(ctx, p, nil) }); err != nil {
 			_ = inner.Close()
 			return nil, fmt.Errorf("hoppersqlite: %s: %w", p, err)
 		}

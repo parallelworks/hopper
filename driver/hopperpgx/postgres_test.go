@@ -1193,7 +1193,7 @@ func TestRescueCandidatesWithoutAttemptTime(t *testing.T) {
 	if _, err := exec.JobInsertMany(ctx, insertParams("k", 1), driver.JobInsertOpts{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.Pool().Exec(ctx, `UPDATE hopper_jobs SET state = 'running', attempt = 1`); err != nil {
+	if _, err := d.Pool().Exec(ctx, `UPDATE hopper_jobs SET state = 'running', attempt = 1, attempted_by = 1`); err != nil {
 		t.Fatal(err)
 	}
 	got, err := exec.JobRescueCandidates(ctx, driver.JobRescueParams{StuckAfter: time.Minute, Limit: 10})
@@ -1292,7 +1292,11 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 	if _, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results(claimed.Jobs), NoBatches: true}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := traced.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: finished}); err != nil {
+	dependsOn := make([]driver.JobID, len(finished))
+	for i, f := range finished {
+		dependsOn[i] = f.ID
+	}
+	if _, err := traced.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: dependsOn}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := traced.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{Limit: 1000}); err != nil {

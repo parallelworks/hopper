@@ -130,6 +130,14 @@ func (fixture) SetProgress(ctx context.Context, t *testing.T, d driver.Driver[*s
 	execSQL(ctx, t, d, "UPDATE hopper_jobs SET progress = ? WHERE id = ?", value, id[:])
 }
 
+func (fixture) ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
+	execSQL(ctx, t, d, "UPDATE hopper_job_leases SET expires_at = ?, renewed_at = ? - ttl WHERE id = ?", now()-1e6, now()-1e6, id[:])
+}
+
+func (fixture) CountJobLeases(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
+	return count(ctx, t, d, "SELECT count(*) FROM hopper_job_leases")
+}
+
 func (fixture) CountEdges(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
 	return count(ctx, t, d, "SELECT count(*) FROM hopper_job_deps")
 }

@@ -31,6 +31,17 @@ var ErrJobRunning = errors.New("hopper: job is running")
 // uniqueness of a live job with the same key.
 var ErrUniqueConflict = errors.New("hopper: a live job with the same unique key exists")
 
+// ErrJobFenced is returned by the job lease operations when the lease
+// named is no longer the job's: it expired, its attempt ended, or the job
+// was claimed again; and by JobClaimByID when the live job's fence is not
+// the one expected.
+var ErrJobFenced = errors.New("hopper: job is no longer running in this attempt")
+
+// ErrJobNotClaimable is returned by JobClaimByID for a job that cannot be
+// claimed now: pending, finalized, past its TTL, held back by its ordering
+// key, or in a paused queue.
+var ErrJobNotClaimable = errors.New("hopper: job is not claimable")
+
 // ErrJobLocked is returned by JobRecordProgress with NoWait when another
 // transaction holds the job's row.
 var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
@@ -174,9 +185,11 @@ type Executor interface {
 	JobAge(ctx context.Context, queue string, after time.Duration) (int64, error)
 	// JobFinalizeMany applies a batch of results in one statement. A result is
 	// applied only if its job is still running in the claim that produced
-	// it, by the same client at the same fence; the IDs that were applied are
-	// returned, and the caller treats the rest as fenced.
-	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobID, error)
+	// it, by the same client at the same fence; the job and fence of each
+	// applied result are returned, and the caller treats the rest as fenced.
+	// Of two results of one job, at most one applies, and its fence says
+	// which.
+	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobFinalized, error)
 	// JobRecordProgress stores a running job's progress, fenced like a
 	// finalize: only while the job is running in the given claim, by the
 	// given client at the given fence and attempt. It returns the progress as stored, or nil if the attempt
@@ -225,6 +238,32 @@ type Executor interface {
 	// longer ago than that by database time. The caller finalizes them,
 	// fenced to the claim each was found in.
 	JobRescueCandidates(ctx context.Context, params JobRescueParams) ([]RescueCandidate, error)
+
+	// JobClaimByID claims a waiting job (available, scheduled or retryable,
+	// whatever its schedule) by ID under a job lease: the job runs with no
+	// owning client, its attempt and fence incremented, and the lease, with a
+	// random token the database generates, owns it until it expires or the
+	// attempt ends. The queue's pause, the job's TTL and its ordering key
+	// apply; the queue's limits do not. It returns the first error that
+	// applies: ErrNotFound for a job neither live nor in history,
+	// ErrJobNotClaimable for one in history, ErrJobFenced for a live job
+	// whose fence is not params.Fence, running or not, ErrJobRunning for
+	// one running at params.Fence, and ErrJobNotClaimable for one pending,
+	// past its TTL, in a paused queue or held back by its ordering key. A
+	// claim of a waiting job waits for its row if another transaction
+	// holds it.
+	JobClaimByID(ctx context.Context, params JobClaimByIDParams) (*JobLeaseRow, error)
+	// JobLeaseRenew extends a job lease by its TTL from database now(), and
+	// reports whether a cancel was requested. It returns ErrJobFenced once
+	// the lease is no longer the job's. A renewal succeeds until an expiry
+	// is applied, not only until ExpiresAt.
+	JobLeaseRenew(ctx context.Context, params JobLeaseRenewParams) (*JobLeaseStatus, error)
+	// JobExpireLeases ends the attempts of up to limit jobs whose leases
+	// expired, by database time: a job is retryable at once, with an error
+	// entry whose Rescue is RescueLeaseExpired, or, on its last attempt,
+	// discarded, or canceled if a cancel was requested. It returns the jobs
+	// as they are afterwards.
+	JobExpireLeases(ctx context.Context, limit int) ([]*JobRow, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
 	ClientRegister(ctx context.Context, params ClientRegisterParams) (int64, error)
@@ -461,7 +500,9 @@ type JobRow struct {
 	ScheduledAt time.Time
 	// AttemptedAt is the time of the latest claim, or zero if never claimed.
 	AttemptedAt time.Time
-	// AttemptedBy is the client ID holding the claim, or zero.
+	// AttemptedBy is the client ID holding the claim, or zero. A job
+	// claimed by ID (JobClaimByID) is running with no owning client: its
+	// job lease owns it.
 	AttemptedBy int64
 	// Fence numbers the job's claims: each claim increments it. Snoozes,
 	// retries, the archive and JobRetry keep it, so for a given job it
@@ -485,8 +526,11 @@ type JobRow struct {
 	ExpiresAt time.Time
 	// CancelRequestedAt is set when JobCancel is called on a running job.
 	CancelRequestedAt time.Time
-	Await             bool
-	CreatedAt         time.Time
+	// LeaseExpiresAt is when the job lease of a job claimed by ID expires,
+	// by database time, or zero for any other job. Only JobGet reads it.
+	LeaseExpiresAt time.Time
+	Await          bool
+	CreatedAt      time.Time
 	// SnoozeReason is the reason the worker gave when it last snoozed the
 	// job, while the job waits out that snooze. It is empty in any state but
 	// scheduled: the claim, any other finalize, a retry and a replacing
@@ -543,6 +587,9 @@ type JobRecordProgressParams struct {
 	AttemptedBy int64
 	Fence       int64
 	Attempt     int
+	// Lease, when set, fences the write to that job lease instead of a
+	// client; AttemptedBy is ignored.
+	Lease *LeaseFence
 	// Step is the last step finished. With KeepStep the stored step is
 	// kept and Step is ignored.
 	Step     string
@@ -568,6 +615,64 @@ type AttemptError struct {
 	Error string `json:"error"`
 	// Trace is the stack trace when the attempt panicked.
 	Trace string `json:"trace,omitempty"`
+	// Rescue is set when hopper, not the attempt, ended it.
+	Rescue RescueReason `json:"rescue,omitempty"`
+}
+
+// RescueReason says why hopper ended an attempt.
+type RescueReason string
+
+const (
+	// RescueClientLost is the reason when the client running the attempt
+	// lost its lease.
+	RescueClientLost RescueReason = "client_lost"
+	// RescueStuck is the reason when the attempt ran past
+	// RescueStuckAfter.
+	RescueStuck RescueReason = "stuck"
+	// RescueLeaseExpired is the reason when the attempt's job lease was not
+	// renewed in time.
+	RescueLeaseExpired RescueReason = "lease_expired"
+)
+
+// LeaseFence names a job lease: the random token the database generated
+// for the claim by ID, and the claim's fence.
+type LeaseFence struct {
+	Token JobID
+	Fence int64
+}
+
+// JobClaimByIDParams claims one job by ID, under a job lease.
+type JobClaimByIDParams struct {
+	ID JobID
+	// Fence is the fence the job must have, 0 for a job never claimed; a
+	// job at another fence is not claimed, and ErrJobFenced is returned.
+	Fence int64
+	// TTL is the lease's time to live, from each claim or renewal: at least
+	// a microsecond, the precision engines store it at.
+	TTL time.Duration
+}
+
+// JobLeaseRow is a job claimed by ID and its lease.
+type JobLeaseRow struct {
+	// Job is the job as claimed: running with no owning client, its attempt
+	// and fence incremented.
+	Job       *JobRow
+	Lease     LeaseFence
+	ExpiresAt time.Time
+}
+
+// JobLeaseRenewParams renews a job lease.
+type JobLeaseRenewParams struct {
+	ID    JobID
+	Lease LeaseFence
+}
+
+// JobLeaseStatus is a job lease as renewed.
+type JobLeaseStatus struct {
+	// ExpiresAt is the lease's new expiry, by database time.
+	ExpiresAt time.Time
+	// CancelRequested reports that JobCancel was called on the job.
+	CancelRequested bool
 }
 
 // JobInsertParams describes one job to insert.
@@ -888,7 +993,8 @@ type JobFinalizeParams struct {
 	// SkipLocked skips the jobs whose rows another transaction holds, such
 	// as a worker's CompleteTx that has not ended, instead of waiting for
 	// it. A skipped job is not among the applied. On a SingleWriter engine
-	// every job is skipped while another transaction writes.
+	// every job is skipped while another transaction writes. It does not
+	// apply to the results of leased jobs.
 	SkipLocked bool
 	// KeepLogs is the most attempt logs a job keeps, the latest; a job given
 	// another drops its oldest. Zero keeps them all.
@@ -916,6 +1022,13 @@ type WorkflowPromoteResult struct {
 	Last    JobID
 }
 
+// JobFinalized names a result JobFinalizeMany applied: its job, and the
+// fence of the claim it belonged to.
+type JobFinalized struct {
+	ID    JobID
+	Fence int64
+}
+
 // JobFinalize is the result of one attempt.
 type JobFinalize struct {
 	ID JobID
@@ -924,6 +1037,10 @@ type JobFinalize struct {
 	// owned by this client, at this fence.
 	AttemptedBy int64
 	Fence       int64
+	// Lease, when set, fences the result to that job lease instead of a
+	// client; AttemptedBy is ignored. A JobFinalizeMany with Lease set on
+	// one result has it set on all of them.
+	Lease *LeaseFence
 	// State is the state to move to: completed, canceled or discarded (the
 	// job moves to history) or retryable or scheduled (it stays live).
 	State JobState

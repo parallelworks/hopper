@@ -208,7 +208,11 @@ func (x *w) insertJobs(ctx context.Context, jobs []jobInsert, onConflict driver.
 }
 
 // finishedDuplicate returns the latest job in history with an insert's
-// kind and unique key in one of its UniqueFinished states, or nil.
+// kind and unique key in one of its UniqueFinished states, or nil. Of jobs
+// finalized at one time, as jobs of one process are while its clock holds
+// the time (clock), the latest is the one inserted last, which is the one
+// finalized last: a job with the key can only be inserted once the one
+// before it has finished.
 func (x *w) finishedDuplicate(ctx context.Context, j jobInsert) (*driver.JobRow, error) {
 	args := []any{j.kind, j.uniqueKey}
 	for _, s := range j.uniqueFinished {
@@ -216,7 +220,7 @@ func (x *w) finishedDuplicate(ctx context.Context, j jobInsert) (*driver.JobRow,
 	}
 	found, err := scanJob(x.QueryRowContext(ctx, "SELECT "+historyColumns+` FROM hopper_job_history
 		WHERE kind = ? AND unique_key = ? AND state IN (`+placeholders(len(j.uniqueFinished))+`)
-		ORDER BY finalized_at DESC LIMIT 1`, args...), true)
+		ORDER BY finalized_at DESC, seq DESC LIMIT 1`, args...), true)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -265,7 +269,8 @@ var claimPartitionedSQL = fmt.Sprintf(claimSetSQL, `SELECT seq FROM (
   SELECT cand.seq, cand.priority, cand.scheduled_at, cand.partition_key,
     row_number() OVER (PARTITION BY cand.partition_key ORDER BY cand.priority, cand.scheduled_at, cand.seq)
       + (SELECT count(*) FROM hopper_jobs pr
-         WHERE pr.queue = cand.queue AND pr.partition_key = cand.partition_key AND pr.state = 'running') AS slot
+         WHERE pr.queue = cand.queue AND pr.partition_key = cand.partition_key AND pr.state = 'running'
+           AND pr.attempted_by IS NOT NULL) AS slot
   FROM hopper_jobs cand WHERE `+claimEligibleSQL+`
 ) WHERE partition_key IS NULL OR slot <= ?5
 ORDER BY priority, scheduled_at, seq LIMIT ?4`)
@@ -369,9 +374,16 @@ func (e *executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 	}
 	err := write(ctx, func(x *w) error {
 		var stored sql.NullString
-		err := x.QueryRowContext(ctx, `SELECT progress FROM hopper_jobs
-			WHERE id = ? AND state = 'running' AND attempted_by = ? AND fence = ? AND attempt = ?`,
-			idParam(params.ID), params.AttemptedBy, params.Fence, params.Attempt).Scan(&stored)
+		row := func() *sql.Row {
+			if params.Lease != nil {
+				return x.QueryRowContext(ctx, `SELECT progress FROM hopper_jobs j WHERE j.id = ?1 AND `+leaseOwnerSQL,
+					idParam(params.ID), idParam(params.Lease.Token), params.Lease.Fence)
+			}
+			return x.QueryRowContext(ctx, `SELECT progress FROM hopper_jobs
+				WHERE id = ? AND state = 'running' AND attempted_by = ? AND fence = ? AND attempt = ?`,
+				idParam(params.ID), params.AttemptedBy, params.Fence, params.Attempt)
+		}
+		err := row().Scan(&stored)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -410,17 +422,22 @@ func (e *executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 
 // JobGet implements driver.Executor.
 func (e *executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
+	var leaseExpiresAt micros
 	job, err := scanJob(e.read().QueryRowContext(ctx, `
-		SELECT `+liveAsHistory+` FROM hopper_jobs WHERE id = ?1
+		SELECT `+liveAsHistory+`,
+		  (SELECT l.expires_at FROM hopper_job_leases l WHERE l.id = hopper_jobs.id AND l.fence = hopper_jobs.fence
+		   AND hopper_jobs.attempted_by IS NULL AND hopper_jobs.state = 'running')
+		FROM hopper_jobs WHERE id = ?1
 		UNION ALL
-		SELECT `+historyColumns+` FROM hopper_job_history WHERE id = ?1
-		LIMIT 1`, idParam(id)), true)
+		SELECT `+historyColumns+`, NULL FROM hopper_job_history WHERE id = ?1
+		LIMIT 1`, idParam(id)), true, &leaseExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, driver.ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("hopper: get job: %w", err)
 	}
+	job.LeaseExpiresAt = leaseExpiresAt.time()
 	return job, nil
 }
 
@@ -840,7 +857,7 @@ func (e *executor) JobRescueCandidates(ctx context.Context, params driver.JobRes
 		return c, err
 	}, `SELECT * FROM (
 		  SELECT `+prefixed(jobColumns, "j")+`, coalesce(j.attempted_at < ?1, false) AS stuck
-		  FROM hopper_jobs j WHERE j.state = 'running'
+		  FROM hopper_jobs j WHERE j.state = 'running' AND j.attempted_by IS NOT NULL
 		) j
 		WHERE stuck OR NOT EXISTS (SELECT 1 FROM hopper_clients c WHERE c.id = j.attempted_by AND c.expires_at > ?2)
 		ORDER BY j.attempted_at LIMIT ?3`, stuckBefore, now.UnixMicro(), params.Limit)

@@ -31,7 +31,8 @@ func MarshalAttemptError(e *driver.AttemptError) ([]byte, error) {
 		Fence   int64  `json:"fence,omitempty"`
 		Error   string `json:"error"`
 		Trace   string `json:"trace,omitempty"`
-	}{e.Attempt, e.Fence, StorableText(e.Error), StorableText(e.Trace)})
+		Rescue  string `json:"rescue,omitempty"`
+	}{e.Attempt, e.Fence, StorableText(e.Error), StorableText(e.Trace), string(e.Rescue)})
 }
 
 // MarshalAttemptLog encodes the log a finalize appends for result f, which

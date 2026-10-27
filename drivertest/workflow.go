@@ -260,7 +260,7 @@ func testWorkflowFanInConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			if err != nil {
 				t.Error(err)
 			}
-			done <- applied
+			done <- appliedIDs(applied)
 		}()
 		f.WaitForLockWait(ctx, t, d)
 		if err := commit(); err != nil {
@@ -450,7 +450,7 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			ids, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{Jobs: fin})
 			scancel()
 			if err == nil {
-				return ids
+				return appliedIDs(ids)
 			}
 			mu.Lock()
 			lastErr = err

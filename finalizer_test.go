@@ -38,7 +38,7 @@ func (e *stubExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error)
 	return nil, driver.ErrNotFound
 }
 
-func (e *stubExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e *stubExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	n := len(params.Jobs)
 	e.mu.Lock()
 	e.sizes = append(e.sizes, n)
@@ -57,9 +57,9 @@ func (e *stubExec) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 			return nil, ctx.Err()
 		}
 	}
-	ids := make([]driver.JobID, n)
+	ids := make([]driver.JobFinalized, n)
 	for i, j := range params.Jobs {
-		ids[i] = j.ID
+		ids[i] = driver.JobFinalized{ID: j.ID, Fence: j.Fence}
 	}
 	return ids, nil
 }
@@ -224,7 +224,7 @@ func (e *failNExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error
 	return nil, driver.ErrNotFound
 }
 
-func (e *failNExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e *failNExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	*e.calls++
 	if *e.calls <= e.fail {
 		return nil, e.err
@@ -232,9 +232,9 @@ func (e *failNExec) JobFinalizeMany(_ context.Context, params driver.JobFinalize
 	if len(params.Jobs) != 8 {
 		return nil, errors.New("batch was split")
 	}
-	ids := make([]driver.JobID, len(params.Jobs))
+	ids := make([]driver.JobFinalized, len(params.Jobs))
 	for i, j := range params.Jobs {
-		ids[i] = j.ID
+		ids[i] = driver.JobFinalized{ID: j.ID, Fence: j.Fence}
 	}
 	return ids, nil
 }
@@ -497,7 +497,7 @@ func (e *heldOnceExec) JobGet(_ context.Context, id driver.JobID) (*driver.JobRo
 	return &driver.JobRow{ID: id, State: driver.JobStateRunning}, nil
 }
 
-func (e *heldOnceExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e *heldOnceExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	if e.held.CompareAndSwap(false, true) {
 		return nil, nil
 	}
@@ -543,7 +543,7 @@ func (h dropCounter) WithGroup(string) slog.Handler      { return h }
 type claimExec struct {
 	stubExec
 	job        driver.JobRow
-	statements [][]driver.JobID
+	statements int
 }
 
 func (e *claimExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error) {
@@ -551,24 +551,23 @@ func (e *claimExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error
 	return &j, nil
 }
 
-func (e *claimExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
-	var ids, applied []driver.JobID
+func (e *claimExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
+	e.statements++
+	var applied []driver.JobFinalized
 	for _, r := range params.Jobs {
-		ids = append(ids, r.ID)
 		if r.ID == e.job.ID && r.AttemptedBy == e.job.AttemptedBy && r.Fence == e.job.Fence {
-			applied = append(applied, r.ID)
+			applied = append(applied, driver.JobFinalized{ID: r.ID, Fence: r.Fence})
 		}
 	}
-	e.statements = append(e.statements, ids)
 	return applied, nil
 }
 
 // A batch can hold a rescued attempt's late result and the result of the
-// claim after it, on the same client. The two go in separate statements, so
-// the applied ID names the result that applied, whichever came first, and
-// whichever has the greater fence: a JobRetry from history by a client of
-// the previous release resets it.
-func TestFinalizerWritesAJobsResultsApart(t *testing.T) {
+// claim after it, on the same client. The statement returns the fence of
+// the result that applied, so that one is credited, whichever came first,
+// and whichever has the greater fence: a JobRetry from history by a client
+// of the previous release resets it.
+func TestFinalizerCreditsTheResultThatApplied(t *testing.T) {
 	id := driver.JobID{1}
 	for _, fences := range [][2]int64{{1, 2}, {5, 1}} {
 		late, current := fences[0], fences[1]
@@ -585,8 +584,8 @@ func TestFinalizerWritesAJobsResultsApart(t *testing.T) {
 			f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeBatch: 10, finalizeBuffer: 10}, 0, func(string) {},
 				func(_ *driver.JobRow, r driver.JobFinalize) { got = append(got, r) })
 			f.write(context.Background(), batch, false)
-			if len(exec.statements) != 2 || len(exec.statements[0]) != 1 || len(exec.statements[1]) != 1 {
-				t.Errorf("fences %d, %d: statements %v; want one result of the job in each", batch[0].result.Fence, batch[1].result.Fence, exec.statements)
+			if exec.statements != 1 {
+				t.Errorf("fences %d, %d: %d statements; want the batch in one", batch[0].result.Fence, batch[1].result.Fence, exec.statements)
 			}
 			if len(got) != 1 || got[0].Fence != current || got[0].State != driver.JobStateRetryable {
 				t.Errorf("fences %d, %d: applied %+v; want the current claim's result alone", batch[0].result.Fence, batch[1].result.Fence, got)

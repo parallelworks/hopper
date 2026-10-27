@@ -488,6 +488,118 @@ the job's ID and attempt. `client.JobLogs` and the web UI read the store.
 `hopper jobs get` shows only logs kept in the database. The store decides
 how long to keep logs.
 
+## Remote workers
+
+Some jobs run outside any hopper client. A coordinator might place each job
+on a remote worker (an SSH host, a batch-scheduler allocation or a pod), and
+that worker might report back days later, through whichever replica of the
+coordinator it reaches. A job lease lets that worker own one attempt.
+
+The job's handler places it on a worker, recording the attempt's fence
+with the placement, and snoozes until the worker connects:
+
+```go
+hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[RunArgs]) error {
+    if err := placeOnWorker(ctx, job.ID, job.Fence); err != nil {
+        return err
+    }
+    return hopper.Snooze(24 * time.Hour) // a claim by ID ends the wait early
+})
+```
+
+When the worker connects, claim the job by ID at the fence it was placed
+at, and hand the worker the lease's token:
+
+```go
+lease, err := client.Leases().Claim(ctx, p.JobID, p.Fence, &hopper.LeaseOpts{
+    TTL: 2 * time.Minute, // one minute by default
+})
+switch {
+case errors.Is(err, hopper.ErrJobFenced):
+    // Another attempt ran, or runs, since this placement: it's superseded.
+case errors.Is(err, hopper.ErrJobRunning):
+    // The placing attempt's snooze isn't written yet: try again shortly.
+case errors.Is(err, hopper.ErrJobNotClaimable):
+    // It finished, or can't be claimed now: past its TTL, in a paused
+    // queue, or held back by its ordering key.
+case err != nil:
+    return err // hopper.ErrNotFound if the job was deleted
+default:
+    // lease.Job is running with no owning client; lease.Token goes to the worker.
+}
+```
+
+The claim succeeds only at that exact fence. A snooze keeps the fence, so
+the placement's claim matches; any attempt since then has moved it on. To
+claim a job that has never run, pass fence 0.
+
+While the job runs, the worker renews the lease about every TTL/3 and
+records its progress. It can call any replica, since every replica can act
+on any token:
+
+```go
+status, err := client.Leases().Renew(ctx, token)
+switch {
+case errors.Is(err, hopper.ErrJobFenced):
+    // The lease expired or the attempt ended: stop working.
+case err != nil:
+    // The call failed, and the lease may still be the worker's: renew again soon.
+case status.CancelRequested:
+    // JobCancel was called: stop, and Finish with an error.
+}
+_, err = client.Leases().RecordStep(ctx, token, "staged", cursor)
+```
+
+The worker ends the attempt with `Finish`, which acts as the job's worker
+returning would. A nil `Err` completes the job with `Output`, `hopper.Snooze`
+snoozes it, `hopper.Cancel` discards it, and any other error retries it
+through `Config.OnError` and the retry policy:
+
+```go
+err := client.Leases().Finish(ctx, token, hopper.LeaseResult{Output: result})
+```
+
+`Finish` writes the result before it returns, so the worker can treat its
+report as delivered once `Finish` returns nil. `FinishTx` writes it in
+your own transaction. A snooze keeps the lease's fence, so to claim the
+snoozed job again, pass `token.Fence()`, not the placement's.
+
+If the lease isn't renewed in time, the leader ends the attempt. Only a
+client that works a queue can lead, so keep at least one running even if
+every job runs on remote workers. The job
+becomes retryable at once, with an entry in `job.Errors` whose `Rescue` is
+`hopper.RescueLeaseExpired` and whose `Fence` is the lease's: one more than
+the placement's, since the claim named the placement's. On its last
+attempt the job is discarded instead, and if a cancel was requested it is
+canceled. hopper never reruns the work itself. The job's handler finds the
+entry on its next run, and decides whether to place the job again.
+
+Every call on a token is fenced to its lease. Once the lease has expired,
+or the attempt has ended and the job been claimed again, the call returns
+`ErrJobFenced` and changes nothing. So a worker that comes back late can't
+overwrite a newer attempt.
+
+A few rules apply to leased jobs:
+
+- A claim by ID respects the queue's pause, the job's TTL and its ordering
+  key, but not the queue's limits. Leased jobs don't count toward those
+  limits either.
+- The token is a capability, not a login, and hopper doesn't authenticate
+  whoever holds it. Authenticate your workers at the coordinator, and keep
+  tokens off channels other people can read.
+- `Finish` applies the configuration of the client it's called on:
+  `Config.OnError`, the queue's `RetryPolicy` and `DeleteCompleted`, and
+  the kind's worker's `NextRetry` if that client has the worker. Give every
+  replica that takes workers' reports the same configuration for those
+  queues and kinds.
+- `hopper jobs get` shows a leased job's lease and its expiry.
+- Start using leases only once every client runs a release that has them.
+  A leader from an earlier release sees a leased job as a running job whose
+  client is gone. Its rescue can't apply to that job, and logs a warning
+  about it on every pass. With a thousand or more leased jobs running, it
+  can also stop rescuing jobs whose client really is gone, and an earlier
+  release counts leased jobs toward the queue's limits.
+
 ## Operate
 
 ```go

@@ -11,7 +11,7 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing to the claim (also inside a caller's transaction), snooze reasons, leases, leader election, rescue candidates,
+// fencing to the claim (also inside a caller's transaction), snooze reasons, leases, claims by ID and their job leases, leader election, rescue candidates,
 // cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
 // notifications and history maintenance. What depends on whether the engine
 // locks rows or runs one writer at a time (driver.Capabilities.SingleWriter)
@@ -55,6 +55,11 @@ type Fixture[TTx any] interface {
 	MakeClaimable(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
 	// AgeAttempt backdates a running job's attempted time by age.
 	AgeAttempt(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID, age time.Duration)
+	// ExpireJobLease makes the job lease of a job claimed by ID expired, as
+	// a worker that stopped renewing it would. CountJobLeases counts the job
+	// lease rows the engine keeps.
+	ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
+	CountJobLeases(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
 	// CountLive and CountHistory count jobs in the live table and in history.
 	CountLive(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
 	CountHistory(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
@@ -111,8 +116,23 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeSkipLockedNoBatches", func(t *testing.T, f Fixture[TTx]) { testFinalizeSkipLocked(t, f, true) }},
 		{"ClaimFence", testClaimFence[TTx]},
 		{"FinalizeFencesReclaim", testFinalizeFencesReclaim[TTx]},
+		{"FinalizeReportsTheAppliedFence", testFinalizeReportsTheAppliedFence[TTx]},
 		{"RescueRacesReclaim", testRescueRacesReclaim[TTx]},
 		{"RecordProgressFencesSnooze", testRecordProgressFencesSnooze[TTx]},
+		{"ClaimByID", testClaimByID[TTx]},
+		{"ClaimByIDInTx", testClaimByIDInTx[TTx]},
+		{"ClaimByIDRacesClaim", testClaimByIDRacesClaim[TTx]},
+		{"LeaseRenew", testLeaseRenew[TTx]},
+		{"LeaseRenewConcurrent", testLeaseRenewConcurrent[TTx]},
+		{"LeaseFinalize", func(t *testing.T, f Fixture[TTx]) { testLeaseFinalize(t, f, false) }},
+		{"LeaseFinalizeNoBatches", func(t *testing.T, f Fixture[TTx]) { testLeaseFinalize(t, f, true) }},
+		{"LeaseProgress", testLeaseProgress[TTx]},
+		{"LeaseFencesClients", testLeaseFencesClients[TTx]},
+		{"LeasesOutsideLimits", testLeasesOutsideLimits[TTx]},
+		{"ExpireLeases", testExpireLeases[TTx]},
+		{"ExpireRacesRenew", testExpireRacesRenew[TTx]},
+		{"ExpireRacesFinalize", testExpireRacesFinalize[TTx]},
+		{"ExpireRacesCancel", testExpireRacesCancel[TTx]},
 		{"FinalizeTx", testFinalizeTx[TTx]},
 		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},
@@ -322,6 +342,18 @@ func (p Postgres[TTx]) SetProgress(ctx context.Context, t *testing.T, d driver.D
 	p.SQL.Exec(ctx, t, d, "UPDATE hopper_jobs SET progress = $2::jsonb WHERE id = $1::uuid", id.String(), value)
 }
 
+// ExpireJobLease implements Fixture.
+func (p Postgres[TTx]) ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_job_leases SET expires_at = now() - interval '1s', renewed_at = now() - interval '1s' - ttl WHERE id = $1::uuid", id.String())
+}
+
+// CountJobLeases implements Fixture.
+func (p Postgres[TTx]) CountJobLeases(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int {
+	t.Helper()
+	return p.count(ctx, t, d, "SELECT count(*)::text FROM hopper_job_leases")
+}
+
 // CountEdges implements Fixture.
 func (p Postgres[TTx]) CountEdges(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int {
 	t.Helper()
@@ -413,7 +445,7 @@ func normalizeJSON(v any) any {
 // outside batches see the same results through it.
 type noBatchesExec struct{ driver.Executor }
 
-func (e noBatchesExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e noBatchesExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	params.NoBatches = true
 	return e.Executor.JobFinalizeMany(ctx, params)
 }
@@ -471,7 +503,16 @@ func finalize(ctx context.Context, t *testing.T, exec driver.Executor, jobs ...d
 	if err != nil {
 		t.Fatal(err)
 	}
-	return applied
+	return appliedIDs(applied)
+}
+
+// appliedIDs returns the jobs of the results a finalize applied.
+func appliedIDs(applied []driver.JobFinalized) []driver.JobID {
+	ids := make([]driver.JobID, len(applied))
+	for i, a := range applied {
+		ids[i] = a.ID
+	}
+	return ids
 }
 
 // finalizeCurrent is finalize for tests of something other than the fence:

@@ -169,7 +169,7 @@ func (e *heldRescueExec) JobRescueCandidates(context.Context, driver.JobRescuePa
 	return out, nil
 }
 
-func (e *heldRescueExec) JobFinalizeMany(context.Context, driver.JobFinalizeParams) ([]driver.JobID, error) {
+func (e *heldRescueExec) JobFinalizeMany(context.Context, driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
 	return nil, nil
 }
 

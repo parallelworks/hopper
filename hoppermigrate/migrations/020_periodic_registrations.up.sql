@@ -1,4 +1,4 @@
--- hopper schema v19: periodic jobs registered by each client.
+-- hopper schema v20: periodic jobs registered by each client.
 --
 -- A client records the periodic jobs it registers, so that the leader
 -- schedules the jobs of every live client, not only its own. A registration

@@ -403,7 +403,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	case clientIdle, clientStopped:
 		c.state = clientStopped
 		c.mu.Unlock()
-		c.notifier.flushNow()
+		c.notifier.flushNow(ctx)
 		return nil
 	case clientStopping:
 		c.mu.Unlock()
@@ -411,11 +411,12 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	case clientStarted:
 	}
 	c.state = clientStopping
+	insertOnly := c.producers == nil
 	c.mu.Unlock()
 
-	if c.producers == nil {
+	if insertOnly {
 		// Insert-only client.
-		c.notifier.flushNow()
+		c.notifier.flushNow(ctx)
 		c.mu.Lock()
 		c.state = clientStopped
 		c.mu.Unlock()
@@ -442,7 +443,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	}
 	c.finCancel()
 	<-c.finalizer.done
-	c.notifier.flushNow()
+	c.notifier.flushNow(ctx)
 
 	// 3. Release the lease.
 	c.workCancel()
@@ -463,11 +464,16 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 }
 
 // waitForJobs blocks until every producer's jobs have returned or ctx is
-// done, and reports which.
+// done, and reports which. It waits for the producers as they are when it
+// is called: Queues().Remove can take one out meanwhile, and waits for its
+// jobs itself.
 func (c *Client[TTx]) waitForJobs(ctx context.Context) bool {
+	c.mu.Lock()
+	producers := slices.Collect(maps.Values(c.producers))
+	c.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
-		for _, p := range c.producers {
+		for _, p := range producers {
 			p.jobs.Wait()
 		}
 		close(done)

@@ -289,7 +289,7 @@ func testFinalizeSkipLocked[TTx any](t *testing.T, f Fixture[TTx], noBatches boo
 	if singleWriter(d) {
 		want = nil
 	}
-	if err != nil || !slices.Equal(applied, want) {
+	if err != nil || !slices.Equal(appliedIDs(applied), want) {
 		t.Fatalf("finalize with a held row = %v, %v; want %v", applied, err, want)
 	}
 	if err := rollback(); err != nil {
@@ -301,9 +301,10 @@ func testFinalizeSkipLocked[TTx any](t *testing.T, f Fixture[TTx], noBatches boo
 		results = append(results, driver.JobFinalize{ID: free, AttemptedBy: clientID, Fence: 1, State: driver.JobStateCompleted, Archive: true})
 		want = append(want, free)
 	}
-	applied, err = exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: results})
-	slices.SortFunc(applied, func(a, b driver.JobID) int { return slices.Index(want, a) - slices.Index(want, b) })
-	if err != nil || !slices.Equal(applied, want) {
+	finalized, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{SkipLocked: true, Jobs: results})
+	got := appliedIDs(finalized)
+	slices.SortFunc(got, func(a, b driver.JobID) int { return slices.Index(want, a) - slices.Index(want, b) })
+	if err != nil || !slices.Equal(got, want) {
 		t.Fatalf("finalize once the row is free = %v, %v", applied, err)
 	}
 	if j, err := exec.JobGet(ctx, held); err != nil || j.State != driver.JobStateRetryable {
@@ -431,7 +432,7 @@ func testFinalizeTxConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 			if err != nil {
 				t.Error(err)
 			}
-			done <- applied
+			done <- appliedIDs(applied)
 		}()
 		f.WaitForLockWait(ctx, t, d)
 		end := rollback
