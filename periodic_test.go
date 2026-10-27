@@ -409,6 +409,51 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 	}
 }
 
+// Registration writes racing the prune of their clients leave no row that a
+// read returns, and a later write by a live client deletes any they left.
+func TestPeriodicRegistrationsRacePrune(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	exec := h.d.Executor()
+	regs := []driver.PeriodicRegistration{{Name: "j", Definition: json.RawMessage(`{}`), Digest: "d"}}
+	var wg sync.WaitGroup
+	for range 50 {
+		id, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "h", TTL: time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Go(func() {
+			if err := exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: id, Registrations: regs}); err != nil {
+				t.Error(err)
+			}
+		})
+		wg.Go(func() {
+			if _, err := exec.ClientPruneExpired(ctx); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	time.Sleep(10 * time.Millisecond)
+	if rows, err := exec.PeriodicRegistrations(ctx); err != nil || len(rows) != 0 {
+		t.Errorf("registrations of expired clients read: %v, %v", rows, err)
+	}
+	if _, err := exec.ClientPruneExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	live, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "h", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: live, Registrations: regs}); err != nil {
+		t.Fatal(err)
+	}
+	if n := h.count("SELECT count(*) FROM hopper_periodic_registrations WHERE client_id <> $1", live); n != 0 {
+		t.Errorf("%d registrations of pruned clients left after a live client's write", n)
+	}
+}
+
 type strictOther struct{}
 
 func (strictOther) Kind() string { return "strict-other" }

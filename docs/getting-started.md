@@ -350,10 +350,13 @@ A job runs while any live client registers it, and stops once none does.
 When clients define one name differently, as during a rolling deploy, the
 newest client's definition wins. Only `Cron` and `Every` schedules can be
 recorded, and a `Cron` only in a zone that loads by its name, so not in
-`time.Local` or, usually, a `time.FixedZone`. Nor can a job whose args the
-`Codec` encodes differently each time, as an encrypting codec with a random
-nonce does, or whose args or metadata hold a NUL. Any other job runs only
-while its own client leads.
+`time.Local` or, usually, a `time.FixedZone`. Nor can a job whose insert
+differs each time it is built, as with an encrypting codec with a random
+nonce or an `InsertOpts` method that reads the clock, or whose name, args or
+options hold a NUL. Any other job runs only while its own client leads. A
+`Cron` in a named zone runs only while a client that can load the zone
+leads, so give every program that can lead the zone database, from the
+system or by importing `time/tzdata`.
 
 ## Batches and workflows
 

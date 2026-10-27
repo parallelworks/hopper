@@ -1680,15 +1680,16 @@ and partition keys, and the unique key without its period), with its schedule,
 Clients tell definitions apart by digest only, since `jsonb` stores the definition
 reformatted. The client writes its whole set in one transaction when it
 starts, when what it records changes, which it checks on every change and every lease
-renewal interval, and when it registers a new lease after losing one, and retries a
+renewal interval, and at once when it registers a new lease after losing one, and retries a
 failed write each lease renewal interval. The leader schedules the jobs of
 **every live client**, so a job is registered only by the programs that should run it,
 and the leader needs none of its Go types: it inserts the stored args and options, and
 the job is worked by whichever client works its queue. For each name the leader takes
 the definition of the newest live client that registers it, by the client's start time,
 and logs once when live clients define a name differently, as during a rolling deploy;
-for itself it reads its in-memory set rather than its rows, so its own changes apply at
-once. It reads the rows of clients whose lease has not expired at the start of a term,
+for itself it reads its in-memory set rather than its rows, so its changes to the names
+it recorded apply at once, while a name it adds that another client records waits for its
+write and the next read. It reads the rows of clients whose lease has not expired at the start of a term,
 before its first pass, and then every leader interval, waking the periodic loop only
 when they changed. A job keeps its registration in the loop while its definition is
 unchanged, whichever client it comes from, so a job whose registering client stops while
@@ -1703,13 +1704,18 @@ client registers it, and stops within a leader interval of the last one removing
 stopping. Only `Cron` schedules (stored as their expression and time zone) and `Every`
 schedules (their interval) can be recorded; a job with another `Schedule`, or a `Cron`
 in `time.Local`, which names a different zone in each process, or in a zone that does
-not load by its name to the same offsets, such as a `time.FixedZone`, or a job whose args
-the `Codec` encodes differently each time (an encrypting codec with a random nonce, whose
-digests would never match across replicas) or whose definition holds a NUL (which `jsonb`
-refuses, and which would fail the client's whole write), is scheduled only
+not load by its name to the same offsets, such as a `time.FixedZone`, or a job whose
+insert differs each time it is built (args an encrypting codec encodes with a random
+nonce, or an `InsertOpts` method that reads the clock, whose values the definition
+would freeze and whose digests would never match across replicas) or whose name or
+definition holds a NUL or invalid UTF-8 (which Postgres refuses, and which would fail the
+client's whole write), is scheduled only
 from its own client's set, while that client leads, as before v20. A definition the leader
-cannot read, such as one of a later definition version, is skipped with a log, and the
-leader schedules its own job of that name if it has one. A leader from before v20
+cannot read, such as one of a later definition version, or a `Cron` in a zone the leader
+cannot load, is skipped with a log, and the leader schedules its own job of that name if
+it has one. So every client that can lead needs the zone database of the zones other
+clients' `Cron` jobs name, from the system or from importing `time/tzdata`, which a
+library leaves to the program. A leader from before v20
 schedules only its own set. A client with no queues holds no lease and records nothing,
 so its jobs are never scheduled. A `NeverLead` client's jobs are recorded and scheduled
 by the leader while it runs, so a developer's process against a shared environment

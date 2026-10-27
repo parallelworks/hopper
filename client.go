@@ -131,18 +131,16 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 	// so an error or a panic here cannot leave a client without it.
 	strict := c.cfg.StrictKinds
 	c.cfg.StrictKinds = false
+	c.periodic.define = c.periodicDefinition
 	for _, r := range c.periodic.jobs {
 		if _, err := c.periodicParams(&r.job, time.Now()); err != nil {
 			return nil, fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
 		}
-		def, err := c.periodicDefinition(&r.job)
-		if err != nil {
-			return nil, fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
+		if err := c.periodic.setDefinition(r); err != nil {
+			return nil, err
 		}
-		r.def, r.digest = string(def), definitionDigest(string(def))
 	}
 	c.cfg.StrictKinds = strict
-	c.periodic.define = c.periodicDefinition
 	c.periodic.recordable = func(r *registeredPeriodic) bool {
 		if !c.cfg.StrictKinds {
 			return true
@@ -634,4 +632,5 @@ func (c *Client[TTx]) fence(ctx context.Context, id int64) {
 	c.clientID.Store(newID)
 	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // canceled by fence or Stop
 	c.pokeLeader()
+	c.periodic.record()
 }

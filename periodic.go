@@ -168,10 +168,13 @@ func resolvePeriodic(jobs []PeriodicJob) ([]PeriodicJob, error) {
 // another client. A job whose schedule cannot be recorded, one other than
 // Cron's or Every's, or a Cron in time.Local or in a zone that does not load
 // by its name, such as a time.FixedZone, is scheduled only from its own
-// client, while that client leads. So is a job whose args the Codec encodes
-// differently each time, as an encrypting codec with a random nonce does,
-// or whose args or metadata hold a NUL. A client with no queues holds no lease
-// and records nothing. It is safe for concurrent use.
+// client, while that client leads. So is a job whose insert differs each
+// time it is built, as with a Codec that encrypts with a random nonce or an
+// InsertOpts method that reads the clock, or whose name, args or options
+// hold a NUL. A Cron in a named zone runs only while a client that can load
+// that zone leads, so every client that can lead needs the zone database.
+// A client with no queues holds no lease and records nothing. It is safe for
+// concurrent use.
 type PeriodicJobs struct {
 	logger     *slog.Logger
 	insertOnly bool
@@ -255,11 +258,10 @@ func (p *PeriodicJobs) AddMany(jobs []PeriodicJob) error {
 		if err := p.check(&job); err != nil {
 			return err
 		}
-		def, err := p.definition(&job)
-		if err != nil {
+		regs[i] = &registeredPeriodic{job: job}
+		if err := p.setDefinition(regs[i]); err != nil {
 			return err
 		}
-		regs[i] = &registeredPeriodic{job: job, def: def, digest: definitionDigest(def)}
 	}
 	p.mu.Lock()
 	for _, r := range regs {
@@ -340,25 +342,34 @@ func (p *PeriodicJobs) snapshot() []*registeredPeriodic {
 }
 
 func (p *PeriodicJobs) notify() {
-	for _, ch := range []chan struct{}{p.changed, p.registered} {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
+	select {
+	case p.changed <- struct{}{}:
+	default:
+	}
+	p.record()
+}
+
+// record asks the client to record the set now, rather than at its next
+// lease renewal interval.
+func (p *PeriodicJobs) record() {
+	select {
+	case p.registered <- struct{}{}:
+	default:
 	}
 }
 
-// definition returns the job's stored definition, empty if its schedule
-// cannot be stored.
-func (p *PeriodicJobs) definition(job *PeriodicJob) (string, error) {
+// setDefinition sets r's stored definition and its digest, empty for a job
+// that cannot be stored.
+func (p *PeriodicJobs) setDefinition(r *registeredPeriodic) error {
 	if p.define == nil {
-		return "", nil
+		return nil
 	}
-	def, err := p.define(job)
+	def, err := p.define(&r.job)
 	if err != nil {
-		return "", fmt.Errorf("hopper: periodic job %q: %w", job.Name, err)
+		return fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
 	}
-	return string(def), nil
+	r.def, r.digest = string(def), definitionDigest(string(def))
+	return nil
 }
 
 // registrations returns the definitions of the jobs the client records.

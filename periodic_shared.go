@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"hash/fnv"
 	"maps"
+	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/parallelworks/hopper/driver"
 )
@@ -59,10 +62,14 @@ type definedUnique struct {
 
 // periodicDefinition encodes p for the leader. It returns nil for a job
 // that cannot be stored, which only its own client schedules: one whose
-// schedule cannot be, whose args the Codec encodes differently each time,
-// as an encrypting codec with a random nonce does, or whose definition has
-// a NUL, which Postgres's jsonb refuses.
+// schedule cannot be, whose insert differs each time it is built, as with
+// a Codec that encrypts with a random nonce or an InsertOpts method that
+// reads the clock, or whose name or definition has a NUL or invalid UTF-8,
+// which Postgres refuses.
 func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error) {
+	if !utf8.ValidString(p.Name) || strings.ContainsRune(p.Name, 0) {
+		return nil, nil
+	}
 	d := periodicDefinition{Version: periodicDefinitionVersion}
 	switch s := p.Schedule.(type) {
 	case *CronSchedule:
@@ -72,6 +79,11 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 		d.Cron, d.Location = s.spec, s.loc.String()
 	case IntervalSchedule:
 		d.Every = s.Interval
+	case *IntervalSchedule:
+		if s == nil {
+			return nil, nil
+		}
+		d.Every = s.Interval
 	default:
 		return nil, nil
 	}
@@ -79,20 +91,12 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 		d.RunOnStart, d.CatchUp = p.Opts.RunOnStart, p.Opts.CatchUp
 	}
 
-	params := p.insertParams()
-	opts := params.effectiveOpts()
-	var byPeriod time.Duration
-	if opts.Unique != nil {
-		unique := *opts.Unique
-		byPeriod, unique.ByPeriod = unique.ByPeriod, 0
-		opts.Unique = &unique
-	}
-	job, _, err := c.buildInsertParams(InsertParams{Args: params.Args, Opts: &opts}, time.Time{})
+	job, byPeriod, err := c.definedInsert(p)
 	if err != nil {
 		return nil, err
 	}
-	again, _, err := c.buildInsertParams(InsertParams{Args: params.Args, Opts: &opts}, time.Time{})
-	if err != nil || !bytes.Equal(again.Args, job.Args) {
+	again, _, err := c.definedInsert(p)
+	if err != nil || !reflect.DeepEqual(again, job) {
 		return nil, err
 	}
 	d.Job = definedJob{
@@ -111,14 +115,43 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 	if !job.ScheduledAt.IsZero() {
 		d.Job.ScheduledAt = &job.ScheduledAt
 	}
-	if opts.Unique != nil {
+	if job.UniqueKey != "" {
 		d.Job.Unique = &definedUnique{Key: job.UniqueKey, ByPeriod: byPeriod, Finished: job.UniqueFinished}
 	}
 	def, err := json.Marshal(d)
-	if err != nil || bytes.Contains(def, []byte(`\u0000`)) {
+	if err != nil || hasNULEscape(def) {
 		return nil, err
 	}
 	return def, nil
+}
+
+// definedInsert builds p's insert with its unique key's period left out,
+// which the leader adds from each slot, and returns that period.
+func (c *Client[TTx]) definedInsert(p *PeriodicJob) (driver.JobInsertParams, time.Duration, error) {
+	params := p.insertParams()
+	opts := params.effectiveOpts()
+	var byPeriod time.Duration
+	if opts.Unique != nil {
+		unique := *opts.Unique
+		byPeriod, unique.ByPeriod = unique.ByPeriod, 0
+		opts.Unique = &unique
+	}
+	job, _, err := c.buildInsertParams(InsertParams{Args: params.Args, Opts: &opts}, time.Time{})
+	return job, byPeriod, err
+}
+
+// hasNULEscape reports whether JSON text holds a \u0000 escape, telling it
+// from an escaped backslash followed by "u0000".
+func hasNULEscape(b []byte) bool {
+	for i := 0; i < len(b); i++ {
+		if b[i] == '\\' {
+			i++
+			if bytes.HasPrefix(b[i:], []byte("u0000")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // loadsByName reports whether the leader, loading loc by its name, gets the
@@ -181,7 +214,7 @@ func definedPeriodic(name string, stored storedDef) (*registeredPeriodic, error)
 		}
 		loc, err := time.LoadLocation(d.Location)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("time zone %q does not load on this client; a client that can lead needs the zone database, from the system or from importing time/tzdata: %w", d.Location, err)
 		}
 		sched = s.In(loc)
 	case d.Every > 0:
@@ -233,10 +266,6 @@ func (j definedJob) params(slot time.Time) (driver.JobInsertParams, error) {
 	return p, nil
 }
 
-// registrationLoop records the client's periodic jobs under its lease, so
-// that whichever client leads schedules them. It writes again when the jobs
-// change or the client registers a new lease, and retries a failed write
-// every lease renewal interval.
 // periodicRecord is what a client last recorded of its periodic jobs.
 type periodicRecord struct {
 	clientID int64
@@ -265,6 +294,10 @@ func (c *Client[TTx]) recordPeriodic(ctx context.Context, r *periodicRecord) {
 	}
 }
 
+// registrationLoop records the client's periodic jobs under its lease, so
+// that whichever client leads schedules them. It writes again when the jobs
+// change or the client registers a new lease, and retries a failed write
+// every lease renewal interval.
 func (c *Client[TTx]) registrationLoop(ctx context.Context, r *periodicRecord) {
 	ticker := time.NewTicker(c.tuning.leaseRenew)
 	defer ticker.Stop()
@@ -353,9 +386,10 @@ func (c *Client[TTx]) watchStored(ctx context.Context, last map[string][]storedD
 
 // effectivePeriodic returns the jobs the leader schedules: for each name,
 // the definition of the newest live client that registers it. For itself
-// the leader reads its own set, not what it recorded, so that its own
-// changes apply at once; its jobs not recorded yet, or whose schedule cannot
-// be stored, come from its own set too. A stored job keeps its registration
+// the leader reads its own set, not what it recorded, so that its changes
+// to the names it recorded apply at once. Its jobs not recorded yet, or
+// whose schedule cannot be stored, come from its own set too, unless
+// another client records that name. A stored job keeps its registration
 // while its definition is unchanged, whichever client it comes from, so a
 // job moving between clients is not started again.
 func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) []*registeredPeriodic {

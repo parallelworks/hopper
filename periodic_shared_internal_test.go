@@ -81,6 +81,7 @@ func TestPeriodicDefinitionKeepsTheSchedule(t *testing.T) {
 	from := time.Date(2030, 3, 9, 12, 0, 0, 0, time.UTC)
 	for name, job := range map[string]PeriodicJob{
 		"every":          Every(90*time.Second, tickArgs{}, nil),
+		"every pointer":  {Name: "tick", Schedule: &IntervalSchedule{Interval: 90 * time.Second}, Args: tickArgs{}},
 		"cron in UTC":    Cron("30 9 * * MON-FRI", tickArgs{}, nil),
 		"cron with zone": Cron("CRON_TZ=Asia/Tokyo 0 9 * * *", tickArgs{}, nil),
 		"cron with opts": Cron("0 2 * * *", tickArgs{}, &PeriodicOpts{Location: chicago, RunOnStart: true, CatchUp: 3}),
@@ -116,6 +117,9 @@ func TestPeriodicDefinitionLeavesOutWhatCannotBeStored(t *testing.T) {
 		"local time zone": Cron("0 9 * * *", tickArgs{}, &PeriodicOpts{Location: time.Local}),
 		"fixed zone":      Cron("0 9 * * *", tickArgs{}, &PeriodicOpts{Location: time.FixedZone("UTC+3", 3*3600)}),
 		"fixed zone named like one with daylight saving": Cron("0 9 * * *", tickArgs{}, &PeriodicOpts{Location: time.FixedZone("CET", 3600)}),
+		"options read from the clock":                    Every(time.Hour, delayedArgs{}, nil),
+		"name with a NUL":                                Every(time.Hour, tickArgs{}, &PeriodicOpts{Name: "a\x00b"}),
+		"name that is not UTF-8":                         Every(time.Hour, tickArgs{}, &PeriodicOpts{Name: "a\xffb"}),
 	} {
 		if err := job.resolve(); err != nil {
 			t.Fatal(err)
@@ -125,6 +129,13 @@ func TestPeriodicDefinitionLeavesOutWhatCannotBeStored(t *testing.T) {
 		}
 	}
 }
+
+// delayedArgs delays each job it inserts by an hour from its insert.
+type delayedArgs struct{}
+
+func (delayedArgs) Kind() string { return "delayed" }
+
+func (delayedArgs) InsertOpts() InsertOpts { return InsertOpts{ScheduledAt: time.Now().Add(time.Hour)} }
 
 // nonceCodec encodes the same args differently each time, as an encrypting
 // codec with a random nonce does.
@@ -153,6 +164,13 @@ func TestPeriodicDefinitionLeavesOutUnstableOrNULArgs(t *testing.T) {
 	if def, err := c.periodicDefinition(&nul); err != nil || def != nil {
 		t.Errorf("args with a NUL: definition = %s, %v; want none", def, err)
 	}
+	backslash := Every(time.Hour, textArgs{Text: `a\u0000b`}, nil)
+	if err := backslash.resolve(); err != nil {
+		t.Fatal(err)
+	}
+	if def, err := c.periodicDefinition(&backslash); err != nil || def == nil {
+		t.Errorf("args with a backslash before u0000, which is no NUL: definition = %s, %v; want one", def, err)
+	}
 
 	c.cfg.Codec = nonceCodec{n: new(atomic.Int64)}
 	job := Every(time.Hour, textArgs{Text: "a"}, nil)
@@ -175,6 +193,18 @@ func storedRow(t *testing.T, c *Client[struct{}], client int64, job PeriodicJob)
 		t.Fatal(err)
 	}
 	return driver.PeriodicRegistrationRow{ClientID: client, PeriodicRegistration: driver.PeriodicRegistration{Name: job.Name, Definition: def, Digest: definitionDigest(string(def))}}
+}
+
+// ownDefinition sets the definition of the client's only periodic job, as
+// NewClient does, and returns the job.
+func ownDefinition(t *testing.T, c *Client[struct{}]) *registeredPeriodic {
+	t.Helper()
+	c.periodic.define = c.periodicDefinition
+	r := c.periodic.jobs[0]
+	if err := c.periodic.setDefinition(r); err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
 
 // The leader schedules another client's job, starts it again only when its
@@ -226,14 +256,8 @@ func TestPeriodicLoopOwnChangesApplyAtOnce(t *testing.T) {
 	job := Every(10*time.Millisecond, tickArgs{}, nil)
 	c := newPeriodicTestClient(t, exec, job)
 	c.clientID.Store(1)
-	c.periodic.define = c.periodicDefinition
-	r := c.periodic.jobs[0]
-	def, err := c.periodicDefinition(&r.job)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.def, r.digest = string(def), definitionDigest(string(def))
-	own := driver.PeriodicRegistrationRow{ClientID: 1, PeriodicRegistration: driver.PeriodicRegistration{Name: "tick", Definition: def, Digest: definitionDigest(string(def))}}
+	r := ownDefinition(t, c)
+	own := driver.PeriodicRegistrationRow{ClientID: 1, PeriodicRegistration: driver.PeriodicRegistration{Name: "tick", Definition: json.RawMessage(r.def), Digest: r.digest}}
 	exec.set(func(e *periodicExec) { e.registrations = []driver.PeriodicRegistrationRow{own} })
 	runPeriodicLoop(t, c)
 	eventually(t, func() bool { return exec.inserted("tick") >= 2 })
@@ -261,12 +285,7 @@ func TestPeriodicLoopFallsBackFromUnreadableDefinition(t *testing.T) {
 	exec := &periodicExec{}
 	c := newPeriodicTestClient(t, exec, Every(time.Hour, tickArgs{}, &PeriodicOpts{RunOnStart: true}))
 	c.clientID.Store(1)
-	r := c.periodic.jobs[0]
-	def, err := c.periodicDefinition(&r.job)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.def, r.digest = string(def), definitionDigest(string(def))
+	ownDefinition(t, c)
 	later := driver.PeriodicRegistrationRow{ClientID: 2, PeriodicRegistration: driver.PeriodicRegistration{Name: "tick", Definition: json.RawMessage(`{"v":99}`), Digest: "99"}}
 	exec.set(func(e *periodicExec) { e.registrations = []driver.PeriodicRegistrationRow{later} })
 	runPeriodicLoop(t, c)
@@ -284,13 +303,7 @@ func TestPeriodicLoopOwnRemovalStopsBackFill(t *testing.T) {
 	job := Every(time.Minute, tickArgs{}, &PeriodicOpts{CatchUp: 100})
 	c := newPeriodicTestClient(t, exec, job)
 	c.clientID.Store(1)
-	c.periodic.define = c.periodicDefinition
-	r := c.periodic.jobs[0]
-	def, err := c.periodicDefinition(&r.job)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.def, r.digest = string(def), definitionDigest(string(def))
+	ownDefinition(t, c)
 	exec.set(func(e *periodicExec) {
 		e.last = map[string]time.Time{"tick": time.Now().Add(-3 * time.Hour)}
 		e.onInsert = func() {
@@ -316,13 +329,7 @@ func TestPeriodicLoopOwnRemovalHandsOverAtOnce(t *testing.T) {
 	c := newPeriodicTestClient(t, exec, job)
 	c.tuning.leaderInterval = time.Hour
 	c.clientID.Store(1)
-	c.periodic.define = c.periodicDefinition
-	r := c.periodic.jobs[0]
-	def, err := c.periodicDefinition(&r.job)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.def, r.digest = string(def), definitionDigest(string(def))
+	ownDefinition(t, c)
 	started := time.Now()
 	own, other := storedRow(t, c, 1, job), storedRow(t, c, 2, job)
 	own.ClientStartedAt, other.ClientStartedAt = started.Add(time.Second), started
