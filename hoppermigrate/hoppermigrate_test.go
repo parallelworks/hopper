@@ -1195,6 +1195,10 @@ func TestJobLeasesUpgradeTakesNoJobLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// This release's claim needs the latest schema; down passes through v19.
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
 	lease, err := d.Executor().JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, TTL: time.Minute})
 	if err != nil {
 		t.Fatal(err)
