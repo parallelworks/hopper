@@ -530,11 +530,14 @@ var scanLiveTableStats = collect(func(r Row) (liveTableStats, error) {
 // server's target: a listing by several tags (rarestTagSQL) tells common
 // tags apart by its most common values, of which a target of 10 would keep
 // only ten. So does the dependency table, whose estimates rest on how many
-// distinct jobs its sample holds, which a larger sample counts better.
+// distinct jobs its sample holds, which a larger sample counts better. The
+// dependency results, read and written by primary key and deleted by
+// workflow, churn as the edges do.
 var liveTables = []liveTable{
 	{"hopper_jobs", 10, analyzeEvery},
 	{"hopper_job_tags", 0, analyzeEvery},
 	{"hopper_job_deps", 0, analyzeDepsEvery},
+	{"hopper_job_results", 0, analyzeDepsEvery},
 }
 
 // analyzeDepsEvery is the least time between the dependency table's
