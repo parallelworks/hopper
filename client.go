@@ -389,7 +389,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	case clientIdle, clientStopped:
 		c.state = clientStopped
 		c.mu.Unlock()
-		c.notifier.flushNow()
+		c.notifier.flushNow(ctx)
 		return nil
 	case clientStopping:
 		c.mu.Unlock()
@@ -402,7 +402,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 
 	if insertOnly {
 		// Insert-only client.
-		c.notifier.flushNow()
+		c.notifier.flushNow(ctx)
 		c.mu.Lock()
 		c.state = clientStopped
 		c.mu.Unlock()
@@ -429,7 +429,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	}
 	c.finCancel()
 	<-c.finalizer.done
-	c.notifier.flushNow()
+	c.notifier.flushNow(ctx)
 
 	// 3. Release the lease.
 	c.workCancel()
