@@ -647,7 +647,8 @@ CREATE TABLE hopper_periodic (          -- last inserted slot per periodic job
 CREATE TABLE hopper_periodic_registrations (  -- v19: each live client's periodic jobs
   client_id  bigint NOT NULL,
   name       text   NOT NULL,
-  definition text   NOT NULL,           -- JSON, compared byte for byte; see §7.9
+  definition jsonb  NOT NULL,
+  digest     text   NOT NULL,           -- of the definition as the client encoded it; see §7.9
   PRIMARY KEY (client_id, name)
 );
 
@@ -1655,7 +1656,9 @@ Each client with queues records its set under its lease, in
 holding the job's definition, the slot-independent part of its insert as the client
 built it (kind, encoded args, queue, priority, attempts, metadata, tags, TTL, ordering
 and partition keys, and the unique key without its period), with its schedule,
-`RunOnStart` and `CatchUp`. The client writes its whole set in one transaction when it
+`RunOnStart` and `CatchUp`, and a digest of the definition as the client encoded it.
+Clients tell definitions apart by digest only, since `jsonb` stores the definition
+reformatted. The client writes its whole set in one transaction when it
 starts, when what it records changes, which it checks on every change and every lease
 renewal interval, and when it registers a new lease after losing one, and retries a
 failed write each lease renewal interval. The leader schedules the jobs of

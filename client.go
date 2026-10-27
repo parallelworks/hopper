@@ -139,7 +139,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		if err != nil {
 			return nil, fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
 		}
-		r.def = string(def)
+		r.def, r.digest = string(def), definitionDigest(string(def))
 	}
 	c.cfg.StrictKinds = strict
 	c.periodic.define = c.periodicDefinition

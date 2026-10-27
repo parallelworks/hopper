@@ -297,8 +297,9 @@ func (e *Executor) PeriodicLastSlots(ctx context.Context) (map[string]time.Time,
 func (e *Executor) PeriodicRegister(ctx context.Context, params driver.PeriodicRegisterParams) error {
 	names := make([]string, len(params.Registrations))
 	definitions := make([]string, len(params.Registrations))
+	digests := make([]string, len(params.Registrations))
 	for i, r := range params.Registrations {
-		names[i], definitions[i] = r.Name, string(r.Definition)
+		names[i], definitions[i], digests[i] = r.Name, string(r.Definition), r.Digest
 	}
 	err := e.withTx(ctx, func(tx Tx) error {
 		if _, err := tx.Exec(ctx, `
@@ -310,10 +311,10 @@ func (e *Executor) PeriodicRegister(ctx context.Context, params driver.PeriodicR
 			return nil
 		}
 		_, err := tx.Exec(ctx, `
-			INSERT INTO {{schema}}.hopper_periodic_registrations (client_id, name, definition)
-			SELECT $1, n, d FROM unnest($2::text[], $3::text[]) AS r(n, d)
+			INSERT INTO {{schema}}.hopper_periodic_registrations (client_id, name, definition, digest)
+			SELECT $1, n, d::jsonb, g FROM unnest($2::text[], $3::text[], $4::text[]) AS r(n, d, g)
 			WHERE EXISTS (SELECT 1 FROM {{schema}}.hopper_clients WHERE id = $1 AND expires_at > now())`,
-			params.ClientID, textArray(names), textArray(definitions))
+			params.ClientID, textArray(names), textArray(definitions), textArray(digests))
 		return err
 	})
 	if err != nil {
@@ -329,11 +330,11 @@ func (e *Executor) PeriodicRegistrations(ctx context.Context) ([]driver.Periodic
 			row        driver.PeriodicRegistrationRow
 			definition jsonText
 		)
-		err := r.Scan(&row.ClientID, &row.ClientStartedAt, &row.Name, &definition)
+		err := r.Scan(&row.ClientID, &row.ClientStartedAt, &row.Name, &definition, &row.Digest)
 		row.Definition = definition.raw()
 		return row, err
 	})(e.Conn.Query(ctx, `
-		SELECT c.id, c.started_at, r.name, r.definition
+		SELECT c.id, c.started_at, r.name, r.definition, r.digest
 		FROM {{schema}}.hopper_periodic_registrations r
 		JOIN {{schema}}.hopper_clients c ON c.id = r.client_id
 		WHERE c.expires_at > now()

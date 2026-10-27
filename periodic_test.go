@@ -339,10 +339,13 @@ func TestPeriodicJobsAcrossPrograms(t *testing.T) {
 	waitFor(t, func() bool { return jobs("1") >= before1+2 && jobs("2") >= before2+2 })
 
 	for _, n := range []string{"1", "2"} {
-		total := jobs(n)
-		distinct := h.count(`SELECT count(DISTINCT unique_key) FROM (
+		var total, distinct int
+		// One statement, so a job finishing between two counts is not counted in both tables.
+		if err := h.pool.QueryRow(ctx, `SELECT count(*), count(DISTINCT unique_key) FROM (
 			SELECT unique_key FROM hopper_jobs WHERE args->>'n' = $1
-			UNION ALL SELECT unique_key FROM hopper_job_history WHERE args->>'n' = $1) j`, n)
+			UNION ALL SELECT unique_key FROM hopper_job_history WHERE args->>'n' = $1) j`, n).Scan(&total, &distinct); err != nil {
+			t.Fatal(err)
+		}
 		if total != distinct {
 			t.Errorf("job %s: %d jobs for %d slots", n, total, distinct)
 		}
@@ -362,7 +365,7 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: id, Registrations: []driver.PeriodicRegistration{
-			{Name: "j", Definition: json.RawMessage(`{}`)},
+			{Name: "j", Definition: json.RawMessage(`{}`), Digest: "d"},
 		}}); err != nil {
 			t.Fatal(err)
 		}
@@ -389,7 +392,7 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 		t.Errorf("%d registrations left after their client was deleted", n)
 	}
 	if err := exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: deleted, Registrations: []driver.PeriodicRegistration{
-		{Name: "j", Definition: json.RawMessage(`{}`)},
+		{Name: "j", Definition: json.RawMessage(`{}`), Digest: "d"},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +400,7 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 		t.Errorf("%d registrations recorded for a deleted client", n)
 	}
 
-	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_periodic_registrations (client_id, name, definition) VALUES (-1, 'left', '{}')`); err != nil {
+	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_periodic_registrations (client_id, name, definition, digest) VALUES (-1, 'left', '{}', 'd')`); err != nil {
 		t.Fatal(err)
 	}
 	register()

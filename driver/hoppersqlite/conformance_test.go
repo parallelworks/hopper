@@ -154,7 +154,7 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 	ctx := context.Background()
 	d := open(t)
 	exec := d.Executor()
-	regs := []driver.PeriodicRegistration{{Name: "j", Definition: json.RawMessage(`{}`)}}
+	regs := []driver.PeriodicRegistration{{Name: "j", Definition: json.RawMessage(`{}`), Digest: "d"}}
 	register := func() int64 {
 		id, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "h", TTL: time.Minute})
 		if err != nil {
@@ -185,7 +185,7 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 		t.Errorf("%d registrations after both clients were gone", n)
 	}
 
-	execSQL(ctx, t, d, `INSERT INTO hopper_periodic_registrations (client_id, name, definition) VALUES (-1, 'left', '{}')`)
+	execSQL(ctx, t, d, `INSERT INTO hopper_periodic_registrations (client_id, name, definition, digest) VALUES (-1, 'left', '{}', 'd')`)
 	register()
 	if n := rows(); n != 1 {
 		t.Errorf("%d registrations, want only the live client's: a gone client's survived another client's write", n)

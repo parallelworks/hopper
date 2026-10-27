@@ -232,7 +232,7 @@ func testPeriodicRegistrations[TTx any](t *testing.T, f Fixture[TTx]) {
 	d := f.NewDriver(t)
 	exec := d.Executor()
 	reg := func(name, def string) driver.PeriodicRegistration {
-		return driver.PeriodicRegistration{Name: name, Definition: json.RawMessage(def)}
+		return driver.PeriodicRegistration{Name: name, Definition: json.RawMessage(def), Digest: "digest of " + def}
 	}
 	set := func(clientID int64, regs ...driver.PeriodicRegistration) {
 		t.Helper()
@@ -257,6 +257,9 @@ func testPeriodicRegistrations[TTx any](t *testing.T, f Fixture[TTx]) {
 				t.Fatalf("definition %q: %v", r.Definition, err)
 			}
 			canonical, _ := json.Marshal(def)
+			if r.Digest != "digest of "+string(canonical) {
+				t.Errorf("registration %q digest = %q, definition %s", r.Name, r.Digest, canonical)
+			}
 			out[i] = entry{r.ClientID, r.Name, string(canonical)}
 		}
 		return out

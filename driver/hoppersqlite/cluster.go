@@ -352,8 +352,8 @@ func (e *executor) PeriodicRegister(ctx context.Context, params driver.PeriodicR
 			return err
 		}
 		for _, r := range params.Registrations {
-			if _, err := x.ExecContext(ctx, `INSERT INTO hopper_periodic_registrations (client_id, name, definition) VALUES (?, ?, ?)`,
-				params.ClientID, r.Name, string(r.Definition)); err != nil {
+			if _, err := x.ExecContext(ctx, `INSERT INTO hopper_periodic_registrations (client_id, name, definition, digest) VALUES (?, ?, ?, ?)`,
+				params.ClientID, r.Name, string(r.Definition), r.Digest); err != nil {
 				return err
 			}
 		}
@@ -373,11 +373,11 @@ func (e *executor) PeriodicRegistrations(ctx context.Context) ([]driver.Periodic
 			startedAt  int64
 			definition string
 		)
-		err := r.Scan(&row.ClientID, &startedAt, &row.Name, &definition)
+		err := r.Scan(&row.ClientID, &startedAt, &row.Name, &definition, &row.Digest)
 		row.ClientStartedAt = time.UnixMicro(startedAt).UTC()
 		row.Definition = json.RawMessage(definition)
 		return row, err
-	}, `SELECT c.id, c.started_at, r.name, r.definition
+	}, `SELECT c.id, c.started_at, r.name, r.definition, r.digest
 		FROM hopper_periodic_registrations r
 		JOIN hopper_clients c ON c.id = r.client_id
 		WHERE c.expires_at > ?

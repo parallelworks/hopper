@@ -199,8 +199,9 @@ type registeredPeriodic struct {
 	job     PeriodicJob
 	removed atomic.Bool
 	// def is the job's stored definition, empty for a job whose schedule
-	// cannot be stored.
-	def string
+	// cannot be stored, and digest identifies it (definitionDigest).
+	def    string
+	digest string
 	// params builds the insert for a slot of a job defined by its stored
 	// definition; nil for the client's own job, built from its args.
 	params func(slot time.Time) (driver.JobInsertParams, error)
@@ -256,7 +257,7 @@ func (p *PeriodicJobs) AddMany(jobs []PeriodicJob) error {
 		if err != nil {
 			return err
 		}
-		regs[i] = &registeredPeriodic{job: job, def: def}
+		regs[i] = &registeredPeriodic{job: job, def: def, digest: definitionDigest(def)}
 	}
 	p.mu.Lock()
 	for _, r := range regs {
@@ -365,7 +366,7 @@ func (p *PeriodicJobs) registrations() []driver.PeriodicRegistration {
 	regs := []driver.PeriodicRegistration{}
 	for _, r := range p.jobs {
 		if p.records(r) {
-			regs = append(regs, driver.PeriodicRegistration{Name: r.job.Name, Definition: json.RawMessage(r.def)})
+			regs = append(regs, driver.PeriodicRegistration{Name: r.job.Name, Definition: json.RawMessage(r.def), Digest: r.digest})
 		}
 	}
 	return regs

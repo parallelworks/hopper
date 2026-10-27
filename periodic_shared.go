@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"maps"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -132,9 +134,24 @@ func loadsByName(loc *time.Location) bool {
 	return true
 }
 
+// definitionDigest identifies a definition by the bytes its client encoded.
+// The engine may store the JSON reformatted, as Postgres's jsonb does, so
+// definitions are compared by digest, never by the JSON read back. It is
+// FNV-1a, not a cryptographic hash: digests are compared only among the
+// definitions live clients register for one name.
+func definitionDigest(def string) string {
+	if def == "" {
+		return ""
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(def))
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
 // definedPeriodic decodes a definition another client stored into a
 // registration the leader schedules.
-func definedPeriodic(name string, raw json.RawMessage) (*registeredPeriodic, error) {
+func definedPeriodic(name string, stored storedDef) (*registeredPeriodic, error) {
+	raw := json.RawMessage(stored.def)
 	var d periodicDefinition
 	if err := json.Unmarshal(raw, &d); err != nil {
 		return nil, err
@@ -162,7 +179,8 @@ func definedPeriodic(name string, raw json.RawMessage) (*registeredPeriodic, err
 	job := d.Job
 	return &registeredPeriodic{
 		job:    PeriodicJob{Name: name, Schedule: sched, Opts: &PeriodicOpts{RunOnStart: d.RunOnStart, CatchUp: d.CatchUp}},
-		def:    string(raw),
+		def:    stored.def,
+		digest: stored.digest,
 		params: job.params,
 	}, nil
 }
@@ -253,8 +271,10 @@ type storedPeriodic struct {
 	rejected map[string]string
 }
 
+// storedDef is a definition with the digest its client computed.
 type storedDef struct {
 	client int64
+	digest string
 	def    string
 }
 
@@ -275,12 +295,11 @@ func (c *Client[TTx]) readStored(ctx context.Context, conflicts map[string]strin
 	}
 	byName := make(map[string][]storedDef, len(rows))
 	for _, r := range rows {
-		def := string(r.Definition)
-		if defs := byName[r.Name]; len(defs) > 0 && def != defs[0].def && conflicts[r.Name] != defs[0].def {
-			conflicts[r.Name] = defs[0].def
+		if defs := byName[r.Name]; len(defs) > 0 && r.Digest != defs[0].digest && conflicts[r.Name] != defs[0].digest {
+			conflicts[r.Name] = defs[0].digest
 			c.logger.WarnContext(ctx, "hopper: periodic: live clients define a job differently; the newest client's definition is scheduled", "periodic", r.Name)
 		}
-		byName[r.Name] = append(byName[r.Name], storedDef{client: r.ClientID, def: def})
+		byName[r.Name] = append(byName[r.Name], storedDef{client: r.ClientID, digest: r.Digest, def: string(r.Definition)})
 	}
 	return byName, true
 }
@@ -327,7 +346,7 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 			names = append(names, r.job.Name)
 		}
 	}
-	wanted := map[string]string{}
+	wanted := map[string]storedDef{}
 	// owner holds the leader's own jobs whose definitions are wanted.
 	owner := map[string]*registeredPeriodic{}
 	var out []*registeredPeriodic
@@ -335,7 +354,7 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 		var source *registeredPeriodic
 		for _, d := range st.stored.byName[name] {
 			if d.client != self {
-				wanted[name] = d.def
+				wanted[name] = d
 				break
 			}
 			if r, ok := own[name]; ok {
@@ -354,22 +373,22 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 		case !c.periodic.records(source):
 			out = append(out, source)
 		default:
-			wanted[name], owner[name] = source.def, source
+			wanted[name], owner[name] = ownDef(source), source
 		}
 	}
 	added := map[string]*registeredPeriodic{}
 	for _, name := range slices.Sorted(maps.Keys(wanted)) {
-		def := wanted[name]
-		if r, ok := st.defined[name]; ok && r.def == def {
+		want := wanted[name]
+		if r, ok := st.defined[name]; ok && r.digest == want.digest {
 			continue
 		}
-		if st.stored.rejected[name] != def {
-			r, err := definedPeriodic(name, json.RawMessage(def))
+		if st.stored.rejected[name] != want.digest {
+			r, err := definedPeriodic(name, want)
 			if err == nil {
 				added[name] = r
 				continue
 			}
-			st.stored.rejected[name] = def
+			st.stored.rejected[name] = want.digest
 			c.logger.ErrorContext(ctx, "hopper: periodic: a stored definition cannot be read; scheduling this client's own, if it has one", "periodic", name, "error", err)
 		}
 		delete(wanted, name)
@@ -379,12 +398,12 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 		case fallback == nil:
 		case !c.periodic.records(fallback):
 			out = append(out, fallback)
-		case st.defined[name] != nil && st.defined[name].def == fallback.def:
-			wanted[name], owner[name] = fallback.def, fallback
+		case st.defined[name] != nil && st.defined[name].digest == fallback.digest:
+			wanted[name], owner[name] = ownDef(fallback), fallback
 		default:
-			if st.stored.rejected[name] != fallback.def {
-				if r, err := definedPeriodic(name, json.RawMessage(fallback.def)); err == nil {
-					wanted[name], owner[name], added[name] = fallback.def, fallback, r
+			if st.stored.rejected[name] != fallback.digest {
+				if r, err := definedPeriodic(name, ownDef(fallback)); err == nil {
+					wanted[name], owner[name], added[name] = ownDef(fallback), fallback, r
 					continue
 				}
 			}
@@ -392,7 +411,7 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 		}
 	}
 	for name, r := range st.defined {
-		if wanted[name] != r.def {
+		if wanted[name].digest != r.digest {
 			r.removed.Store(true)
 			delete(st.defined, name)
 		}
@@ -404,4 +423,8 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 		out = append(out, r)
 	}
 	return out
+}
+
+func ownDef(r *registeredPeriodic) storedDef {
+	return storedDef{digest: r.digest, def: r.def}
 }

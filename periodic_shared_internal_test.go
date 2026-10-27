@@ -49,7 +49,7 @@ func TestPeriodicDefinitionInsertsWhatTheClientWould(t *testing.T) {
 		if err != nil || def == nil {
 			t.Fatalf("%s: definition = %s, %v", name, def, err)
 		}
-		r, err := definedPeriodic(job.Name, def)
+		r, err := definedPeriodic(job.Name, storedDef{digest: definitionDigest(string(def)), def: string(def)})
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -89,7 +89,7 @@ func TestPeriodicDefinitionKeepsTheSchedule(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r, err := definedPeriodic(job.Name, def)
+		r, err := definedPeriodic(job.Name, storedDef{digest: definitionDigest(string(def)), def: string(def)})
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -133,7 +133,7 @@ func storedRow(t *testing.T, c *Client[struct{}], client int64, job PeriodicJob)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return driver.PeriodicRegistrationRow{ClientID: client, PeriodicRegistration: driver.PeriodicRegistration{Name: job.Name, Definition: def}}
+	return driver.PeriodicRegistrationRow{ClientID: client, PeriodicRegistration: driver.PeriodicRegistration{Name: job.Name, Definition: def, Digest: definitionDigest(string(def))}}
 }
 
 // The leader schedules another client's job, starts it again only when its
@@ -191,8 +191,8 @@ func TestPeriodicLoopOwnChangesApplyAtOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.def = string(def)
-	own := driver.PeriodicRegistrationRow{ClientID: 1, PeriodicRegistration: driver.PeriodicRegistration{Name: "tick", Definition: def}}
+	r.def, r.digest = string(def), definitionDigest(string(def))
+	own := driver.PeriodicRegistrationRow{ClientID: 1, PeriodicRegistration: driver.PeriodicRegistration{Name: "tick", Definition: def, Digest: definitionDigest(string(def))}}
 	exec.set(func(e *periodicExec) { e.registrations = []driver.PeriodicRegistrationRow{own} })
 	runPeriodicLoop(t, c)
 	eventually(t, func() bool { return exec.inserted("tick") >= 2 })
@@ -225,8 +225,8 @@ func TestPeriodicLoopFallsBackFromUnreadableDefinition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.def = string(def)
-	later := driver.PeriodicRegistrationRow{ClientID: 2, PeriodicRegistration: driver.PeriodicRegistration{Name: "tick", Definition: json.RawMessage(`{"v":99}`)}}
+	r.def, r.digest = string(def), definitionDigest(string(def))
+	later := driver.PeriodicRegistrationRow{ClientID: 2, PeriodicRegistration: driver.PeriodicRegistration{Name: "tick", Definition: json.RawMessage(`{"v":99}`), Digest: "99"}}
 	exec.set(func(e *periodicExec) { e.registrations = []driver.PeriodicRegistrationRow{later} })
 	runPeriodicLoop(t, c)
 	eventually(t, func() bool { return exec.inserted("tick") == 1 })
@@ -249,7 +249,7 @@ func TestPeriodicLoopOwnRemovalStopsBackFill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.def = string(def)
+	r.def, r.digest = string(def), definitionDigest(string(def))
 	exec.set(func(e *periodicExec) {
 		e.last = map[string]time.Time{"tick": time.Now().Add(-3 * time.Hour)}
 		e.onInsert = func() {

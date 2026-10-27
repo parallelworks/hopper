@@ -817,10 +817,14 @@ type PeriodicRegisterParams struct {
 }
 
 // PeriodicRegistration is one periodic job a client has registered.
-// Definition is opaque to the driver: a JSON document the client encodes.
+// Definition is opaque to the driver: a JSON document the client encodes,
+// which the engine may store reformatted. Digest identifies the definition
+// as the client encoded it, so that clients compare definitions by Digest,
+// never by the stored JSON.
 type PeriodicRegistration struct {
 	Name       string
 	Definition json.RawMessage
+	Digest     string
 }
 
 // PeriodicRegistrationRow is a live client's registration, with when that
