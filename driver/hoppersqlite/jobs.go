@@ -306,7 +306,51 @@ func (x *w) claim(ctx context.Context, queue string, clientID int64, limit int, 
 	for i, r := range rows {
 		jobs[i] = r.job
 	}
+	if err := x.readDependencies(ctx, jobs); err != nil {
+		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
+	}
 	return jobs, nil
+}
+
+// readDependencies sets, on each claimed job in a batch, the dependencies
+// that have finished: those with a result, and those gone from the live
+// table without one, which finished before the engine recorded results and
+// read with no state.
+func (x *w) readDependencies(ctx context.Context, jobs []*driver.JobRow) error {
+	for _, j := range jobs {
+		if j.BatchID.IsZero() {
+			continue
+		}
+		deps, err := queryAll(ctx, x, func(r scanner) (driver.Dependency, error) {
+			var (
+				d           driver.Dependency
+				id          []byte
+				step, state sql.NullString
+				output      sql.NullString
+			)
+			if err := r.Scan(&id, &step, &state, &output); err != nil {
+				return d, err
+			}
+			if err := d.ID.Scan(id); err != nil {
+				return d, err
+			}
+			d.Step, d.State = step.String, driver.JobState(state.String)
+			if output.Valid {
+				d.Output = json.RawMessage(output.String)
+			}
+			return d, nil
+		}, `SELECT d.depends_on, d.step, r.state, r.output
+			FROM hopper_job_deps d LEFT JOIN hopper_job_results r ON r.job_id = d.depends_on
+			WHERE d.job_id = ? AND (r.job_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = d.depends_on))
+			ORDER BY d.depends_on`, idParam(j.ID))
+		if err != nil {
+			return err
+		}
+		if len(deps) > 0 {
+			j.Dependencies = deps
+		}
+	}
+	return nil
 }
 
 // JobClaim implements driver.Executor. The write lock makes the claim

@@ -146,6 +146,14 @@ func (fixture) CountEdges(ctx context.Context, t *testing.T, d driver.Driver[*sq
 	return count(ctx, t, d, "SELECT count(*) FROM hopper_job_deps")
 }
 
+func (fixture) CountJobResults(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
+	return count(ctx, t, d, "SELECT count(*) FROM hopper_job_results")
+}
+
+func (fixture) DeleteJobResult(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
+	execSQL(ctx, t, d, "DELETE FROM hopper_job_results WHERE job_id = ?", id[:])
+}
+
 func (fixture) WaitForLockWait(_ context.Context, t *testing.T, d driver.Driver[*sql.Tx]) {
 	t.Helper()
 	for deadline := time.Now().Add(10 * time.Second); hoppersqlite.LockWaiters(d.(*hoppersqlite.Driver)) == 0; time.Sleep(time.Millisecond) {

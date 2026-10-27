@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -406,6 +407,33 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 		}
 	}
 
+	// Record the result of each job that still has a dependent, for its
+	// dependents' claims. countBatch deletes a workflow's results when it
+	// completes.
+	finishing := make(map[driver.JobID]bool, len(done))
+	for _, f := range done {
+		finishing[f.row.job.ID] = true
+	}
+	for _, f := range done {
+		if f.row.job.BatchID.IsZero() {
+			continue
+		}
+		dependents, err := x.ids(ctx, "SELECT job_id FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
+		if err != nil {
+			return nil, err
+		}
+		if !slices.ContainsFunc(dependents, func(id driver.JobID) bool { return !finishing[id] }) {
+			continue
+		}
+		if _, err := x.ExecContext(ctx, `
+			INSERT INTO hopper_job_results (job_id, batch_id, state, output, finalized_at) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (job_id) DO UPDATE SET batch_id = excluded.batch_id, state = excluded.state, output = excluded.output,
+			  finalized_at = excluded.finalized_at`,
+			idParam(f.row.job.ID), idParam(f.row.job.BatchID), string(f.state), f.output, x.us()); err != nil {
+			return nil, fmt.Errorf("record result of job %s: %w", f.row.job.ID, err)
+		}
+	}
+
 	// Count the jobs down in their batches.
 	type count struct{ n, failed int }
 	var batches []driver.JobID
@@ -518,6 +546,9 @@ func (x *w) countBatch(ctx context.Context, id driver.JobID, n, failed int) erro
 		return err
 	}
 	if _, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = 0, failed = ?, completed_at = ? WHERE id = ?`, failed, x.us(), idParam(id)); err != nil {
+		return err
+	}
+	if _, err := x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id = ?`, idParam(id)); err != nil {
 		return err
 	}
 	outcome := onSuccess

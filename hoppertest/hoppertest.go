@@ -188,6 +188,9 @@ type WorkOpts struct {
 	// resuming. Work runs the job with a copy, which RecordStep and
 	// RecordCursor update in memory; Progress itself is left as it is.
 	Progress *hopper.Progress
+	// Dependencies are the finished dependencies of a workflow step, as a
+	// claim would give them. Work runs the job with a copy.
+	Dependencies []hopper.Dependency
 }
 
 var workSeq atomic.Int64
@@ -249,6 +252,9 @@ func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.
 	if opts.Progress != nil {
 		p := *opts.Progress
 		row.Progress = &p
+	}
+	if len(opts.Dependencies) > 0 {
+		row.Dependencies = slices.Clone(opts.Dependencies)
 	}
 	return workers.Work(ctx, row, hopper.JSONCodec{})
 }

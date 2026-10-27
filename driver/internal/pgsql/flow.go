@@ -186,6 +186,9 @@ folded AS (
   RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete, b.completed_at
 ),
 batches AS (SELECT f.* FROM folded f JOIN locked l ON l.id = f.id WHERE l.open AND f.completed_at IS NOT NULL),
+results_cleared AS (
+  DELETE FROM {{schema}}.hopper_job_results r WHERE r.batch_id = ANY (ARRAY(SELECT id FROM batches)) RETURNING r.job_id
+),
 ` + batchCallbacksSQL("$1") + `
 SELECT (SELECT count(*) FROM locked), (SELECT count(*) FROM batches), (SELECT id FROM locked ORDER BY id DESC LIMIT 1)`
 }
@@ -193,7 +196,9 @@ SELECT (SELECT count(*) FROM locked), (SELECT count(*) FROM batches), (SELECT id
 // batchSweepSQL settles, in ID order, up to $2 batches with progress and
 // an ID after $3, skipping a batch row another statement holds (that
 // statement settles it, or the next pass does), and deletes progress rows
-// whose batch no longer exists.
+// whose batch no longer exists and up to $2 dependency results of
+// workflows that have completed or no longer exist, which a client of an
+// earlier release, completing a workflow, leaves.
 var batchSweepSQL = strings.Replace(batchSettleSQL(`
   SELECT b.id, b.completed_at IS NULL AS open FROM {{schema}}.hopper_batches b
   WHERE b.id IN (SELECT p.batch_id FROM {{schema}}.hopper_batch_progress p WHERE p.batch_id > $3)
@@ -205,6 +210,13 @@ orphans AS (
   DELETE FROM {{schema}}.hopper_batch_progress p
   WHERE p.batch_id > $3 AND NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_batches b WHERE b.id = p.batch_id)
   RETURNING p.batch_id
+),
+result_orphans AS (
+  DELETE FROM {{schema}}.hopper_job_results r WHERE r.job_id = ANY (ARRAY(
+    SELECT o.job_id FROM {{schema}}.hopper_job_results o
+    WHERE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_batches b WHERE b.id = o.batch_id AND b.completed_at IS NULL)
+    LIMIT $2))
+  RETURNING r.job_id
 )
 SELECT (`, 1)
 

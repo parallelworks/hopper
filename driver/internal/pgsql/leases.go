@@ -54,7 +54,8 @@ lease AS (
     renewed_at = EXCLUDED.renewed_at, expires_at = EXCLUDED.expires_at
   RETURNING id, token, expires_at
 )
-SELECT %s, lease.token, lease.expires_at FROM claimed JOIN lease ON lease.id = claimed.id`, JobColumns("j."), JobColumns("claimed."))
+SELECT %s, ` + claimDependenciesSQL + `, lease.token, lease.expires_at FROM claimed JOIN lease ON lease.id = claimed.id`,
+	JobColumns("j."), JobColumns("claimed."))
 
 // JobClaimByID implements driver.Executor.
 func (e *Executor) JobClaimByID(ctx context.Context, params driver.JobClaimByIDParams) (*driver.JobLeaseRow, error) {
@@ -62,8 +63,8 @@ func (e *Executor) JobClaimByID(ctx context.Context, params driver.JobClaimByIDP
 		return nil, errors.New("hopper: claim job by ID: the lease TTL must be at least a microsecond")
 	}
 	var lease driver.JobLeaseRow
-	job, err := scanJob(e.Conn.QueryRow(ctx, jobClaimByIDSQL, uuidParam(params.ID), params.Fence, params.TTL.Seconds()),
-		false, &lease.Lease.Token, &lease.ExpiresAt)
+	job, err := scanClaimed(e.Conn.QueryRow(ctx, jobClaimByIDSQL, uuidParam(params.ID), params.Fence, params.TTL.Seconds()),
+		&lease.Lease.Token, &lease.ExpiresAt)
 	switch {
 	case err == nil:
 		lease.Job, lease.Lease.Fence = job, job.Fence

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/parallelworks/hopper/driver"
 )
@@ -44,9 +46,21 @@ type StepOpts struct {
 	After []Step
 	// OnDependencyFailure defaults to DependencyCancel.
 	OnDependencyFailure DependencyFailure
+	// Name names the step for its dependents, which find it among their
+	// JobRow.Dependencies by it, and for WorkflowGet. Names are unique
+	// within a workflow; a step may have none.
+	Name string
 	// Insert holds the job's own options.
 	Insert *InsertOpts
 }
+
+// Dependency is a finished dependency of a workflow step, as the claim
+// that started the step's attempt read it: its step name, its final state
+// (completed, canceled or discarded) and its output. A step's
+// dependencies are kept until its workflow completes, whatever the
+// history's retention and DeleteCompleted, so a step retried or snoozed
+// gets them again.
+type Dependency = driver.Dependency
 
 // After returns options for a step that waits for the given steps.
 func After(steps ...Step) *StepOpts {
@@ -136,8 +150,22 @@ func (c *Client[TTx]) insertWorkflow(ctx context.Context, exec driver.Executor, 
 		*cb.dst = &p
 	}
 	params := make([]InsertParams, len(wf.steps))
+	names := map[string]int{}
 	for i, s := range wf.steps {
 		params[i] = s.params
+		if s.opts.Name != "" {
+			if !utf8.ValidString(s.opts.Name) || strings.ContainsRune(s.opts.Name, 0) {
+				return nil, fmt.Errorf("hopper: step %d: name %q is not valid UTF-8 text", i, s.opts.Name)
+			}
+			if j, dup := names[s.opts.Name]; dup {
+				return nil, fmt.Errorf("hopper: steps %d and %d are both named %q", j, i, s.opts.Name)
+			}
+			names[s.opts.Name] = i
+			if wp.Steps == nil {
+				wp.Steps = make([]string, len(wf.steps))
+			}
+			wp.Steps[i] = s.opts.Name
+		}
 		for _, dep := range s.opts.After {
 			if dep.wf != wf || dep.i >= i {
 				return nil, fmt.Errorf("hopper: step %d depends on a step of another workflow", i)

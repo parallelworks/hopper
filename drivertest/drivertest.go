@@ -87,6 +87,11 @@ type Fixture[TTx any] interface {
 	// CountEdges counts the dependency edges the engine keeps for workflow
 	// jobs that have not finished.
 	CountEdges(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
+	// CountJobResults counts the dependency results the engine keeps for
+	// workflow steps' claims. DeleteJobResult deletes a job's, as a job
+	// finished before the engine recorded them has none.
+	CountJobResults(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
+	DeleteJobResult(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
 	// WaitForLockWait waits until a statement on the driver's database
 	// waits for a lock another transaction holds, so that a test knows its
 	// competing statement is blocked rather than not yet started.
@@ -186,6 +191,10 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Workflows", testWorkflows[TTx]},
 		{"WorkflowFanInConcurrent", testWorkflowFanInConcurrent[TTx]},
 		{"WorkflowsConcurrent", testWorkflowsConcurrent[TTx]},
+		{"DependencyResults", testDependencyResults[TTx]},
+		{"DependencyResultsFailed", testDependencyResultsFailed[TTx]},
+		{"DependencyResultsConcurrent", testDependencyResultsConcurrent[TTx]},
+		{"DependencyResultsLeaseExpiry", testDependencyResultsLeaseExpiry[TTx]},
 		{"Streams", testStreams[TTx]},
 		{"StreamsRetention", testStreamsRetention[TTx]},
 		{"Maintain", testMaintain[TTx]},
@@ -372,6 +381,18 @@ func (p Postgres[TTx]) CountJobLeases(ctx context.Context, t *testing.T, d drive
 func (p Postgres[TTx]) CountEdges(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int {
 	t.Helper()
 	return p.count(ctx, t, d, "SELECT count(*)::text FROM hopper_job_deps")
+}
+
+// CountJobResults implements Fixture.
+func (p Postgres[TTx]) CountJobResults(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int {
+	t.Helper()
+	return p.count(ctx, t, d, "SELECT count(*)::text FROM hopper_job_results")
+}
+
+// DeleteJobResult implements Fixture.
+func (p Postgres[TTx]) DeleteJobResult(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "DELETE FROM hopper_job_results WHERE job_id = $1::uuid", id.String())
 }
 
 // WaitForLockWait implements Fixture: a statement on the driver's schema,

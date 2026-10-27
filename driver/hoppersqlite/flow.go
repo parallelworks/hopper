@@ -139,10 +139,10 @@ func encodeBatch(onSuccess, onFailure, onComplete *driver.JobInsertParams, metad
 }
 
 // insertBatch inserts a batch row expecting total jobs.
-func (x *w) insertBatch(ctx context.Context, id driver.JobID, name string, total int, b batchRow, edges any) error {
-	_, err := x.ExecContext(ctx, `INSERT INTO hopper_batches (id, name, pending, total, on_success, on_failure, on_complete, metadata, edges, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		idParam(id), nullable(name), total, total, b.onSuccess, b.onFailure, b.onComplete, b.metadata, edges, x.us())
+func (x *w) insertBatch(ctx context.Context, id driver.JobID, name string, total int, b batchRow, edges, steps any) error {
+	_, err := x.ExecContext(ctx, `INSERT INTO hopper_batches (id, name, pending, total, on_success, on_failure, on_complete, metadata, edges, steps, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		idParam(id), nullable(name), total, total, b.onSuccess, b.onFailure, b.onComplete, b.metadata, edges, steps, x.us())
 	return err
 }
 
@@ -155,7 +155,7 @@ func (e *executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 	var id driver.JobID
 	err = e.write(ctx, func(x *w) error {
 		id = newID(x.now)
-		return x.insertBatch(ctx, id, "", params.Total, b, nil)
+		return x.insertBatch(ctx, id, "", params.Total, b, nil, nil)
 	})
 	if err != nil {
 		return driver.JobID{}, fmt.Errorf("hopper: insert batch: %w", err)
@@ -165,8 +165,29 @@ func (e *executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 
 // BatchSettle implements driver.Executor. The transaction that finalizes a
 // batch's jobs counts them down on its row and completes it, so there is no
-// progress to fold, and no batch a race left open.
-func (e *executor) BatchSettle(context.Context, driver.BatchSettleParams) (driver.BatchSettleResult, error) {
+// progress to fold, and no batch a race left open. A sweep deletes the
+// dependency results of workflows that completed or no longer exist, which
+// a client of an earlier release, completing a workflow, leaves.
+func (e *executor) BatchSettle(ctx context.Context, params driver.BatchSettleParams) (driver.BatchSettleResult, error) {
+	if params.IDs != nil {
+		return driver.BatchSettleResult{}, nil
+	}
+	const orphans = `SELECT o.job_id FROM hopper_job_results o
+		WHERE NOT EXISTS (SELECT 1 FROM hopper_batches b WHERE b.id = o.batch_id AND b.completed_at IS NULL)`
+	var found bool
+	if err := e.read().QueryRowContext(ctx, `SELECT EXISTS (`+orphans+`)`).Scan(&found); err != nil {
+		return driver.BatchSettleResult{}, fmt.Errorf("hopper: settle batches: %w", err)
+	}
+	if !found {
+		return driver.BatchSettleResult{}, nil
+	}
+	err := e.write(ctx, func(x *w) error {
+		_, err := x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE job_id IN (`+orphans+` LIMIT ?)`, max(params.Limit, 1))
+		return err
+	})
+	if err != nil {
+		return driver.BatchSettleResult{}, fmt.Errorf("hopper: settle batches: %w", err)
+	}
 	return driver.BatchSettleResult{}, nil
 }
 

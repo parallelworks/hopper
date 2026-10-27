@@ -95,10 +95,7 @@ func scanJob(row Row, history bool, extra ...any) (*driver.JobRow, error) {
 	return &j, nil
 }
 
-var (
-	liveJobs    = collect(func(r Row) (*driver.JobRow, error) { return scanJob(r, false) })
-	historyJobs = collect(func(r Row) (*driver.JobRow, error) { return scanJob(r, true) })
-)
+var historyJobs = collect(func(r Row) (*driver.JobRow, error) { return scanJob(r, true) })
 
 var scanInsertResults = collect(func(r Row) (driver.JobInsertResult, error) {
 	var dup bool
@@ -448,6 +445,20 @@ const claimEligibleSQL = `
                         WHERE o.queue = cand.queue AND o.ordering_key = cand.ordering_key
                           AND o.state IN ('available', 'scheduled', 'retryable'))))`
 
+// claimDependenciesSQL reads, for a job a CTE named claimed claims, the
+// dependencies that have finished, as a JSON array: those with a result,
+// and those gone from the live table without one, which finished before
+// the engine recorded results and read with no state. Only a job in a
+// batch can have any, so a claimed job outside one costs a CASE and
+// nothing else.
+const claimDependenciesSQL = `CASE WHEN claimed.batch_id IS NOT NULL THEN (
+    SELECT jsonb_agg(jsonb_build_object('id', d.depends_on, 'step', d.step, 'state', r.state, 'output', r.output)
+                     ORDER BY d.depends_on)
+    FROM {{schema}}.hopper_job_deps d LEFT JOIN {{schema}}.hopper_job_results r ON r.job_id = d.depends_on
+    WHERE d.job_id = claimed.id
+      AND (r.job_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = d.depends_on))
+  ) END`
+
 // jobClaimSQL is the hot path. The candidate CTE walks the claim index in
 // claim order and locks its rows, skipping any locked by other clients. It
 // is MATERIALIZED so that it runs exactly once however the planner joins
@@ -481,7 +492,7 @@ claimed AS (
   WHERE j.id = c.id AND c.n <= $3
   RETURNING j.seq, ` + "%s" + `
 )
-SELECT ` + "%s" + ` FROM claimed ORDER BY priority, scheduled_at, seq`
+SELECT ` + "%s" + `, ` + claimDependenciesSQL + ` FROM claimed ORDER BY priority, scheduled_at, seq`
 
 // jobClaimPartitionedSQL ranks candidates within their partition key and
 // admits only those whose rank, counting the key's running jobs, fits under
@@ -513,7 +524,7 @@ claimed AS (
   WHERE j.id = c.id AND c.n <= $3
   RETURNING j.seq, ` + "%s" + `
 )
-SELECT ` + "%s" + ` FROM claimed ORDER BY priority, scheduled_at, seq`
+SELECT ` + "%s" + `, ` + claimDependenciesSQL + ` FROM claimed ORDER BY priority, scheduled_at, seq`
 
 // claimBuckets are the LIMIT constants the claim statements are built
 // with; a claim uses the smallest bucket that covers its count, and locks
@@ -565,8 +576,22 @@ func (e *Executor) JobClaim(ctx context.Context, params driver.JobClaimParams) (
 	return driver.JobClaimResult{Jobs: jobs}, nil
 }
 
+// scanClaimed scans a claimed row: JobColumns, then its dependencies
+// (claimDependenciesSQL), then extra.
+func scanClaimed(row Row, extra ...any) (*driver.JobRow, error) {
+	var deps jsonText
+	j, err := scanJob(row, false, append([]any{&deps}, extra...)...)
+	if err != nil {
+		return nil, err
+	}
+	j.Dependencies = jobcodec.DecodeDependencies(string(deps))
+	return j, nil
+}
+
+var claimedJobs = collect(func(r Row) (*driver.JobRow, error) { return scanClaimed(r) })
+
 func claimRows(ctx context.Context, conn Conn, query string, args ...any) ([]*driver.JobRow, error) {
-	jobs, err := liveJobs(conn.Query(ctx, query, args...))
+	jobs, err := claimedJobs(conn.Query(ctx, query, args...))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
 	}
