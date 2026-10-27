@@ -28,14 +28,13 @@ func (reportArgs) InsertOpts() InsertOpts {
 // would insert for the same slot.
 func TestPeriodicDefinitionInsertsWhatTheClientWould(t *testing.T) {
 	c := newPeriodicTestClient(t, &periodicExec{})
-	scheduled := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
 	jobs := map[string]PeriodicJob{
 		"plain": Every(time.Minute, tickArgs{}, nil),
 		"args options": Every(time.Hour, reportArgs{Tenant: "acme", Note: "n"}, &PeriodicOpts{
 			InsertOpts: &InsertOpts{MaxAttempts: 3},
 		}),
 		"every option": Cron("0 * * * *", reportArgs{Tenant: "acme"}, &PeriodicOpts{InsertOpts: &InsertOpts{
-			Queue: "q", Priority: PriorityLow, MaxAttempts: 7, ScheduledAt: scheduled,
+			Queue: "q", Priority: PriorityLow, MaxAttempts: 7,
 			Metadata: json.RawMessage(`{"trace":"t"}`), Tags: []string{"a", "b"}, TTL: time.Hour, Await: true,
 			OrderingKey: "o", PartitionKey: "p",
 			Unique: &UniqueOpts{ByArgs: true, ByQueue: true, ByPeriod: 24 * time.Hour, Finished: []JobState{JobStateCompleted}},
@@ -118,8 +117,11 @@ func TestPeriodicDefinitionLeavesOutWhatCannotBeStored(t *testing.T) {
 		"fixed zone":      Cron("0 9 * * *", tickArgs{}, &PeriodicOpts{Location: time.FixedZone("UTC+3", 3*3600)}),
 		"fixed zone named like one with daylight saving": Cron("0 9 * * *", tickArgs{}, &PeriodicOpts{Location: time.FixedZone("CET", 3600)}),
 		"options read from the clock":                    Every(time.Hour, delayedArgs{}, nil),
+		"a scheduled time that reads the same twice":     Every(time.Hour, tickArgs{}, &PeriodicOpts{InsertOpts: &InsertOpts{ScheduledAt: time.Now().Truncate(time.Hour).Add(time.Hour)}}),
 		"name with a NUL":                                Every(time.Hour, tickArgs{}, &PeriodicOpts{Name: "a\x00b"}),
 		"name that is not UTF-8":                         Every(time.Hour, tickArgs{}, &PeriodicOpts{Name: "a\xffb"}),
+		"ordering key that is not UTF-8":                 Every(time.Hour, tickArgs{}, &PeriodicOpts{InsertOpts: &InsertOpts{OrderingKey: "a\xffb"}}),
+		"metadata that is not UTF-8":                     Every(time.Hour, tickArgs{}, &PeriodicOpts{InsertOpts: &InsertOpts{Metadata: json.RawMessage("{\"k\":\"a\xffb\"}")}}),
 	} {
 		if err := job.resolve(); err != nil {
 			t.Fatal(err)
@@ -179,6 +181,17 @@ func TestPeriodicDefinitionLeavesOutUnstableOrNULArgs(t *testing.T) {
 	}
 	if def, err := c.periodicDefinition(&job); err != nil || def != nil {
 		t.Errorf("args a codec encodes differently each time: definition = %s, %v; want none", def, err)
+	}
+}
+
+// A nil schedule pointer is no schedule, refused when the job is added
+// rather than a panic when it is recorded or scheduled.
+func TestPeriodicJobWithNilSchedulePointer(t *testing.T) {
+	for name, s := range map[string]Schedule{"cron": (*CronSchedule)(nil), "interval": (*IntervalSchedule)(nil)} {
+		job := PeriodicJob{Schedule: s, Args: tickArgs{}}
+		if err := job.resolve(); err == nil {
+			t.Errorf("%s: a job with a nil schedule pointer resolved", name)
+		}
 	}
 }
 
@@ -370,5 +383,31 @@ func TestReadStoredNewestClientFirst(t *testing.T) {
 	}
 	if want := []int64{1, 3, 2}; !slices.Equal(clients, want) {
 		t.Errorf("clients %v, want %v: the latest started first, then the highest ID", clients, want)
+	}
+}
+
+// The leader's own row that its job no longer records, as after the job was
+// removed and added again with a schedule that cannot be stored, does not
+// shadow another client's definition of the name until the next read.
+func TestEffectivePeriodicSkipsOwnRowItNoLongerRecords(t *testing.T) {
+	exec := &periodicExec{}
+	c := newPeriodicTestClient(t, exec, PeriodicJob{Name: "tick", Schedule: onStartOnly{}, Args: tickArgs{}})
+	c.clientID.Store(1)
+	ownDefinition(t, c)
+	started := time.Now()
+	stale, other := storedRow(t, c, 1, Every(time.Hour, tickArgs{}, nil)), storedRow(t, c, 2, Every(time.Minute, tickArgs{}, nil))
+	stale.ClientStartedAt, other.ClientStartedAt = started.Add(time.Second), started
+	exec.set(func(e *periodicExec) { e.registrations = []driver.PeriodicRegistrationRow{stale, other} })
+	byName, ok := c.readStored(t.Context(), map[string]string{})
+	if !ok {
+		t.Fatal("read failed")
+	}
+	st := &periodicState{stored: storedPeriodic{byName: byName, rejected: map[string]string{}}, defined: map[string]*registeredPeriodic{}}
+	regs := c.effectivePeriodic(t.Context(), st)
+	if len(regs) != 1 {
+		t.Fatalf("scheduled %d jobs, want 1", len(regs))
+	}
+	if regs[0].digest != other.Digest {
+		t.Errorf("scheduled the definition of digest %q, want the other client's, %q", regs[0].digest, other.Digest)
 	}
 }

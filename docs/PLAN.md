@@ -1706,8 +1706,9 @@ schedules (their interval) can be recorded; a job with another `Schedule`, or a 
 in `time.Local`, which names a different zone in each process, or in a zone that does
 not load by its name to the same offsets, such as a `time.FixedZone`, or a job whose
 insert differs each time it is built (args an encrypting codec encodes with a random
-nonce, or an `InsertOpts` method that reads the clock, whose values the definition
-would freeze and whose digests would never match across replicas) or whose name or
+nonce, whose digests would never match across replicas), a job whose insert sets
+`ScheduledAt` (usually read from the clock, which the definition would freeze at `Add`,
+and which a coarse clock can read the same twice), or one whose name or
 definition holds a NUL or invalid UTF-8 (which Postgres refuses, and which would fail the
 client's whole write), is scheduled only
 from its own client's set, while that client leads, as before v20. A definition the leader

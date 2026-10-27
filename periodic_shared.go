@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -41,7 +40,6 @@ type definedJob struct {
 	Queue        string          `json:"queue"`
 	Priority     int             `json:"priority"`
 	MaxAttempts  int             `json:"max_attempts"`
-	ScheduledAt  *time.Time      `json:"scheduled_at,omitempty"`
 	Args         json.RawMessage `json:"args"`
 	Metadata     json.RawMessage `json:"metadata,omitempty"`
 	Tags         []string        `json:"tags,omitempty"`
@@ -63,11 +61,11 @@ type definedUnique struct {
 // periodicDefinition encodes p for the leader. It returns nil for a job
 // that cannot be stored, which only its own client schedules: one whose
 // schedule cannot be, whose insert differs each time it is built, as with
-// a Codec that encrypts with a random nonce or an InsertOpts method that
-// reads the clock, or whose name or definition has a NUL or invalid UTF-8,
-// which Postgres refuses.
+// a Codec that encrypts with a random nonce, whose insert sets ScheduledAt,
+// which is usually read from the clock and would be frozen at Add, or whose name or definition has a NUL or invalid UTF-8,
+// which Postgres refuses and encoding/json replaces in a string.
 func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error) {
-	if !utf8.ValidString(p.Name) || strings.ContainsRune(p.Name, 0) {
+	if !storableName(p.Name) {
 		return nil, nil
 	}
 	d := periodicDefinition{Version: periodicDefinitionVersion}
@@ -80,9 +78,6 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 	case IntervalSchedule:
 		d.Every = s.Interval
 	case *IntervalSchedule:
-		if s == nil {
-			return nil, nil
-		}
 		d.Every = s.Interval
 	default:
 		return nil, nil
@@ -96,8 +91,11 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 		return nil, err
 	}
 	again, _, err := c.definedInsert(p)
-	if err != nil || !reflect.DeepEqual(again, job) {
+	if err != nil || !reflect.DeepEqual(again, job) || !job.ScheduledAt.IsZero() {
 		return nil, err
+	}
+	if slices.ContainsFunc([]string{job.Kind, job.Queue, job.OrderingKey, job.PartitionKey, job.UniqueKey}, func(s string) bool { return !utf8.ValidString(s) }) {
+		return nil, nil
 	}
 	d.Job = definedJob{
 		Kind:         job.Kind,
@@ -112,14 +110,11 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 		OrderingKey:  job.OrderingKey,
 		PartitionKey: job.PartitionKey,
 	}
-	if !job.ScheduledAt.IsZero() {
-		d.Job.ScheduledAt = &job.ScheduledAt
-	}
 	if job.UniqueKey != "" {
 		d.Job.Unique = &definedUnique{Key: job.UniqueKey, ByPeriod: byPeriod, Finished: job.UniqueFinished}
 	}
 	def, err := json.Marshal(d)
-	if err != nil || hasNULEscape(def) {
+	if err != nil || !utf8.Valid(def) || hasNULEscape(def) {
 		return nil, err
 	}
 	return def, nil
@@ -245,9 +240,6 @@ func (j definedJob) params(slot time.Time) (driver.JobInsertParams, error) {
 		Await:        j.Await,
 		OrderingKey:  j.OrderingKey,
 		PartitionKey: j.PartitionKey,
-	}
-	if j.ScheduledAt != nil {
-		p.ScheduledAt = *j.ScheduledAt
 	}
 	if u := j.Unique; u != nil {
 		p.UniqueKey, p.UniqueFinished = u.Key, u.Finished
@@ -414,7 +406,7 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 				wanted[name] = d
 				break
 			}
-			if r, ok := own[name]; ok {
+			if r, ok := own[name]; ok && c.periodic.records(r) {
 				source = r
 				break
 			}

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"maps"
 	"math"
+	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -105,7 +106,7 @@ func (p *PeriodicJob) resolve() error {
 	if p.Args == nil {
 		return errors.New("hopper: periodic job has nil Args")
 	}
-	if p.Schedule == nil {
+	if s := reflect.ValueOf(p.Schedule); !s.IsValid() || s.Kind() == reflect.Pointer && s.IsNil() {
 		return fmt.Errorf("hopper: periodic job for %q has no Schedule", p.Args.Kind())
 	}
 	if p.Opts != nil && p.Opts.Name != "" {
@@ -169,12 +170,12 @@ func resolvePeriodic(jobs []PeriodicJob) ([]PeriodicJob, error) {
 // Cron's or Every's, or a Cron in time.Local or in a zone that does not load
 // by its name, such as a time.FixedZone, is scheduled only from its own
 // client, while that client leads. So is a job whose insert differs each
-// time it is built, as with a Codec that encrypts with a random nonce or an
-// InsertOpts method that reads the clock, or whose name, args or options
-// hold a NUL. A Cron in a named zone runs only while a client that can load
-// that zone leads, so every client that can lead needs the zone database.
-// A client with no queues holds no lease and records nothing. It is safe for
-// concurrent use.
+// time it is built, as with a Codec that encrypts with a random nonce, a
+// job whose insert sets ScheduledAt, and one whose name, args or options
+// hold a NUL or invalid UTF-8. A Cron in a named zone runs only while a
+// client that can load that zone leads, so every client that can lead needs
+// the zone database. A client with no queues holds no lease and records
+// nothing. It is safe for concurrent use.
 type PeriodicJobs struct {
 	logger     *slog.Logger
 	insertOnly bool
@@ -700,9 +701,14 @@ func (c *Client[TTx]) insertPeriodic(ctx context.Context, r *registeredPeriodic,
 		params driver.JobInsertParams
 		err    error
 	)
-	if r.params != nil {
+	switch {
+	case r.owner != nil:
+		// The leader's own job is built from its args at each slot, as
+		// any InsertOpts method expects.
+		params, err = c.periodicParams(&r.owner.job, slot)
+	case r.params != nil:
 		params, err = r.params(slot)
-	} else {
+	default:
 		params, err = c.periodicParams(p, slot)
 	}
 	if err != nil {
