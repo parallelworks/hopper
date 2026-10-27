@@ -1835,7 +1835,9 @@ rates:
   sends at most one insert notification per queue per 10ms, on the trailing edge of
   the window, after the window's inserts have committed, so a woken worker always
   finds the jobs. A busy queue's producers are claiming continuously anyway, so extra
-  notifications would add nothing.
+  notifications would add nothing. `Stop` sends what is pending at once, after
+  waiting for a window's notification that is already being sent, so none is sent
+  once `Stop` returns.
 - **One listener connection** per client, multiplexing every channel. It can be pointed
   at a direct Postgres address (`hopperpgx.Config.ListenConn`) when the pool goes
   through a transaction pooler.
