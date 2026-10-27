@@ -582,11 +582,11 @@ client, err := hopper.NewClient(driver, &hopper.Config{
 ```
 
 A start of any client that works a queue counts, so a rolling deploy also
-delays expiries by up to the grace. A client that only inserts registers
-no start, so restarting one gives no grace. Neither does a database outage
-too short for any client's lease to lapse (`Config.LeaseTTL`), since no
-client restarts: give leases a TTL longer than the outages your workers
-should ride out.
+delays expiries, by up to the grace or, if it is longer, a lease's TTL. A
+client that only inserts registers no start, so restarting one gives no
+grace. Neither does a database outage too short for any client's lease to
+lapse (`Config.LeaseTTL`), since no client restarts: give leases a TTL
+longer than the outages your workers should ride out.
 
 Every call on a token is fenced to its lease. Once the lease has expired,
 or the attempt has ended and the job been claimed again, the call returns

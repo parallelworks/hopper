@@ -54,15 +54,16 @@ func (c *Client[TTx]) Leases() *Leases[TTx] {
 // fenced to it, from any client of the cluster: once the lease has expired,
 // or the attempt has ended and the job been claimed again, the call returns
 // ErrJobFenced and changes nothing. A lease that is not renewed within its
-// TTL expires, though a lease last renewed before a client's start is
-// given at least its TTL, or Config.JobLeaseGrace, from that start, so
-// that leases outlast a restart of the whole cluster. The leader then
-// makes the job retryable at once, with an entry in its errors whose
-// Rescue is RescueLeaseExpired and whose Fence is the lease's, or, on its
-// last attempt, discards it, or cancels it if JobCancel was called.
-// hopper never runs a leased attempt's work itself. Only a client with
-// queues, and without Config.NeverLead, can lead, so a cluster whose
-// clients only insert and take reports never expires a lease.
+// TTL expires, though a lease last renewed before the start of a client
+// whose own lease is live is given the larger of its TTL and
+// Config.JobLeaseGrace from the first such start, so that leases outlast
+// a restart of the whole cluster. The leader then makes the job retryable
+// at once, with an entry in its errors whose Rescue is RescueLeaseExpired
+// and whose Fence is the lease's, or, on its last attempt, discards it, or
+// cancels it if JobCancel was called. hopper never runs a leased attempt's
+// work itself. Only a client with queues, and without Config.NeverLead, can
+// lead, so a cluster whose clients only insert and take reports never
+// expires a lease.
 //
 // The queue's pause applies to a claim by ID; its limits (GlobalLimit,
 // PartitionLimit, RateLimit) do not, and leased jobs do not count toward
