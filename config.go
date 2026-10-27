@@ -102,6 +102,20 @@ type Config struct {
 	// than this even though their client's lease is live, for workers that
 	// ignore their context. Off by default; timeouts cover most cases.
 	RescueStuckAfter time.Duration
+	// JobLeaseGrace is the least time a job lease is given after a cluster
+	// restart, for holders that could not renew while no client ran. A
+	// lease whose last renewal predates the start of a client whose own
+	// lease is live is due no earlier than the first such start plus the
+	// larger of its TTL and JobLeaseGrace, by database time. Zero gives
+	// such a lease its TTL from that start; set it to how long remote
+	// workers may take to reach the cluster again, such as their reconnect
+	// backoff. The start of any client that works a queue counts (one that
+	// only inserts registers none), as does one that re-registers after its
+	// lease lapsed, so it also delays expiries across a rolling deploy, and
+	// clients that each stop within the grace of their start, the next
+	// starting before the last stops, keep a lease that is never renewed
+	// again from expiring. The leader's setting applies.
+	JobLeaseGrace time.Duration
 }
 
 // QueueConfig configures one queue on a client.
@@ -215,7 +229,7 @@ func (cfg *Config) withDefaults() (Config, error) {
 	if out.JobLogs, err = withJobLogDefaults(out.JobLogs); err != nil {
 		return out, err
 	}
-	if out.JobTimeout < 0 || out.StopTimeout < 0 || out.PollInterval < 0 || out.RescueStuckAfter < 0 {
+	if out.JobTimeout < 0 || out.StopTimeout < 0 || out.PollInterval < 0 || out.RescueStuckAfter < 0 || out.JobLeaseGrace < 0 {
 		return out, errors.New("hopper: Config durations must be positive")
 	}
 	if out.LeaseTTL < time.Second {

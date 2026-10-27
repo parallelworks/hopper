@@ -261,7 +261,9 @@ func (c *Client[TTx]) age(ctx context.Context) {
 // flight, and a renewal that commits first keeps its lease.
 func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
 	for {
-		jobs, err := c.exec.JobExpireLeases(ctx, c.tuning.rescueBatch)
+		jobs, err := c.exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{
+			Limit: c.tuning.rescueBatch, ClientID: c.clientID.Load(), Grace: c.cfg.JobLeaseGrace,
+		})
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: expire job leases", "error", err)

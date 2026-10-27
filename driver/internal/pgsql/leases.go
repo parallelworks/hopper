@@ -155,6 +155,18 @@ func (e *Executor) JobLeaseRenew(ctx context.Context, params driver.JobLeaseRene
 	return &st, nil
 }
 
+// leaseDueSQL is the condition that the lease l is due. Only the starts of
+// clients whose leases are live count: a client that started after the
+// renewal and lapsed before the cluster went down keeps its row until a
+// leader prunes it, after the first expiry once the cluster is back. A
+// start later than now(), which only a clock set ahead and then corrected
+// leaves, counts once the clock reaches it: counted before, it would hold
+// every lease renewed before it until then.
+const leaseDueSQL = `l.expires_at <= now()
+    AND coalesce((SELECT min(c.started_at) FROM {{schema}}.hopper_clients c
+                  WHERE c.started_at > l.renewed_at AND c.started_at <= now() AND c.expires_at > now())
+      + greatest(l.ttl, make_interval(secs => $5::float8)), l.expires_at) <= now()`
+
 // jobLeaseExpiredError is the error entry of an attempt whose lease expired.
 const jobLeaseExpiredError = `jsonb_build_object('at', now(), 'attempt', j.attempt, 'fence', j.fence,
       'error', 'hopper: job lease expired', 'rescue', 'lease_expired')`
@@ -169,20 +181,26 @@ const jobLeaseExpiredError = `jsonb_build_object('at', now(), 'attempt', j.attem
 // is decided in due, from the job's row as locked: retry and finished scan
 // the statement's snapshot, which a JobCancel committed after it began does
 // not show, and deciding there would leave such a job in neither, running
-// with its lease gone.
+// with its lease gone. A lease is due at its expiry or, if a client whose
+// lease is live started after the lease's last renewal, at the first such
+// start plus the larger of its TTL and the grace ($5), so that a holder who
+// could not renew while no client ran gets that long from the cluster's
+// restart; nothing is due unless the expiring client's own lease ($4) is
+// live.
 var jobExpireLeasesSQL = `
 WITH RECURSIVE due AS (
   SELECT j.id, l.fence, j.attempt < j.max_attempts AND j.cancel_requested_at IS NULL AS retry
   FROM {{schema}}.hopper_job_leases l
   JOIN {{schema}}.hopper_jobs j ON j.id = l.id
-  WHERE l.expires_at <= now() AND ` + isRunning("j.state") + ` AND j.attempted_by IS NULL AND j.fence = l.fence
+  WHERE ` + leaseDueSQL + ` AND ` + isRunning("j.state") + ` AND j.attempted_by IS NULL AND j.fence = l.fence
+    AND EXISTS (SELECT 1 FROM {{schema}}.hopper_clients me WHERE me.id = $4 AND me.expires_at > now())
   ORDER BY l.expires_at
   LIMIT $1
   FOR UPDATE OF j SKIP LOCKED
 ),
 released AS (
   DELETE FROM {{schema}}.hopper_job_leases l USING due
-  WHERE l.id = due.id AND l.fence = due.fence AND l.expires_at <= now()
+  WHERE l.id = due.id AND l.fence = due.fence AND ` + leaseDueSQL + `
   RETURNING l.id, l.fence, due.retry
 ),
 retry AS (
@@ -206,8 +224,9 @@ UNION ALL
 SELECT ` + strings.Replace(JobColumns(""), ", state,", ", state::text,", 1) + `, NULL::timestamptz, NULL::jsonb FROM retry`
 
 // JobExpireLeases implements driver.Executor.
-func (e *Executor) JobExpireLeases(ctx context.Context, limit int) ([]*driver.JobRow, error) {
-	jobs, err := historyJobs(e.Conn.Query(ctx, jobExpireLeasesSQL, max(limit, 1), driver.ChannelDone, driver.ChannelInsert))
+func (e *Executor) JobExpireLeases(ctx context.Context, params driver.JobExpireLeasesParams) ([]*driver.JobRow, error) {
+	jobs, err := historyJobs(e.Conn.Query(ctx, jobExpireLeasesSQL, max(params.Limit, 1), driver.ChannelDone, driver.ChannelInsert,
+		params.ClientID, max(params.Grace, 0).Seconds()))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: expire job leases: %w", err)
 	}

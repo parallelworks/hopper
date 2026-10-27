@@ -412,3 +412,78 @@ func TestLeasesRaceTheExpiry(t *testing.T) {
 		t.Logf("%d expiries and %d finishes: the race was not run both ways", expiries, finishes)
 	}
 }
+
+// TestLeasesOutlastARestart stops the whole cluster while remote workers
+// hold job leases, for longer than their TTL, so that no worker can renew.
+// Once a client starts again, the workers that come back within the grace
+// keep their leases, and the lease of one that never comes back expires no
+// earlier than the grace after the restart, not after the start of a client
+// that crashed before it.
+func TestLeasesOutlastARestart(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	const ttl, grace = time.Second, 4 * time.Second
+	first := leaseClient(h, &hopper.Config{JobLeaseGrace: grace})
+	ids := make([]hopper.JobID, 4)
+	tokens := make([]hopper.LeaseToken, len(ids))
+	for i := range ids {
+		ids[i] = insertRemote(t, first, i, 3)
+		l, err := first.Leases().Claim(ctx, ids[i], 0, &hopper.LeaseOpts{TTL: ttl})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens[i] = l.Token
+	}
+	// A client that started after the claims and crashed with the cluster:
+	// its row stays, its lease lapsed, until the next leader prunes it. The
+	// cluster stays down for longer than the grace from that start.
+	if _, err := h.pool.Exec(ctx, "INSERT INTO hopper_clients (hostname, expires_at) VALUES ('crashed', now() + interval '2s')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(grace + ttl/2)
+	second := leaseClient(h, &hopper.Config{JobLeaseGrace: grace})
+	// The restart is the second client's start, by database time, as the
+	// expiry's error entry is.
+	var restarted time.Time
+	if err := h.pool.QueryRow(ctx, "SELECT max(started_at) FROM hopper_clients").Scan(&restarted); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * fastTuning.LeaderInterval)
+
+	lost, back := ids[0], tokens[1:]
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, token := range back {
+		wg.Go(func() {
+			for {
+				if _, err := second.Leases().Renew(ctx, token); err != nil {
+					t.Errorf("job %s: renew after the restart = %v", token.JobID(), err)
+					return
+				}
+				select {
+				case <-stop:
+					return
+				case <-time.After(ttl / 5):
+				}
+			}
+		})
+	}
+	job := waitForJob(t, second, lost, hopper.JobStateRetryable)
+	close(stop)
+	wg.Wait()
+	if len(job.Errors) != 1 || job.Errors[0].Rescue != hopper.RescueLeaseExpired {
+		t.Fatalf("the lost worker's job's errors = %+v", job.Errors)
+	}
+	if after := job.Errors[0].At.Sub(restarted); after < grace {
+		t.Errorf("the lost worker's lease expired %s after the restart, before the grace of %s", after, grace)
+	}
+	for _, token := range back {
+		if j, err := second.JobGet(ctx, token.JobID()); err != nil || j.State != hopper.JobStateRunning {
+			t.Errorf("job of a worker that came back: %+v, %v", j, err)
+		}
+	}
+}

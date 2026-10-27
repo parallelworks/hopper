@@ -195,6 +195,7 @@ func TestNewClientValidation(t *testing.T) {
 		"empty queue name":       {Queues: map[string]hopper.QueueConfig{"": {MaxWorkers: 1}}, Workers: workers},
 		"negative attempts":      {MaxAttempts: -1},
 		"negative timeout":       {JobTimeout: -1},
+		"negative lease grace":   {JobLeaseGrace: -1},
 		"lease under a second":   {LeaseTTL: 500 * time.Millisecond},
 		"strict without workers": {StrictKinds: true},
 	}
