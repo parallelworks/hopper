@@ -262,9 +262,9 @@ type Executor interface {
 	// leases are due, by database time: a job is retryable at once, with an
 	// error entry whose Rescue is RescueLeaseExpired, or, on its last
 	// attempt, discarded, or canceled if a cancel was requested. A lease is
-	// due at its expiry, or, if a client started after the lease was last
-	// renewed, at the first such start plus the larger of its TTL and
-	// params.Grace, if that is later. It expires nothing unless the lease of
+	// due at its expiry, or, if a client whose own lease is live started
+	// after the lease was last renewed, at the first such start plus the
+	// larger of its TTL and params.Grace, if that is later. It expires nothing unless the lease of
 	// client params.ClientID is live. It returns the jobs as they are
 	// afterwards.
 	JobExpireLeases(ctx context.Context, params JobExpireLeasesParams) ([]*JobRow, error)
@@ -521,7 +521,9 @@ type JobRow struct {
 	// CancelRequestedAt is set when JobCancel is called on a running job.
 	CancelRequestedAt time.Time
 	// LeaseExpiresAt is when the job lease of a job claimed by ID expires,
-	// by database time, or zero for any other job. Only JobGet reads it.
+	// by database time, or zero for any other job. A lease last renewed
+	// before a client's start is given a grace past it (see
+	// Executor.JobExpireLeases). Only JobGet reads it.
 	LeaseExpiresAt time.Time
 	Await          bool
 	CreatedAt      time.Time

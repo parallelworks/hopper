@@ -417,7 +417,8 @@ func TestLeasesRaceTheExpiry(t *testing.T) {
 // hold job leases, for longer than their TTL, so that no worker can renew.
 // Once a client starts again, the workers that come back within the grace
 // keep their leases, and the lease of one that never comes back expires no
-// earlier than the grace after the restart.
+// earlier than the grace after the restart, not after the start of a client
+// that crashed before it.
 func TestLeasesOutlastARestart(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -434,10 +435,16 @@ func TestLeasesOutlastARestart(t *testing.T) {
 		}
 		tokens[i] = l.Token
 	}
+	// A client that started after the claims and crashed with the cluster:
+	// its row stays, its lease lapsed, until the next leader prunes it. The
+	// cluster stays down for longer than the grace from that start.
+	if _, err := h.pool.Exec(ctx, "INSERT INTO hopper_clients (hostname, expires_at) VALUES ('crashed', now() + interval '2s')"); err != nil {
+		t.Fatal(err)
+	}
 	if err := first.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(5 * ttl / 2)
+	time.Sleep(grace + ttl/2)
 	restarted := time.Now()
 	second := leaseClient(h, &hopper.Config{JobLeaseGrace: grace})
 	time.Sleep(3 * fastTuning.LeaderInterval)

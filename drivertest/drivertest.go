@@ -134,6 +134,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"ExpireLeases", testExpireLeases[TTx]},
 		{"ExpireLeasesAfterRestart", testExpireLeasesAfterRestart[TTx]},
 		{"ExpireLeasesAfterRestartNoGrace", testExpireLeasesAfterRestartNoGrace[TTx]},
+		{"ExpireLeasesAfterLapsedStart", testExpireLeasesAfterLapsedStart[TTx]},
+		{"ExpireLeasesAfterTwoStarts", testExpireLeasesAfterTwoStarts[TTx]},
 		{"ExpireRacesRenew", testExpireRacesRenew[TTx]},
 		{"ExpireRacesFinalize", testExpireRacesFinalize[TTx]},
 		{"ExpireRacesCancel", testExpireRacesCancel[TTx]},

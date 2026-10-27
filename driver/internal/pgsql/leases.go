@@ -155,9 +155,12 @@ func (e *Executor) JobLeaseRenew(ctx context.Context, params driver.JobLeaseRene
 	return &st, nil
 }
 
-// leaseDueSQL is the condition that the lease l is due.
+// leaseDueSQL is the condition that the lease l is due. Only the starts of
+// clients whose leases are live count: a client that started after the
+// renewal and lapsed before the cluster went down keeps its row until a
+// leader prunes it, after the first expiry once the cluster is back.
 const leaseDueSQL = `l.expires_at <= now()
-    AND coalesce((SELECT min(c.started_at) FROM {{schema}}.hopper_clients c WHERE c.started_at > l.renewed_at)
+    AND coalesce((SELECT min(c.started_at) FROM {{schema}}.hopper_clients c WHERE c.started_at > l.renewed_at AND c.expires_at > now())
       + greatest(l.ttl, make_interval(secs => $5::float8)), l.expires_at) <= now()`
 
 // jobLeaseExpiredError is the error entry of an attempt whose lease expired.
@@ -174,11 +177,12 @@ const jobLeaseExpiredError = `jsonb_build_object('at', now(), 'attempt', j.attem
 // is decided in due, from the job's row as locked: retry and finished scan
 // the statement's snapshot, which a JobCancel committed after it began does
 // not show, and deciding there would leave such a job in neither, running
-// with its lease gone. A lease is due at its expiry or, if a client started
-// after the lease's last renewal, at the first such start plus the larger
-// of its TTL and the grace ($5), so that a holder who could not renew while
-// no client ran gets that long from the cluster's restart; nothing is due
-// unless the expiring client's own lease ($4) is live.
+// with its lease gone. A lease is due at its expiry or, if a client whose
+// lease is live started after the lease's last renewal, at the first such
+// start plus the larger of its TTL and the grace ($5), so that a holder who
+// could not renew while no client ran gets that long from the cluster's
+// restart; nothing is due unless the expiring client's own lease ($4) is
+// live.
 var jobExpireLeasesSQL = `
 WITH RECURSIVE due AS (
   SELECT j.id, l.fence, j.attempt < j.max_attempts AND j.cancel_requested_at IS NULL AS retry

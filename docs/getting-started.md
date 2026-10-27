@@ -580,8 +580,9 @@ client, err := hopper.NewClient(driver, &hopper.Config{
 })
 ```
 
-A start of any client counts, so a rolling deploy also delays expiries by
-up to the grace.
+A start of any client that works a queue counts, so a rolling deploy also
+delays expiries by up to the grace. A client that only inserts registers
+no start, so restarting one gives no grace.
 
 Every call on a token is fenced to its lease. Once the lease has expired,
 or the attempt has ended and the job been claimed again, the call returns

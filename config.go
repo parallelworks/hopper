@@ -104,14 +104,17 @@ type Config struct {
 	RescueStuckAfter time.Duration
 	// JobLeaseGrace is the least time a job lease is given after a cluster
 	// restart, for holders that could not renew while no client ran. A
-	// lease whose last renewal predates a client's start is due no earlier
-	// than the first such start plus the larger of its TTL and
-	// JobLeaseGrace, by database time. Zero gives such a lease its TTL from
-	// that start; set it to how long remote workers may take to reach the
-	// cluster again, such as their reconnect backoff. A start of any client
-	// counts, as does one that re-registers after its lease lapsed, so it
-	// also delays expiries across a rolling deploy. The leader's setting
-	// applies.
+	// lease whose last renewal predates the start of a client whose own
+	// lease is live is due no earlier than the first such start plus the
+	// larger of its TTL and JobLeaseGrace, by database time. Zero gives
+	// such a lease its TTL from that start; set it to how long remote
+	// workers may take to reach the cluster again, such as their reconnect
+	// backoff. The start of any client that works a queue counts (one that
+	// only inserts registers none), as does one that re-registers after its
+	// lease lapsed, so it also delays expiries across a rolling deploy, and
+	// clients that each stop within the grace of their start, the next
+	// starting before the last stops, keep a lease that is never renewed
+	// again from expiring. The leader's setting applies.
 	JobLeaseGrace time.Duration
 }
 
