@@ -78,6 +78,8 @@ meant to replace a *rabbit*.
 | **Queue** | A named lane with a per-client worker count and optional cluster-wide concurrency and rate limits. Queues can be declared in config or added at runtime. |
 | **Worker** | Code that performs one kind of job: a type implementing `Worker[T]`, or a plain function. |
 | **Client** | The per-process runtime. It inserts, claims, works and finalizes jobs, and holds a liveness lease. |
+| **Fence** | A per-job counter that every claim increments. Each result, progress write and rescue names the fence of its claim, and applies only to that claim (§7.3). |
+| **Job lease** | The owner of an attempt that runs outside any client, such as on a remote worker: a claim by job ID starts one, and the worker renews it, records progress and finishes the attempt with its token (§7.14). |
 | **Driver** | The storage engine binding (`hopperpgx` for Postgres). It is generic over the engine's transaction type. |
 | **Leader** | The one client, elected through the database, that runs periodic jobs and maintenance. |
 | **History** | Finalized jobs, moved out of the live table into time-partitioned storage for inspection and replay. |
@@ -308,6 +310,8 @@ for job, err := range client.Jobs(ctx, hopper.JobFilter{
 }) { ... }                           // by tags (any or all), metadata containment, priority or ID
 
 client.Queues().Pause(ctx, "email")
+lease, err := client.Leases().Claim(ctx, id, fence, nil) // a job lease at the job's expected fence, for an attempt run on a remote worker (§7.14)
+client.Leases().Renew(ctx, lease.Token)           // ... and RecordStep, RecordCursor, Finish and their Tx forms
 client.Queues().Add(ctx, "tenant_42", hopper.QueueConfig{MaxWorkers: 5}) // runtime, multi-tenant
 client.PeriodicJobs().Add(hopper.Cron("0 * * * *", TenantReport{ID: 42}, &hopper.PeriodicOpts{Name: "report:42"})) // on every client that can lead
 
@@ -679,6 +683,9 @@ history (§7.5), and v16 adds `logs` the same way (§7.5). Schema v17 adds `tags
 same way, with `hopper_job_tags`, `hopper_job_history_tags` (whose time partitions the
 leader keeps with history's) and the triggers that maintain them (§7.2). Schema v18
 adds `fence` to `hopper_jobs` and history (§7.3), in the loop v17's columns took.
+Schema v19 adds `hopper_job_leases (id, token, fence, ttl, renewed_at, expires_at)` for
+job leases (§7.14), a plain `CREATE TABLE` that takes no lock on `hopper_jobs` or
+history.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -713,6 +720,8 @@ insert ──► scheduled ─┼─► (claim) running ─────┼──
                ▲               │    └──► retryable / scheduled (snooze)  │
                └───────────────┘                                        │
   rescuer: running, owner's lease expired ──► retryable (or discarded)   │
+  Leases.Claim (by ID): waiting ──► running, owned by a job lease         │
+  job lease expired ──► retryable (or discarded, or canceled)            │
   JobRetry ◄─────────────────────────────────────────────────────────────┘
   JobCancel: any live state; running jobs are signaled and finalize as canceled
   JobDelete: any state but running; a waiting job is canceled without a history row
@@ -1150,14 +1159,14 @@ retry AS (
          wake_requested_at = NULL
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
     AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
-  RETURNING j.id),
+  RETURNING j.id, j.fence),
 done AS (
   DELETE FROM hopper_jobs j USING r
   WHERE j.id = r.id AND r.state IN ('completed','canceled','discarded')
     AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence
   RETURNING j.*, r.state AS final_state, r.error, r.output, r.archive),
 archived AS (INSERT INTO hopper_job_history SELECT … , now() FROM done WHERE archive)
-SELECT id FROM retry UNION ALL SELECT id FROM done;
+SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
 ```
 
 - The `state = 'running' AND attempted_by = r.attempted_by AND fence = r.fence`
@@ -1166,10 +1175,10 @@ SELECT id FROM retry UNION ALL SELECT id FROM done;
   finalizes the attempts it claimed under the old one. If the job was rescued and
   claimed again, by another client or by the same one, the result is dropped and
   logged, so a finalize can never overwrite a newer attempt. The statement returns
-  the IDs it applied; the client logs the rest. A flush can hold two results of one
-  job, a rescued attempt's late one and that of the claim after it, and the statement
-  would return the job's ID once whichever applied, so the finalizer writes the second
-  in a statement of its own, and the late result emits no event. The client keeps the
+  the job and fence of each result it applied; the client logs the rest. A flush can
+  hold two results of one job, a rescued attempt's late one and that of the claim
+  after it: at most one applies, its fence says which, and the late result emits no
+  event. The client keeps the
   cancel function of each running job's latest claim, and an attempt that returns
   removes only its own claim's, so that the return of a rescued attempt does not take
   away the cancel of the claim after it. A claim that replaces another cancels the
@@ -1458,7 +1467,9 @@ running job, it sets `cancel_requested_at` and sends
 `pg_notify('hopper_control', 'cancel:<id>')`. The owning client cancels the job's
 context immediately, with cause `hopper.ErrJobCanceled`. Each lease renewal also
 returns any cancel requests for that client's running jobs (through the small running
-index), which covers missed notifications. The job finalizes as `canceled` if the
+index), which covers missed notifications. A job claimed by ID has no owning client,
+so no client acts on the notification: the holder of its job lease learns of the
+request from its next `Renew` (§7.14). The job finalizes as `canceled` if the
 worker returns an error after the request, and as `completed` if it finishes anyway.
 `JobRetry` re-drives a canceled or discarded job from history (with one more attempt
 allowed if it had run out, and a fresh `seq`) or brings a waiting job forward; either
@@ -1509,7 +1520,7 @@ PgBouncer in transaction mode and behind RDS Proxy, it can be inspected with pla
 and it doesn't pin a connection. Leader-only duties are idempotent, because two leaders
 can briefly overlap during a partition.
 
-Leader duties: periodic jobs, the rescuer, expiring TTL'd jobs, creating history
+Leader duties: periodic jobs, the rescuer, expiring job leases (§7.14), expiring TTL'd jobs, creating history
 partitions ahead of time and dropping expired ones, building the ordering-key and
 unique-key indexes of any history partition that lacks them (after the v13 and v14
 upgrades), removing stale
@@ -1857,6 +1868,140 @@ Args, outputs and message payloads go through a `Codec`. The default is
 codec to encrypt payloads with their own keys, in which case the payload is stored as
 a JSON string. hopper itself never encrypts.
 
+### 7.14 Job leases
+Some attempts run outside any client: a coordinator whose jobs run on remote workers
+(SSH hosts, batch-scheduler allocations, pods) places an attempt on a worker, and the
+worker reports progress and results through any replica, possibly days later. Client
+leases (§7.6) prove that the coordinator process is alive, not the worker, so such an
+attempt is owned by a **job lease** instead.
+
+- **The claim by ID starts it.** `Leases().Claim(ctx, id, fence, opts)` moves a waiting job
+  (available, scheduled or retryable, whatever its `scheduled_at`, so a job snoozed while
+  it waits for its worker can be claimed early) to running with `attempted_by` NULL, its
+  attempt and fence incremented, and writes the lease row in the same statement:
+  `(id, token, fence, ttl, renewed_at, expires_at)`, with a token from
+  `gen_random_uuid()` (`randomblob(16)` on SQLite), so hopper's Go code generates no
+  randomness. It respects the queue's pause, the job's TTL and its ordering key, but not
+  the queue's limits (§9). It claims only at the exact `fence` the caller expects, 0 for
+  a job never claimed, with no sentinel: the job's handler records its attempt's fence
+  with the placement it makes and snoozes (a snooze keeps the fence), and the claim
+  names that fence, so a superseded placement's claim, made before another attempt ran,
+  fails with `ErrJobFenced`, even while that attempt runs; `ErrJobRunning` means the job
+  runs at the expected fence, such as the placing attempt before its snooze is written.
+  The claim returns the first row of this table that applies, on both engines:
+
+  | The job | Claim by ID at `fence` |
+  | --- | --- |
+  | neither live nor in history (never inserted, or deleted by `DeleteCompleted`, `JobDelete` or retention) | `ErrNotFound` |
+  | in history, at any fence | `ErrJobNotClaimable` |
+  | live at another fence, running or not | `ErrJobFenced` |
+  | running at `fence`, by a client or a lease | `ErrJobRunning` (try again shortly) |
+  | pending, past its TTL, in a paused queue, or held back by its ordering key | `ErrJobNotClaimable` |
+  | available, scheduled or retryable | claimed |
+
+  On PostgreSQL the claim is one statement and, when it matches nothing, a second one
+  reads the reason; an attempt at `fence` that ends between the two (a snooze or a
+  retry, which keep the fence) reads as `ErrJobRunning`, or, for a keyed job, as held
+  back. `ClaimTx` claims in the
+  caller's transaction instead, with a placement row it locks; the claim's time is its
+  `statement_timestamp()`, so a transaction that began earlier does not shorten the
+  lease, date the attempt before the claim, or claim a job whose TTL passed while it
+  ran. A claim of a waiting job waits for
+  its row, as `JobCancel` does; a client's claim skips locked rows, so the two
+  never both win. Nothing else starts a lease: the job's other attempts, before and
+  after, are ordinary ones its handler runs.
+- **The token** (`LeaseToken`) names the job, the claim's fence and the random value. It
+  has a text form for the worker to carry. hopper does not authenticate its holder: it
+  is a capability, and the coordinator authenticates its workers. Job IDs are meant to be
+  exposed and fences are small integers, so without the random value anyone with a job
+  ID could forge one.
+- **Ownership.** A leased job is running with no client, and its lease row is its owner.
+  No client's finalize, progress write or rescue can match a NULL `attempted_by`, and the
+  rescue's candidate query leaves such jobs out (`attempted_by IS NOT NULL`), so a dead
+  client never takes a leased job with it. Every call on the attempt names the token
+  and the fence:
+
+  ```sql
+  -- renew: locks only the lease row
+  UPDATE hopper_job_leases l SET renewed_at = now(), expires_at = now() + l.ttl
+  FROM hopper_jobs j
+  WHERE l.id = $1 AND l.token = $2 AND l.fence = $3
+    AND j.id = l.id AND j.state::text = 'running' AND j.attempted_by IS NULL AND j.fence = l.fence
+  RETURNING l.expires_at, j.cancel_requested_at IS NOT NULL;
+  -- progress and finalize: the client's owner condition is replaced by
+  j.attempted_by IS NULL AND j.fence = r.fence
+    AND EXISTS (SELECT 1 FROM hopper_job_leases l WHERE l.id = j.id AND l.token = r.token AND l.fence = r.fence)
+  ```
+
+  The finalize is the batched finalize statement with that condition and a
+  `released` CTE that deletes the lease rows of the jobs it moved; one call does not mix
+  leased results with others.
+- **Renewals** extend the lease by its TTL (one minute by default, fixed per lease) from
+  database `now()`, and report a cancel request. A renewal succeeds until the leader
+  applies the expiry, not only until `expires_at`, so a holder learns that it lost the
+  lease from `ErrJobFenced`, never from its own clock. A renewal is a HOT update of a
+  narrow row in a small table: the lease lives outside `hopper_jobs` so that no
+  heartbeat rewrites a job row (§8.1), and `expires_at` has no index, which would make
+  every renewal non-HOT; the expiry scans the table instead.
+- **Finish** ends the attempt as the job's worker returning would: nil completes it with
+  its output, a snooze gives the attempt back and keeps the fence (the lease's, which the
+  job's next claim by ID names), `Cancel` discards it,
+  and any other error retries it through `Config.OnError`, the kind's worker's
+  `NextRetry` (when the client has that worker) and the retry policies, or discards it
+  on its last attempt. After `JobCancel`, an error cancels it. `Finish` reads the job
+  to choose the outcome before the fenced write, so a `JobCancel` that commits between
+  the two, like one that reaches a worker after it returned, is left to the next
+  attempt: the job retries with the request still set, which that attempt's first
+  renewal (or its client) reports and its expiry honors. `Finish` writes
+  the result before it returns, so a worker's report is durable once acknowledged, then
+  settles the job's batch and promotes its dependents as the finalizer does after a
+  flush; `FinishTx` leaves that to the leader, and emits no event, since the client
+  cannot know whether the caller's transaction commits. The outcome uses the calling
+  client's configuration (`OnError`, the queue's `RetryPolicy` and `DeleteCompleted`,
+  the kind's worker), so the replicas that take reports share it. `OnError` runs before
+  the fenced write, as for a worker, and may run for a `Finish` that returns
+  `ErrJobFenced`. The calls on the pool wait for a transaction that holds the job's
+  row, as `Finish` does. The calls work on a client that is not
+  started. A leased attempt keeps no log of its own: a remote worker can write to
+  `Config.JobLogs.Store` under the job's ID and attempt.
+- **Expiry** is a leader duty, beside the rescue, in one statement: it locks the jobs
+  whose leases expired, skipping rows another statement holds, deletes their leases
+  where `expires_at <= now()` still holds on the lease row as locked, and, judging each
+  job by its row as locked (so a cancel that committed while the statement ran counts),
+  makes it retryable at once with the error entry `{attempt, fence, error: "hopper: job lease
+  expired", rescue: "lease_expired"}`, or discards it on its last attempt, or cancels it
+  if a cancel was requested, since its holder can no longer act on the request. hopper
+  never reruns the work: the job's handler finds the entry on its next run, matches it to
+  its placement by the fence (one more than the placement's, which the claim named), and
+  places the job again or fails it. SQLite's expiry waits
+  only briefly for the write lock, as its rescue does, and leaves the leases to the next
+  pass. The expiry fires within a leader interval of the deadline, so it needs a client
+  that can lead (§7.8): one that works a queue without `NeverLead`, which a coordinator
+  that only inserts and takes reports is not.
+- **Lock order.** Every statement that touches a job and its lease locks the job's row
+  first, then the lease's; a renewal locks only the lease's and reads the job's. So a
+  renewal and an expiry of one lease queue on the lease row, and whichever commits
+  first wins: the expiry re-checks the expiry on the lease row once it has it, and a
+  renewal after an expiry finds no lease. A finish and an expiry queue on the job row:
+  the expiry skips a row a finish holds, and a finish after an expiry finds the job no
+  longer running in its lease.
+- **Rescue reasons.** Error entries hopper writes when it ends an attempt carry
+  `rescue`: `client_lost` and `stuck` for the rescue, and `lease_expired`
+  (`AttemptError.Rescue`), so a handler matches an entry to a placement without parsing
+  its text.
+- **Rolling deploys.** A leader of the previous release sees a leased job as running
+  with a lost client; its rescue's finalize matches `attempted_by` against NULL, which
+  never matches, so it drops the rescue and logs a warning on every pass. That is not
+  only noise: its rescue reads the oldest running jobs a batch (1000) at a time and stops
+  at a batch it applied none of, so once a full batch of leased jobs is older than a job
+  whose client really is lost, that job is not rescued while the old leader leads. Its
+  claims also count leased jobs toward `GlobalLimit` and `PartitionLimit`. So leases are
+  used only once every client runs this release. Schema v19's down migration moves
+  leased jobs back to `retryable` before it drops the table.
+- **Orphaned lease rows**, which only direct SQL leaves, are never read: every read and
+  write checks the job's state and fence too, and the job's next claim by ID replaces
+  the row.
+
 ## 8. Performance
 
 ### 8.1 Principles
@@ -1981,6 +2126,12 @@ the partition's extension lock, so the data volume has no size limit.
 | `PartitionLimit` | cluster, per `partition_key` | For example, "at most 5 concurrent per customer". The claim ranks candidates with `row_number() OVER (PARTITION BY partition_key)` plus the key's running count, and admits those that fit. The ranking scans the queue's waiting jobs, so only partition-limited queues pay for it. A per-key rate is not implemented. |
 | Priorities | per job | Four levels in the claim order. `PriorityAging` makes the leader promote a waiting job one level each time it has waited that long (`JobAge`), so low priorities cannot starve; the claim order itself stays index-only. |
 | Pause / resume | cluster, per queue | Row flag with a control notification. |
+
+A claim by job ID (§7.14) respects the queue's pause, but not `GlobalLimit`,
+`PartitionLimit` or `RateLimit`, and jobs running under job leases are left out of the
+running counts those take (`attempted_by IS NOT NULL`, which the running index
+serves). The limits govern client worker slots: counted, a thousand leased jobs would
+starve a queue's own handler runs under a `GlobalLimit` of fifty.
 
 Limit state lives in the database, so limits hold across any number of replicas and
 survive restarts. Limits declared in `QueueConfig` are recorded on the queue row when the
@@ -2257,6 +2408,8 @@ observability without new machinery.
   waits, and gives up with an error after 10 minutes, so a transaction held open for
   longer fails the migration (end it and run `Up` again) rather than stalling it
   forever.
+  A migration that only creates a table, as v19 does for `hopper_job_leases`, takes
+  no lock on `hopper_jobs` and needs no loop.
 - Each release's statements target its own schema version: the code is deployed after
   `Up` (the client never runs against an older schema), and the previous release keeps
   working on the new schema while it is rolled out. `Client.Start` enforces the first
@@ -2312,7 +2465,7 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease or a job, backdate an attempt, store a value as a direct write would, wait until a statement waits for a lock, count rows); what depends on row locks is tested either way by `Capabilities.SingleWriter`. `drivertest.RunPostgres` adds the tests of what the Postgres drivers share beyond the interface (partitions and their indexes, the tags tables, progress rows, planner statistics); other engine internals stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Job leases: a claim by ID against a client's claim of the same jobs claims each once; concurrent renewals of a lease and of a stale lease of the same job; a renewal held open against the expiry, which the renewal wins; a finish held open against the expiry, which skips the job; cancels that commit while the expiry runs, which leave no job running without its lease; a stale token's finish after an expiry; and holders that renew late at random against the leader's expiry, where every claim ends exactly once, by its Finish or its expiry, and no expiry is recorded before the expiry its holder was last given. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |
@@ -2356,7 +2509,7 @@ targets. v1.0.0 follows M8, once the API has been proven in production.
 
 | Risk | Mitigation |
 | --- | --- |
-| Subtle concurrency bugs: double execution, lost jobs | Every state transition is a conditional statement that checks the prior state and the owning client. Chaos and concurrency suites run from M1 onward, on every driver. |
+| Subtle concurrency bugs: double execution, lost jobs | Every state transition is a conditional statement that checks the prior state and the owning client or job lease. Chaos and concurrency suites run from M1 onward, on every driver. |
 | Vacuum and bloat at sustained peak rates | A small live table, fillfactor 70, partition-drop retention, no per-job heartbeats, batched finalize, a documented autovacuum profile, and the 24h soak test. |
 | NOTIFY contention at high commit rates (Postgres serializes notifying commits) | One notify per queue per transaction, per-process coalescing, and adaptive polling that makes notifications unnecessary on busy queues. |
 | Claim contention with many clients on one hot queue | Batched claims with a cooldown, so each client claims less often but more at a time. Benchmarks cover 1–64 clients. |

@@ -148,7 +148,7 @@ func testJobRecordProgressRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 		if err != nil {
 			t.Error(err)
 		}
-		done <- applied
+		done <- appliedIDs(applied)
 	}()
 	f.WaitForLockWait(ctx, t, d)
 	if err := commit(); err != nil {

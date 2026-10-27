@@ -243,6 +243,29 @@ func TestUI(t *testing.T) {
 	}
 	code, body = post(admin, "/jobs/"+busy.Job.ID.String()+"/delete", nil, true)
 	want(409, body, code, "running")
+	leased, err := client.Insert(ctx, ping{N: 4}, &hopper.InsertOpts{Queue: "busy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Leases().Claim(ctx, leased.Job.ID, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	code, body = get(readOnly, "/jobs/"+leased.Job.ID.String())
+	want(200, body, code, "under a job lease, fence 1, expiring")
+	// A retry or a snooze clears the client of a job a client attempted, as
+	// a lease's does.
+	retried, err := client.Insert(ctx, ping{N: 5}, &hopper.InsertOpts{Queue: "busy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE hopper_jobs SET state = 'retryable', attempt = 1, fence = 1, attempted_at = now() WHERE id = $1", [16]byte(retried.Job.ID)); err != nil {
+		t.Fatal(err)
+	}
+	code, body = get(readOnly, "/jobs/"+retried.Job.ID.String())
+	want(200, body, code, "<dt>attempted</dt>")
+	if strings.Contains(body, "job lease") {
+		t.Error("a retried job's page says it ran under a job lease")
+	}
 
 	// A workflow whose jobs were deleted draws only the edges between the
 	// jobs left, and none once every job is gone.

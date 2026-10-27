@@ -15,7 +15,8 @@ import (
 
 // Sentinel errors from control operations.
 var (
-	// ErrJobRunning is returned by JobRetry and JobDelete for a running job.
+	// ErrJobRunning is returned by JobRetry and JobDelete for a running
+	// job, and by Leases.Claim for a job running at the fence it names.
 	ErrJobRunning = driver.ErrJobRunning
 	// ErrUniqueConflict is returned by JobRetry when a live job holds the
 	// same unique key.
@@ -416,7 +417,8 @@ const (
 type Event struct {
 	Kind EventKind
 	At   time.Time
-	// Job is set for job events: the row as claimed, before the outcome.
+	// Job is set for job events: the row as claimed, before the outcome;
+	// for the EventJobRescued of a job lease's expiry, the row after it.
 	Job *JobRow
 	// Error is the attempt's error text for failed, discarded and
 	// canceled jobs, and the snooze reason, if any, for snoozed jobs.

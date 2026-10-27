@@ -175,18 +175,9 @@ func record[T JobArgs](ctx context.Context, job *Job[T], txExec func() (driver.E
 	if job == nil || job.JobRow == nil || (ok && job.ID != a.completion.ID) {
 		return errors.New("hopper: record progress: the job is not the one ctx belongs to")
 	}
-	if !keepStep && !storableStep(step) {
-		return fmt.Errorf("hopper: record the progress of job %s: step %q holds a NUL or invalid UTF-8, which PostgreSQL cannot store", job.ID, step)
-	}
-	var raw json.RawMessage
-	if cursor != nil {
-		b, err := json.Marshal(cursor)
-		if err != nil {
-			return fmt.Errorf("hopper: record the progress of job %s: encode the cursor: %w", job.ID, err)
-		}
-		if string(b) != "null" {
-			raw = b
-		}
+	raw, err := progressCursor(job.ID, step, keepStep, cursor)
+	if err != nil {
+		return err
 	}
 	if !ok {
 		p := &Progress{Step: step, Cursor: raw, RecordedAt: time.Now()}
@@ -201,7 +192,6 @@ func record[T JobArgs](ctx context.Context, job *Job[T], txExec func() (driver.E
 	}
 	exec := a.exec
 	if txExec != nil {
-		var err error
 		if exec, err = txExec(); err != nil {
 			return err
 		}
@@ -229,6 +219,25 @@ func record[T JobArgs](ctx context.Context, job *Job[T], txExec func() (driver.E
 	}
 	job.Progress = p
 	return nil
+}
+
+// progressCursor checks the step of a progress record of job id, unless
+// keepStep, and encodes its cursor: nil for none, which leaves the key out.
+func progressCursor(id JobID, step string, keepStep bool, cursor any) (json.RawMessage, error) {
+	if !keepStep && !storableStep(step) {
+		return nil, fmt.Errorf("hopper: record the progress of job %s: step %q holds a NUL or invalid UTF-8, which PostgreSQL cannot store", id, step)
+	}
+	if cursor == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(cursor)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: record the progress of job %s: encode the cursor: %w", id, err)
+	}
+	if string(b) == "null" {
+		return nil, nil
+	}
+	return b, nil
 }
 
 // completedInTx reports whether the attempt ctx belongs to was completed
