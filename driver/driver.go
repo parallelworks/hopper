@@ -258,12 +258,16 @@ type Executor interface {
 	// the lease is no longer the job's. A renewal succeeds until an expiry
 	// is applied, not only until ExpiresAt.
 	JobLeaseRenew(ctx context.Context, params JobLeaseRenewParams) (*JobLeaseStatus, error)
-	// JobExpireLeases ends the attempts of up to limit jobs whose leases
-	// expired, by database time: a job is retryable at once, with an error
-	// entry whose Rescue is RescueLeaseExpired, or, on its last attempt,
-	// discarded, or canceled if a cancel was requested. It returns the jobs
-	// as they are afterwards.
-	JobExpireLeases(ctx context.Context, limit int) ([]*JobRow, error)
+	// JobExpireLeases ends the attempts of up to params.Limit jobs whose
+	// leases are due, by database time: a job is retryable at once, with an
+	// error entry whose Rescue is RescueLeaseExpired, or, on its last
+	// attempt, discarded, or canceled if a cancel was requested. A lease is
+	// due at its expiry, or, if a client started after the lease was last
+	// renewed, at the first such start plus the larger of its TTL and
+	// params.Grace, if that is later. It expires nothing unless the lease of
+	// client params.ClientID is live. It returns the jobs as they are
+	// afterwards.
+	JobExpireLeases(ctx context.Context, params JobExpireLeasesParams) ([]*JobRow, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
 	ClientRegister(ctx context.Context, params ClientRegisterParams) (int64, error)
@@ -629,6 +633,15 @@ const (
 type LeaseFence struct {
 	Token JobID
 	Fence int64
+}
+
+// JobExpireLeasesParams expires job leases (Executor.JobExpireLeases).
+type JobExpireLeasesParams struct {
+	Limit int
+	// ClientID is the expiring client, whose own lease must be live.
+	ClientID int64
+	// Grace is the least time a lease is given past a client's start.
+	Grace time.Duration
 }
 
 // JobClaimByIDParams claims one job by ID, under a job lease.

@@ -60,6 +60,8 @@ type Fixture[TTx any] interface {
 	// lease rows the engine keeps.
 	ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
 	CountJobLeases(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
+	// AgeClientStart backdates a client's start by age.
+	AgeClientStart(ctx context.Context, t *testing.T, d driver.Driver[TTx], clientID int64, age time.Duration)
 	// CountLive and CountHistory count jobs in the live table and in history.
 	CountLive(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
 	CountHistory(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
@@ -130,6 +132,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"LeaseFencesClients", testLeaseFencesClients[TTx]},
 		{"LeasesOutsideLimits", testLeasesOutsideLimits[TTx]},
 		{"ExpireLeases", testExpireLeases[TTx]},
+		{"ExpireLeasesAfterRestart", testExpireLeasesAfterRestart[TTx]},
+		{"ExpireLeasesAfterRestartNoGrace", testExpireLeasesAfterRestartNoGrace[TTx]},
 		{"ExpireRacesRenew", testExpireRacesRenew[TTx]},
 		{"ExpireRacesFinalize", testExpireRacesFinalize[TTx]},
 		{"ExpireRacesCancel", testExpireRacesCancel[TTx]},
@@ -345,6 +349,12 @@ func (p Postgres[TTx]) SetProgress(ctx context.Context, t *testing.T, d driver.D
 func (p Postgres[TTx]) ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
 	t.Helper()
 	p.SQL.Exec(ctx, t, d, "UPDATE hopper_job_leases SET expires_at = now() - interval '1s', renewed_at = now() - interval '1s' - ttl WHERE id = $1::uuid", id.String())
+}
+
+// AgeClientStart implements Fixture.
+func (p Postgres[TTx]) AgeClientStart(ctx context.Context, t *testing.T, d driver.Driver[TTx], clientID int64, age time.Duration) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, "UPDATE hopper_clients SET started_at = started_at - make_interval(secs => $2::float8) WHERE id = $1::bigint", clientID, age.Seconds())
 }
 
 // CountJobLeases implements Fixture.

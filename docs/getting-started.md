@@ -567,6 +567,22 @@ attempt the job is discarded instead, and if a cancel was requested it is
 canceled. hopper never reruns the work itself. The job's handler finds the
 entry on its next run, and decides whether to place the job again.
 
+Leases survive a restart of the whole cluster. While no client runs, no
+worker can renew, so a lease last renewed before a client started is
+given at least its TTL from that start, or `Config.JobLeaseGrace` if that
+is longer. Set the grace to how long your workers may take to reach the
+cluster again:
+
+```go
+client, err := hopper.NewClient(driver, &hopper.Config{
+    JobLeaseGrace: 5 * time.Minute, // zero gives each lease its TTL from the restart
+    // ...
+})
+```
+
+A start of any client counts, so a rolling deploy also delays expiries by
+up to the grace.
+
 Every call on a token is fenced to its lease. Once the lease has expired,
 or the attempt has ended and the job been claimed again, the call returns
 `ErrJobFenced` and changes nothing. So a worker that comes back late can't

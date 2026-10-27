@@ -133,6 +133,10 @@ func (fixture) ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver
 	execSQL(ctx, t, d, "UPDATE hopper_job_leases SET expires_at = ?, renewed_at = ? - ttl WHERE id = ?", now()-1e6, now()-1e6, id[:])
 }
 
+func (fixture) AgeClientStart(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], clientID int64, age time.Duration) {
+	execSQL(ctx, t, d, "UPDATE hopper_clients SET started_at = started_at - ? WHERE id = ?", age.Microseconds(), clientID)
+}
+
 func (fixture) CountJobLeases(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx]) int {
 	return count(ctx, t, d, "SELECT count(*) FROM hopper_job_leases")
 }
