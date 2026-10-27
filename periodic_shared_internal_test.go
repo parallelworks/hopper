@@ -3,7 +3,10 @@ package hopper
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,6 +123,44 @@ func TestPeriodicDefinitionLeavesOutWhatCannotBeStored(t *testing.T) {
 		if def, err := c.periodicDefinition(&job); err != nil || def != nil {
 			t.Errorf("%s: definition = %s, %v; want none", name, def, err)
 		}
+	}
+}
+
+// nonceCodec encodes the same args differently each time, as an encrypting
+// codec with a random nonce does.
+type nonceCodec struct{ n *atomic.Int64 }
+
+func (c nonceCodec) Marshal(v any) ([]byte, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(fmt.Sprintf("%d:%s", c.n.Add(1), b))
+}
+
+func (nonceCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) }
+
+type textArgs struct{ Text string }
+
+func (textArgs) Kind() string { return "text" }
+
+func TestPeriodicDefinitionLeavesOutUnstableOrNULArgs(t *testing.T) {
+	c := newPeriodicTestClient(t, &periodicExec{})
+	nul := Every(time.Hour, textArgs{Text: "a\x00b"}, nil)
+	if err := nul.resolve(); err != nil {
+		t.Fatal(err)
+	}
+	if def, err := c.periodicDefinition(&nul); err != nil || def != nil {
+		t.Errorf("args with a NUL: definition = %s, %v; want none", def, err)
+	}
+
+	c.cfg.Codec = nonceCodec{n: new(atomic.Int64)}
+	job := Every(time.Hour, textArgs{Text: "a"}, nil)
+	if err := job.resolve(); err != nil {
+		t.Fatal(err)
+	}
+	if def, err := c.periodicDefinition(&job); err != nil || def != nil {
+		t.Errorf("args a codec encodes differently each time: definition = %s, %v; want none", def, err)
 	}
 }
 
@@ -263,5 +304,64 @@ func TestPeriodicLoopOwnRemovalStopsBackFill(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if n := exec.inserted("tick"); n != 1 {
 		t.Errorf("a job removed during its back-fill inserted %d slots, want 1", n)
+	}
+}
+
+// Removing the leader's own job during its back-fill, while an older client
+// registers the same definition, hands the job over at once rather than
+// after a leader interval.
+func TestPeriodicLoopOwnRemovalHandsOverAtOnce(t *testing.T) {
+	exec := &periodicExec{}
+	job := Every(time.Minute, tickArgs{}, &PeriodicOpts{CatchUp: 100})
+	c := newPeriodicTestClient(t, exec, job)
+	c.tuning.leaderInterval = time.Hour
+	c.clientID.Store(1)
+	c.periodic.define = c.periodicDefinition
+	r := c.periodic.jobs[0]
+	def, err := c.periodicDefinition(&r.job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.def, r.digest = string(def), definitionDigest(string(def))
+	started := time.Now()
+	own, other := storedRow(t, c, 1, job), storedRow(t, c, 2, job)
+	own.ClientStartedAt, other.ClientStartedAt = started.Add(time.Second), started
+	exec.set(func(e *periodicExec) {
+		e.registrations = []driver.PeriodicRegistrationRow{own, other}
+		e.last = map[string]time.Time{"tick": time.Now().Add(-3 * time.Hour)}
+		e.onInsert = func() {
+			if err := c.periodic.Remove("tick"); err != nil && !errors.Is(err, ErrNotFound) {
+				t.Error(err)
+			}
+		}
+	})
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool { return exec.inserted("tick") >= 3 })
+}
+
+// The newest live client's definition of a name comes first, whatever order
+// the driver returns the rows in.
+func TestReadStoredNewestClientFirst(t *testing.T) {
+	exec := &periodicExec{}
+	c := newPeriodicTestClient(t, exec)
+	started := time.Now()
+	row := func(client int64, at time.Time, n int) driver.PeriodicRegistrationRow {
+		r := storedRow(t, c, client, Every(time.Hour, tickArgs{}, &PeriodicOpts{InsertOpts: &InsertOpts{MaxAttempts: n}}))
+		r.ClientStartedAt = at
+		return r
+	}
+	exec.set(func(e *periodicExec) {
+		e.registrations = []driver.PeriodicRegistrationRow{row(3, started, 1), row(1, started.Add(time.Second), 2), row(2, started, 3)}
+	})
+	byName, ok := c.readStored(t.Context(), map[string]string{})
+	if !ok {
+		t.Fatal("read failed")
+	}
+	var clients []int64
+	for _, d := range byName["tick"] {
+		clients = append(clients, d.client)
+	}
+	if want := []int64{1, 3, 2}; !slices.Equal(clients, want) {
+		t.Errorf("clients %v, want %v: the latest started first, then the highest ID", clients, want)
 	}
 }

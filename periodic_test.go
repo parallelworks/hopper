@@ -487,3 +487,32 @@ func TestPeriodicRunOnStartOnceAcrossReplicas(t *testing.T) {
 		t.Errorf("RunOnStart inserted %d jobs as a replica started and stopped, want 1", n)
 	}
 }
+
+// A client that leads from its start schedules its own definition of a job
+// from the term's first pass, not first an older client's.
+func TestPeriodicLeaderStartsWithItsOwnDefinition(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	start := func(n int, neverLead bool) *hopper.Client[pgxTx] {
+		c := h.client(&hopper.Config{
+			Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
+			Workers:   noopWorkers(),
+			NeverLead: neverLead,
+			Periodic:  []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: n}, &hopper.PeriodicOpts{Name: "x", RunOnStart: true})},
+		})
+		if err := c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = c.Stop(context.Background()) })
+		return c
+	}
+	start(8, true)
+	leader := start(9, false)
+	waitFor(t, leader.IsLeader)
+	waitFor(t, func() bool { return h.countN("9") == 1 })
+	time.Sleep(500 * time.Millisecond)
+	if n := h.countN("8"); n != 0 {
+		t.Errorf("the older client's definition was inserted %d times before the leader's own", n)
+	}
+}

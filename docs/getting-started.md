@@ -349,8 +349,11 @@ err = client.PeriodicJobs().Remove("report:42")
 A job runs while any live client registers it, and stops once none does.
 When clients define one name differently, as during a rolling deploy, the
 newest client's definition wins. Only `Cron` and `Every` schedules can be
-recorded; a job with a custom `Schedule` runs only while its own client
-leads.
+recorded, and a `Cron` only in a zone that loads by its name, so not in
+`time.Local` or, usually, a `time.FixedZone`. Nor can a job whose args the
+`Codec` encodes differently each time, as an encrypting codec with a random
+nonce does, or whose args or metadata hold a NUL. Any other job runs only
+while its own client leads.
 
 ## Batches and workflows
 

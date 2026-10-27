@@ -168,7 +168,9 @@ func resolvePeriodic(jobs []PeriodicJob) ([]PeriodicJob, error) {
 // another client. A job whose schedule cannot be recorded, one other than
 // Cron's or Every's, or a Cron in time.Local or in a zone that does not load
 // by its name, such as a time.FixedZone, is scheduled only from its own
-// client, while that client leads. A client with no queues holds no lease
+// client, while that client leads. So is a job whose args the Codec encodes
+// differently each time, as an encrypting codec with a random nonce does,
+// or whose args or metadata hold a NUL. A client with no queues holds no lease
 // and records nothing. It is safe for concurrent use.
 type PeriodicJobs struct {
 	logger     *slog.Logger
@@ -488,6 +490,12 @@ func (c *Client[TTx]) periodicPass(ctx context.Context, st *periodicState) time.
 		return ok && read.Before(at)
 	}
 	retry := func(r *registeredPeriodic) {
+		// A job whose owner was removed during the pass did not fail: the
+		// removal wakes the next pass, which drops the job or, if another
+		// client registers it too, goes on with it at once.
+		if r.owner != nil && r.owner.removed.Load() {
+			return
+		}
 		st.retryAt[r] = time.Now().Add(c.tuning.leaderInterval)
 	}
 
@@ -672,8 +680,8 @@ func (c *Client[TTx]) insertPeriodic(ctx context.Context, r *registeredPeriodic,
 		return true
 	}
 	if r.owner != nil && r.owner.removed.Load() {
-		// The next pass drops the job, or goes on from this slot if another
-		// client registers it too.
+		// The next pass, which the removal wakes, drops the job, or goes on
+		// from this slot if another client registers it too.
 		return false
 	}
 	p := &r.job

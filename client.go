@@ -222,11 +222,15 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	if c.caps.Listen {
 		c.listenWG.Go(func() { c.listenLoop(c.bgCtx) })
 	}
+	// Recorded before leading, so the term's first read has this client's
+	// own jobs rather than only those of older clients.
+	var record periodicRecord
+	c.recordPeriodic(ctx, &record)
 	if c.cfg.leads() {
 		c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
 	}
 	c.leaseWG.Go(func() { c.leaseLoop(c.bgCtx) })
-	c.leaseWG.Go(func() { c.registrationLoop(c.bgCtx) })
+	c.leaseWG.Go(func() { c.registrationLoop(c.bgCtx, &record) })
 
 	c.state = clientStarted
 	c.logger.InfoContext(ctx, "hopper: client started", "client_id", id, "queues", slices.Sorted(maps.Keys(c.cfg.Queues)))

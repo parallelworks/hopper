@@ -1703,7 +1703,10 @@ client registers it, and stops within a leader interval of the last one removing
 stopping. Only `Cron` schedules (stored as their expression and time zone) and `Every`
 schedules (their interval) can be recorded; a job with another `Schedule`, or a `Cron`
 in `time.Local`, which names a different zone in each process, or in a zone that does
-not load by its name to the same offsets, such as a `time.FixedZone`, is scheduled only
+not load by its name to the same offsets, such as a `time.FixedZone`, or a job whose args
+the `Codec` encodes differently each time (an encrypting codec with a random nonce, whose
+digests would never match across replicas) or whose definition holds a NUL (which `jsonb`
+refuses, and which would fail the client's whole write), is scheduled only
 from its own client's set, while that client leads, as before v20. A definition the leader
 cannot read, such as one of a later definition version, is skipped with a log, and the
 leader schedules its own job of that name if it has one. A leader from before v20

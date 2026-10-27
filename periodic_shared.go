@@ -1,6 +1,8 @@
 package hopper
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -56,7 +58,10 @@ type definedUnique struct {
 }
 
 // periodicDefinition encodes p for the leader. It returns nil for a job
-// whose schedule cannot be stored, which only its own client schedules.
+// that cannot be stored, which only its own client schedules: one whose
+// schedule cannot be, whose args the Codec encodes differently each time,
+// as an encrypting codec with a random nonce does, or whose definition has
+// a NUL, which Postgres's jsonb refuses.
 func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error) {
 	d := periodicDefinition{Version: periodicDefinitionVersion}
 	switch s := p.Schedule.(type) {
@@ -86,6 +91,10 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 	if err != nil {
 		return nil, err
 	}
+	again, _, err := c.buildInsertParams(InsertParams{Args: params.Args, Opts: &opts}, time.Time{})
+	if err != nil || !bytes.Equal(again.Args, job.Args) {
+		return nil, err
+	}
 	d.Job = definedJob{
 		Kind:         job.Kind,
 		Queue:        job.Queue,
@@ -105,7 +114,11 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 	if opts.Unique != nil {
 		d.Job.Unique = &definedUnique{Key: job.UniqueKey, ByPeriod: byPeriod, Finished: job.UniqueFinished}
 	}
-	return json.Marshal(d)
+	def, err := json.Marshal(d)
+	if err != nil || bytes.Contains(def, []byte(`\u0000`)) {
+		return nil, err
+	}
+	return def, nil
 }
 
 // loadsByName reports whether the leader, loading loc by its name, gets the
@@ -224,32 +237,39 @@ func (j definedJob) params(slot time.Time) (driver.JobInsertParams, error) {
 // that whichever client leads schedules them. It writes again when the jobs
 // change or the client registers a new lease, and retries a failed write
 // every lease renewal interval.
-func (c *Client[TTx]) registrationLoop(ctx context.Context) {
+// periodicRecord is what a client last recorded of its periodic jobs.
+type periodicRecord struct {
+	clientID int64
+	regs     []driver.PeriodicRegistration
+	lastErr  string
+}
+
+// recordPeriodic writes the client's periodic jobs unless r already holds
+// them. They are compared each time rather than on change alone, since a
+// worker registered later changes what a StrictKinds client records.
+func (c *Client[TTx]) recordPeriodic(ctx context.Context, r *periodicRecord) {
+	id := c.clientID.Load()
+	regs := c.periodic.registrations()
+	if id == r.clientID && slices.EqualFunc(regs, r.regs, sameRegistration) {
+		return
+	}
+	err := c.exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: id, Registrations: regs})
+	switch {
+	case err == nil:
+		r.clientID, r.regs, r.lastErr = id, regs, ""
+		c.logger.DebugContext(ctx, "hopper: recorded periodic jobs", "client_id", id, "count", len(regs))
+	case ctx.Err() != nil:
+	case err.Error() != r.lastErr:
+		r.lastErr = err.Error()
+		c.logger.WarnContext(ctx, "hopper: record periodic jobs", "client_id", id, "error", err)
+	}
+}
+
+func (c *Client[TTx]) registrationLoop(ctx context.Context, r *periodicRecord) {
 	ticker := time.NewTicker(c.tuning.leaseRenew)
 	defer ticker.Stop()
-	var (
-		writtenID int64
-		written   []driver.PeriodicRegistration
-		lastErr   string
-	)
 	for {
-		id := c.clientID.Load()
-		// Compared each time rather than on change alone, since a worker
-		// registered later changes what a StrictKinds client records.
-		regs := c.periodic.registrations()
-		if id != writtenID || !slices.EqualFunc(regs, written, sameRegistration) {
-			err := c.exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: id, Registrations: regs})
-			switch {
-			case err == nil:
-				writtenID, written, lastErr = id, regs, ""
-				c.logger.DebugContext(ctx, "hopper: recorded periodic jobs", "client_id", id, "count", len(regs))
-			case ctx.Err() != nil:
-				return
-			case err.Error() != lastErr:
-				lastErr = err.Error()
-				c.logger.WarnContext(ctx, "hopper: record periodic jobs", "client_id", id, "error", err)
-			}
-		}
+		c.recordPeriodic(ctx, r)
 		select {
 		case <-ctx.Done():
 			return
@@ -293,6 +313,9 @@ func (c *Client[TTx]) readStored(ctx context.Context, conflicts map[string]strin
 		}
 		return nil, false
 	}
+	slices.SortStableFunc(rows, func(a, b driver.PeriodicRegistrationRow) int {
+		return cmp.Or(b.ClientStartedAt.Compare(a.ClientStartedAt), cmp.Compare(b.ClientID, a.ClientID))
+	})
 	byName := make(map[string][]storedDef, len(rows))
 	for _, r := range rows {
 		if defs := byName[r.Name]; len(defs) > 0 && r.Digest != defs[0].digest && conflicts[r.Name] != defs[0].digest {
