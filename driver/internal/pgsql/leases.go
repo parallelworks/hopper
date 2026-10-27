@@ -158,9 +158,13 @@ func (e *Executor) JobLeaseRenew(ctx context.Context, params driver.JobLeaseRene
 // leaseDueSQL is the condition that the lease l is due. Only the starts of
 // clients whose leases are live count: a client that started after the
 // renewal and lapsed before the cluster went down keeps its row until a
-// leader prunes it, after the first expiry once the cluster is back.
+// leader prunes it, after the first expiry once the cluster is back. A
+// start later than now(), which only a clock set ahead and then corrected
+// leaves, counts once the clock reaches it: counted before, it would hold
+// every lease renewed before it until then.
 const leaseDueSQL = `l.expires_at <= now()
-    AND coalesce((SELECT min(c.started_at) FROM {{schema}}.hopper_clients c WHERE c.started_at > l.renewed_at AND c.expires_at > now())
+    AND coalesce((SELECT min(c.started_at) FROM {{schema}}.hopper_clients c
+                  WHERE c.started_at > l.renewed_at AND c.started_at <= now() AND c.expires_at > now())
       + greatest(l.ttl, make_interval(secs => $5::float8)), l.expires_at) <= now()`
 
 // jobLeaseExpiredError is the error entry of an attempt whose lease expired.

@@ -445,8 +445,13 @@ func TestLeasesOutlastARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(grace + ttl/2)
-	restarted := time.Now()
 	second := leaseClient(h, &hopper.Config{JobLeaseGrace: grace})
+	// The restart is the second client's start, by database time, as the
+	// expiry's error entry is.
+	var restarted time.Time
+	if err := h.pool.QueryRow(ctx, "SELECT max(started_at) FROM hopper_clients").Scan(&restarted); err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(3 * fastTuning.LeaderInterval)
 
 	lost, back := ids[0], tokens[1:]
@@ -473,7 +478,7 @@ func TestLeasesOutlastARestart(t *testing.T) {
 	if len(job.Errors) != 1 || job.Errors[0].Rescue != hopper.RescueLeaseExpired {
 		t.Fatalf("the lost worker's job's errors = %+v", job.Errors)
 	}
-	if after := job.Errors[0].At.Sub(restarted); after < grace-time.Second {
+	if after := job.Errors[0].At.Sub(restarted); after < grace {
 		t.Errorf("the lost worker's lease expired %s after the restart, before the grace of %s", after, grace)
 	}
 	for _, token := range back {

@@ -173,10 +173,14 @@ func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireL
 	// FinishTx's, and leaves the leases to the next pass.
 	err := e.writeBrief(ctx, func(x *w) error {
 		jobs = jobs[:0]
+		// A client's start later than now, which a host clock set ahead and
+		// then corrected leaves (see clock), counts once the clock
+		// reaches it, as on PostgreSQL.
 		rows, err := queryAll(ctx, x, scanLive, `SELECT `+prefixed(liveRowColumns, "j")+` FROM hopper_job_leases l
 			JOIN hopper_jobs j ON j.id = l.id
 			WHERE l.expires_at <= ?1
-			  AND coalesce((SELECT min(c.started_at) FROM hopper_clients c WHERE c.started_at > l.renewed_at AND c.expires_at > ?1)
+			  AND coalesce((SELECT min(c.started_at) FROM hopper_clients c
+			                WHERE c.started_at > l.renewed_at AND c.started_at <= ?1 AND c.expires_at > ?1)
 			    + max(l.ttl, ?3), l.expires_at) <= ?1
 			  AND j.state = 'running' AND j.attempted_by IS NULL AND j.fence = l.fence
 			  AND EXISTS (SELECT 1 FROM hopper_clients me WHERE me.id = ?4 AND me.expires_at > ?1)

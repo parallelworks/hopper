@@ -1998,9 +1998,15 @@ attempt is owned by a **job lease** instead.
   lease. The leader expires leases only while its own client lease is live, checked in
   the same statement, so a leader that slept past its lease expires nothing until it
   has re-registered, which is itself a start; one that slept past job leases' TTL but
-  not its own lease, as the only client, expires them on waking, with no grace. The
-  condition is
-  computed from `hopper_job_leases` and `hopper_clients` alone: no schema change, and
+  not its own lease, as the only client, expires them on waking, with no grace. So a
+  sole leader whose own lease keeps lapsing within the grace of its last start also
+  keeps such a lease from expiring, though its starts do not overlap. A database outage
+  too short for any client's lease to lapse restarts no client, so it gives no grace: a
+  lease whose TTL it outlasts expires once the database is back. A start later than
+  `now()`, which only a clock set ahead and then corrected leaves, counts once the clock
+  reaches it; counted before, it would hold every lease renewed before it until then.
+  The condition is computed from `hopper_job_leases` and `hopper_clients` alone: no
+  schema change, and
   the cost is a scan of the small clients table for each lease past its expiry, twice
   on PostgreSQL (in `due` and on the locked row), on every pass while the grace runs:
   leases times clients per leader interval after a restart.

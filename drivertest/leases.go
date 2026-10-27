@@ -690,6 +690,26 @@ func testExpireLeasesAfterTwoStarts[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+// testExpireLeasesAfterFutureStart gives no grace for a client's start
+// later than now, which a clock set ahead and then corrected leaves:
+// counted, it would hold every lease renewed before it until the clock
+// caught up.
+func testExpireLeasesAfterFutureStart[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	me := expirer(ctx, t, f, d)
+	id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+	claimByID(ctx, t, exec, id)
+	f.ExpireJobLease(ctx, t, d, id)
+	ahead := register(ctx, t, exec)
+	f.AgeClientStart(ctx, t, d, ahead, -time.Hour)
+	jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
+	if err != nil || len(jobs) != 1 {
+		t.Errorf("expire after a client's start an hour ahead = %d jobs, %v; want the lease", len(jobs), err)
+	}
+}
+
 // testExpireRacesRenew expires a lease whose renewal holds the lease row:
 // the renewal wins once it commits, and the job stays leased. A
 // single-writer engine's expiry does not wait for the renewal's

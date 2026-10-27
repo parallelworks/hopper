@@ -263,10 +263,10 @@ type Executor interface {
 	// error entry whose Rescue is RescueLeaseExpired, or, on its last
 	// attempt, discarded, or canceled if a cancel was requested. A lease is
 	// due at its expiry, or, if a client whose own lease is live started
-	// after the lease was last renewed, at the first such start plus the
-	// larger of its TTL and params.Grace, if that is later. It expires nothing unless the lease of
-	// client params.ClientID is live. It returns the jobs as they are
-	// afterwards.
+	// after the lease was last renewed (and no later than now), at the first
+	// such start plus the larger of its TTL and params.Grace, if that is
+	// later. It expires nothing unless the lease of client params.ClientID
+	// is live. It returns the jobs as they are afterwards.
 	JobExpireLeases(ctx context.Context, params JobExpireLeasesParams) ([]*JobRow, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.

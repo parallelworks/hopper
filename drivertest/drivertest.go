@@ -60,7 +60,8 @@ type Fixture[TTx any] interface {
 	// lease rows the engine keeps.
 	ExpireJobLease(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
 	CountJobLeases(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
-	// AgeClientStart backdates a client's start by age.
+	// AgeClientStart backdates a client's start by age; a negative age
+	// moves it ahead.
 	AgeClientStart(ctx context.Context, t *testing.T, d driver.Driver[TTx], clientID int64, age time.Duration)
 	// CountLive and CountHistory count jobs in the live table and in history.
 	CountLive(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
@@ -136,6 +137,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"ExpireLeasesAfterRestartNoGrace", testExpireLeasesAfterRestartNoGrace[TTx]},
 		{"ExpireLeasesAfterLapsedStart", testExpireLeasesAfterLapsedStart[TTx]},
 		{"ExpireLeasesAfterTwoStarts", testExpireLeasesAfterTwoStarts[TTx]},
+		{"ExpireLeasesAfterFutureStart", testExpireLeasesAfterFutureStart[TTx]},
 		{"ExpireRacesRenew", testExpireRacesRenew[TTx]},
 		{"ExpireRacesFinalize", testExpireRacesFinalize[TTx]},
 		{"ExpireRacesCancel", testExpireRacesCancel[TTx]},
