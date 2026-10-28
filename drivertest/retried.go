@@ -26,18 +26,28 @@ func retriedWorkflow(ctx context.Context, t *testing.T, exec driver.Executor) *d
 	return wf
 }
 
-// callbackKinds returns the kinds of the callbacks in the queue "callbacks".
-func callbackKinds(ctx context.Context, t *testing.T, exec driver.Executor) map[string]bool {
+// checkCallbacks checks that the callbacks in the queue "callbacks" are
+// on-complete and, of on-success and on-failure, the one failed calls
+// for, each inserted once.
+func checkCallbacks(ctx context.Context, t *testing.T, exec driver.Executor, failed bool) {
 	t.Helper()
 	jobs, err := exec.JobList(ctx, driver.JobListParams{Queue: "callbacks", Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
-	kinds := map[string]bool{}
+	got := map[string]int{}
 	for _, j := range jobs {
-		kinds[j.Kind] = true
+		got[j.Kind]++
 	}
-	return kinds
+	want := map[string]int{"on-complete": 1, "on-success": 1, "on-failure": 0}
+	if failed {
+		want["on-success"], want["on-failure"] = 0, 1
+	}
+	for kind, n := range want {
+		if got[kind] != n {
+			t.Errorf("callback %s inserted %d times, want %d (callbacks %v)", kind, got[kind], n, got)
+		}
+	}
 }
 
 // testWorkflowRetriedFailure checks that a failed workflow step retried
@@ -84,21 +94,18 @@ func testWorkflowRetriedFailure[TTx any](t *testing.T, f Fixture[TTx]) {
 			if err != nil || batch.CompletedAt.IsZero() || batch.Pending != 0 || batch.Failed != wantFailed {
 				t.Fatalf("workflow = %+v, %v; want it completed with %d failed", batch, err, wantFailed)
 			}
-			want := map[string]bool{"on-complete": true, "on-success": again == driver.JobStateCompleted, "on-failure": again != driver.JobStateCompleted}
-			got := callbackKinds(ctx, t, exec)
-			for kind, ran := range want {
-				if got[kind] != ran {
-					t.Errorf("callback %s ran = %v, want %v (callbacks %v)", kind, got[kind], ran, got)
-				}
-			}
+			checkCallbacks(ctx, t, exec, again != driver.JobStateCompleted)
 		})
 	}
 }
 
 // testWorkflowRetriedFailureHeld checks that a retry of a failed workflow
 // step held open in a caller's transaction holds up neither the finalize of
-// its workflow's last other step nor the leader's settle, and that once it
-// commits and the step completes, the workflow's counts come out right.
+// its workflow's last other step nor the leader's settle. The finalize,
+// which decides from its snapshot, completes the workflow without the step
+// and with its failure, and runs OnFailure. Once the retry commits and the
+// step completes, the workflow keeps that failure, as one whose retry found
+// it completed does, rather than report none after its OnFailure has run.
 func testWorkflowRetriedFailureHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -118,8 +125,10 @@ func testWorkflowRetriedFailureHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 	})
 
 	tx, commit, rollback := f.Begin(ctx, t, d)
+	// A helper that fails the test while the transaction is open must not
+	// leave it open, for the driver's cleanup would wait for it.
+	t.Cleanup(func() { _ = rollback() })
 	if _, err := d.UnwrapTx(tx).JobRetry(ctx, driver.JobRetryParams{ID: a}); err != nil {
-		_ = rollback()
 		t.Fatal(err)
 	}
 	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -127,25 +136,30 @@ func testWorkflowRetriedFailureHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 	applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: result})
 	cancel()
 	if err != nil || len(applied) != 1 {
-		_ = rollback()
 		t.Fatalf("finalize of the last step while a retry of its failed sibling is held open = %v, %v", applied, err)
 	}
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	_, err = exec.BatchSettle(sctx, driver.BatchSettleParams{Limit: 10, Results: true})
 	cancel()
 	if err != nil {
-		_ = rollback()
 		t.Fatalf("the leader's settle while a retry is held open: %v", err)
+	}
+	if batch, err := exec.BatchGet(ctx, wf.ID); err != nil || batch.CompletedAt.IsZero() || batch.Failed != 1 {
+		t.Fatalf("workflow = %+v, %v; want it completed by its last other step, with the held step's failure", batch, err)
 	}
 	if err := commit(); err != nil {
 		t.Fatal(err)
+	}
+	if batch, err := exec.BatchGet(ctx, wf.ID); err != nil || batch.Pending != 0 || batch.Failed != 1 {
+		t.Fatalf("workflow = %+v, %v; want the retry, which found it completed, to leave its counts", batch, err)
 	}
 	claimOne(ctx, t, exec, clientID, a)
 	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: a, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
 	if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{Limit: 10}); err != nil {
 		t.Fatal(err)
 	}
-	if batch, err := exec.BatchGet(ctx, wf.ID); err != nil || batch.CompletedAt.IsZero() || batch.Pending != 0 || batch.Failed != 0 {
-		t.Fatalf("workflow = %+v, %v; want it completed, with no pending step and no failure", batch, err)
+	if batch, err := exec.BatchGet(ctx, wf.ID); err != nil || batch.CompletedAt.IsZero() || batch.Pending != 0 || batch.Failed != 1 {
+		t.Fatalf("workflow = %+v, %v; want it completed with the failure its callbacks were given", batch, err)
 	}
+	checkCallbacks(ctx, t, exec, true)
 }

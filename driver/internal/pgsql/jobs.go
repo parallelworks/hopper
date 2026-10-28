@@ -1790,7 +1790,9 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 			// batch row: a retry held open in a caller's transaction
 			// (JobRetryTx) would hold that row, and the finalize that
 			// completes the batch, with its whole flush, would wait for the
-			// transaction.
+			// transaction. A statement that completes the batch without
+			// seeing the row completes it without the job, with its failure,
+			// and BatchSettle drops the row when it commits (batchSettleSQL).
 			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_batch_progress (batch_id, done, failed)
 				SELECT b.id, -1, CASE WHEN $2 THEN -1 ELSE 0 END FROM {{schema}}.hopper_batches b WHERE b.id = $1 AND b.completed_at IS NULL`,
 				uuidParam(job.BatchID), failed); err != nil {
