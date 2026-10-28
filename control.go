@@ -67,7 +67,9 @@ func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, id JobID) (*JobRo
 // whose re-driven job then completes runs OnSuccess, not OnFailure. Jobs
 // its failure canceled by cascade stay failed. A retry that finds the batch
 // completed changes nothing of it, and neither does the job's next finish:
-// a completed batch keeps the counts its callbacks were given.
+// a completed batch keeps the counts its callbacks were given. On Postgres,
+// a batch whose last other job finishes while the retry commits may
+// complete without it, as with JobRetryTx.
 func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID, opts ...RetryOption) (*JobRow, error) {
 	job, err := c.exec.JobRetry(ctx, retryParams(id, opts))
 	if err != nil {

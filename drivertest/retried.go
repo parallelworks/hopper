@@ -77,15 +77,7 @@ func testWorkflowRetriedFailure[TTx any](t *testing.T, f Fixture[TTx]) {
 			if batch, err := exec.BatchGet(ctx, wf.ID); err != nil || !batch.CompletedAt.IsZero() || batch.Failed != 0 {
 				t.Fatalf("workflow = %+v, %v; want it open, with no failure, while the retried step runs", batch, err)
 			}
-			claimOne(ctx, t, exec, clientID, a)
-			fin := driver.JobFinalize{ID: a, AttemptedBy: clientID, State: again, Archive: true}
-			if again != driver.JobStateCompleted {
-				fin.Error = &driver.AttemptError{Attempt: 2, Error: "boom again"}
-			}
-			finalizeCurrent(ctx, t, exec, fin)
-			if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{Limit: 10}); err != nil {
-				t.Fatal(err)
-			}
+			finishAgain(ctx, t, exec, clientID, a, again)
 			batch, err := exec.BatchGet(ctx, wf.ID)
 			wantFailed := 0
 			if again != driver.JobStateCompleted {
@@ -100,8 +92,9 @@ func testWorkflowRetriedFailure[TTx any](t *testing.T, f Fixture[TTx]) {
 }
 
 // testWorkflowRetriedFailureHeld checks that a retry of a failed workflow
-// step held open in a caller's transaction holds up neither the finalize of
-// its workflow's last other step nor the leader's settle. The finalize,
+// step held open in a caller's transaction holds up neither a client's
+// settle by ID, the finalize of its workflow's last other step nor the
+// leader's settle. The finalize,
 // which decides from its snapshot, completes the workflow without the step
 // and with its failure, and runs OnFailure. Once the retry commits and the
 // step finishes again, completed or failed, the workflow keeps that
@@ -133,6 +126,12 @@ func testWorkflowRetriedFailureHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 			t.Cleanup(func() { _ = rollback() })
 			if _, err := d.UnwrapTx(tx).JobRetry(ctx, driver.JobRetryParams{ID: a}); err != nil {
 				t.Fatal(err)
+			}
+			// The settle a client runs on the batches of its flush folds the
+			// step's failure without waiting for the retry: one that waited
+			// would give up at its lock timeout and fold nothing.
+			if res, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{wf.ID}}); err != nil || res.Folded != 1 {
+				t.Fatalf("settle by ID while a retry of a failed step is held open = %+v, %v; want the workflow folded", res, err)
 			}
 			fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			result := withFences(ctx, t, exec, []driver.JobFinalize{{ID: b, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}})

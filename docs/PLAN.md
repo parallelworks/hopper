@@ -1504,12 +1504,12 @@ re-driven job fails again counts it once (§11). A retry that finds the batch
 completed changes none of its counts, and on Postgres neither does one that the
 statement completing the batch did not see (held open in a caller's transaction,
 `JobRetryTx`, or committed while that statement ran, the finalize of the batch's last
-other job or a settle): it completed the batch without the job, with its failure and
-`OnFailure`. Neither does the job's next finish, completed or failed: a completed
-batch keeps the counts its callbacks were given. Jobs that its failure canceled by
-cascade stay failed. Re-driving one of those too counts it as pending again, but its
-dependencies went with its cancel, so it runs at once, not after the job it depended
-on.
+other job or a settle): it completed the batch without the job, with the job's earlier
+outcome (its failure and `OnFailure`, for a failed job). Neither does the job's next
+finish, completed or failed: a completed batch keeps the counts its callbacks were
+given. Jobs that its failure canceled by cascade stay failed. Re-driving one of those
+too counts it as pending again, but its dependencies went with its cancel, so it runs
+at once, not after the job it depended on.
 
 `JobDelete` removes a job that is not running and refuses a running one (cancel it,
 then delete it once it has finished). A finalized job's history row is deleted. A
@@ -2394,12 +2394,14 @@ observability without new machinery.
     jobs at the same time each miss the other's uncommitted row, so neither completes
     the batch. `BatchSettle` locks batch rows that have progress rows, folds the rows
     into `pending` and `failed`, and completes those with nothing remaining, with
-    their callbacks. The rows of a batch that had completed when locked it deletes
-    without folding them: a retry the completing statement missed, and the finish of a
-    job re-driven after it completed (below), so that a completed batch keeps the
-    counts its callbacks were given. The finalizer runs it on the batches of a flush
-    once the flush has committed, waiting for a batch row another settle holds, so of
-    the two the one settling second sees the other's progress and completes the batch.
+    their callbacks. It deletes the rows of a batch that had completed when it locked
+    the batch without folding them: a retry the completing statement missed, and the
+    finish of a job re-driven after it completed (below), so that a completed batch
+    keeps the counts its callbacks were given. A leader of the previous release still
+    folds them, so while one holds the lease such a batch's counts can change. The
+    finalizer runs it on the batches of a flush once the flush has committed, waiting
+    for a batch row another settle holds, so of the two the one settling second sees
+    the other's progress and completes the batch.
     The wait is bounded (`lock_timeout` 500 ms, below `deadlock_timeout`, so a settle that
     would deadlock with a finalize completing several batches gives up first); a
     batch it cannot get is left to the leader, which on every pass sweeps batches

@@ -172,7 +172,8 @@ const batchProgressSelect = `CASE WHEN b.completed_at IS NULL THEN greatest(b.pe
 // until it commits. Whether a batch was open is read from the row as
 // locked, which nothing else can change before the fold, rather than
 // inferred from completed_at = now(), which a batch completed earlier in the
-// same transaction also satisfies.
+// same transaction also satisfies; only open batches are folded, so a
+// folded batch with completed_at set completed here.
 //
 // The rows of a batch that had completed when locked are deleted without
 // being folded. They are of jobs re-driven from history (JobRetry) that the
@@ -205,7 +206,7 @@ folded AS (
   FROM sums s WHERE b.id = s.batch_id
   RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete, b.completed_at, b.reads
 ),
-batches AS (SELECT f.* FROM folded f JOIN locked l ON l.id = f.id WHERE l.open AND f.completed_at IS NOT NULL),
+batches AS (SELECT * FROM folded WHERE completed_at IS NOT NULL),
 ` + resultsClearedSQL + `,
 ` + batchCallbacksSQL("$1") + `
 SELECT (SELECT count(*) FROM locked), (SELECT count(*) FROM batches), (SELECT id FROM locked ORDER BY id DESC LIMIT 1)`
