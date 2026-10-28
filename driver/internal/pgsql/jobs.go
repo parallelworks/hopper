@@ -1779,8 +1779,14 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 				return err
 			}
 			// The job counts as pending in its batch again, so that its next
-			// finish does not complete the batch while its dependents run.
-			if _, err := tx.Exec(ctx, `UPDATE {{schema}}.hopper_batches SET pending = pending + 1 WHERE id = $1 AND completed_at IS NULL`,
+			// finish does not complete the batch while its dependents run. It
+			// is a progress row of -1, appended as a finalize's count is,
+			// rather than an update of the batch row: a retry held open in a
+			// caller's transaction (JobRetryTx) would hold that row, and the
+			// finalize that completes the batch, with its whole flush, would
+			// wait for the transaction.
+			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_batch_progress (batch_id, done, failed)
+				SELECT b.id, -1, 0 FROM {{schema}}.hopper_batches b WHERE b.id = $1 AND b.completed_at IS NULL`,
 				uuidParam(job.BatchID)); err != nil {
 				return err
 			}

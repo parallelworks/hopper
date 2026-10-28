@@ -438,21 +438,25 @@ func benchWorkflow(i int, reads bool) *hopper.Workflow {
 // output: none for the first step, the first for each middle one, and the
 // middle ones for the last.
 func benchDependenciesOK(job *hopper.Job[benchArgs]) bool {
-	want := 1
-	switch job.Args.N % workflowSteps {
+	first := job.Args.N - job.Args.N%workflowSteps
+	lo, hi := first, first // the steps, by N, whose outputs it gets
+	switch job.Args.N - first {
 	case 0:
-		want = 0
+		lo, hi = first, first-1
 	case workflowSteps - 1:
-		want = workflowSteps - 2
+		lo, hi = first+1, first+workflowSteps-2
 	}
-	if len(job.Dependencies) != want {
+	if len(job.Dependencies) != hi-lo+1 {
 		return false
 	}
+	seen := make(map[int]bool, len(job.Dependencies))
 	for _, d := range job.Dependencies {
 		var out benchOutput
-		if d.State != hopper.JobStateCompleted || json.Unmarshal(d.Output, &out) != nil || out.Artifact != "bench/"+strconv.Itoa(out.N) {
+		if d.State != hopper.JobStateCompleted || json.Unmarshal(d.Output, &out) != nil ||
+			out.N < lo || out.N > hi || seen[out.N] || out.Artifact != "bench/"+strconv.Itoa(out.N) {
 			return false
 		}
+		seen[out.N] = true
 	}
 	return true
 }

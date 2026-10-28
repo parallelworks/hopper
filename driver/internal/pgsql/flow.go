@@ -186,9 +186,7 @@ folded AS (
   RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete, b.completed_at, b.reads
 ),
 batches AS (SELECT f.* FROM folded f JOIN locked l ON l.id = f.id WHERE l.open AND f.completed_at IS NOT NULL),
-results_cleared AS (
-  DELETE FROM {{schema}}.hopper_job_results r WHERE r.batch_id = ANY (ARRAY(SELECT id FROM batches WHERE reads)) RETURNING r.job_id
-),
+` + resultsClearedSQL + `,
 ` + batchCallbacksSQL("$1") + `
 SELECT (SELECT count(*) FROM locked), (SELECT count(*) FROM batches), (SELECT id FROM locked ORDER BY id DESC LIMIT 1)`
 }

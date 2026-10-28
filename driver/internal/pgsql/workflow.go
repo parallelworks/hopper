@@ -205,7 +205,13 @@ const resultsSQL = `results AS (
     finalized_at = EXCLUDED.finalized_at
   RETURNING job_id
 ),
-results_cleared AS (
+` + resultsClearedSQL
+
+// resultsClearedSQL deletes the dependency results of the batches a CTE
+// named batches has just completed that have a step that reads them
+// (hopper_batches.reads), for the statements that complete batches: the
+// finalize tail and BatchSettle.
+const resultsClearedSQL = `results_cleared AS (
   DELETE FROM {{schema}}.hopper_job_results r WHERE r.batch_id = ANY (ARRAY(SELECT id FROM batches WHERE reads)) RETURNING r.job_id
 )`
 

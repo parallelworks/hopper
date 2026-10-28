@@ -520,6 +520,51 @@ func testDependencyResultsRetried[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+// testDependencyResultsRetryHeld retries a finished workflow step from
+// history in a transaction held open (JobRetryTx) while its sibling, the
+// workflow's last pending step, finalizes. The retry counts the step as
+// pending again without holding the workflow's row, so the finalize, which
+// completes the workflow from its snapshot, waits for nothing.
+func testDependencyResultsRetryHeld[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	if singleWriter(d) {
+		t.Skip("on an engine that runs one writer at a time, every write waits for an open transaction")
+	}
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Name: "held", Jobs: params("step", 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID
+	if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
+		t.Fatalf("claimed %d jobs, want both steps", len(jobs))
+	}
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: a, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+
+	tx, commit, rollback := f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
+	if _, err := d.UnwrapTx(tx).JobRetry(ctx, driver.JobRetryParams{ID: a}); err != nil {
+		t.Fatal(err)
+	}
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	result := withFences(ctx, t, exec, []driver.JobFinalize{{ID: b, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}})
+	if applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: result}); err != nil || len(applied) != 1 {
+		t.Fatalf("finalize of the last step while a retry of its sibling is held open = %v, %v", applied, err)
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	claimOne(ctx, t, exec, clientID, a)
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: a, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	if b, err := exec.BatchGet(ctx, wf.ID); err != nil || b.CompletedAt.IsZero() || b.Pending != 0 {
+		t.Fatalf("workflow = %+v, %v; want it completed", b, err)
+	}
+}
+
 // testDependencyResultsUnread checks that a workflow none of whose steps
 // reads its dependencies records no results and claims none.
 func testDependencyResultsUnread[TTx any](t *testing.T, f Fixture[TTx]) {

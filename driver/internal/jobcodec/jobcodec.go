@@ -165,32 +165,29 @@ func DecodeSteps(stored string) map[driver.JobID]string {
 	return out
 }
 
-// Dependency is a dependency as a claim reads it, in JSON.
-type Dependency struct {
+// dependency is a driver.Dependency as a claim reads it, in JSON. A null
+// step or state, of an unnamed step or a dependency without a result,
+// leaves the field empty.
+type dependency struct {
 	ID     driver.JobID    `json:"id"`
-	Step   *string         `json:"step"`
-	State  *string         `json:"state"`
+	Step   string          `json:"step"`
+	State  driver.JobState `json:"state"`
 	Output json.RawMessage `json:"output"`
 }
 
 // DecodeDependencies reads a claim's JSON array of dependencies, or none
 // if it is not one.
 func DecodeDependencies(stored string) []driver.Dependency {
-	var deps []Dependency
+	var deps []dependency
 	if stored == "" || json.Unmarshal([]byte(stored), &deps) != nil || len(deps) == 0 {
 		return nil
 	}
 	out := make([]driver.Dependency, len(deps))
 	for i, d := range deps {
-		out[i] = driver.Dependency{ID: d.ID}
-		if d.Step != nil {
-			out[i].Step = *d.Step
-		}
-		if d.State != nil {
-			out[i].State = driver.JobState(*d.State)
-		}
-		if len(d.Output) > 0 && string(d.Output) != "null" {
-			out[i].Output = d.Output
+		out[i] = driver.Dependency(d)
+		// A JSON null reads as no output, as on SQLite.
+		if string(d.Output) == "null" {
+			out[i].Output = nil
 		}
 	}
 	return out

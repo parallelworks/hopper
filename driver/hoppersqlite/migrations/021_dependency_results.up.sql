@@ -23,5 +23,8 @@ ALTER TABLE hopper_job_deps ADD COLUMN step TEXT;
 ALTER TABLE hopper_job_deps ADD COLUMN reads INTEGER;
 ALTER TABLE hopper_batches ADD COLUMN steps TEXT;
 ALTER TABLE hopper_batches ADD COLUMN reads INTEGER;
+-- A claim finds the edges that read by the partial index, which is empty
+-- for workflows that never ask. The finalize reads every dependent of a
+-- job, with its flag, by hopper_job_deps_depends_on, for the promotion
+-- too, so the edges need no index by dependency of their own.
 CREATE INDEX hopper_job_deps_reads_job ON hopper_job_deps (job_id) WHERE reads;
-CREATE INDEX hopper_job_deps_reads_depends_on ON hopper_job_deps (depends_on) WHERE reads;
