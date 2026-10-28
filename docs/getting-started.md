@@ -387,9 +387,10 @@ that have finished: name a step with `StepOpts.Name`, and a step after it
 finds it with `job.Dependency(name)`, with its final state (`completed`,
 `canceled` or `discarded`) and the output its worker passed to
 `hopper.SetOutput`. They are kept until the workflow completes, whatever the
-history's retention, so a step that is retried or snoozed gets them again.
-hopper records a step's state and output only for a dependent that asks, so
-a workflow that never does costs nothing extra.
+history's retention, so a step whose attempt is retried or snoozed gets them
+again; a step retried from history with `JobRetry` after it finished is
+claimed without them. hopper records a step's state and output only for a
+dependent that asks, so a workflow that never does costs nothing extra.
 
 ```go
 parse := wf.Add(Parse{}, &hopper.StepOpts{Name: "parse", After: []hopper.Step{fetch}})

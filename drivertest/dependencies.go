@@ -520,11 +520,14 @@ func testDependencyResultsRetried[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
-// testDependencyResultsRetryHeld retries a finished workflow step from
-// history in a transaction held open (JobRetryTx) while its sibling, the
-// workflow's last pending step, finalizes. The retry counts the step as
-// pending again without holding the workflow's row, so the finalize, which
-// completes the workflow from its snapshot, waits for nothing.
+// testDependencyResultsRetryHeld retries a finished workflow step, whose
+// dependent read its result, from history in a transaction held open
+// (JobRetryTx) while its sibling, the workflow's last pending step,
+// finalizes. The retry counts the step as pending again without holding
+// the workflow's row, and the statement that completes the workflow skips
+// the result row the retry holds, so the finalize, which completes the
+// workflow from its snapshot, waits for nothing. A retry that commits has
+// deleted that result; one that rolls back leaves it to the leader's sweep.
 func testDependencyResultsRetryHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -534,34 +537,60 @@ func testDependencyResultsRetryHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 	exec := d.Executor()
 	clientID := register(ctx, t, exec)
 
-	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Name: "held", Jobs: params("step", 2)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, b := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID
-	if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
-		t.Fatalf("claimed %d jobs, want both steps", len(jobs))
-	}
-	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: a, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	for _, committed := range []bool{true, false} {
+		// a, then c, which reads it; b, the last to finish, runs beside them.
+		wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+			Name: "held", Jobs: params("step", 3), Steps: []string{"a", "b", "c"},
+			Deps: []driver.JobDependency{{Job: 2, DependsOn: 0, Reads: true}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, b, c := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID, wf.Jobs[2].Job.ID
+		if jobs := claim(ctx, t, exec, clientID, 2); len(jobs) != 2 {
+			t.Fatalf("claimed %d jobs, want a and b", len(jobs))
+		}
+		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: a, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`1`)})
+		checkDependencies(t, claimOne(ctx, t, exec, clientID, c), wantDependency{"a", driver.JobStateCompleted, `1`})
+		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: c, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+		if n := f.CountJobResults(ctx, t, d); n != 1 {
+			t.Fatalf("%d dependency results before the retry, want a's", n)
+		}
 
-	tx, commit, rollback := f.Begin(ctx, t, d)
-	defer rollback() //nolint:errcheck // already committed on the happy path
-	if _, err := d.UnwrapTx(tx).JobRetry(ctx, driver.JobRetryParams{ID: a}); err != nil {
-		t.Fatal(err)
-	}
-	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	result := withFences(ctx, t, exec, []driver.JobFinalize{{ID: b, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}})
-	if applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: result}); err != nil || len(applied) != 1 {
-		t.Fatalf("finalize of the last step while a retry of its sibling is held open = %v, %v", applied, err)
-	}
-	if err := commit(); err != nil {
-		t.Fatal(err)
-	}
-	claimOne(ctx, t, exec, clientID, a)
-	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: a, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
-	if b, err := exec.BatchGet(ctx, wf.ID); err != nil || b.CompletedAt.IsZero() || b.Pending != 0 {
-		t.Fatalf("workflow = %+v, %v; want it completed", b, err)
+		tx, commit, rollback := f.Begin(ctx, t, d)
+		if _, err := d.UnwrapTx(tx).JobRetry(ctx, driver.JobRetryParams{ID: a}); err != nil {
+			_ = rollback()
+			t.Fatal(err)
+		}
+		fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		result := withFences(ctx, t, exec, []driver.JobFinalize{{ID: b, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}})
+		applied, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: result})
+		cancel()
+		if err != nil || len(applied) != 1 {
+			_ = rollback()
+			t.Fatalf("finalize of the last step while a retry of its sibling is held open = %v, %v", applied, err)
+		}
+		end := rollback
+		if committed {
+			end = commit
+		}
+		if err := end(); err != nil {
+			t.Fatal(err)
+		}
+		if committed {
+			claimOne(ctx, t, exec, clientID, a)
+			finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: a, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+		} else {
+			if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{Limit: 10, Results: true}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if b, err := exec.BatchGet(ctx, wf.ID); err != nil || b.CompletedAt.IsZero() || b.Pending != 0 {
+			t.Fatalf("workflow = %+v, %v; want it completed", b, err)
+		}
+		if n := f.CountJobResults(ctx, t, d); n != 0 {
+			t.Errorf("retry committed %v: %d dependency results once the workflow completed, want none", committed, n)
+		}
 	}
 }
 

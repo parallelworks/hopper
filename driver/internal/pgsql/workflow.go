@@ -210,9 +210,17 @@ const resultsSQL = `results AS (
 // resultsClearedSQL deletes the dependency results of the batches a CTE
 // named batches has just completed that have a step that reads them
 // (hopper_batches.reads), for the statements that complete batches: the
-// finalize tail and BatchSettle.
+// finalize tail and BatchSettle. It skips a row another transaction holds:
+// a JobRetryTx held open that deletes its step's result, which the
+// statement would otherwise wait for, with its whole flush. A retry that
+// commits has deleted the row, and one that rolls back leaves it to the
+// leader's sweep of the results of completed workflows.
 const resultsClearedSQL = `results_cleared AS (
-  DELETE FROM {{schema}}.hopper_job_results r WHERE r.batch_id = ANY (ARRAY(SELECT id FROM batches WHERE reads)) RETURNING r.job_id
+  DELETE FROM {{schema}}.hopper_job_results r WHERE (r.batch_id, r.job_id) IN (
+    SELECT l.batch_id, l.job_id FROM {{schema}}.hopper_job_results l
+    WHERE l.batch_id = ANY (ARRAY(SELECT id FROM batches WHERE reads))
+    FOR UPDATE SKIP LOCKED)
+  RETURNING r.job_id
 )`
 
 // workflowPromoteSQL promotes the pending jobs among those a CTE named

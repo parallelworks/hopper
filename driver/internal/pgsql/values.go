@@ -133,6 +133,10 @@ func ArrayLiteral(v any) (literal string, ok bool) {
 		for i, e := range v {
 			write(i, strconv.FormatBool(e), false)
 		}
+	case []*bool:
+		for i, e := range v {
+			write(i, strconv.FormatBool(deref(e)), e == nil)
+		}
 	case [][]byte:
 		for i, e := range v {
 			write(i, string(e), e == nil)

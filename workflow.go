@@ -62,8 +62,10 @@ type StepOpts struct {
 // that started the step's attempt read it: its step name, its final state
 // (completed, canceled or discarded) and its output. A step's
 // dependencies are kept until its workflow completes, whatever the
-// history's retention and DeleteCompleted, so a step retried or snoozed
-// gets them again.
+// history's retention and DeleteCompleted, so a step whose attempt is
+// retried or snoozed gets them again. A step retried from history
+// (JobRetry) after it finished has no edges left, and is claimed without
+// them.
 type Dependency = driver.Dependency
 
 // After returns options for a step that waits for the given steps.

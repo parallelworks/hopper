@@ -120,3 +120,13 @@ func TestJobListTxSavepointOnlyForRefusableFilters(t *testing.T) {
 		}
 	}
 }
+
+// TestArrayLiteralNullableBools checks that a transport without slices
+// (hoppersql over lib/pq) can send the edges' reads flags, which a workflow
+// insert passes as []*bool.
+func TestArrayLiteralNullableBools(t *testing.T) {
+	yes := true
+	if got, ok := ArrayLiteral([]*bool{&yes, nil}); !ok || got != `{"true",NULL}` {
+		t.Errorf("ArrayLiteral([]*bool) = %q, %v", got, ok)
+	}
+}
