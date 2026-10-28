@@ -189,7 +189,8 @@ type WorkOpts struct {
 	// RecordCursor update in memory; Progress itself is left as it is.
 	Progress *hopper.Progress
 	// Dependencies are the finished dependencies of a workflow step, as a
-	// claim would give them. Work runs the job with a copy.
+	// claim gives them to a step with StepOpts.Dependencies set. Work runs
+	// the job with a copy.
 	Dependencies []hopper.Dependency
 }
 

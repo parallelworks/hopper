@@ -1222,9 +1222,11 @@ func TestJobLeasesUpgradeTakesNoJobLock(t *testing.T) {
 // the upgrade, its dependent promoted, and a step after that. While a
 // transaction holds hopper_job_deps, as a finalize does, the migration
 // retries without holding up a statement on hopper_jobs, and it completes
-// once the transaction ends. The dependent's claim then carries the step
-// that finished before the upgrade with no state, and the next claim the
-// state and output this release recorded. Down drops the table and columns.
+// once the transaction ends. The workflow's edges, written before the
+// upgrade, do not read their dependencies (StepOpts.Dependencies), so its
+// steps are claimed without them and their finalizes record no results; an
+// edge marked as reading after the upgrade gets the dependency's state and
+// output. Down drops the table, columns and indexes.
 func TestDependencyResultsUpgrade(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1303,9 +1305,10 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 	if err != nil || len(claimed.Jobs) != 1 || claimed.Jobs[0].ID != b {
 		t.Fatalf("claim = %+v, %v; want the promoted step", claimed, err)
 	}
-	if deps := claimed.Jobs[0].Dependencies; len(deps) != 1 || deps[0].ID != a || deps[0].State != "" || deps[0].Output != nil {
-		t.Errorf("dependencies of the step whose dependency finished before the upgrade = %+v; want it with no state", deps)
+	if deps := claimed.Jobs[0].Dependencies; deps != nil {
+		t.Errorf("a step of a workflow inserted before the upgrade claimed with dependencies %+v", deps)
 	}
+	q(`UPDATE hopper_job_deps SET reads = true WHERE job_id = $1`, c)
 	applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
 		{ID: b, AttemptedBy: clientID, Fence: claimed.Jobs[0].Fence, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`{"after":true}`)},
 	}})
@@ -1325,7 +1328,8 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 	}
 	var left int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
-		WHERE table_schema = current_schema() AND (table_name, column_name) IN (('hopper_job_deps', 'step'), ('hopper_batches', 'steps'))`).Scan(&left); err != nil {
+		WHERE table_schema = current_schema() AND (table_name, column_name) IN
+		  (('hopper_job_deps', 'step'), ('hopper_batches', 'steps'), ('hopper_job_deps', 'reads'), ('hopper_batches', 'reads'))`).Scan(&left); err != nil {
 		t.Fatal(err)
 	}
 	var table *string

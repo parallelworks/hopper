@@ -24,6 +24,9 @@
 //	retry       as throughput, with every job failing its first attempt
 //	workflow    as throughput, in workflows of ten steps (one, then eight after it, then one after those),
 //	            each step recording a small output; -jobs is rounded down to a multiple of ten
+//	workflow-outputs
+//	            as workflow, with every step after the first claimed with its dependencies' outputs
+//	            (StepOpts.Dependencies), which each worker checks
 //	insert      InsertMany in batches of 100 (the unnest statement)
 //	copy        InsertMany in batches of 5000 (the COPY path)
 //	latency     commit-to-Work on an idle queue, local wake-up
@@ -54,6 +57,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -169,7 +173,9 @@ func run(ctx context.Context, url, schema string, scenarios []string, opts optio
 		case "retry":
 			r, err = b.drain(ctx, "retry", b.params(opts.jobs, nil), failOnceWorker)
 		case "workflow":
-			r, err = b.workflows(ctx, opts.jobs)
+			r, err = b.workflows(ctx, "workflow", opts.jobs, false)
+		case "workflow-outputs":
+			r, err = b.workflows(ctx, "workflow-outputs", opts.jobs, true)
 		case "insert":
 			r, err = b.insert(ctx, opts.jobs, 100)
 		case "copy":
@@ -366,7 +372,7 @@ func (b *bench) waitDrained(ctx context.Context) error {
 	}
 }
 
-func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
+func (b *bench) workflows(ctx context.Context, name string, jobs int, reads bool) (result, error) {
 	n := jobs / workflowSteps
 	if n < 1 {
 		return result{}, fmt.Errorf("-jobs must be at least %d", workflowSteps)
@@ -375,7 +381,7 @@ func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
 		return fanOut(ctx, n, 100, func(ctx context.Context, lo, hi int) error {
 			return pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
 				for i := lo; i < hi; i++ {
-					if _, err := inserter.InsertWorkflowTx(ctx, tx, benchWorkflow(i)); err != nil {
+					if _, err := inserter.InsertWorkflowTx(ctx, tx, benchWorkflow(i, reads)); err != nil {
 						return err
 					}
 				}
@@ -383,9 +389,22 @@ func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
 			})
 		})
 	}
-	r, err := b.drainLoaded(ctx, "workflow", n*workflowSteps, load, outputWorker)
+	work := outputWorker
+	var wrong atomic.Int64
+	if reads {
+		work = func(ctx context.Context, job *hopper.Job[benchArgs]) error {
+			if !benchDependenciesOK(job) {
+				wrong.Add(1)
+			}
+			return outputWorker(ctx, job)
+		}
+	}
+	r, err := b.drainLoaded(ctx, name, n*workflowSteps, load, work)
 	if err != nil {
 		return result{}, err
+	}
+	if n := wrong.Load(); n > 0 {
+		return result{}, fmt.Errorf("%d jobs claimed without their dependencies' outputs", n)
 	}
 	var outputs, open int
 	if err := b.pool.QueryRow(ctx, `SELECT
@@ -402,16 +421,40 @@ func (b *bench) workflows(ctx context.Context, jobs int) (result, error) {
 	return r, nil
 }
 
-func benchWorkflow(i int) *hopper.Workflow {
+func benchWorkflow(i int, reads bool) *hopper.Workflow {
 	wf := hopper.NewWorkflow("bench-"+strconv.Itoa(i), nil)
 	n := i * workflowSteps
 	root := wf.Add(benchArgs{N: n}, nil)
 	middle := make([]hopper.Step, workflowSteps-2)
 	for j := range middle {
-		middle[j] = wf.Add(benchArgs{N: n + 1 + j}, hopper.After(root))
+		middle[j] = wf.Add(benchArgs{N: n + 1 + j}, &hopper.StepOpts{After: []hopper.Step{root}, Dependencies: reads})
 	}
-	wf.Add(benchArgs{N: n + workflowSteps - 1}, hopper.After(middle...))
+	wf.Add(benchArgs{N: n + workflowSteps - 1}, &hopper.StepOpts{After: middle, Dependencies: reads})
 	return wf
+}
+
+// benchDependenciesOK reports whether a step of a workflow-outputs
+// workflow was claimed with each of its dependencies completed and its
+// output: none for the first step, the first for each middle one, and the
+// middle ones for the last.
+func benchDependenciesOK(job *hopper.Job[benchArgs]) bool {
+	want := 1
+	switch job.Args.N % workflowSteps {
+	case 0:
+		want = 0
+	case workflowSteps - 1:
+		want = workflowSteps - 2
+	}
+	if len(job.Dependencies) != want {
+		return false
+	}
+	for _, d := range job.Dependencies {
+		var out benchOutput
+		if d.State != hopper.JobStateCompleted || json.Unmarshal(d.Output, &out) != nil || out.Artifact != "bench/"+strconv.Itoa(out.N) {
+			return false
+		}
+	}
+	return true
 }
 
 type benchOutput struct {

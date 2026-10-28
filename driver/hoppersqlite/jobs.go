@@ -357,7 +357,7 @@ func (x *w) readDependencies(ctx context.Context, jobs []*driver.JobRow) error {
 	}, `SELECT d.job_id, d.depends_on, d.step, r.state, r.output
 		FROM hopper_job_deps d JOIN hopper_jobs j ON j.id = d.job_id
 		LEFT JOIN hopper_job_results r ON r.batch_id = j.batch_id AND r.job_id = d.depends_on
-		WHERE d.job_id IN (`+placeholders(len(args))+`)
+		WHERE d.job_id IN (`+placeholders(len(args))+`) AND d.reads
 		  AND (r.job_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = d.depends_on))
 		ORDER BY d.job_id, d.depends_on`, args...)
 	if err != nil {

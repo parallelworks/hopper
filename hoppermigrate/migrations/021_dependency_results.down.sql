@@ -12,8 +12,8 @@ BEGIN
   LOOP
     BEGIN
       LOCK TABLE hopper_job_deps, hopper_batches IN ACCESS EXCLUSIVE MODE;
-      ALTER TABLE hopper_batches DROP COLUMN steps;
-      ALTER TABLE hopper_job_deps DROP COLUMN step;
+      ALTER TABLE hopper_batches DROP COLUMN steps, DROP COLUMN reads;
+      ALTER TABLE hopper_job_deps DROP COLUMN step, DROP COLUMN reads;
       EXIT;
     EXCEPTION WHEN lock_not_available THEN
       tries := tries + 1;

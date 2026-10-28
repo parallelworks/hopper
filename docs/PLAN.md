@@ -699,8 +699,11 @@ job leases (§7.14), a plain `CREATE TABLE` that takes no lock on `hopper_jobs` 
 history. Schema v21 adds `hopper_job_results (job_id, batch_id, state, output,
 finalized_at)`, keyed by `(batch_id, job_id)`, for the dependencies a claimed workflow
 step carries (§11), `step` on `hopper_job_deps` (the name of the edge's dependency) and
-`steps` on `hopper_batches` (a workflow's step names by job ID). The columns take v17's
-loop on `hopper_job_deps` and `hopper_batches`, in the order a finalize names them;
+`steps` on `hopper_batches` (a workflow's step names by job ID), and `reads` on both (an
+edge whose dependent reads its dependencies, and a workflow with any such edge; NULL
+otherwise), with partial indexes on the edges that read, by dependent and by dependency.
+The columns and indexes take v17's loop on `hopper_job_deps` and `hopper_batches`, in
+the order a finalize names them; the indexes cover none of the existing edges, and
 neither `hopper_jobs` nor history is locked, so claims never wait for it.
 
 ### 6.1 Job IDs
@@ -2204,7 +2207,9 @@ the partition's extension lock, so the data volume has no size limit.
   one JSON line per scenario. It has the no-op baseline, mixed-priority, scheduled-heavy,
   tagged and retry-heavy workloads, a workflow workload (ten-step workflows, one step,
   then eight after it, then one after those, each step recording a small output, which
-  measures the finalize tail, dependency promotion and output), the two insert paths,
+  measures the finalize tail, dependency promotion and output, and `workflow-outputs`,
+  the same with every step after the first claimed with its dependencies' outputs, for
+  the cost of `StepOpts.Dependencies`), the two insert paths,
   pickup latency on an idle queue and under a paced load (`loaded`, at `-rate` jobs/s),
   and `-history N` to preload history rows. It warms up before measuring, because the
   first leader election creates history partitions, which briefly blocks finalizes.
@@ -2438,19 +2443,24 @@ observability without new machinery.
     chunk at a time in ID order, for at most one leader interval per pass, resuming
     where it stopped, so it costs nothing without unfinished workflows and a bounded
     amount per pass however many pending steps they have.
-  - **Dependencies on the claim.** A claimed step's `JobRow.Dependencies` lists its
-    direct dependencies that have finished, in ID order, each with its step name
+  - **Dependencies on the claim.** A step that asks for them (`StepOpts.Dependencies`,
+    which marks its edges, `hopper_job_deps.reads`) is claimed with
+    `JobRow.Dependencies`: its direct dependencies that have finished, in ID order,
+    each with its step name
     (`StepOpts.Name`, unique within the workflow), its final state (`completed`,
     `canceled` or `discarded`) and its output; `JobRow.Dependency(step)` finds one by
     name. So a step behind an `ignore` edge sees how its dependencies ended, and reads
-    what they produced without a round trip of its own. The finalize tail copies the
-    state and output of each finished job that still has a dependent into
-    `hopper_job_results`, keyed by workflow and job, in
+    what they produced without a round trip of its own. It is opt-in because it costs:
+    in the benchmark's workflows, whose steps all have outputs and nine in ten a
+    dependent, recording and reading every result took a fifth of the throughput. The
+    finalize tail copies the state and output of each finished job with a dependent
+    that reads it into `hopper_job_results`, keyed by workflow and job, in
     the statement that deletes it from the live table: every snapshot sees a
     dependency either live or with its result, and a fan-out writes the output once,
     not once per dependent, with no lock another finalize waits for. The rows are
     deleted when the workflow completes, by the statement that completes it (the
-    tail's or `BatchSettle`'s), which needs every job, dependents included, finished;
+    tail's or `BatchSettle`'s) when `hopper_batches.reads` marks it as having any,
+    which needs every job, dependents included, finished;
     a refcount delete when the last dependent finishes would race as two last batch
     jobs do. History's partition drops and `DeleteCompleted` do not reach them, and a
     step that is retried or snoozed is claimed with them again. `JobRetry` of a finished
@@ -2463,12 +2473,16 @@ observability without new machinery.
     row; `hopper_batches.steps` holds them for `WorkflowGet`.
     - Every claim statement (by queue, partitioned, limited and by ID) reads the
       dependencies in its outer select, `CASE WHEN batch_id IS NOT NULL THEN (...)`,
-      a correlated subquery over the job's edges and their results by primary key,
+      a correlated subquery over the job's edges that read and their results by
+      primary key,
       aggregated to one JSON value. The result is a lateral subquery and the live row of
       a dependency without one a scalar subquery, each on a primary key and kept from
       being flattened: as a plain join or `NOT EXISTS` the planner hashed the whole
       table on every claim. Postgres evaluates it only for a claimed job in a
-      batch, so a job outside one costs the `CASE` and nothing else. A dependency gone
+      batch, so a job outside one costs the `CASE` and nothing else, and one whose
+      edges do not read costs a probe of the empty partial index. The tail's probe for
+      a dependent that reads is the same, so a workflow that never asks records
+      nothing, deletes nothing and costs what it did before. A dependency gone
       from the live table without a result, which finished before the upgrade or on a
       client of an earlier release during a rolling deploy, is reported with no state
       rather than left out.

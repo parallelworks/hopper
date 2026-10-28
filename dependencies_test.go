@@ -74,14 +74,19 @@ func TestWorkflowDependencies(t *testing.T) {
 	lint := wf.Add(depStep{Name: "lint", Fail: true}, &hopper.StepOpts{Name: "lint"})
 	report := wf.Add(depStep{Name: "report"}, &hopper.StepOpts{
 		Name: "report", After: []hopper.Step{build, lint},
-		OnDependencyFailure: hopper.DependencyIgnore,
+		OnDependencyFailure: hopper.DependencyIgnore, Dependencies: true,
 	})
-	wf.Add(depStep{Name: "last"}, hopper.After(report))
+	wf.Add(depStep{Name: "last"}, &hopper.StepOpts{After: []hopper.Step{report}, Dependencies: true})
+	wf.Add(depStep{Name: "audit"}, hopper.After(build))
 	res, err := c.InsertWorkflow(ctx, wf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitForJob(t, c, res.Jobs[3].Job.ID, hopper.JobStateCompleted)
+	waitForJob(t, c, res.Jobs[4].Job.ID, hopper.JobStateCompleted)
+	if got := rec.get("0/audit"); len(got) != 1 || got[0] != nil {
+		t.Errorf("audit, which does not read its dependencies, ran with %+v", got)
+	}
 
 	if got := rec.get("0/build"); len(got) != 1 || got[0] != nil {
 		t.Errorf("build ran with dependencies %+v", got)
@@ -162,9 +167,9 @@ func TestWorkflowDependenciesConcurrent(t *testing.T) {
 			name := fmt.Sprintf("m%d", m)
 			fail := rng.IntN(4) == 0
 			failed[fmt.Sprintf("%d/%s", w, name)] = fail
-			mids[m] = wf.Add(depStep{Workflow: w, Name: name, Fail: fail}, &hopper.StepOpts{Name: name, After: []hopper.Step{root}})
+			mids[m] = wf.Add(depStep{Workflow: w, Name: name, Fail: fail}, &hopper.StepOpts{Name: name, After: []hopper.Step{root}, Dependencies: true})
 		}
-		wf.Add(depStep{Workflow: w, Name: "sink"}, &hopper.StepOpts{After: mids, OnDependencyFailure: hopper.DependencyIgnore})
+		wf.Add(depStep{Workflow: w, Name: "sink"}, &hopper.StepOpts{After: mids, OnDependencyFailure: hopper.DependencyIgnore, Dependencies: true})
 		res, err := clients[w%len(clients)].InsertWorkflow(ctx, wf)
 		if err != nil {
 			t.Fatal(err)
@@ -238,8 +243,8 @@ func TestWorkflowDependencyOfRescuedJob(t *testing.T) {
 	wf := hopper.NewWorkflow("rescued", nil)
 	again := wf.Add(crashStep{Name: "again"}, &hopper.StepOpts{Name: "again", Insert: &hopper.InsertOpts{MaxAttempts: 2}})
 	lost := wf.Add(crashStep{Name: "lost"}, &hopper.StepOpts{Name: "lost", Insert: &hopper.InsertOpts{MaxAttempts: 1}})
-	wf.Add(depStep{Name: "after-again"}, hopper.After(again))
-	wf.Add(depStep{Name: "after-lost"}, &hopper.StepOpts{After: []hopper.Step{lost}, OnDependencyFailure: hopper.DependencyIgnore})
+	wf.Add(depStep{Name: "after-again"}, &hopper.StepOpts{After: []hopper.Step{again}, Dependencies: true})
+	wf.Add(depStep{Name: "after-lost"}, &hopper.StepOpts{After: []hopper.Step{lost}, OnDependencyFailure: hopper.DependencyIgnore, Dependencies: true})
 	res, err := victim.InsertWorkflow(ctx, wf)
 	if err != nil {
 		t.Fatal(err)

@@ -48,6 +48,12 @@ type StepOpts struct {
 	// JobRow.Dependencies by it, and for WorkflowGet. Names are unique
 	// within a workflow; a step may have none.
 	Name string
+	// Dependencies has the step claimed with the steps in After, once they
+	// have finished, in JobRow.Dependencies: each one's name, final state
+	// and output. The engine records a step's state and output only for a
+	// step with a dependent that sets it, so a workflow that does not costs
+	// what one without dependencies' results did.
+	Dependencies bool
 	// Insert holds the job's own options.
 	Insert *InsertOpts
 }
@@ -168,7 +174,7 @@ func (c *Client[TTx]) insertWorkflow(ctx context.Context, exec driver.Executor, 
 			if dep.wf != wf || dep.i >= i {
 				return nil, fmt.Errorf("hopper: step %d depends on a step of another workflow", i)
 			}
-			wp.Deps = append(wp.Deps, driver.JobDependency{Job: i, DependsOn: dep.i, OnFailure: s.opts.OnDependencyFailure})
+			wp.Deps = append(wp.Deps, driver.JobDependency{Job: i, DependsOn: dep.i, OnFailure: s.opts.OnDependencyFailure, Reads: s.opts.Dependencies})
 		}
 	}
 

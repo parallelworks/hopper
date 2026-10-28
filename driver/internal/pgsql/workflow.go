@@ -157,7 +157,7 @@ ready AS (
 batches AS (
   UPDATE {{schema}}.hopper_batches b SET completed_at = now(), pending = 0, failed = r.failed
   FROM ready r WHERE b.id = r.id AND b.completed_at IS NULL
-  RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete
+  RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete, b.reads
 ),
 progress AS (
   INSERT INTO {{schema}}.hopper_batch_progress (batch_id, done, failed)
@@ -185,25 +185,28 @@ edges AS (
 )`
 }
 
-// resultsSQL records the final state and output of each job of done that
-// still has a dependent, for its dependents' claims, and deletes the
-// results of the workflows the statement completes, whose jobs have all
-// finished. A job of a workflow completing in the statement has no
-// dependent left, so it records none. Whether a job has a dependent is a
-// probe of the depends_on index per job, a scalar subquery: a filter on an
-// array of the statement's jobs compared every pair. A job retried from
-// history and finished again replaces its result.
+// resultsSQL records the final state and output of each job of done with
+// a dependent that reads it (StepOpts.Dependencies), for that dependent's
+// claims, and deletes the results of the workflows the statement completes
+// that have any such dependent, whose jobs have all finished. A job of a
+// workflow completing in the statement has no dependent left, so it
+// records none. Whether a job has such a dependent is a probe per job of
+// the partial index on the edges that read, a scalar subquery, which
+// finds nothing in a workflow that never asks: a filter on an array of
+// the statement's jobs compared every pair. A job retried from history
+// and finished again replaces its result.
 const resultsSQL = `results AS (
   INSERT INTO {{schema}}.hopper_job_results (job_id, batch_id, state, output)
   SELECT d.id, d.batch_id, d.final_state::{{schema}}.hopper_job_state, d.output FROM done d
-  WHERE d.batch_id IS NOT NULL AND d.batch_id <> ALL (ARRAY(SELECT id FROM batches))
-    AND (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id LIMIT 1) IS NOT NULL
+  WHERE d.batch_id IS NOT NULL
+    AND (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id AND e.reads LIMIT 1) IS NOT NULL
+    AND d.batch_id <> ALL (ARRAY(SELECT id FROM batches))
   ON CONFLICT (batch_id, job_id) DO UPDATE SET state = EXCLUDED.state, output = EXCLUDED.output,
     finalized_at = EXCLUDED.finalized_at
   RETURNING job_id
 ),
 results_cleared AS (
-  DELETE FROM {{schema}}.hopper_job_results r WHERE r.batch_id = ANY (ARRAY(SELECT id FROM batches)) RETURNING r.job_id
+  DELETE FROM {{schema}}.hopper_job_results r WHERE r.batch_id = ANY (ARRAY(SELECT id FROM batches WHERE reads)) RETURNING r.job_id
 )`
 
 // workflowPromoteSQL promotes the pending jobs among those a CTE named
@@ -351,8 +354,15 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		}
 		jobIDs, depIDs, policies := make([]driver.JobID, len(params.Deps)), make([]driver.JobID, len(params.Deps)), make([]string, len(params.Deps))
 		depSteps := make([]string, len(params.Deps))
+		// An edge that does not read, and a workflow with none that do, store
+		// NULL, as the partial indexes on the edges expect.
+		reads, yes := make([]*bool, len(params.Deps)), true
+		var anyReads *bool
 		for i, d := range params.Deps {
 			jobIDs[i], depIDs[i] = ids[d.Job], ids[d.DependsOn]
+			if d.Reads {
+				reads[i], anyReads = &yes, &yes
+			}
 			if len(params.Steps) > 0 {
 				depSteps[i] = params.Steps[d.DependsOn]
 			}
@@ -367,10 +377,10 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return err
 		}
 		err = tx.QueryRow(ctx, `
-			INSERT INTO {{schema}}.hopper_batches (name, pending, total, on_success, on_failure, on_complete, metadata, edges, steps)
-			VALUES ($1, $2, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb) RETURNING id`,
+			INSERT INTO {{schema}}.hopper_batches (name, pending, total, on_success, on_failure, on_complete, metadata, edges, steps, reads)
+			VALUES ($1, $2, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9) RETURNING id`,
 			nullable(params.Name), n, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata), string(edgesJSON),
-			nullable(string(steps))).Scan(&res.ID)
+			nullable(string(steps)), anyReads).Scan(&res.ID)
 		if err != nil {
 			return fmt.Errorf("insert batch: %w", err)
 		}
@@ -382,9 +392,9 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return fmt.Errorf("insert jobs: %w", err)
 		}
 		if len(params.Deps) > 0 {
-			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_job_deps (job_id, depends_on, on_failure, step)
-				SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::text[]) ON CONFLICT DO NOTHING`,
-				uuidArray(jobIDs), uuidArray(depIDs), textArray(policies), nullableTextArray(depSteps)); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_job_deps (job_id, depends_on, on_failure, step, reads)
+				SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::boolean[]) ON CONFLICT DO NOTHING`,
+				uuidArray(jobIDs), uuidArray(depIDs), textArray(policies), nullableTextArray(depSteps), reads); err != nil {
 				return fmt.Errorf("insert dependencies: %w", err)
 			}
 		}

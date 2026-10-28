@@ -56,15 +56,15 @@ func testDependencyResults[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	// build, lint and flaky run first. report waits for all three behind
 	// ignore edges, notify for build alone, and the last, unnamed step for
-	// report.
+	// report, which it does not read, so report's result is not recorded.
 	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Name: "deps", Jobs: params("step", 6),
 		Steps: []string{"build", "lint", "flaky", "report", "notify", ""},
 		Deps: []driver.JobDependency{
-			{Job: 3, DependsOn: 0, OnFailure: driver.DependencyIgnore},
-			{Job: 3, DependsOn: 1, OnFailure: driver.DependencyIgnore},
-			{Job: 3, DependsOn: 2, OnFailure: driver.DependencyIgnore},
-			{Job: 4, DependsOn: 0},
+			{Job: 3, DependsOn: 0, OnFailure: driver.DependencyIgnore, Reads: true},
+			{Job: 3, DependsOn: 1, OnFailure: driver.DependencyIgnore, Reads: true},
+			{Job: 3, DependsOn: 2, OnFailure: driver.DependencyIgnore, Reads: true},
+			{Job: 4, DependsOn: 0, Reads: true},
 			{Job: 5, DependsOn: 3},
 		},
 	})
@@ -129,10 +129,11 @@ func testDependencyResults[TTx any](t *testing.T, f Fixture[TTx]) {
 	if applied := finalize(ctx, t, exec, done); len(applied) != 1 {
 		t.Fatalf("notify's result applied %v", applied)
 	}
-	last := claimOne(ctx, t, exec, clientID, id(5))
-	checkDependencies(t, last, wantDependency{"report", driver.JobStateCompleted, `{"pages":7}`})
-	if n := f.CountJobResults(ctx, t, d); n != 4 {
-		t.Errorf("%d dependency results before the workflow completes, want 4", n)
+	if last := claimOne(ctx, t, exec, clientID, id(5)); last.Dependencies != nil {
+		t.Errorf("a step that does not read its dependencies claimed with %+v", last.Dependencies)
+	}
+	if n := f.CountJobResults(ctx, t, d); n != 3 {
+		t.Errorf("%d dependency results before the workflow completes, want build's, lint's and flaky's", n)
 	}
 	w, err := exec.WorkflowGet(ctx, wf.ID)
 	if err != nil {
@@ -174,9 +175,9 @@ func testDependencyResultsFailed[TTx any](t *testing.T, f Fixture[TTx]) {
 	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Name: "failed", Jobs: params("step", 4), Steps: []string{"p", "q", "r", "s"},
 		Deps: []driver.JobDependency{
-			{Job: 1, DependsOn: 0},
-			{Job: 2, DependsOn: 1, OnFailure: driver.DependencyIgnore},
-			{Job: 3, DependsOn: 0, OnFailure: driver.DependencyIgnore},
+			{Job: 1, DependsOn: 0, Reads: true},
+			{Job: 2, DependsOn: 1, OnFailure: driver.DependencyIgnore, Reads: true},
+			{Job: 3, DependsOn: 0, OnFailure: driver.DependencyIgnore, Reads: true},
 		},
 	})
 	if err != nil {
@@ -205,7 +206,7 @@ func testDependencyResultsFailed[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 
 	chain, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
-		Name: "before", Jobs: params("chain", 2), Steps: []string{"a", "b"}, Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+		Name: "before", Jobs: params("chain", 2), Steps: []string{"a", "b"}, Deps: []driver.JobDependency{{Job: 1, DependsOn: 0, Reads: true}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +231,7 @@ func testDependencyResultsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	clientID := register(ctx, t, exec)
 	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Name: "fan-in", Jobs: params("step", 3), Steps: []string{"x", "y", "z"},
-		Deps: []driver.JobDependency{{Job: 2, DependsOn: 0}, {Job: 2, DependsOn: 1, OnFailure: driver.DependencyIgnore}},
+		Deps: []driver.JobDependency{{Job: 2, DependsOn: 0, Reads: true}, {Job: 2, DependsOn: 1, OnFailure: driver.DependencyIgnore, Reads: true}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -301,7 +302,7 @@ func testDependencyResultsLeaseExpiry[TTx any](t *testing.T, f Fixture[TTx]) {
 		jobs[0].MaxAttempts = 1
 		wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 			Name: "leased", Jobs: jobs, Steps: []string{"remote", "after"},
-			Deps: []driver.JobDependency{{Job: 1, DependsOn: 0, OnFailure: driver.DependencyIgnore}},
+			Deps: []driver.JobDependency{{Job: 1, DependsOn: 0, OnFailure: driver.DependencyIgnore, Reads: true}},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -360,7 +361,7 @@ func testDependencyResultsOrphans[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Name: "orphans", Jobs: params("step", 2), Steps: []string{"build", "report"},
-		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0, Reads: true}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -396,7 +397,7 @@ func testDependencyResultsRetried[TTx any](t *testing.T, f Fixture[TTx]) {
 
 	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Name: "retried", Jobs: params("step", 2), Steps: []string{"build", "report"},
-		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0, Reads: true}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -417,5 +418,42 @@ func testDependencyResultsRetried[TTx any](t *testing.T, f Fixture[TTx]) {
 	f.MakeClaimable(ctx, t, d, report)
 	if j := claimOne(ctx, t, exec, clientID, report); len(j.Dependencies) != 0 {
 		t.Errorf("claimed with a retried dependency live again, dependencies = %+v, want none", j.Dependencies)
+	}
+}
+
+// testDependencyResultsUnread checks that a workflow none of whose steps
+// reads its dependencies records no results and claims none.
+func testDependencyResultsUnread[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Name: "unread", Jobs: params("step", 4), Steps: []string{"a", "b", "c", "d"},
+		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}, {Job: 2, DependsOn: 0}, {Job: 3, DependsOn: 1}, {Job: 3, DependsOn: 2}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wave := range []int{1, 2, 1} {
+		jobs := claim(ctx, t, exec, clientID, 10)
+		if len(jobs) != wave {
+			t.Fatalf("claimed %d steps, want %d", len(jobs), wave)
+		}
+		for _, j := range jobs {
+			if j.Dependencies != nil {
+				t.Errorf("step %s claimed with dependencies %+v, though none reads them", j.ID, j.Dependencies)
+			}
+		}
+		for _, j := range jobs {
+			finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`{"x":1}`)})
+			if n := f.CountJobResults(ctx, t, d); n != 0 {
+				t.Errorf("%d dependency results after step %s finished, want none", n, j.ID)
+			}
+		}
+	}
+	if b, err := exec.BatchGet(ctx, wf.ID); err != nil || b.CompletedAt.IsZero() {
+		t.Fatalf("workflow = %+v, %v; want it completed", b, err)
 	}
 }

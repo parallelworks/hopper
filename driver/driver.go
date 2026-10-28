@@ -550,9 +550,10 @@ type JobRow struct {
 	// Output is the value recorded by the worker, for jobs in history.
 	Output json.RawMessage
 	// Dependencies are the finished direct dependencies of a workflow
-	// step, as the claim that started this attempt read them, in the
-	// order of their IDs. Only a claim (JobClaim, JobClaimByID) sets them;
-	// they are nil on a job with no dependencies and on any other read.
+	// step that reads them (JobDependency.Reads), as the claim that
+	// started this attempt read them, in the order of their IDs. Only a
+	// claim (JobClaim, JobClaimByID) sets them; they are nil on a job with
+	// none it reads and on any other read.
 	Dependencies []Dependency
 }
 
@@ -922,6 +923,10 @@ const (
 type JobDependency struct {
 	Job, DependsOn int
 	OnFailure      DependencyFailure
+	// Reads has Job claimed with DependsOn among its Dependencies, once
+	// DependsOn has finished: the engine records DependsOn's final state and
+	// output only for a job with a dependent that reads it.
+	Reads bool
 }
 
 // WorkflowInsertParams describes a workflow: a named batch whose jobs

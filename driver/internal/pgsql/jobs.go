@@ -446,7 +446,9 @@ const claimEligibleSQL = `
                           AND o.state IN ('available', 'scheduled', 'retryable'))))`
 
 // claimDependenciesSQL reads, for a job a CTE named claimed claims, the
-// dependencies that have finished, as a JSON array: those with a result,
+// dependencies it reads (hopper_job_deps.reads, through the partial index
+// on those edges, empty for workflows that never ask) that have finished,
+// as a JSON array: those with a result,
 // and those gone from the live table without one, which finished before
 // the engine recorded results and read with no state. Only a job in a
 // batch can have any, so a claimed job outside one costs a CASE and
@@ -466,7 +468,7 @@ const claimDependenciesSQL = `CASE WHEN claimed.batch_id IS NOT NULL THEN (
       WHERE r.batch_id = claimed.batch_id AND r.job_id = d.depends_on
       OFFSET 0
     ) r ON true
-    WHERE d.job_id = claimed.id
+    WHERE d.job_id = claimed.id AND d.reads
       AND (r.state IS NOT NULL OR (SELECT x.id FROM {{schema}}.hopper_jobs x WHERE x.id = d.depends_on) IS NULL)
   ) END`
 

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"slices"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -407,14 +406,11 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 		}
 	}
 
-	// Record the result of each job that still has a dependent, for its
-	// dependents' claims. countBatch deletes a workflow's results when it
-	// completes. The edges do not change until the end of the tail, so each
-	// job's dependents are read once, here, for the promotion below too.
-	finishing := make(map[driver.JobID]bool, len(done))
-	for _, f := range done {
-		finishing[f.row.job.ID] = true
-	}
+	// Record the result of each job with a dependent that reads it
+	// (StepOpts.Dependencies), for that dependent's claims. countBatch
+	// deletes a workflow's results when it completes. The edges do not
+	// change until the end of the tail, so each job's dependents are read
+	// once, here, for the promotion below too.
 	dependents := make([][]driver.JobID, len(done))
 	for i, f := range done {
 		deps, err := x.ids(ctx, "SELECT job_id FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
@@ -422,11 +418,12 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 			return nil, err
 		}
 		dependents[i] = deps
-		if f.row.job.BatchID.IsZero() || !slices.ContainsFunc(deps, func(id driver.JobID) bool { return !finishing[id] }) {
+		if f.row.job.BatchID.IsZero() || len(deps) == 0 {
 			continue
 		}
 		if _, err := x.ExecContext(ctx, `
-			INSERT INTO hopper_job_results (job_id, batch_id, state, output, finalized_at) VALUES (?, ?, ?, ?, ?)
+			INSERT INTO hopper_job_results (job_id, batch_id, state, output, finalized_at)
+			SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM hopper_job_deps WHERE depends_on = ?1 AND reads)
 			ON CONFLICT (batch_id, job_id) DO UPDATE SET state = excluded.state, output = excluded.output,
 			  finalized_at = excluded.finalized_at`,
 			idParam(f.row.job.ID), idParam(f.row.job.BatchID), string(f.state), f.output, x.us()); err != nil {

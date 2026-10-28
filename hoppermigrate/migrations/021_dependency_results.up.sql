@@ -1,19 +1,24 @@
 -- hopper schema v21: dependency results, for workflow steps.
 --
--- A claimed workflow step carries its dependencies' final states and
--- outputs. The statement that finalizes a job that still has dependents
--- copies its state and output here, in the statement that moves it out of
--- the live table, so every snapshot sees a dependency either live or with
--- its result; history's retention and DeleteCompleted do not reach it. A
--- workflow's results are deleted when it completes, after all its jobs,
--- dependents included, have finished.
+-- A workflow step that asks for them (StepOpts.Dependencies) is claimed
+-- with its dependencies' final states and outputs. The statement that
+-- finalizes a job with such a dependent copies its state and output here,
+-- in the statement that moves it out of the live table, so every snapshot
+-- sees a dependency either live or with its result; history's retention
+-- and DeleteCompleted do not reach it. A workflow's results are deleted
+-- when it completes, after all its jobs, dependents included, have
+-- finished.
 --
 -- hopper_job_deps.step is the name of the edge's dependency, copied per
 -- edge, so a claim reads names without the workflow's row, and
 -- hopper_batches.steps maps a workflow's job IDs to their names, for
--- WorkflowGet.
+-- WorkflowGet. hopper_job_deps.reads marks the edges of a dependent that
+-- asked, and hopper_batches.reads a workflow with any, NULL for none. The
+-- partial indexes on the marked edges are empty for workflows that never
+-- ask, so their finalizes and claims probe nothing.
 --
--- Adding the columns changes only the catalog but needs an ACCESS
+-- Adding the columns changes only the catalog, and the partial indexes
+-- index none of the existing edges, but both need an ACCESS
 -- EXCLUSIVE lock on hopper_job_deps and hopper_batches, which finalizes
 -- use, so it tries as v17 and v18 do: with a short lock_timeout per try, in
 -- a loop, locking hopper_job_deps before hopper_batches, the order a
@@ -43,8 +48,10 @@ BEGIN
   LOOP
     BEGIN
       LOCK TABLE hopper_job_deps, hopper_batches IN ACCESS EXCLUSIVE MODE;
-      ALTER TABLE hopper_job_deps ADD COLUMN step text;
-      ALTER TABLE hopper_batches ADD COLUMN steps jsonb;
+      ALTER TABLE hopper_job_deps ADD COLUMN step text, ADD COLUMN reads boolean;
+      ALTER TABLE hopper_batches ADD COLUMN steps jsonb, ADD COLUMN reads boolean;
+      CREATE INDEX hopper_job_deps_reads_job ON hopper_job_deps (job_id) WHERE reads;
+      CREATE INDEX hopper_job_deps_reads_depends_on ON hopper_job_deps (depends_on) WHERE reads;
       EXIT;
     EXCEPTION WHEN lock_not_available THEN
       tries := tries + 1;

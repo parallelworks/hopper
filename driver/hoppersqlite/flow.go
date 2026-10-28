@@ -139,10 +139,10 @@ func encodeBatch(onSuccess, onFailure, onComplete *driver.JobInsertParams, metad
 }
 
 // insertBatch inserts a batch row expecting total jobs.
-func (x *w) insertBatch(ctx context.Context, id driver.JobID, name string, total int, b batchRow, edges, steps any) error {
-	_, err := x.ExecContext(ctx, `INSERT INTO hopper_batches (id, name, pending, total, on_success, on_failure, on_complete, metadata, edges, steps, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		idParam(id), nullable(name), total, total, b.onSuccess, b.onFailure, b.onComplete, b.metadata, edges, steps, x.us())
+func (x *w) insertBatch(ctx context.Context, id driver.JobID, name string, total int, b batchRow, edges, steps, reads any) error {
+	_, err := x.ExecContext(ctx, `INSERT INTO hopper_batches (id, name, pending, total, on_success, on_failure, on_complete, metadata, edges, steps, reads, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		idParam(id), nullable(name), total, total, b.onSuccess, b.onFailure, b.onComplete, b.metadata, edges, steps, reads, x.us())
 	return err
 }
 
@@ -155,7 +155,7 @@ func (e *executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 	var id driver.JobID
 	err = e.write(ctx, func(x *w) error {
 		id = newID(x.now)
-		return x.insertBatch(ctx, id, "", params.Total, b, nil, nil)
+		return x.insertBatch(ctx, id, "", params.Total, b, nil, nil, nil)
 	})
 	if err != nil {
 		return driver.JobID{}, fmt.Errorf("hopper: insert batch: %w", err)
