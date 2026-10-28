@@ -526,8 +526,10 @@ func testDependencyResultsRetried[TTx any](t *testing.T, f Fixture[TTx]) {
 // finalizes. The retry counts the step as pending again without holding
 // the workflow's row, and the statement that completes the workflow skips
 // the result row the retry holds, so the finalize, which completes the
-// workflow from its snapshot, waits for nothing. A retry that commits has
-// deleted that result; one that rolls back leaves it to the leader's sweep.
+// workflow from its snapshot, waits for nothing, and neither does the
+// leader's sweep of results run while the retry is held. A retry that
+// commits has deleted that result; one that rolls back leaves it to the
+// leader's next sweep.
 func testDependencyResultsRetryHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -569,6 +571,16 @@ func testDependencyResultsRetryHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 		if err != nil || len(applied) != 1 {
 			_ = rollback()
 			t.Fatalf("finalize of the last step while a retry of its sibling is held open = %v, %v", applied, err)
+		}
+		// The leader's sweep finds the result the finalize skipped, of a
+		// workflow that has completed, and skips it too rather than wait
+		// for the transaction.
+		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err = exec.BatchSettle(sctx, driver.BatchSettleParams{Limit: 10, Results: true})
+		cancel()
+		if err != nil {
+			_ = rollback()
+			t.Fatalf("the leader's sweep of results while a retry is held open: %v", err)
 		}
 		end := rollback
 		if committed {

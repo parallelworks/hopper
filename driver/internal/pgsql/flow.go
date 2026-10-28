@@ -213,12 +213,17 @@ SELECT (`, 1)
 // that have completed or no longer exist, which a client of an earlier
 // release, completing a workflow, leaves. It reads the whole table, the
 // results of the workflows in flight, so the leader runs it once per
-// maintenance interval rather than on every pass.
+// maintenance interval rather than on every pass. It skips a row another
+// transaction holds, as resultsClearedSQL does: a JobRetryTx held open that
+// deletes the result the statement completing its workflow skipped, which
+// the leader, its every duty and its lease's renewal would otherwise wait
+// for. A retry that rolls back leaves the row to the next sweep.
 const jobResultsOrphansSQL = `
 DELETE FROM {{schema}}.hopper_job_results r WHERE (r.batch_id, r.job_id) IN (
   SELECT o.batch_id, o.job_id FROM {{schema}}.hopper_job_results o
   WHERE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_batches b WHERE b.id = o.batch_id AND b.completed_at IS NULL)
-  LIMIT $1)`
+  LIMIT $1
+  FOR UPDATE OF o SKIP LOCKED)`
 
 // batchSettleIDsSQL settles the batches in $2 that have progress, waiting
 // for a batch row another statement holds, so that of two clients that
