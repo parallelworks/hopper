@@ -350,7 +350,8 @@ func (x *w) readDependencies(ctx context.Context, jobs []*driver.JobRow) error {
 			return e, err
 		}
 		e.dep.Step, e.dep.State = step.String, driver.JobState(state.String)
-		if output.Valid {
+		// A JSON null reads as no output, as on Postgres.
+		if output.Valid && output.String != "null" {
 			e.dep.Output = json.RawMessage(output.String)
 		}
 		return e, nil
@@ -820,6 +821,14 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 				return err
 			}
 			if _, err := x.ExecContext(ctx, `DELETE FROM hopper_job_history WHERE rowid = ?`, rowid); err != nil {
+				return err
+			}
+			if job.BatchID.IsZero() {
+				return nil
+			}
+			// The job counts as pending in its batch again, so that its next
+			// finish does not complete the batch while its dependents run.
+			if _, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = pending + 1 WHERE id = ? AND completed_at IS NULL`, idParam(job.BatchID)); err != nil {
 				return err
 			}
 			_, err = x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id = ? AND job_id = ?`, idParam(job.BatchID), idParam(id))

@@ -1778,6 +1778,12 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 			if err != nil || job.BatchID.IsZero() {
 				return err
 			}
+			// The job counts as pending in its batch again, so that its next
+			// finish does not complete the batch while its dependents run.
+			if _, err := tx.Exec(ctx, `UPDATE {{schema}}.hopper_batches SET pending = pending + 1 WHERE id = $1 AND completed_at IS NULL`,
+				uuidParam(job.BatchID)); err != nil {
+				return err
+			}
 			_, err = tx.Exec(ctx, `DELETE FROM {{schema}}.hopper_job_results WHERE batch_id = $1 AND job_id = $2`,
 				uuidParam(job.BatchID), uuidParam(id))
 			return err

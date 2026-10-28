@@ -66,10 +66,6 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		if err != nil {
 			return err
 		}
-		var stepsParam any
-		if steps != nil {
-			stepsParam = string(steps)
-		}
 		res.ID = newID(x.now)
 		for i := range jobs {
 			jobs[i].batchID = res.ID
@@ -82,7 +78,7 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 				reads = 1
 			}
 		}
-		if err := x.insertBatch(ctx, res.ID, params.Name, n, batch, string(edgesJSON), stepsParam, reads); err != nil {
+		if err := x.insertBatch(ctx, res.ID, params.Name, n, batch, string(edgesJSON), nullable(string(steps)), reads); err != nil {
 			return fmt.Errorf("insert batch: %w", err)
 		}
 		res.Jobs = make([]driver.JobInsertResult, n)
@@ -98,13 +94,14 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			if policy == "" {
 				policy = driver.DependencyCancel
 			}
-			var step any
-			if len(params.Steps) > 0 && params.Steps[d.DependsOn] != "" {
-				step = params.Steps[d.DependsOn]
-			}
-			var read any
+			// Only a claim reads an edge's step name, and only of an edge
+			// that reads.
+			var step, read any
 			if d.Reads {
 				read = 1
+				if len(params.Steps) > 0 {
+					step = nullable(params.Steps[d.DependsOn])
+				}
 			}
 			if _, err := x.ExecContext(ctx, `INSERT OR IGNORE INTO hopper_job_deps (job_id, depends_on, on_failure, step, reads) VALUES (?, ?, ?, ?, ?)`,
 				idParam(jobs[d.Job].id), idParam(jobs[d.DependsOn].id), string(policy), step, read); err != nil {

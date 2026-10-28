@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -387,8 +388,92 @@ func testDependencyResultsOrphans[TTx any](t *testing.T, f Fixture[TTx]) {
 	checkDependencies(t, claimOne(ctx, t, exec, clientID, wf.Jobs[1].Job.ID), wantDependency{"build", driver.JobStateCompleted, ""})
 }
 
+// testDependencyResultsSweepConcurrent runs the leader's sweep of orphaned
+// results without pause while workflows are worked: it deletes no result of
+// a workflow in flight, so every dependent is claimed with both of its
+// dependencies' states and outputs, and once the workflows complete no
+// result is left.
+func testDependencyResultsSweepConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+
+	const workflows = 20
+	type step struct {
+		w int
+		s string
+	}
+	output := func(s step) string { return fmt.Sprintf(`{"w":%d,"s":%q}`, s.w, s.s) }
+	steps := map[driver.JobID]step{}
+	for w := range workflows {
+		wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+			Name: "swept", Jobs: params("step", 3), Steps: []string{"a", "c", "b"},
+			Deps: []driver.JobDependency{
+				{Job: 2, DependsOn: 0, Reads: true},
+				{Job: 2, DependsOn: 1, OnFailure: driver.DependencyIgnore, Reads: true},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, s := range []string{"a", "c", "b"} {
+			steps[wf.Jobs[i].Job.ID] = step{w, s}
+		}
+	}
+
+	sctx, stop := context.WithCancel(ctx)
+	defer stop()
+	swept := make(chan error, 1)
+	go func() {
+		for sctx.Err() == nil {
+			if _, err := exec.BatchSettle(sctx, driver.BatchSettleParams{Limit: 1, Results: true}); err != nil && sctx.Err() == nil {
+				swept <- err
+				return
+			}
+		}
+		swept <- nil
+	}()
+
+	claimed := map[driver.JobID][]driver.Dependency{}
+	for finished, deadline := 0, time.Now().Add(30*time.Second); finished < len(steps); {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d steps finished", finished, len(steps))
+		}
+		for _, j := range claim(ctx, t, exec, clientID, 4) {
+			claimed[j.ID] = j.Dependencies
+			if applied := finalize(ctx, t, exec, driver.JobFinalize{
+				ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true,
+				Output: json.RawMessage(output(steps[j.ID])),
+			}); len(applied) != 1 {
+				t.Fatalf("finalize of %s applied %v", j.ID, applied)
+			}
+			finished++
+		}
+	}
+	stop()
+	if err := <-swept; err != nil {
+		t.Fatal(err)
+	}
+
+	for id, deps := range claimed {
+		s := steps[id]
+		if s.s != "b" {
+			continue
+		}
+		checkDependencies(t, &driver.JobRow{ID: id, Dependencies: deps},
+			wantDependency{"a", driver.JobStateCompleted, output(step{s.w, "a"})},
+			wantDependency{"c", driver.JobStateCompleted, output(step{s.w, "c"})})
+	}
+	if n := f.CountJobResults(ctx, t, d); n != 0 {
+		t.Errorf("%d dependency results after the workflows completed, want none", n)
+	}
+}
+
 // testDependencyResultsRetried checks that a dependency retried from history
-// is not reported finished with its old result while it is live again.
+// is not reported finished with its old result while it is live again, and
+// that its next finish, which leaves the workflow open while its dependent
+// has yet to finish, records the new one.
 func testDependencyResultsRetried[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -418,6 +503,20 @@ func testDependencyResultsRetried[TTx any](t *testing.T, f Fixture[TTx]) {
 	f.MakeClaimable(ctx, t, d, report)
 	if j := claimOne(ctx, t, exec, clientID, report); len(j.Dependencies) != 0 {
 		t.Errorf("claimed with a retried dependency live again, dependencies = %+v, want none", j.Dependencies)
+	}
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: build, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`{"n":2}`)})
+	if b, err := exec.BatchGet(ctx, wf.ID); err != nil || !b.CompletedAt.IsZero() {
+		t.Fatalf("workflow = %+v, %v; want it open while report has yet to finish", b, err)
+	}
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{
+		ID: report, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour,
+		Error: &driver.AttemptError{Attempt: 2, Error: "retry"},
+	})
+	f.MakeClaimable(ctx, t, d, report)
+	checkDependencies(t, claimOne(ctx, t, exec, clientID, report), wantDependency{"build", driver.JobStateCompleted, `{"n":2}`})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: report, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	if b, err := exec.BatchGet(ctx, wf.ID); err != nil || b.CompletedAt.IsZero() {
+		t.Fatalf("workflow = %+v, %v; want it completed", b, err)
 	}
 }
 

@@ -9,18 +9,20 @@
 -- when it completes, after all its jobs, dependents included, have
 -- finished.
 --
--- hopper_job_deps.step is the name of the edge's dependency, copied per
--- edge, so a claim reads names without the workflow's row, and
--- hopper_batches.steps maps a workflow's job IDs to their names, for
--- WorkflowGet. hopper_job_deps.reads marks the edges of a dependent that
--- asked, and hopper_batches.reads a workflow with any, NULL for none. The
--- partial indexes on the marked edges are empty for workflows that never
--- ask, so their finalizes and claims probe nothing.
+-- hopper_job_deps.step is the name of the edge's dependency, copied to
+-- each edge that reads, so a claim reads names without the workflow's
+-- row, and hopper_batches.steps maps a workflow's job IDs to their
+-- names, for WorkflowGet. hopper_job_deps.reads marks the edges of a
+-- dependent that asked, and hopper_batches.reads a workflow with any, NULL
+-- for none. The partial indexes on the marked edges are empty for
+-- workflows that never ask, so their finalizes and claims probe nothing.
 --
 -- Adding the columns changes only the catalog, and the partial indexes
--- index none of the existing edges, but both need an ACCESS
--- EXCLUSIVE lock on hopper_job_deps and hopper_batches, which finalizes
--- use, so it tries as v17 and v18 do: with a short lock_timeout per try, in
+-- cover none of the existing edges, though building them reads
+-- hopper_job_deps, which holds only the edges of the workflows in flight.
+-- Both need an ACCESS EXCLUSIVE lock on hopper_job_deps and
+-- hopper_batches, which finalizes use, so it tries as v17 and v18 do: with
+-- a short lock_timeout per try, in
 -- a loop, locking hopper_job_deps before hopper_batches, the order a
 -- finalize names them in. Neither hopper_jobs nor history is locked, so
 -- claims never wait for this migration.

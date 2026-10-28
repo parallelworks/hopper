@@ -410,20 +410,40 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 	// (StepOpts.Dependencies), for that dependent's claims. countBatch
 	// deletes a workflow's results when it completes. The edges do not
 	// change until the end of the tail, so each job's dependents are read
-	// once, here, for the promotion below too.
+	// once, here, with whether any reads it, for the promotion below too: a
+	// workflow that never asks runs no statement more than it did.
 	dependents := make([][]driver.JobID, len(done))
 	for i, f := range done {
-		deps, err := x.ids(ctx, "SELECT job_id FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
+		type dependent struct {
+			id    driver.JobID
+			reads bool
+		}
+		deps, err := queryAll(ctx, x, func(r scanner) (dependent, error) {
+			var (
+				d     dependent
+				id    []byte
+				reads sql.NullBool
+			)
+			if err := r.Scan(&id, &reads); err != nil {
+				return d, err
+			}
+			d.reads = reads.Bool
+			err := d.id.Scan(id)
+			return d, err
+		}, "SELECT job_id, reads FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
 		if err != nil {
 			return nil, err
 		}
-		dependents[i] = deps
-		if f.row.job.BatchID.IsZero() || len(deps) == 0 {
+		read := false
+		for _, d := range deps {
+			dependents[i] = append(dependents[i], d.id)
+			read = read || d.reads
+		}
+		if !read || f.row.job.BatchID.IsZero() {
 			continue
 		}
 		if _, err := x.ExecContext(ctx, `
-			INSERT INTO hopper_job_results (job_id, batch_id, state, output, finalized_at)
-			SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM hopper_job_deps WHERE depends_on = ?1 AND reads)
+			INSERT INTO hopper_job_results (job_id, batch_id, state, output, finalized_at) VALUES (?, ?, ?, ?, ?)
 			ON CONFLICT (batch_id, job_id) DO UPDATE SET state = excluded.state, output = excluded.output,
 			  finalized_at = excluded.finalized_at`,
 			idParam(f.row.job.ID), idParam(f.row.job.BatchID), string(f.state), f.output, x.us()); err != nil {
@@ -523,9 +543,10 @@ func (x *w) countBatch(ctx context.Context, id driver.JobID, n, failed int) erro
 		pending, wasFailed               int
 		completed                        micros
 		onSuccess, onFailure, onComplete sql.NullString
+		reads                            sql.NullBool
 	)
-	err := x.QueryRowContext(ctx, `SELECT pending, failed, completed_at, on_success, on_failure, on_complete FROM hopper_batches WHERE id = ?`,
-		idParam(id)).Scan(&pending, &wasFailed, &completed, &onSuccess, &onFailure, &onComplete)
+	err := x.QueryRowContext(ctx, `SELECT pending, failed, completed_at, on_success, on_failure, on_complete, reads FROM hopper_batches WHERE id = ?`,
+		idParam(id)).Scan(&pending, &wasFailed, &completed, &onSuccess, &onFailure, &onComplete, &reads)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -541,8 +562,11 @@ func (x *w) countBatch(ctx context.Context, id driver.JobID, n, failed int) erro
 	if _, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = 0, failed = ?, completed_at = ? WHERE id = ?`, failed, x.us(), idParam(id)); err != nil {
 		return err
 	}
-	if _, err := x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id = ?`, idParam(id)); err != nil {
-		return err
+	// Only a workflow with a step that reads its dependencies has results.
+	if reads.Bool {
+		if _, err := x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id = ?`, idParam(id)); err != nil {
+			return err
+		}
 	}
 	outcome := onSuccess
 	if failed > 0 {

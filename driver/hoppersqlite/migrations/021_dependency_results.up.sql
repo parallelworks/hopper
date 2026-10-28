@@ -5,8 +5,10 @@
 -- with a dependent that asked (hopper_job_deps.reads) copies its state and
 -- output here, so history's retention and DeleteCompleted do not reach
 -- them. A workflow's results are deleted when it completes, and
--- hopper_batches.reads marks a workflow with any dependent that asked. hopper_job_deps.step is the name of the edge's dependency,
--- and hopper_batches.steps maps a workflow's job IDs to their names.
+-- hopper_batches.reads marks a workflow with any dependent that asked.
+-- hopper_job_deps.step is the name of an edge's dependency, on the edges
+-- that read, and hopper_batches.steps maps a workflow's job IDs to their
+-- names.
 
 CREATE TABLE hopper_job_results (
   batch_id     BLOB    NOT NULL,

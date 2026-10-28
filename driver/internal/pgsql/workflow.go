@@ -355,16 +355,17 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		jobIDs, depIDs, policies := make([]driver.JobID, len(params.Deps)), make([]driver.JobID, len(params.Deps)), make([]string, len(params.Deps))
 		depSteps := make([]string, len(params.Deps))
 		// An edge that does not read, and a workflow with none that do, store
-		// NULL, as the partial indexes on the edges expect.
+		// NULL, as the partial indexes on the edges expect. Only a claim
+		// reads an edge's step name, and only of an edge that reads.
 		reads, yes := make([]*bool, len(params.Deps)), true
 		var anyReads *bool
 		for i, d := range params.Deps {
 			jobIDs[i], depIDs[i] = ids[d.Job], ids[d.DependsOn]
 			if d.Reads {
 				reads[i], anyReads = &yes, &yes
-			}
-			if len(params.Steps) > 0 {
-				depSteps[i] = params.Steps[d.DependsOn]
+				if len(params.Steps) > 0 {
+					depSteps[i] = params.Steps[d.DependsOn]
+				}
 			}
 			edges[i] = [2]string{ids[d.Job].String(), ids[d.DependsOn].String()}
 			policies[i] = string(d.OnFailure)
