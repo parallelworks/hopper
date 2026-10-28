@@ -62,7 +62,10 @@ func TestClientFromContextInJobs(t *testing.T) {
 	}
 	seen := map[int]bool{}
 	waitFor(t, func() bool {
-		for row := range c.Jobs(ctx, hopper.JobFilter{Kinds: []string{"ctx_second"}}) {
+		for row, err := range c.Jobs(ctx, hopper.JobFilter{Kinds: []string{"ctx_second"}}) {
+			if err != nil {
+				t.Fatal(err)
+			}
 			var args second
 			if err := json.Unmarshal(row.Args, &args); err == nil {
 				seen[args.N] = true

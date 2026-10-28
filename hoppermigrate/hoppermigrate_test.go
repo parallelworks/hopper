@@ -689,7 +689,7 @@ func TestMigrationCancelsBuildStartedWhileItWaits(t *testing.T) {
 		t.Error("the migration did not cancel a build started while it waited")
 		_ = held.Rollback(ctx)
 		_ = indexing.Rollback(ctx)
-		<-built
+		t.Logf("the build ended with %v", <-built)
 	}
 	_ = indexing.Rollback(ctx)
 	if err := <-migrated; err != nil {
