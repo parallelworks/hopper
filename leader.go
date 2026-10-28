@@ -327,8 +327,17 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 // where it stopped.
 func (c *Client[TTx]) settleBatches(ctx context.Context) {
 	deadline := time.Now().Add(c.tuning.leaderInterval)
+	// The sweep of orphaned dependency results rides on the first settle
+	// of a pass once per maintenance interval. It counts as run once tried:
+	// a sweep that kept failing, retried on every pass, would fail each
+	// pass's first settle and so keep the walk from ever getting past it.
+	results := time.Since(c.resultsSweptAt) >= c.tuning.maintenanceInterval
+	if results {
+		c.resultsSweptAt = time.Now()
+	}
 	for {
-		res, err := c.exec.BatchSettle(ctx, driver.BatchSettleParams{After: c.settleAfter, Limit: c.tuning.rescueBatch})
+		res, err := c.exec.BatchSettle(ctx, driver.BatchSettleParams{After: c.settleAfter, Limit: c.tuning.rescueBatch, Results: results})
+		results = false
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: settle batches", "error", err)

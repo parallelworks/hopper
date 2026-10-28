@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/driver/internal/jobcodec"
 )
 
 // Every statement that finalizes jobs (the batched finalize, canceling a
@@ -156,7 +157,7 @@ ready AS (
 batches AS (
   UPDATE {{schema}}.hopper_batches b SET completed_at = now(), pending = 0, failed = r.failed
   FROM ready r WHERE b.id = r.id AND b.completed_at IS NULL
-  RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete
+  RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete, b.reads
 ),
 progress AS (
   INSERT INTO {{schema}}.hopper_batch_progress (batch_id, done, failed)
@@ -166,6 +167,7 @@ progress AS (
 progress_cleared AS (
   DELETE FROM {{schema}}.hopper_batch_progress p WHERE p.batch_id = ANY (ARRAY(SELECT id FROM batches)) RETURNING p.batch_id
 ),
+` + resultsSQL + `,
 ` + batchCallbacksSQL(insertChannelParam) + `,
 promoted AS (
   UPDATE {{schema}}.hopper_jobs j
@@ -182,6 +184,44 @@ edges AS (
   DELETE FROM {{schema}}.hopper_job_deps d WHERE d.job_id = ANY (ARRAY(SELECT id FROM done)) RETURNING d.job_id
 )`
 }
+
+// resultsSQL records the final state and output of each job of done with
+// a dependent that reads it (StepOpts.Dependencies), for that dependent's
+// claims, and deletes the results of the workflows the statement completes
+// that have any such dependent, whose jobs have all finished. A job of a
+// workflow completing in the statement has no dependent left, so it
+// records none. Whether a job has such a dependent is a probe per job of
+// the partial index on the edges that read, a scalar subquery, which
+// finds nothing in a workflow that never asks: a filter on an array of
+// the statement's jobs compared every pair. A job retried from history
+// and finished again replaces its result.
+const resultsSQL = `results AS (
+  INSERT INTO {{schema}}.hopper_job_results (job_id, batch_id, state, output)
+  SELECT d.id, d.batch_id, d.final_state::{{schema}}.hopper_job_state, d.output FROM done d
+  WHERE d.batch_id IS NOT NULL
+    AND (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id AND e.reads LIMIT 1) IS NOT NULL
+    AND d.batch_id <> ALL (ARRAY(SELECT id FROM batches))
+  ON CONFLICT (batch_id, job_id) DO UPDATE SET state = EXCLUDED.state, output = EXCLUDED.output,
+    finalized_at = EXCLUDED.finalized_at
+  RETURNING job_id
+),
+` + resultsClearedSQL
+
+// resultsClearedSQL deletes the dependency results of the batches a CTE
+// named batches has just completed that have a step that reads them
+// (hopper_batches.reads), for the statements that complete batches: the
+// finalize tail and BatchSettle. It skips a row another transaction holds:
+// a JobRetryTx held open that deletes its step's result, which the
+// statement would otherwise wait for, with its whole flush. A retry that
+// commits has deleted the row, and one that rolls back leaves it to the
+// leader's sweep of the results of completed workflows.
+const resultsClearedSQL = `results_cleared AS (
+  DELETE FROM {{schema}}.hopper_job_results r WHERE (r.batch_id, r.job_id) IN (
+    SELECT l.batch_id, l.job_id FROM {{schema}}.hopper_job_results l
+    WHERE l.batch_id = ANY (ARRAY(SELECT id FROM batches WHERE reads))
+    FOR UPDATE SKIP LOCKED)
+  RETURNING r.job_id
+)`
 
 // workflowPromoteSQL promotes the pending jobs among those a CTE named
 // candidates selects none of whose dependencies is still live, skipping rows
@@ -322,9 +362,25 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		}
 		// The graph, for inspection, and the working set of edges.
 		edges := make([][2]string, len(params.Deps))
+		steps, err := jobcodec.StepsJSON(params.Steps, ids)
+		if err != nil {
+			return err
+		}
 		jobIDs, depIDs, policies := make([]driver.JobID, len(params.Deps)), make([]driver.JobID, len(params.Deps)), make([]string, len(params.Deps))
+		depSteps := make([]string, len(params.Deps))
+		// An edge that does not read, and a workflow with none that do, store
+		// NULL, as the partial indexes on the edges expect. Only a claim
+		// reads an edge's step name, and only of an edge that reads.
+		reads, yes := make([]*bool, len(params.Deps)), true
+		var anyReads *bool
 		for i, d := range params.Deps {
 			jobIDs[i], depIDs[i] = ids[d.Job], ids[d.DependsOn]
+			if d.Reads {
+				reads[i], anyReads = &yes, &yes
+				if len(params.Steps) > 0 {
+					depSteps[i] = params.Steps[d.DependsOn]
+				}
+			}
 			edges[i] = [2]string{ids[d.Job].String(), ids[d.DependsOn].String()}
 			policies[i] = string(d.OnFailure)
 			if d.OnFailure == "" {
@@ -336,9 +392,10 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return err
 		}
 		err = tx.QueryRow(ctx, `
-			INSERT INTO {{schema}}.hopper_batches (name, pending, total, on_success, on_failure, on_complete, metadata, edges)
-			VALUES ($1, $2, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb) RETURNING id`,
-			nullable(params.Name), n, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata), string(edgesJSON)).Scan(&res.ID)
+			INSERT INTO {{schema}}.hopper_batches (name, pending, total, on_success, on_failure, on_complete, metadata, edges, steps, reads)
+			VALUES ($1, $2, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9) RETURNING id`,
+			nullable(params.Name), n, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata), string(edgesJSON),
+			nullable(string(steps)), anyReads).Scan(&res.ID)
 		if err != nil {
 			return fmt.Errorf("insert batch: %w", err)
 		}
@@ -350,9 +407,9 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return fmt.Errorf("insert jobs: %w", err)
 		}
 		if len(params.Deps) > 0 {
-			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_job_deps (job_id, depends_on, on_failure)
-				SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::text[]) ON CONFLICT DO NOTHING`,
-				uuidArray(jobIDs), uuidArray(depIDs), textArray(policies)); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_job_deps (job_id, depends_on, on_failure, step, reads)
+				SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::boolean[]) ON CONFLICT DO NOTHING`,
+				uuidArray(jobIDs), uuidArray(depIDs), textArray(policies), nullableTextArray(depSteps), reads); err != nil {
 				return fmt.Errorf("insert dependencies: %w", err)
 			}
 		}
@@ -394,10 +451,11 @@ func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		completed sql.NullTime
 		metadata  jsonText
 		edges     jsonText
+		steps     jsonText
 	)
-	err := e.Conn.QueryRow(ctx, `SELECT id, name, `+batchProgressSelect+`, total, created_at, completed_at, metadata, edges
+	err := e.Conn.QueryRow(ctx, `SELECT id, name, `+batchProgressSelect+`, total, created_at, completed_at, metadata, edges, steps
 		FROM {{schema}}.hopper_batches b, `+batchProgressSQL+` WHERE id = $1`, uuidParam(id)).
-		Scan(&w.Batch.ID, &name, &w.Batch.Pending, &w.Batch.Failed, &w.Batch.Total, &w.Batch.CreatedAt, &completed, &metadata, &edges)
+		Scan(&w.Batch.ID, &name, &w.Batch.Pending, &w.Batch.Failed, &w.Batch.Total, &w.Batch.CreatedAt, &completed, &metadata, &edges, &steps)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound
 	}
@@ -405,6 +463,7 @@ func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		return nil, fmt.Errorf("hopper: get workflow: %w", err)
 	}
 	w.Batch.Name, w.Batch.CompletedAt, w.Batch.Metadata = name.String, completed.Time, metadata.raw()
+	w.Steps = jobcodec.DecodeSteps(string(steps))
 	if edges != "" {
 		var pairs [][2]driver.JobID
 		if err := json.Unmarshal([]byte(edges), &pairs); err != nil {

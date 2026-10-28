@@ -73,9 +73,12 @@ type Client[TTx any] struct {
 	// with deferred partition work, and keptLogged is when it last logged
 	// partitions kept past retention for their index.
 	settleAfter, promoteAfter driver.JobID
-	ddlDeferrals              int
-	keptLogged                time.Time
-	streamPoke                chan struct{}
+	// resultsSweptAt is when the leader last deleted orphaned dependency
+	// results.
+	resultsSweptAt time.Time
+	ddlDeferrals   int
+	keptLogged     time.Time
+	streamPoke     chan struct{}
 
 	events *eventBus
 

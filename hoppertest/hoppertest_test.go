@@ -157,3 +157,26 @@ func (slowWorker) Work(ctx context.Context, _ *hopper.Job[sendEmail]) error {
 }
 
 func (slowWorker) Timeout(*hopper.Job[sendEmail]) time.Duration { return 20 * time.Millisecond }
+
+func TestWorkDependencies(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	workers := hopper.NewWorkers()
+	var got hopper.Dependency
+	var ok bool
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[sendEmail]) error {
+		got, ok = job.Dependency("render")
+		job.Dependencies[0].Step = "changed"
+		return nil
+	})
+	deps := []hopper.Dependency{{Step: "render", State: hopper.JobStateCompleted, Output: []byte(`{"html":"<p>"}`)}}
+	if err := hoppertest.Work(ctx, t, workers, sendEmail{UserID: 1}, &hoppertest.WorkOpts{Dependencies: deps}); err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got.State != hopper.JobStateCompleted || string(got.Output) != `{"html":"<p>"}` {
+		t.Errorf("dependency = %+v, %v", got, ok)
+	}
+	if deps[0].Step != "render" {
+		t.Error("the worker changed the caller's dependencies")
+	}
+}

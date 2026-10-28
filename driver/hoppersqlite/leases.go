@@ -39,6 +39,9 @@ func (e *executor) JobClaimByID(ctx context.Context, params driver.JobClaimByIDP
 		if err != nil {
 			return err
 		}
+		if err := x.readDependencies(ctx, []*driver.JobRow{job}); err != nil {
+			return err
+		}
 		l := &driver.JobLeaseRow{Job: job, Lease: driver.LeaseFence{Fence: job.Fence}}
 		if err := x.QueryRowContext(ctx, `
 			INSERT INTO hopper_job_leases (id, token, fence, ttl, renewed_at, expires_at) VALUES (?1, randomblob(16), ?2, ?3, ?4, ?5)

@@ -306,7 +306,70 @@ func (x *w) claim(ctx context.Context, queue string, clientID int64, limit int, 
 	for i, r := range rows {
 		jobs[i] = r.job
 	}
+	if err := x.readDependencies(ctx, jobs); err != nil {
+		return nil, fmt.Errorf("hopper: claim jobs: %w", err)
+	}
 	return jobs, nil
+}
+
+// readDependencies sets, on each claimed job in a batch, the dependencies
+// that have finished: those with a result, and those gone from the live
+// table without one, which finished before the engine recorded results and
+// read with no state. One statement reads those of every claimed job, each
+// job's result looked up in its own batch.
+func (x *w) readDependencies(ctx context.Context, jobs []*driver.JobRow) error {
+	byID := make(map[driver.JobID]*driver.JobRow, len(jobs))
+	var args []any
+	for _, j := range jobs {
+		if !j.BatchID.IsZero() {
+			byID[j.ID] = j
+			args = append(args, idParam(j.ID))
+		}
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	type edge struct {
+		job driver.JobID
+		dep driver.Dependency
+	}
+	edges, err := queryAll(ctx, x, func(r scanner) (edge, error) {
+		var (
+			e           edge
+			job, id     []byte
+			step, state sql.NullString
+			output      sql.NullString
+		)
+		if err := r.Scan(&job, &id, &step, &state, &output); err != nil {
+			return e, err
+		}
+		if err := e.job.Scan(job); err != nil {
+			return e, err
+		}
+		if err := e.dep.ID.Scan(id); err != nil {
+			return e, err
+		}
+		e.dep.Step, e.dep.State = step.String, driver.JobState(state.String)
+		// A JSON null reads as no output, as on Postgres.
+		if output.Valid && output.String != "null" {
+			e.dep.Output = json.RawMessage(output.String)
+		}
+		return e, nil
+	}, `SELECT d.job_id, d.depends_on, d.step, r.state, r.output
+		FROM hopper_job_deps d JOIN hopper_jobs j ON j.id = d.job_id
+		LEFT JOIN hopper_job_results r ON r.batch_id = j.batch_id AND r.job_id = d.depends_on
+		WHERE d.job_id IN (`+placeholders(len(args))+`) AND d.reads
+		  AND (r.job_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = d.depends_on))
+		ORDER BY d.job_id, d.depends_on`, args...)
+	if err != nil {
+		return err
+	}
+	for _, e := range edges {
+		if j := byID[e.job]; j != nil {
+			j.Dependencies = append(j.Dependencies, e.dep)
+		}
+	}
+	return nil
 }
 
 // JobClaim implements driver.Executor. The write lock makes the claim
@@ -757,7 +820,18 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 				tagsJSON(jobcodec.DecodeTags(tags.String)), rowid), false); err != nil {
 				return err
 			}
-			_, err = x.ExecContext(ctx, `DELETE FROM hopper_job_history WHERE rowid = ?`, rowid)
+			if _, err := x.ExecContext(ctx, `DELETE FROM hopper_job_history WHERE rowid = ?`, rowid); err != nil {
+				return err
+			}
+			if job.BatchID.IsZero() {
+				return nil
+			}
+			// The job counts as pending in its batch again, so that its next
+			// finish does not complete the batch while its dependents run.
+			if _, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = pending + 1 WHERE id = ? AND completed_at IS NULL`, idParam(job.BatchID)); err != nil {
+				return err
+			}
+			_, err = x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id = ? AND job_id = ?`, idParam(job.BatchID), idParam(id))
 			return err
 		case row.job.State == driver.JobStateRunning:
 			return driver.ErrJobRunning

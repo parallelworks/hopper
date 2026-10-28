@@ -44,9 +44,29 @@ type StepOpts struct {
 	After []Step
 	// OnDependencyFailure defaults to DependencyCancel.
 	OnDependencyFailure DependencyFailure
+	// Name names the step for its dependents, which find it among their
+	// JobRow.Dependencies by it, and for WorkflowGet. Names are unique
+	// within a workflow; a step may have none.
+	Name string
+	// Dependencies has the step claimed with the steps in After, once they
+	// have finished, in JobRow.Dependencies: each one's name, final state
+	// and output. The engine records a step's state and output only for a
+	// step with a dependent that sets it, so a workflow that does not costs
+	// what one without dependencies' results did.
+	Dependencies bool
 	// Insert holds the job's own options.
 	Insert *InsertOpts
 }
+
+// Dependency is a finished dependency of a workflow step, as the claim
+// that started the step's attempt read it: its step name, its final state
+// (completed, canceled or discarded) and its output. A step's
+// dependencies are kept until its workflow completes, whatever the
+// history's retention and DeleteCompleted, so a step whose attempt is
+// retried or snoozed gets them again. A step retried from history
+// (JobRetry) after it finished has no edges left, and is claimed without
+// them.
+type Dependency = driver.Dependency
 
 // After returns options for a step that waits for the given steps.
 func After(steps ...Step) *StepOpts {
@@ -136,13 +156,27 @@ func (c *Client[TTx]) insertWorkflow(ctx context.Context, exec driver.Executor, 
 		*cb.dst = &p
 	}
 	params := make([]InsertParams, len(wf.steps))
+	names := map[string]int{}
 	for i, s := range wf.steps {
 		params[i] = s.params
+		if s.opts.Name != "" {
+			if !storableName(s.opts.Name) {
+				return nil, fmt.Errorf("hopper: step %d: name %q holds a NUL or invalid UTF-8, which PostgreSQL cannot store", i, s.opts.Name)
+			}
+			if j, dup := names[s.opts.Name]; dup {
+				return nil, fmt.Errorf("hopper: steps %d and %d are both named %q", j, i, s.opts.Name)
+			}
+			names[s.opts.Name] = i
+			if wp.Steps == nil {
+				wp.Steps = make([]string, len(wf.steps))
+			}
+			wp.Steps[i] = s.opts.Name
+		}
 		for _, dep := range s.opts.After {
 			if dep.wf != wf || dep.i >= i {
 				return nil, fmt.Errorf("hopper: step %d depends on a step of another workflow", i)
 			}
-			wp.Deps = append(wp.Deps, driver.JobDependency{Job: i, DependsOn: dep.i, OnFailure: s.opts.OnDependencyFailure})
+			wp.Deps = append(wp.Deps, driver.JobDependency{Job: i, DependsOn: dep.i, OnFailure: s.opts.OnDependencyFailure, Reads: s.opts.Dependencies})
 		}
 	}
 

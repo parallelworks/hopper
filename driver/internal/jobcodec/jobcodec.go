@@ -9,6 +9,7 @@ package jobcodec
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -118,4 +119,76 @@ func DecodeTags(stored string) []string {
 		}
 	}
 	return jobtags.Distinct(tags)
+}
+
+// StepsJSON checks a workflow's step names against its n jobs and returns
+// them as the JSON object, keyed by job ID, that a workflow row stores, or
+// nil if no step is named.
+func StepsJSON(steps []string, ids []driver.JobID) ([]byte, error) {
+	if len(steps) == 0 {
+		return nil, nil
+	}
+	if len(steps) != len(ids) {
+		return nil, fmt.Errorf("%d step names for %d jobs", len(steps), len(ids))
+	}
+	named := make(map[string]string, len(steps))
+	seen := make(map[string]bool, len(steps))
+	for i, s := range steps {
+		if s == "" {
+			continue
+		}
+		if seen[s] {
+			return nil, fmt.Errorf("step name %q is used twice", s)
+		}
+		seen[s] = true
+		named[ids[i].String()] = s
+	}
+	if len(named) == 0 {
+		return nil, nil
+	}
+	return json.Marshal(named)
+}
+
+// DecodeSteps reads the step names a workflow row stores, skipping what is
+// not in the form StepsJSON writes.
+func DecodeSteps(stored string) map[driver.JobID]string {
+	var named map[string]string
+	if json.Unmarshal([]byte(stored), &named) != nil || len(named) == 0 {
+		return nil
+	}
+	out := make(map[driver.JobID]string, len(named))
+	for k, v := range named {
+		if id, err := driver.ParseJobID(k); err == nil {
+			out[id] = v
+		}
+	}
+	return out
+}
+
+// dependency is a driver.Dependency as a claim reads it, in JSON. A null
+// step or state, of an unnamed step or a dependency without a result,
+// leaves the field empty.
+type dependency struct {
+	ID     driver.JobID    `json:"id"`
+	Step   string          `json:"step"`
+	State  driver.JobState `json:"state"`
+	Output json.RawMessage `json:"output"`
+}
+
+// DecodeDependencies reads a claim's JSON array of dependencies, or none
+// if it is not one.
+func DecodeDependencies(stored string) []driver.Dependency {
+	var deps []dependency
+	if stored == "" || json.Unmarshal([]byte(stored), &deps) != nil || len(deps) == 0 {
+		return nil
+	}
+	out := make([]driver.Dependency, len(deps))
+	for i, d := range deps {
+		out[i] = driver.Dependency(d)
+		// A JSON null reads as no output, as on SQLite.
+		if string(d.Output) == "null" {
+			out[i].Output = nil
+		}
+	}
+	return out
 }

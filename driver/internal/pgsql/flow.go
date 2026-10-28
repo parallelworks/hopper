@@ -183,9 +183,10 @@ folded AS (
   SET pending = greatest(b.pending - s.done, 0), failed = b.failed + s.failed,
       completed_at = CASE WHEN b.completed_at IS NULL AND b.pending - s.done <= 0 THEN now() ELSE b.completed_at END
   FROM sums s WHERE b.id = s.batch_id
-  RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete, b.completed_at
+  RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete, b.completed_at, b.reads
 ),
 batches AS (SELECT f.* FROM folded f JOIN locked l ON l.id = f.id WHERE l.open AND f.completed_at IS NOT NULL),
+` + resultsClearedSQL + `,
 ` + batchCallbacksSQL("$1") + `
 SELECT (SELECT count(*) FROM locked), (SELECT count(*) FROM batches), (SELECT id FROM locked ORDER BY id DESC LIMIT 1)`
 }
@@ -207,6 +208,22 @@ orphans AS (
   RETURNING p.batch_id
 )
 SELECT (`, 1)
+
+// jobResultsOrphansSQL deletes up to $1 dependency results of workflows
+// that have completed or no longer exist, which a client of an earlier
+// release, completing a workflow, leaves. It reads the whole table, the
+// results of the workflows in flight, so the leader runs it once per
+// maintenance interval rather than on every pass. It skips a row another
+// transaction holds, as resultsClearedSQL does: a JobRetryTx held open that
+// deletes the result the statement completing its workflow skipped, which
+// the leader, its every duty and its lease's renewal would otherwise wait
+// for. A retry that rolls back leaves the row to the next sweep.
+const jobResultsOrphansSQL = `
+DELETE FROM {{schema}}.hopper_job_results r WHERE (r.batch_id, r.job_id) IN (
+  SELECT o.batch_id, o.job_id FROM {{schema}}.hopper_job_results o
+  WHERE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_batches b WHERE b.id = o.batch_id AND b.completed_at IS NULL)
+  LIMIT $1
+  FOR UPDATE OF o SKIP LOCKED)`
 
 // batchSettleIDsSQL settles the batches in $2 that have progress, waiting
 // for a batch row another statement holds, so that of two clients that
@@ -236,6 +253,11 @@ func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 			Scan(&res.Folded, &res.Completed, &last)
 		if err != nil {
 			return res, fmt.Errorf("hopper: settle batches: %w", err)
+		}
+		if params.Results {
+			if _, err := e.Conn.Exec(ctx, jobResultsOrphansSQL, max(params.Limit, 1)); err != nil {
+				return res, fmt.Errorf("hopper: delete orphaned dependency results: %w", err)
+			}
 		}
 		res.Last = last.ID
 		return res, nil

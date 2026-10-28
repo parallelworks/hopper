@@ -549,6 +549,40 @@ type JobRow struct {
 	FinalizedAt time.Time
 	// Output is the value recorded by the worker, for jobs in history.
 	Output json.RawMessage
+	// Dependencies are the finished direct dependencies of a workflow
+	// step that reads them (JobDependency.Reads), as the claim that
+	// started this attempt read them, in the order of their IDs. Only a
+	// claim (JobClaim, JobClaimByID) sets them; they are nil on a job with
+	// none it reads and on any other read.
+	Dependencies []Dependency
+}
+
+// Dependency is a finished dependency of a workflow step.
+type Dependency struct {
+	ID JobID
+	// Step is the dependency's step name, or empty for an unnamed step.
+	Step string
+	// State is completed, canceled or discarded. It is empty for a
+	// dependency that finished before its engine recorded dependency
+	// results: before the upgrade that added them, or on a client of an
+	// earlier release during a rolling deploy.
+	State JobState
+	// Output is what the dependency's worker passed to SetOutput, or nil.
+	Output json.RawMessage
+}
+
+// Dependency returns the dependency with the given step name. An empty name
+// names no step, so it finds none, not the first unnamed dependency.
+func (r *JobRow) Dependency(step string) (Dependency, bool) {
+	if step == "" {
+		return Dependency{}, false
+	}
+	for _, d := range r.Dependencies {
+		if d.Step == step {
+			return d, true
+		}
+	}
+	return Dependency{}, false
 }
 
 // Progress is how far a job's worker got: the last step it finished, and a
@@ -839,6 +873,11 @@ type BatchSettleParams struct {
 	// After are settled, in ID order, skipping rows other statements hold.
 	After JobID
 	Limit int
+	// Results, with IDs nil, also deletes up to Limit dependency results
+	// of workflows that have completed or no longer exist, which a client
+	// of an earlier release leaves. It reads every workflow's results, so
+	// the leader asks for it once per maintenance interval.
+	Results bool
 }
 
 // BatchSettleResult reports what BatchSettle did.
@@ -884,6 +923,10 @@ const (
 type JobDependency struct {
 	Job, DependsOn int
 	OnFailure      DependencyFailure
+	// Reads has Job claimed with DependsOn among its Dependencies, once
+	// DependsOn has finished: the engine records DependsOn's final state and
+	// output only for a job with a dependent that reads it.
+	Reads bool
 }
 
 // WorkflowInsertParams describes a workflow: a named batch whose jobs
@@ -893,7 +936,10 @@ type WorkflowInsertParams struct {
 	// Jobs must have no unique keys; a skipped job would leave its
 	// dependents waiting forever.
 	Jobs []JobInsertParams
-	Deps []JobDependency
+	// Steps names the jobs, in Jobs order: empty, or one name per job,
+	// "" for an unnamed one. Names are unique.
+	Steps []string
+	Deps  []JobDependency
 	// Callbacks and Metadata are the batch's; see BatchInsertParams.
 	OnSuccess, OnFailure, OnComplete *JobInsertParams
 	Metadata                         json.RawMessage
@@ -919,6 +965,8 @@ type WorkflowRow struct {
 	// Jobs are in insertion order, live and finished alike.
 	Jobs  []*JobRow
 	Edges []JobEdge
+	// Steps are the names of the named steps, by job ID.
+	Steps map[JobID]string
 }
 
 // PeriodicInsertParams identifies a periodic slot and the job to insert

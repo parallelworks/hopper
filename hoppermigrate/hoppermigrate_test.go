@@ -2,6 +2,7 @@ package hoppermigrate_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -33,7 +34,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 20
+	const latest = 21
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -1194,6 +1195,10 @@ func TestJobLeasesUpgradeTakesNoJobLock(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// This release's claim needs the latest schema; down passes through v19.
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
 	lease, err := d.Executor().JobClaimByID(ctx, driver.JobClaimByIDParams{ID: id, TTL: time.Minute})
 	if err != nil {
 		t.Fatal(err)
@@ -1209,5 +1214,160 @@ func TestJobLeasesUpgradeTakesNoJobLock(t *testing.T) {
 	}
 	if state != "retryable" || attempt != lease.Job.Attempt || attemptedBy != nil {
 		t.Errorf("leased job after down: %s, attempt %d, attempted by %v; want retryable at attempt %d", state, attempt, attemptedBy, lease.Job.Attempt)
+	}
+}
+
+// TestDependencyResultsUpgrade migrates to v21 with a workflow in flight,
+// written as the previous release writes one: a step that finished before
+// the upgrade, its dependent promoted, and a step after that. While a
+// transaction holds hopper_job_deps, as a finalize does, the migration
+// retries without holding up a statement on hopper_jobs, and it completes
+// once the transaction ends. The workflow's edges, written before the
+// upgrade, do not read their dependencies (StepOpts.Dependencies), so its
+// steps are claimed without them and their finalizes record no results; an
+// edge marked as reading after the upgrade gets the dependency's state and
+// output. Down drops the table, columns and indexes.
+func TestDependencyResultsUpgrade(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	exec := d.Executor()
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 20}); err != nil {
+		t.Fatal(err)
+	}
+	q := func(query string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, query, args...); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	var batch driver.JobID
+	if err := pool.QueryRow(ctx, `INSERT INTO hopper_batches (name, pending, total) VALUES ('before', 3, 3) RETURNING id`).Scan(&batch); err != nil {
+		t.Fatal(err)
+	}
+	var a, b, c driver.JobID
+	for _, x := range []struct {
+		id    *driver.JobID
+		state string
+	}{{&a, "running"}, {&b, "pending"}, {&c, "pending"}} {
+		if err := pool.QueryRow(ctx, `INSERT INTO hopper_jobs (kind, state, batch_id) VALUES ('step', $1, $2) RETURNING id`,
+			x.state, batch).Scan(x.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q(`INSERT INTO hopper_job_deps (job_id, depends_on, on_failure) VALUES ($1, $2, 'ignore'), ($3, $1, 'cancel')`, b, a, c)
+	q(`WITH j AS (DELETE FROM hopper_jobs WHERE id = $1 RETURNING *)
+	   INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at,
+	     args, metadata, errors, await, created_at, batch_id, finalized_at, output)
+	   SELECT id, seq, kind, queue, 'completed', priority, 1, max_attempts, scheduled_at, args, metadata, errors, await,
+	     created_at, batch_id, now(), '{"before":true}' FROM j`, a)
+	q(`UPDATE hopper_jobs SET state = 'available' WHERE id = $1`, b)
+	q(`INSERT INTO hopper_batch_progress (batch_id, done, failed) VALUES ($1, 1, 0)`, batch)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // ended below
+	if _, err := tx.Exec(ctx, `DELETE FROM hopper_job_deps WHERE false`); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := make(chan error, 1)
+	go func() {
+		_, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 21})
+		upgraded <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-upgraded:
+		t.Fatalf("v21 completed while a transaction held hopper_job_deps: %v", err)
+	default:
+	}
+	sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	if _, err := pool.Exec(sctx, `SELECT id FROM hopper_jobs WHERE id = $1 FOR UPDATE`, b); err != nil {
+		t.Errorf("a statement on hopper_jobs during the migration: %v", err)
+	}
+	cancel()
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-upgraded; err != nil {
+		t.Fatal(err)
+	}
+
+	clientID, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 10})
+	if err != nil || len(claimed.Jobs) != 1 || claimed.Jobs[0].ID != b {
+		t.Fatalf("claim = %+v, %v; want the promoted step", claimed, err)
+	}
+	if deps := claimed.Jobs[0].Dependencies; deps != nil {
+		t.Errorf("a step of a workflow inserted before the upgrade claimed with dependencies %+v", deps)
+	}
+	q(`UPDATE hopper_job_deps SET reads = true WHERE job_id = $1`, c)
+	applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+		{ID: b, AttemptedBy: clientID, Fence: claimed.Jobs[0].Fence, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`{"after":true}`)},
+	}})
+	if err != nil || len(applied) != 1 {
+		t.Fatalf("finalize = %v, %v", applied, err)
+	}
+	claimed, err = exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 10})
+	if err != nil || len(claimed.Jobs) != 1 || claimed.Jobs[0].ID != c {
+		t.Fatalf("claim = %+v, %v; want the last step", claimed, err)
+	}
+	if deps := claimed.Jobs[0].Dependencies; len(deps) != 1 || deps[0].ID != b || deps[0].State != driver.JobStateCompleted || string(deps[0].Output) != `{"after": true}` {
+		t.Errorf("dependencies of the last step = %+v", deps)
+	}
+
+	// While a transaction holds the results table alone, as the leader's
+	// sweep of orphaned results or its analyze of the table does, down
+	// retries without holding hopper_job_deps for a finalize to wait on, and
+	// it completes once the transaction ends.
+	held, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Rollback(ctx) //nolint:errcheck // ended below
+	if _, err := held.Exec(ctx, `SELECT count(*) FROM hopper_job_results`); err != nil {
+		t.Fatal(err)
+	}
+	downgraded := make(chan error, 1)
+	go func() {
+		_, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 20})
+		downgraded <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-downgraded:
+		t.Fatalf("v21's down completed while a transaction held hopper_job_results: %v", err)
+	default:
+	}
+	sctx, cancel = context.WithTimeout(ctx, 2*time.Second)
+	if _, err := pool.Exec(sctx, `SELECT count(*) FROM hopper_job_deps`); err != nil {
+		t.Errorf("a statement on hopper_job_deps during the down migration: %v", err)
+	}
+	cancel()
+	if err := held.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-downgraded; err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = current_schema() AND (table_name, column_name) IN
+		  (('hopper_job_deps', 'step'), ('hopper_batches', 'steps'), ('hopper_job_deps', 'reads'), ('hopper_batches', 'reads'))`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	var table *string
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('hopper_job_results')::text`).Scan(&table); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 || table != nil {
+		t.Errorf("after down: %d step columns and table %v left", left, table)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"slices"
 
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/driver/internal/jobcodec"
 )
 
 // WorkflowInsert implements driver.Executor.
@@ -57,11 +58,27 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		if err != nil {
 			return err
 		}
+		ids := make([]driver.JobID, n)
+		for i := range jobs {
+			ids[i] = jobs[i].id
+		}
+		steps, err := jobcodec.StepsJSON(params.Steps, ids)
+		if err != nil {
+			return err
+		}
 		res.ID = newID(x.now)
 		for i := range jobs {
 			jobs[i].batchID = res.ID
 		}
-		if err := x.insertBatch(ctx, res.ID, params.Name, n, batch, string(edgesJSON)); err != nil {
+		// An edge that does not read, and a workflow with none that do, store
+		// NULL, as the partial indexes on the edges expect.
+		var reads any
+		for _, d := range params.Deps {
+			if d.Reads {
+				reads = 1
+			}
+		}
+		if err := x.insertBatch(ctx, res.ID, params.Name, n, batch, string(edgesJSON), nullable(string(steps)), reads); err != nil {
 			return fmt.Errorf("insert batch: %w", err)
 		}
 		res.Jobs = make([]driver.JobInsertResult, n)
@@ -77,8 +94,17 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			if policy == "" {
 				policy = driver.DependencyCancel
 			}
-			if _, err := x.ExecContext(ctx, `INSERT OR IGNORE INTO hopper_job_deps (job_id, depends_on, on_failure) VALUES (?, ?, ?)`,
-				idParam(jobs[d.Job].id), idParam(jobs[d.DependsOn].id), string(policy)); err != nil {
+			// Only a claim reads an edge's step name, and only of an edge
+			// that reads.
+			var step, read any
+			if d.Reads {
+				read = 1
+				if len(params.Steps) > 0 {
+					step = nullable(params.Steps[d.DependsOn])
+				}
+			}
+			if _, err := x.ExecContext(ctx, `INSERT OR IGNORE INTO hopper_job_deps (job_id, depends_on, on_failure, step, reads) VALUES (?, ?, ?, ?, ?)`,
+				idParam(jobs[d.Job].id), idParam(jobs[d.DependsOn].id), string(policy), step, read); err != nil {
 				return fmt.Errorf("insert dependencies: %w", err)
 			}
 		}
@@ -100,8 +126,9 @@ func (e *executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		var (
 			name  sql.NullString
 			edges sql.NullString
+			steps sql.NullString
 		)
-		b, err := scanBatch(q.QueryRowContext(ctx, `SELECT `+batchColumns+`, name, edges FROM hopper_batches WHERE id = ?`, idParam(id)), &name, &edges)
+		b, err := scanBatch(q.QueryRowContext(ctx, `SELECT `+batchColumns+`, name, edges, steps FROM hopper_batches WHERE id = ?`, idParam(id)), &name, &edges, &steps)
 		if errors.Is(err, sql.ErrNoRows) {
 			return driver.ErrNotFound
 		}
@@ -110,6 +137,7 @@ func (e *executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		}
 		w.Batch = *b
 		w.Batch.Name = name.String
+		w.Steps = jobcodec.DecodeSteps(steps.String)
 		if edges.Valid {
 			var pairs [][2]driver.JobID
 			if err := json.Unmarshal([]byte(edges.String), &pairs); err != nil {

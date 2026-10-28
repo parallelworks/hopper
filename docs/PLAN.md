@@ -356,12 +356,15 @@ b.Add(ProcessShard{Shard: 1}, nil)
 err = b.InsertTx(ctx, tx)
 
 wf := hopper.NewWorkflow("ingest-9", &hopper.WorkflowOpts{OnFailure: AlertOps{RunID: 9}})
-fetch := wf.Add(Fetch{URL: u}, nil)
-parse := wf.Add(Parse{}, hopper.After(fetch))
-wf.Add(Index{}, hopper.After(parse))
-wf.Add(Notify{}, hopper.After(parse))
+fetch := wf.Add(Fetch{URL: u}, &hopper.StepOpts{Name: "fetch"})
+parse := wf.Add(Parse{}, &hopper.StepOpts{Name: "parse", After: []hopper.Step{fetch}})
+wf.Add(Index{}, &hopper.StepOpts{After: []hopper.Step{parse}, Dependencies: true})
+wf.Add(Notify{}, &hopper.StepOpts{After: []hopper.Step{parse}, OnDependencyFailure: hopper.DependencyIgnore})
 res, err := client.InsertWorkflowTx(ctx, tx, wf)
-row, err := client.WorkflowGet(ctx, res.ID)   // progress, jobs and edges
+row, err := client.WorkflowGet(ctx, res.ID)   // progress, jobs, edges and step names
+
+// In Index's worker: the claim carried parse's final state and output.
+dep, ok := job.Dependency("parse")            // dep.State, dep.Output
 ```
 
 ### 4.7 API conventions
@@ -693,7 +696,16 @@ leader keeps with history's) and the triggers that maintain them (§7.2). Schema
 adds `fence` to `hopper_jobs` and history (§7.3), in the loop v17's columns took.
 Schema v19 adds `hopper_job_leases (id, token, fence, ttl, renewed_at, expires_at)` for
 job leases (§7.14), a plain `CREATE TABLE` that takes no lock on `hopper_jobs` or
-history.
+history. Schema v21 adds `hopper_job_results (job_id, batch_id, state, output,
+finalized_at)`, keyed by `(batch_id, job_id)`, for the dependencies a claimed workflow
+step carries (§11), `step` on `hopper_job_deps` (the name of the edge's dependency, on
+an edge that reads) and
+`steps` on `hopper_batches` (a workflow's step names by job ID), and `reads` on both (an
+edge whose dependent reads its dependencies, and a workflow with any such edge; NULL
+otherwise), with partial indexes on the edges that read, by dependent and by dependency.
+The columns and indexes take v17's loop on `hopper_job_deps` and `hopper_batches`, in
+the order a finalize names them; the indexes cover none of the existing edges, and
+neither `hopper_jobs` nor history is locked, so claims never wait for it.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -1143,7 +1155,10 @@ RETURNING j.*;
   `metadata`. Middleware runs in `Config.Middleware` order, outermost first, inside
   the panic guard.
 - `hopper.SetOutput(ctx, v)` records a result, which is stored with the finalized job
-  and returned by `Await` and `JobGet`. Output is kept only for archived jobs.
+  and returned by `Await` and `JobGet`. Output is kept in history only for archived
+  jobs. A workflow step's output is also kept, with its final state, for the steps
+  after it that read it (`StepOpts.Dependencies`), until the workflow completes,
+  whatever history's retention and `DeleteCompleted` (§11).
 
 ### 7.5 Finalize
 Results are buffered and written by a per-client finalizer. It flushes every 25ms or
@@ -2193,7 +2208,9 @@ the partition's extension lock, so the data volume has no size limit.
   one JSON line per scenario. It has the no-op baseline, mixed-priority, scheduled-heavy,
   tagged and retry-heavy workloads, a workflow workload (ten-step workflows, one step,
   then eight after it, then one after those, each step recording a small output, which
-  measures the finalize tail, dependency promotion and output), the two insert paths,
+  measures the finalize tail, dependency promotion and output, and `workflow-outputs`,
+  the same with every step after the first claimed with its dependencies' outputs, for
+  the cost of `StepOpts.Dependencies`), the two insert paths,
   pickup latency on an idle queue and under a paced load (`loaded`, at `-rate` jobs/s),
   and `-history N` to preload history rows. It warms up before measuring, because the
   first leader election creates history partitions, which briefly blocks finalizes.
@@ -2427,6 +2444,64 @@ observability without new machinery.
     chunk at a time in ID order, for at most one leader interval per pass, resuming
     where it stopped, so it costs nothing without unfinished workflows and a bounded
     amount per pass however many pending steps they have.
+  - **Dependencies on the claim.** A step that asks for them (`StepOpts.Dependencies`,
+    which marks its edges, `hopper_job_deps.reads`) is claimed with
+    `JobRow.Dependencies`: its direct dependencies that have finished, in ID order,
+    each with its step name
+    (`StepOpts.Name`, unique within the workflow), its final state (`completed`,
+    `canceled` or `discarded`) and its output; `JobRow.Dependency(step)` finds one by
+    name. So a step behind an `ignore` edge sees how its dependencies ended, and reads
+    what they produced without a round trip of its own. It is opt-in because it costs:
+    in the benchmark's workflows, whose steps all have outputs and nine in ten a
+    dependent, recording and reading every result took an eighth of the throughput. The
+    finalize tail copies the state and output of each finished job with a dependent
+    that reads it into `hopper_job_results`, keyed by workflow and job, in
+    the statement that deletes it from the live table: every snapshot sees a
+    dependency either live or with its result, and a fan-out writes the output once,
+    not once per dependent, with no lock another finalize waits for. The rows are
+    deleted when the workflow completes, by the statement that completes it (the
+    tail's or `BatchSettle`'s) when `hopper_batches.reads` marks it as having any,
+    which needs every job, dependents included, finished;
+    a refcount delete when the last dependent finishes would race as two last batch
+    jobs do. History's partition drops and `DeleteCompleted` do not reach them, and a
+    step that is retried or snoozed is claimed with them again. `JobRetry` of a finished
+    dependency deletes its result, so that while it is live again its dependents are
+    claimed without it, and counts it as pending in its open batch again, so that its
+    next finish does not complete the workflow while its dependents run; on Postgres
+    the count is a progress row of −1, so that a retry held open in a caller's
+    transaction (`JobRetryTx`) holds no batch row a finalize waits for, and the
+    statement that completes a workflow skips a result row such a retry holds (it is
+    deleted when the retry commits, and swept if it rolls back). Once per
+    maintenance interval the leader's batch settle deletes those of workflows that
+    completed or are gone, which a client of an earlier release, completing a
+    workflow, leaves; it is not run on every pass because it reads the whole table, and
+    a sweep that fails waits for the next interval rather than holding up the settle.
+    It skips a row another transaction holds, as the completing statement does, so a
+    retry held open holds up neither the leader's duties nor its lease's renewal.
+    A step's name is copied to each of
+    its edges that read (`hopper_job_deps.step`), so the claim reads names without the workflow
+    row; `hopper_batches.steps` holds them for `WorkflowGet`.
+    - Every claim statement (by queue, partitioned, limited and by ID) reads the
+      dependencies in its outer select, `CASE WHEN batch_id IS NOT NULL THEN (...)`,
+      a correlated subquery over the job's edges that read and their results by
+      primary key,
+      aggregated to one JSON value. The result is a lateral subquery and the live row of
+      a dependency without one a scalar subquery, each on a primary key and kept from
+      being flattened: as a plain join or `NOT EXISTS` the planner hashed the whole
+      table on every claim. Postgres evaluates it only for a claimed job in a
+      batch, so a job outside one costs the `CASE` and nothing else, and one whose
+      edges do not read costs a probe of the empty partial index. The tail's probe for
+      a dependent that reads is the same, so a workflow that never asks records
+      nothing, deletes nothing and costs what it did before. A dependency gone
+      from the live table without a result, which finished before the upgrade or on a
+      client of an earlier release during a rolling deploy, is reported with no state
+      rather than left out.
+    - Only claims set `Dependencies`: `JobGet`, listings and `Await` leave them nil. A
+      step retried from history (`JobRetry`) after it finished has no edges left and is
+      claimed without them. A claim carries the outputs of all a job's dependencies,
+      so the size of a claim of workflow steps is bounded by what those steps'
+      dependencies recorded; an application that keeps outputs large caps them before
+      `SetOutput`.
   Workflows are inspectable with
   `WorkflowGet`, `hopper workflows get` and, as a DAG, in `hopperui`.
 
@@ -2564,8 +2639,8 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease or a job, backdate an attempt, store a value as a direct write would, wait until a statement waits for a lock, count rows); what depends on row locks is tested either way by `Capabilities.SingleWriter`. `drivertest.RunPostgres` adds the tests of what the Postgres drivers share beyond the interface (partitions and their indexes, the tags tables, progress rows, planner statistics); other engine internals stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Job leases: a claim by ID against a client's claim of the same jobs claims each once; concurrent renewals of a lease and of a stale lease of the same job; a renewal held open against the expiry, which the renewal wins; a finish held open against the expiry, which skips the job; cancels that commit while the expiry runs, which leave no job running without its lease; a stale token's finish after an expiry; and holders that renew late at random against the leader's expiry, where every claim ends exactly once, by its Finish or its expiry, and no expiry is recorded before the expiry its holder was last given. A whole-cluster restart while workers hold leases: those that come back within the grace keep them, and a lease never renewed again expires no earlier than the grace after the restart, even when a client that started after the claims crashed with the cluster, its lease lapsing before the restart. Global and rate limits never exceeded. Ordering keys never run two at once. |
-| Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Job leases: a claim by ID against a client's claim of the same jobs claims each once; concurrent renewals of a lease and of a stale lease of the same job; a renewal held open against the expiry, which the renewal wins; a finish held open against the expiry, which skips the job; cancels that commit while the expiry runs, which leave no job running without its lease; a stale token's finish after an expiry; and holders that renew late at random against the leader's expiry, where every claim ends exactly once, by its Finish or its expiry, and no expiry is recorded before the expiry its holder was last given. A whole-cluster restart while workers hold leases: those that come back within the grace keep them, and a lease never renewed again expires no earlier than the grace after the restart, even when a client that started after the claims crashed with the cluster, its lease lapsing before the restart. Workflow dependencies: two dependencies finalized in concurrent transactions, whose dependent is promoted once both commit and claimed with both results; a leased dependency's result against its lease's expiry, whichever applies giving the dependent its state; four clients working forty workflows with failing steps, every step claimed with exactly its dependencies' states and outputs and no result left once they complete; the leader's sweep of orphaned results run without pause while workflows are worked, which deletes none of a workflow in flight; and a `JobRetry` of a finished step whose result its dependent read, held open in a transaction while its sibling, the workflow's last step, finalizes, which neither the finalize nor the leader's sweep waits for, and which leaves no result whether it commits or rolls back. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes while running two workflow dependencies: the one rerun elsewhere gives its dependent the output of the attempt that completed, and the one the rescue discards gives its dependent that state and no output. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |
 | Test helpers | The `hoppertest` package: `RequireInserted[T]`, `RequireManyInserted[T]`, `RequireNotInserted[T]` and their `Tx` variants (which look inside the caller's transaction), and `Work[T]`, which runs a worker inline on a synthetic job with no database round trip. |
