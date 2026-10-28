@@ -1323,7 +1323,38 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 		t.Errorf("dependencies of the last step = %+v", deps)
 	}
 
-	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 20}); err != nil {
+	// While a transaction holds the results table alone, as the leader's
+	// sweep of orphaned results or its analyze of the table does, down
+	// retries without holding hopper_job_deps for a finalize to wait on, and
+	// it completes once the transaction ends.
+	held, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Rollback(ctx) //nolint:errcheck // ended below
+	if _, err := held.Exec(ctx, `SELECT count(*) FROM hopper_job_results`); err != nil {
+		t.Fatal(err)
+	}
+	downgraded := make(chan error, 1)
+	go func() {
+		_, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 20})
+		downgraded <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-downgraded:
+		t.Fatalf("v21's down completed while a transaction held hopper_job_results: %v", err)
+	default:
+	}
+	sctx, cancel = context.WithTimeout(ctx, 2*time.Second)
+	if _, err := pool.Exec(sctx, `SELECT count(*) FROM hopper_job_deps`); err != nil {
+		t.Errorf("a statement on hopper_job_deps during the down migration: %v", err)
+	}
+	cancel()
+	if err := held.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-downgraded; err != nil {
 		t.Fatal(err)
 	}
 	var left int
