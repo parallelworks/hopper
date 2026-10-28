@@ -1714,6 +1714,8 @@ RETURNING %s`, JobColumns(""))
 	// jobRetryHistorySQL moves a finalized job back to the live table with
 	// its history (attempt count and errors) intact. It gets a fresh seq,
 	// as a newly inserted job would, and one more attempt if it had run out.
+	// It also returns whether the job had failed (canceled or discarded),
+	// which its batch counted.
 	jobRetryHistorySQL = fmt.Sprintf(`
 WITH h AS (DELETE FROM {{schema}}.hopper_job_history WHERE id = $1 RETURNING *)
 INSERT INTO {{schema}}.hopper_jobs (id, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata,
@@ -1723,7 +1725,7 @@ SELECT id, kind, queue, 'available', priority, attempt,
   errors, unique_key, ordering_key, partition_key, batch_id, await, created_at, CASE WHEN $2 THEN NULL ELSE progress END, logs,
   %s, fence
 FROM h
-RETURNING %s`, storedTagsSQL("tags"), JobColumns(""))
+RETURNING %s, (SELECT h.state IN ('canceled', 'discarded') FROM h LIMIT 1)`, storedTagsSQL("tags"), JobColumns(""))
 )
 
 // storedTagsSQL returns the tags a stored tags value, expr, holds, as a
@@ -1768,7 +1770,8 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 		err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
 		switch {
 		case errors.Is(err, ErrNoRows):
-			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id), params.FromStart), false)
+			var failed bool
+			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id), params.FromStart), false, &failed)
 			if errors.Is(err, ErrNoRows) {
 				return driver.ErrNotFound
 			}
@@ -1779,15 +1782,18 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 				return err
 			}
 			// The job counts as pending in its batch again, so that its next
-			// finish does not complete the batch while its dependents run. It
-			// is a progress row of -1, appended as a finalize's count is,
-			// rather than an update of the batch row: a retry held open in a
-			// caller's transaction (JobRetryTx) would hold that row, and the
-			// finalize that completes the batch, with its whole flush, would
-			// wait for the transaction.
+			// finish does not complete the batch while its dependents run,
+			// and a failure of it no longer counts, so that a batch whose
+			// retried job completes runs OnSuccess, not OnFailure. It is a
+			// progress row of -1 done (and -1 failed for a failed job),
+			// appended as a finalize's count is, rather than an update of the
+			// batch row: a retry held open in a caller's transaction
+			// (JobRetryTx) would hold that row, and the finalize that
+			// completes the batch, with its whole flush, would wait for the
+			// transaction.
 			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_batch_progress (batch_id, done, failed)
-				SELECT b.id, -1, 0 FROM {{schema}}.hopper_batches b WHERE b.id = $1 AND b.completed_at IS NULL`,
-				uuidParam(job.BatchID)); err != nil {
+				SELECT b.id, -1, CASE WHEN $2 THEN -1 ELSE 0 END FROM {{schema}}.hopper_batches b WHERE b.id = $1 AND b.completed_at IS NULL`,
+				uuidParam(job.BatchID), failed); err != nil {
 				return err
 			}
 			_, err = tx.Exec(ctx, `DELETE FROM {{schema}}.hopper_job_results WHERE batch_id = $1 AND job_id = $2`,
