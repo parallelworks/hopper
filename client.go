@@ -76,9 +76,9 @@ type Client[TTx any] struct {
 	// resultsSweptAt is when the leader last deleted orphaned dependency
 	// results.
 	resultsSweptAt time.Time
-	ddlDeferrals              int
-	keptLogged                time.Time
-	streamPoke                chan struct{}
+	ddlDeferrals   int
+	keptLogged     time.Time
+	streamPoke     chan struct{}
 
 	events *eventBus
 
