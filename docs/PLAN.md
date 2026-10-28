@@ -697,7 +697,7 @@ adds `fence` to `hopper_jobs` and history (§7.3), in the loop v17's columns too
 Schema v19 adds `hopper_job_leases (id, token, fence, ttl, renewed_at, expires_at)` for
 job leases (§7.14), a plain `CREATE TABLE` that takes no lock on `hopper_jobs` or
 history. Schema v20 adds `hopper_job_results (job_id, batch_id, state, output,
-finalized_at)`, with an index on `batch_id`, for the dependencies a claimed workflow
+finalized_at)`, keyed by `(batch_id, job_id)`, for the dependencies a claimed workflow
 step carries (§11), `step` on `hopper_job_deps` (the name of the edge's dependency) and
 `steps` on `hopper_batches` (a workflow's step names by job ID). The columns take v17's
 loop on `hopper_job_deps` and `hopper_batches`, in the order a finalize names them;
@@ -2445,7 +2445,7 @@ observability without new machinery.
     name. So a step behind an `ignore` edge sees how its dependencies ended, and reads
     what they produced without a round trip of its own. The finalize tail copies the
     state and output of each finished job that still has a dependent (other than one
-    finishing in the same statement) into `hopper_job_results`, keyed by the job, in
+    finishing in the same statement) into `hopper_job_results`, keyed by workflow and job, in
     the statement that deletes it from the live table: every snapshot sees a
     dependency either live or with its result, and a fan-out writes the output once,
     not once per dependent, with no lock another finalize waits for. The rows are
@@ -2453,15 +2453,18 @@ observability without new machinery.
     tail's or `BatchSettle`'s), which needs every job, dependents included, finished;
     a refcount delete when the last dependent finishes would race as two last batch
     jobs do. History's partition drops and `DeleteCompleted` do not reach them, and a
-    step that is retried or snoozed is claimed with them again. The leader's batch
-    sweep deletes those of workflows that completed or are gone, which a client of an
-    earlier release, completing a workflow, leaves. A step's name is copied to each of
+    step that is retried or snoozed is claimed with them again. Once per maintenance
+    interval the leader's batch settle deletes those of workflows that completed or are
+    gone, which a client of an earlier release, completing a workflow, leaves; it is
+    not run on every pass because it reads the whole table. A step's name is copied to each of
     its edges (`hopper_job_deps.step`), so the claim reads names without the workflow
     row; `hopper_batches.steps` holds them for `WorkflowGet`.
     - Every claim statement (by queue, partitioned, limited and by ID) reads the
       dependencies in its outer select, `CASE WHEN batch_id IS NOT NULL THEN (...)`,
       a correlated subquery over the job's edges and their results by primary key,
-      aggregated to one JSON value. Postgres evaluates it only for a claimed job in a
+      aggregated to one JSON value. Each lookup (the result, and the live row of a
+      dependency without one) is a scalar subquery on a primary key, which a join or
+      `NOT EXISTS` would plan as a hash over the whole table on every claim. Postgres evaluates it only for a claimed job in a
       batch, so a job outside one costs the `CASE` and nothing else. A dependency gone
       from the live table without a result, which finished before the upgrade or on a
       client of an earlier release during a rolling deploy, is reported with no state

@@ -327,8 +327,13 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 // where it stopped.
 func (c *Client[TTx]) settleBatches(ctx context.Context) {
 	deadline := time.Now().Add(c.tuning.leaderInterval)
+	results := time.Since(c.resultsSweptAt) >= c.tuning.maintenanceInterval
+	if results {
+		c.resultsSweptAt = time.Now()
+	}
 	for {
-		res, err := c.exec.BatchSettle(ctx, driver.BatchSettleParams{After: c.settleAfter, Limit: c.tuning.rescueBatch})
+		res, err := c.exec.BatchSettle(ctx, driver.BatchSettleParams{After: c.settleAfter, Limit: c.tuning.rescueBatch, Results: results})
+		results = false
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: settle batches", "error", err)

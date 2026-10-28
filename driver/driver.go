@@ -868,6 +868,11 @@ type BatchSettleParams struct {
 	// After are settled, in ID order, skipping rows other statements hold.
 	After JobID
 	Limit int
+	// Results, with IDs nil, also deletes up to Limit dependency results
+	// of workflows that have completed or no longer exist, which a client
+	// of an earlier release leaves. It reads every workflow's results, so
+	// the leader asks for it once per maintenance interval.
+	Results bool
 }
 
 // BatchSettleResult reports what BatchSettle did.

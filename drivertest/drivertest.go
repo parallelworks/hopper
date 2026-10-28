@@ -89,9 +89,12 @@ type Fixture[TTx any] interface {
 	CountEdges(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
 	// CountJobResults counts the dependency results the engine keeps for
 	// workflow steps' claims. DeleteJobResult deletes a job's, as a job
-	// finished before the engine recorded them has none.
+	// finished before the engine recorded them has none. OrphanJobResult
+	// copies a job's to a workflow that does not exist, as a client of an
+	// earlier release, completing a workflow, leaves one.
 	CountJobResults(ctx context.Context, t *testing.T, d driver.Driver[TTx]) int
 	DeleteJobResult(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
+	OrphanJobResult(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID)
 	// WaitForLockWait waits until a statement on the driver's database
 	// waits for a lock another transaction holds, so that a test knows its
 	// competing statement is blocked rather than not yet started.
@@ -195,6 +198,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"DependencyResultsFailed", testDependencyResultsFailed[TTx]},
 		{"DependencyResultsConcurrent", testDependencyResultsConcurrent[TTx]},
 		{"DependencyResultsLeaseExpiry", testDependencyResultsLeaseExpiry[TTx]},
+		{"DependencyResultsOrphans", testDependencyResultsOrphans[TTx]},
 		{"Streams", testStreams[TTx]},
 		{"StreamsRetention", testStreamsRetention[TTx]},
 		{"Maintain", testMaintain[TTx]},
@@ -393,6 +397,13 @@ func (p Postgres[TTx]) CountJobResults(ctx context.Context, t *testing.T, d driv
 func (p Postgres[TTx]) DeleteJobResult(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
 	t.Helper()
 	p.SQL.Exec(ctx, t, d, "DELETE FROM hopper_job_results WHERE job_id = $1::uuid", id.String())
+}
+
+// OrphanJobResult implements Fixture.
+func (p Postgres[TTx]) OrphanJobResult(ctx context.Context, t *testing.T, d driver.Driver[TTx], id driver.JobID) {
+	t.Helper()
+	p.SQL.Exec(ctx, t, d, `INSERT INTO hopper_job_results (batch_id, job_id, state, output, finalized_at)
+		SELECT job_id, job_id, state, output, finalized_at FROM hopper_job_results WHERE job_id = $1::uuid`, id.String())
 }
 
 // WaitForLockWait implements Fixture: a statement on the driver's schema,

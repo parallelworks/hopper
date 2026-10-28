@@ -154,6 +154,11 @@ func (fixture) DeleteJobResult(ctx context.Context, t *testing.T, d driver.Drive
 	execSQL(ctx, t, d, "DELETE FROM hopper_job_results WHERE job_id = ?", id[:])
 }
 
+func (fixture) OrphanJobResult(ctx context.Context, t *testing.T, d driver.Driver[*sql.Tx], id driver.JobID) {
+	execSQL(ctx, t, d, `INSERT INTO hopper_job_results (batch_id, job_id, state, output, finalized_at)
+		SELECT job_id, job_id, state, output, finalized_at FROM hopper_job_results WHERE job_id = ?`, id[:])
+}
+
 func (fixture) WaitForLockWait(_ context.Context, t *testing.T, d driver.Driver[*sql.Tx]) {
 	t.Helper()
 	for deadline := time.Now().Add(10 * time.Second); hoppersqlite.LockWaiters(d.(*hoppersqlite.Driver)) == 0; time.Sleep(time.Millisecond) {

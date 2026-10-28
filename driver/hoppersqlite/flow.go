@@ -169,10 +169,10 @@ func (e *executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 // dependency results of workflows that completed or no longer exist, which
 // a client of an earlier release, completing a workflow, leaves.
 func (e *executor) BatchSettle(ctx context.Context, params driver.BatchSettleParams) (driver.BatchSettleResult, error) {
-	if params.IDs != nil {
+	if params.IDs != nil || !params.Results {
 		return driver.BatchSettleResult{}, nil
 	}
-	const orphans = `SELECT o.job_id FROM hopper_job_results o
+	const orphans = `SELECT o.batch_id FROM hopper_job_results o
 		WHERE NOT EXISTS (SELECT 1 FROM hopper_batches b WHERE b.id = o.batch_id AND b.completed_at IS NULL)`
 	var found bool
 	if err := e.read().QueryRowContext(ctx, `SELECT EXISTS (`+orphans+`)`).Scan(&found); err != nil {
@@ -182,7 +182,7 @@ func (e *executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 		return driver.BatchSettleResult{}, nil
 	}
 	err := e.write(ctx, func(x *w) error {
-		_, err := x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE job_id IN (`+orphans+` LIMIT ?)`, max(params.Limit, 1))
+		_, err := x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id IN (`+orphans+` LIMIT ?)`, max(params.Limit, 1))
 		return err
 	})
 	if err != nil {

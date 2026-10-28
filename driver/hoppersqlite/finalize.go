@@ -427,7 +427,7 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 		}
 		if _, err := x.ExecContext(ctx, `
 			INSERT INTO hopper_job_results (job_id, batch_id, state, output, finalized_at) VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT (job_id) DO UPDATE SET batch_id = excluded.batch_id, state = excluded.state, output = excluded.output,
+			ON CONFLICT (batch_id, job_id) DO UPDATE SET state = excluded.state, output = excluded.output,
 			  finalized_at = excluded.finalized_at`,
 			idParam(f.row.job.ID), idParam(f.row.job.BatchID), string(f.state), f.output, x.us()); err != nil {
 			return nil, fmt.Errorf("record result of job %s: %w", f.row.job.ID, err)

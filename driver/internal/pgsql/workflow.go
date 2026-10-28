@@ -198,7 +198,7 @@ const resultsSQL = `results AS (
     AND d.id = ANY (ARRAY(
       SELECT e.depends_on FROM {{schema}}.hopper_job_deps e
       WHERE e.depends_on = ANY (ARRAY(SELECT id FROM done)) AND e.job_id <> ALL (ARRAY(SELECT id FROM done))))
-  ON CONFLICT (job_id) DO UPDATE SET batch_id = EXCLUDED.batch_id, state = EXCLUDED.state, output = EXCLUDED.output,
+  ON CONFLICT (batch_id, job_id) DO UPDATE SET state = EXCLUDED.state, output = EXCLUDED.output,
     finalized_at = EXCLUDED.finalized_at
   RETURNING job_id
 ),

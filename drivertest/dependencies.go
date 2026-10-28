@@ -348,3 +348,40 @@ func testDependencyResultsLeaseExpiry[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	checkDependencies(t, claimOne(ctx, t, exec, clientID, dependent), wantDependency{"remote", driver.JobStateDiscarded, ""})
 }
+
+// testDependencyResultsOrphans checks that the leader's settle, when asked
+// for results, deletes those of a workflow that no longer exists and keeps
+// those of one in flight.
+func testDependencyResultsOrphans[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Name: "orphans", Jobs: params("step", 2), Steps: []string{"build", "report"},
+		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimOne(ctx, t, exec, clientID, wf.Jobs[0].Job.ID)
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: wf.Jobs[0].Job.ID, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true})
+	f.OrphanJobResult(ctx, t, d, wf.Jobs[0].Job.ID)
+	if n := f.CountJobResults(ctx, t, d); n != 2 {
+		t.Fatalf("%d dependency results, want the workflow's and an orphan", n)
+	}
+	if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{Limit: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.CountJobResults(ctx, t, d); n != 2 {
+		t.Errorf("%d dependency results after a settle not asked for them, want 2", n)
+	}
+	if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{Limit: 10, Results: true}); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.CountJobResults(ctx, t, d); n != 1 {
+		t.Errorf("%d dependency results after the sweep, want the workflow's alone", n)
+	}
+	checkDependencies(t, claimOne(ctx, t, exec, clientID, wf.Jobs[1].Job.ID), wantDependency{"build", driver.JobStateCompleted, ""})
+}

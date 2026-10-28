@@ -20,15 +20,17 @@
 -- finalize names them in. Neither hopper_jobs nor history is locked, so
 -- claims never wait for this migration.
 
+-- Keyed by workflow first, so that one index serves both a claim's lookup
+-- of a dependency (in the dependent's own workflow) and the delete of a
+-- completed workflow's results.
 CREATE TABLE hopper_job_results (
-  job_id       uuid             PRIMARY KEY,   -- the finished dependency
-  batch_id     uuid             NOT NULL,      -- its workflow; deleted when that completes
+  batch_id     uuid             NOT NULL,      -- the workflow; its rows go when it completes
+  job_id       uuid             NOT NULL,      -- the finished dependency
   state        hopper_job_state NOT NULL,      -- completed, canceled or discarded
   output       jsonb,
-  finalized_at timestamptz      NOT NULL DEFAULT now()
+  finalized_at timestamptz      NOT NULL DEFAULT now(),
+  PRIMARY KEY (batch_id, job_id)
 ) WITH (vacuum_truncate = false);
-
-CREATE INDEX hopper_job_results_batch ON hopper_job_results (batch_id);
 
 DO $$
 DECLARE

@@ -450,13 +450,22 @@ const claimEligibleSQL = `
 // and those gone from the live table without one, which finished before
 // the engine recorded results and read with no state. Only a job in a
 // batch can have any, so a claimed job outside one costs a CASE and
-// nothing else.
+// nothing else. Each edge's result and its job's row are looked up by
+// primary key, as scalar subqueries, which the planner cannot turn into
+// scans: as a join, a results table or a hopper_job_deps without
+// statistics had it hash the whole results table, and the check that the
+// dependency left the live table, as NOT EXISTS, became a hash of all of
+// hopper_jobs, built for every claim of a workflow job.
 const claimDependenciesSQL = `CASE WHEN claimed.batch_id IS NOT NULL THEN (
-    SELECT jsonb_agg(jsonb_build_object('id', d.depends_on, 'step', d.step, 'state', r.state, 'output', r.output)
-                     ORDER BY d.depends_on)
-    FROM {{schema}}.hopper_job_deps d LEFT JOIN {{schema}}.hopper_job_results r ON r.job_id = d.depends_on
-    WHERE d.job_id = claimed.id
-      AND (r.job_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = d.depends_on))
+    SELECT jsonb_agg(jsonb_build_object('id', e.depends_on, 'step', e.step) || coalesce(e.result, '{}') ORDER BY e.depends_on)
+    FROM (
+      SELECT d.depends_on, d.step,
+        (SELECT jsonb_build_object('state', r.state, 'output', r.output)
+         FROM {{schema}}.hopper_job_results r WHERE r.batch_id = claimed.batch_id AND r.job_id = d.depends_on) AS result
+      FROM {{schema}}.hopper_job_deps d WHERE d.job_id = claimed.id
+      OFFSET 0
+    ) e
+    WHERE e.result IS NOT NULL OR (SELECT x.id FROM {{schema}}.hopper_jobs x WHERE x.id = e.depends_on) IS NULL
   ) END`
 
 // jobClaimSQL is the hot path. The candidate CTE walks the claim index in
