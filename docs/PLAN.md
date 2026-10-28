@@ -1503,11 +1503,13 @@ job then completes runs `OnSuccess` and `OnComplete`, not `OnFailure`, and one w
 re-driven job fails again counts it once (§11). A retry that finds the batch
 completed changes none of its counts, and on Postgres neither does one that the
 statement completing the batch did not see (held open in a caller's transaction,
-`JobRetryTx`, or committed while the batch's last other job finalized): that
-statement completed the batch without the job, with its failure and `OnFailure`. Jobs
-that its failure canceled by cascade stay failed. Re-driving one of those too counts
-it as pending again, but its dependencies went with its cancel, so it runs at once,
-not after the job it depended on.
+`JobRetryTx`, or committed while that statement ran, the finalize of the batch's last
+other job or a settle): it completed the batch without the job, with its failure and
+`OnFailure`. Neither does the job's next finish, completed or failed: a completed
+batch keeps the counts its callbacks were given. Jobs that its failure canceled by
+cascade stay failed. Re-driving one of those too counts it as pending again, but its
+dependencies went with its cancel, so it runs at once, not after the job it depended
+on.
 
 `JobDelete` removes a job that is not running and refuses a running one (cancel it,
 then delete it once it has finished). A finalized job's history row is deleted. A
@@ -2392,10 +2394,13 @@ observability without new machinery.
     jobs at the same time each miss the other's uncommitted row, so neither completes
     the batch. `BatchSettle` locks batch rows that have progress rows, folds the rows
     into `pending` and `failed`, and completes those with nothing remaining, with
-    their callbacks. The finalizer runs it on the batches of a flush once the flush
-    has committed, waiting for a batch row another settle holds, so of the two the
-    one settling second sees the other's progress and completes the batch. The wait
-    is bounded (`lock_timeout` 500 ms, below `deadlock_timeout`, so a settle that
+    their callbacks. The rows of a batch that had completed when locked it deletes
+    without folding them: a retry the completing statement missed, and the finish of a
+    job re-driven after it completed (below), so that a completed batch keeps the
+    counts its callbacks were given. The finalizer runs it on the batches of a flush
+    once the flush has committed, waiting for a batch row another settle holds, so of
+    the two the one settling second sees the other's progress and completes the batch.
+    The wait is bounded (`lock_timeout` 500 ms, below `deadlock_timeout`, so a settle that
     would deadlock with a finalize completing several batches gives up first); a
     batch it cannot get is left to the leader, which on every pass sweeps batches
     with progress rows in ID order (`SKIP LOCKED`, resuming where a pass stopped)
@@ -2409,7 +2414,8 @@ observability without new machinery.
     finalize without the batch and dependency steps, which roughly halves the cost of
     a small flush.
   - **Reading progress.** `BatchGet` and `WorkflowGet` report `pending` and `failed`
-    with the progress rows folded in.
+    with the progress rows folded in, and a completed batch's as it completed with,
+    leaving out the rows the settle deletes without folding.
   - **Rolling deploys.** A client of the previous release counts down `pending`, which
     the remaining count includes, and completes the batch when `pending` reaches zero,
     which it does only if it finalized every job. Otherwise this release completes it;
@@ -2484,10 +2490,10 @@ observability without new machinery.
     statement that completes a workflow skips a result row such a retry holds (it is
     deleted when the retry commits, and swept if it rolls back). That statement
     completes the workflow from its snapshot, without the retried step and with its
-    failure; `BatchSettle` deletes the retry's row, once it commits, without folding
-    it into the completed workflow, and `BatchGet` and `WorkflowGet` leave it out, so
-    the workflow keeps the counts its callbacks were given. Once per
-    maintenance interval the leader's batch settle deletes those of workflows that
+    failure; `BatchSettle` deletes the retry's row, once it commits, and the row of the
+    step's next finish without folding them into the completed workflow, and
+    `BatchGet` and `WorkflowGet` leave them out, so the workflow keeps the counts its
+    callbacks were given. Once per maintenance interval the leader's batch settle deletes those of workflows that
     completed or are gone, which a client of an earlier release, completing a
     workflow, leaves; it is not run on every pass because it reads the whole table, and
     a sweep that fails waits for the next interval rather than holding up the settle.
@@ -2654,7 +2660,7 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease or a job, backdate an attempt, store a value as a direct write would, wait until a statement waits for a lock, count rows); what depends on row locks is tested either way by `Capabilities.SingleWriter`. `drivertest.RunPostgres` adds the tests of what the Postgres drivers share beyond the interface (partitions and their indexes, the tags tables, progress rows, planner statistics); other engine internals stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Job leases: a claim by ID against a client's claim of the same jobs claims each once; concurrent renewals of a lease and of a stale lease of the same job; a renewal held open against the expiry, which the renewal wins; a finish held open against the expiry, which skips the job; cancels that commit while the expiry runs, which leave no job running without its lease; a stale token's finish after an expiry; and holders that renew late at random against the leader's expiry, where every claim ends exactly once, by its Finish or its expiry, and no expiry is recorded before the expiry its holder was last given. A whole-cluster restart while workers hold leases: those that come back within the grace keep them, and a lease never renewed again expires no earlier than the grace after the restart, even when a client that started after the claims crashed with the cluster, its lease lapsing before the restart. Workflow dependencies: two dependencies finalized in concurrent transactions, whose dependent is promoted once both commit and claimed with both results; a leased dependency's result against its lease's expiry, whichever applies giving the dependent its state; four clients working forty workflows with failing steps, every step claimed with exactly its dependencies' states and outputs and no result left once they complete; the leader's sweep of orphaned results run without pause while workflows are worked, which deletes none of a workflow in flight; and a `JobRetry` of a finished step whose result its dependent read, held open in a transaction while its sibling, the workflow's last step, finalizes, which neither the finalize nor the leader's sweep waits for, and which leaves no result whether it commits or rolls back; and a `JobRetry` of a failed step held open the same way, which neither the finalize nor the leader's settle waits for, and which the finalize completes the workflow without, with the step's failure and `OnFailure`, a failure the workflow keeps once the retry commits and the step completes. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Job leases: a claim by ID against a client's claim of the same jobs claims each once; concurrent renewals of a lease and of a stale lease of the same job; a renewal held open against the expiry, which the renewal wins; a finish held open against the expiry, which skips the job; cancels that commit while the expiry runs, which leave no job running without its lease; a stale token's finish after an expiry; and holders that renew late at random against the leader's expiry, where every claim ends exactly once, by its Finish or its expiry, and no expiry is recorded before the expiry its holder was last given. A whole-cluster restart while workers hold leases: those that come back within the grace keep them, and a lease never renewed again expires no earlier than the grace after the restart, even when a client that started after the claims crashed with the cluster, its lease lapsing before the restart. Workflow dependencies: two dependencies finalized in concurrent transactions, whose dependent is promoted once both commit and claimed with both results; a leased dependency's result against its lease's expiry, whichever applies giving the dependent its state; four clients working forty workflows with failing steps, every step claimed with exactly its dependencies' states and outputs and no result left once they complete; the leader's sweep of orphaned results run without pause while workflows are worked, which deletes none of a workflow in flight; and a `JobRetry` of a finished step whose result its dependent read, held open in a transaction while its sibling, the workflow's last step, finalizes, which neither the finalize nor the leader's sweep waits for, and which leaves no result whether it commits or rolls back; and a `JobRetry` of a failed step held open the same way, which neither the finalize nor the leader's settle waits for, and which the finalize completes the workflow without, with the step's failure and `OnFailure`, a failure the workflow keeps, once, after the retry commits and the step completes or fails again. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes while running two workflow dependencies: the one rerun elsewhere gives its dependent the output of the attempt that completed, and the one the rescue discards gives its dependent that state and no output. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |

@@ -196,6 +196,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"WorkflowsConcurrent", testWorkflowsConcurrent[TTx]},
 		{"WorkflowRetriedFailure", testWorkflowRetriedFailure[TTx]},
 		{"WorkflowRetriedFailureHeld", testWorkflowRetriedFailureHeld[TTx]},
+		{"WorkflowRetriedAfterCompletion", testWorkflowRetriedAfterCompletion[TTx]},
 		{"DependencyResults", testDependencyResults[TTx]},
 		{"DependencyResultsFailed", testDependencyResultsFailed[TTx]},
 		{"DependencyResultsConcurrent", testDependencyResultsConcurrent[TTx]},

@@ -157,17 +157,12 @@ func (e *Executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 }
 
 // batchProgressSelect reads a batch's pending and failed counts, with its
-// progress rows (batchReadProgressSQL) folded in, from a hopper_batches row
-// aliased b.
+// progress rows (batchProgressSQL) folded in, from a hopper_batches row
+// aliased b. A completed batch reads the counts it completed with: the rows
+// it has left, which BatchSettle deletes without folding (batchSettleSQL),
+// are not counted.
 const batchProgressSelect = `CASE WHEN b.completed_at IS NULL THEN greatest(b.pending - p.done, 0) ELSE 0 END AS pending,
-  b.failed + p.failed AS failed`
-
-// batchReadProgressSQL is batchProgressSQL for reading a batch row aliased
-// b: a completed batch leaves out the row of a JobRetry (done -1) that the
-// statement completing it missed, which BatchSettle drops rather than
-// folds (batchSettleSQL).
-const batchReadProgressSQL = `LATERAL (SELECT coalesce(sum(p.done), 0) AS done, coalesce(sum(p.failed), 0) AS failed
-    FROM {{schema}}.hopper_batch_progress p WHERE p.batch_id = b.id AND (b.completed_at IS NULL OR p.done > 0)) p`
+  b.failed + CASE WHEN b.completed_at IS NULL THEN p.failed ELSE 0 END AS failed`
 
 // batchSettleSQL folds batches' progress rows into their batch rows and
 // completes, with their callbacks, those with nothing remaining: batches
@@ -179,15 +174,17 @@ const batchReadProgressSQL = `LATERAL (SELECT coalesce(sum(p.done), 0) AS done, 
 // inferred from completed_at = now(), which a batch completed earlier in the
 // same transaction also satisfies.
 //
-// A JobRetry's row (done -1, and failed -1 for a failed job) found on a
-// batch that has completed is deleted without being folded. The statement
-// that completed the batch missed it: the retry was held open in a caller's
-// transaction (JobRetryTx), or committed while that statement ran, and it
-// completed the batch without the job, with the job's failure, and ran the
-// callbacks that failure called for. Dropping the row keeps the batch's
-// counts those its callbacks were given, as a retry that finds the batch
-// completed leaves them, rather than taking a failure off a batch whose
-// OnFailure has run.
+// The rows of a batch that had completed when locked are deleted without
+// being folded. They are of jobs re-driven from history (JobRetry) that the
+// batch completed without: a retry's own row (done -1, and failed -1 for a
+// failed job) that the statement completing the batch missed, the retry
+// held open in a caller's transaction (JobRetryTx) or committed while that
+// statement ran, and the re-driven job's next finish. The batch completed
+// with the job's earlier outcome and ran the callbacks it called for.
+// Dropping the rows keeps the batch's counts those its callbacks were
+// given, as a retry that finds the batch completed leaves them, rather than
+// taking a failure off a batch whose OnFailure has run, or adding one to a
+// batch whose OnSuccess has.
 func batchSettleSQL(locked string) string {
 	return `
 WITH locked AS (` + locked + `),
@@ -198,7 +195,7 @@ moved AS (
 sums AS (
   SELECT m.batch_id, sum(m.done) AS done, sum(m.failed) AS failed
   FROM moved m JOIN locked l ON l.id = m.batch_id
-  WHERE l.open OR m.done > 0
+  WHERE l.open
   GROUP BY m.batch_id
 ),
 folded AS (
@@ -320,7 +317,7 @@ func (e *Executor) BatchGet(ctx context.Context, id driver.JobID) (*driver.Batch
 		metadata  jsonText
 	)
 	err := e.Conn.QueryRow(ctx, `SELECT id, `+batchProgressSelect+`, total, created_at, completed_at, metadata
-		FROM {{schema}}.hopper_batches b, `+batchReadProgressSQL+` WHERE id = $1`, uuidParam(id)).
+		FROM {{schema}}.hopper_batches b, `+batchProgressSQL+` WHERE id = $1`, uuidParam(id)).
 		Scan(&b.ID, &b.Pending, &b.Failed, &b.Total, &b.CreatedAt, &completed, &metadata)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound

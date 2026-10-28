@@ -454,7 +454,7 @@ func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		steps     jsonText
 	)
 	err := e.Conn.QueryRow(ctx, `SELECT id, name, `+batchProgressSelect+`, total, created_at, completed_at, metadata, edges, steps
-		FROM {{schema}}.hopper_batches b, `+batchReadProgressSQL+` WHERE id = $1`, uuidParam(id)).
+		FROM {{schema}}.hopper_batches b, `+batchProgressSQL+` WHERE id = $1`, uuidParam(id)).
 		Scan(&w.Batch.ID, &name, &w.Batch.Pending, &w.Batch.Failed, &w.Batch.Total, &w.Batch.CreatedAt, &completed, &metadata, &edges, &steps)
 	if errors.Is(err, ErrNoRows) {
 		return nil, driver.ErrNotFound

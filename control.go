@@ -66,7 +66,8 @@ func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, id JobID) (*JobRo
 // history, counts in it as pending again and no longer as failed, so one
 // whose re-driven job then completes runs OnSuccess, not OnFailure. Jobs
 // its failure canceled by cascade stay failed. A retry that finds the batch
-// completed changes nothing of it.
+// completed changes nothing of it, and neither does the job's next finish:
+// a completed batch keeps the counts its callbacks were given.
 func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID, opts ...RetryOption) (*JobRow, error) {
 	job, err := c.exec.JobRetry(ctx, retryParams(id, opts))
 	if err != nil {
@@ -80,7 +81,8 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID, opts ...RetryOptio
 // JobRetryTx is JobRetry inside the caller's transaction. The job's queue
 // is woken when the transaction commits. Until then the job's batch does
 // not see it as pending again: on Postgres, a batch whose last other job
-// finishes meanwhile completes without it, with its failure.
+// finishes meanwhile completes without it, with its failure if it had
+// failed.
 func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id JobID, opts ...RetryOption) (*JobRow, error) {
 	exec := c.driver.UnwrapTx(tx)
 	job, err := exec.JobRetry(ctx, retryParams(id, opts))
