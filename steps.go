@@ -126,7 +126,7 @@ func RunSteps[T JobArgs](ctx context.Context, job *Job[T], steps ...JobStep[T]) 
 		if s.name == "" || s.run == nil {
 			return Cancel(fmt.Errorf("hopper: step %d has no name or no function", i))
 		}
-		if !storableStep(s.name) {
+		if !storableName(s.name) {
 			return Cancel(fmt.Errorf("hopper: step %q holds a NUL or invalid UTF-8, which PostgreSQL cannot store", s.name))
 		}
 		if slices.ContainsFunc(steps[:i], func(o JobStep[T]) bool { return o.name == s.name }) {
@@ -224,7 +224,7 @@ func record[T JobArgs](ctx context.Context, job *Job[T], txExec func() (driver.E
 // progressCursor checks the step of a progress record of job id, unless
 // keepStep, and encodes its cursor: nil for none, which leaves the key out.
 func progressCursor(id JobID, step string, keepStep bool, cursor any) (json.RawMessage, error) {
-	if !keepStep && !storableStep(step) {
+	if !keepStep && !storableName(step) {
 		return nil, fmt.Errorf("hopper: record the progress of job %s: step %q holds a NUL or invalid UTF-8, which PostgreSQL cannot store", id, step)
 	}
 	if cursor == nil {
@@ -247,10 +247,10 @@ func completedInTx(ctx context.Context) bool {
 	return a != nil && a.completedTx() != nil
 }
 
-// storableStep reports whether PostgreSQL can store name as text. A step
-// name is matched exactly on resume, so it is refused rather than replaced
-// the way storableText replaces an error message.
-func storableStep(name string) bool {
+// storableName reports whether PostgreSQL can store name as text. A step or
+// periodic job name is matched exactly, so it is refused rather than
+// replaced the way jobcodec.StorableText replaces an error message.
+func storableName(name string) bool {
 	return utf8.ValidString(name) && !strings.ContainsRune(name, 0)
 }
 

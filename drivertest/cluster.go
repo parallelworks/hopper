@@ -227,6 +227,68 @@ func testPeriodic[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 }
 
+func testPeriodicRegistrations[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	reg := func(name, def string) driver.PeriodicRegistration {
+		return driver.PeriodicRegistration{Name: name, Definition: json.RawMessage(def), Digest: "digest of " + def}
+	}
+	set := func(clientID int64, regs ...driver.PeriodicRegistration) {
+		t.Helper()
+		if err := exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: clientID, Registrations: regs}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type entry struct {
+		client    int64
+		name, def string
+	}
+	listed := func() []entry {
+		t.Helper()
+		rows, err := exec.PeriodicRegistrations(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := make([]entry, len(rows))
+		for i, r := range rows {
+			var def any
+			if err := json.Unmarshal(r.Definition, &def); err != nil {
+				t.Fatalf("definition %q: %v", r.Definition, err)
+			}
+			canonical, _ := json.Marshal(def)
+			if r.Digest != "digest of "+string(canonical) {
+				t.Errorf("registration %q digest = %q, definition %s", r.Name, r.Digest, canonical)
+			}
+			out[i] = entry{r.ClientID, r.Name, string(canonical)}
+		}
+		return out
+	}
+
+	older, newer := register(ctx, t, exec), register(ctx, t, exec)
+	set(older, reg("a", `{"n":1}`), reg("b", `{"n":2}`))
+	set(newer, reg("a", `{"n":3}`))
+	if got, want := listed(), []entry{{newer, "a", `{"n":3}`}, {older, "a", `{"n":1}`}, {older, "b", `{"n":2}`}}; !slices.Equal(got, want) {
+		t.Errorf("registrations = %v, want %v: by name, newest client first", got, want)
+	}
+
+	set(older, reg("b", `{"n":4}`))
+	if got, want := listed(), []entry{{newer, "a", `{"n":3}`}, {older, "b", `{"n":4}`}}; !slices.Equal(got, want) {
+		t.Errorf("after replacing a client's set, registrations = %v, want %v", got, want)
+	}
+
+	f.ExpireLease(ctx, t, d, newer)
+	if got, want := listed(), []entry{{older, "b", `{"n":4}`}}; !slices.Equal(got, want) {
+		t.Errorf("with a lease expired, registrations = %v, want %v", got, want)
+	}
+	if err := exec.ClientDelete(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	if got := listed(); len(got) != 0 {
+		t.Errorf("registrations of expired and deleted clients = %v", got)
+	}
+}
+
 func testStats[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	exec := f.NewDriver(t).Executor()

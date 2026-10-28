@@ -313,7 +313,7 @@ client.Queues().Pause(ctx, "email")
 lease, err := client.Leases().Claim(ctx, id, fence, nil) // a job lease at the job's expected fence, for an attempt run on a remote worker (§7.14)
 client.Leases().Renew(ctx, lease.Token)           // ... and RecordStep, RecordCursor, Finish and their Tx forms
 client.Queues().Add(ctx, "tenant_42", hopper.QueueConfig{MaxWorkers: 5}) // runtime, multi-tenant
-client.PeriodicJobs().Add(hopper.Cron("0 * * * *", TenantReport{ID: 42}, &hopper.PeriodicOpts{Name: "report:42"})) // on every client that can lead
+client.PeriodicJobs().Add(hopper.Cron("0 * * * *", TenantReport{ID: 42}, &hopper.PeriodicOpts{Name: "report:42"})) // the leader schedules it while this client runs
 
 for ev := range client.Events(ctx, hopper.EventJobFailed, hopper.EventJobDiscarded) { ... }
 
@@ -648,6 +648,14 @@ CREATE TABLE hopper_queues (
 CREATE TABLE hopper_periodic (          -- last inserted slot per periodic job
   name      text PRIMARY KEY,
   last_slot timestamptz NOT NULL
+);
+
+CREATE TABLE hopper_periodic_registrations (  -- v20: each live client's periodic jobs
+  client_id  bigint NOT NULL,
+  name       text   NOT NULL,
+  definition jsonb  NOT NULL,
+  digest     text   NOT NULL,           -- of the definition as the client encoded it; see §7.9
+  PRIMARY KEY (client_id, name)
 );
 
 CREATE TABLE hopper_subscriptions (
@@ -1661,13 +1669,63 @@ upsert would otherwise reject as older than the last one.
 `Config.Periodic` is a client's initial set of periodic jobs. `Client.PeriodicJobs()`
 changes the set at runtime with `Add`, `AddMany`, `Remove` and `Clear`, and lists it with
 `All`. A job is identified by its name, the key of `hopper_periodic`; adding a name that
-is already registered fails, so a job is changed by removing it and adding it again. The
-set is held in memory, per client, and is not persisted or shared: the leader schedules
-only its own set, so **every client that can lead must register the job**, as with
-`Config.Periodic`. A job added only on the leader stops when leadership moves, a job
-added only on a follower starts when that client leads, and a job removed only on the
-leader comes back with a leader that still has it. Overlapping leaders with different
-sets still insert a slot at most once. A change wakes the leader's loop, which schedules
+is already registered fails, so a job is changed by removing it and adding it again.
+
+Each client with queues records its set under its lease, in
+`hopper_periodic_registrations` (schema v20): a row per job, keyed by client and name,
+holding the job's definition, the slot-independent part of its insert as the client
+built it (kind, encoded args, queue, priority, attempts, metadata, tags, TTL, ordering
+and partition keys, and the unique key without its period), with its schedule,
+`RunOnStart` and `CatchUp`, and a digest of the definition as the client encoded it.
+Clients tell definitions apart by digest only, since `jsonb` stores the definition
+reformatted. The client writes its whole set in one transaction when it
+starts, when what it records changes, which it checks on every change and every lease
+renewal interval, and at once when it registers a new lease after losing one, and retries a
+failed write each lease renewal interval. The leader schedules the jobs of
+**every live client**, so a job is registered only by the programs that should run it,
+and the leader needs none of its Go types: it inserts the stored args and options, and
+the job is worked by whichever client works its queue. For each name the leader takes
+the definition of the newest live client that registers it, by the client's start time,
+and logs once when live clients define a name differently, as during a rolling deploy;
+for itself it reads its in-memory set rather than its rows, so its changes to the names
+it recorded apply at once, while a name it adds that another client records waits for its
+write and the next read. A job the leader registers with the definition it schedules is
+built from its own args at each slot, whichever client's row is the newest, as a leader
+built its jobs before v20. It reads the rows of clients whose lease has not expired at the start of a term,
+before its first pass, and then every leader interval, waking the periodic loop only
+when they changed. A job keeps its registration in the loop while its definition is
+unchanged, whichever client it comes from, so a job whose registering client stops while
+another still registers it is not started again; a changed definition is started again
+as an added job. A registration lasts as long as its client's lease: the leader reads
+only live clients' rows, and deleting a client's row, when it stops or when the leader
+prunes it, deletes its registrations in the same statement or transaction. A write that
+races a prune, or a prune by a release from before v20, can leave rows behind; each
+write deletes the rows of clients whose row is gone. A write for a
+client whose lease has expired records nothing. A job therefore runs while any live
+client registers it, and stops within a leader interval of the last one removing it or
+stopping. Only `Cron` schedules (stored as their expression and time zone) and `Every`
+schedules (their interval) can be recorded; a job with another `Schedule`, or a `Cron`
+in `time.Local`, which names a different zone in each process, or in a zone that does
+not load by its name to the same offsets, such as a `time.FixedZone`, or a job whose
+insert differs each time it is built (args an encrypting codec encodes with a random
+nonce, whose digests would never match across replicas), a job whose insert sets
+`ScheduledAt` (usually read from the clock, which the definition would freeze at `Add`,
+and which a coarse clock can read the same twice), or one whose name or
+definition holds a NUL or invalid UTF-8 (which Postgres refuses, and which would fail the
+client's whole write), is scheduled only
+from its own client's set, while that client leads and no other client records the name,
+as before v20. A definition the leader
+cannot read, such as one of a later definition version, or a `Cron` in a zone the leader
+cannot load, is skipped with a log, and the leader schedules its own job of that name if
+it has one. So every client that can lead needs the zone database of the zones other
+clients' `Cron` jobs name, from the system or from importing `time/tzdata`, which a
+library leaves to the program. A leader from before v20
+schedules only its own set. A client with no queues holds no lease and records nothing,
+so its jobs are never scheduled. A `NeverLead` client's jobs are recorded and scheduled
+by the leader while it runs, so a developer's process against a shared environment
+registers none it should not run.
+
+Overlapping leaders with different sets still insert a slot at most once. A change wakes the leader's loop, which schedules
 an added job as if its term had just started: `RunOnStart` inserts a job, `CatchUp`
 back-fills, and otherwise slots since the last recorded one within the lease TTL are
 inserted, so a job removed and added again within the lease TTL inserts the slots it
@@ -1675,9 +1733,7 @@ missed. Rows are kept, so a name whose recorded slot is older, however long ago 
 removed, inserts the slots of the last lease TTL, or back-fills up to `CatchUp`, as a
 term start after an outage does. A `RunOnStart` added on every client inserts one job because only the leader
 schedules; its slot is the leader's database time, so two overlapping leaders each
-insert one, as at the start of a term. `Remove` applies only to the client it is called
-on, so a job is removed on every client that can lead, or a failover to a client that
-still has it brings it back. A removed job stops being inserted; a slot being inserted as
+insert one, as at the start of a term. A removed job stops being inserted; a slot being inserted as
 it is removed may still be. Its `hopper_periodic` row is kept, because another client may
 still have the job and the row is what keeps a slot from being inserted twice, so the
 table holds a row for every name ever scheduled. Starting added jobs reads the whole
@@ -1696,13 +1752,16 @@ inserted, and the jobs already scheduled insert their due slots before added job
 start. `NewClient`, for
 `Config.Periodic`, and `Add` build each job's insert as `Insert` would and fail if it
 cannot be built, such as for invalid `InsertOpts`. `Add` also applies `StrictKinds`, as
-an `Insert` at that moment would; `NewClient` leaves it to each insert, since workers may
-be registered after it. A periodic job's `UniqueReplace` acts as `UniqueSkip`. A job's `UniqueOpts.ByPeriod` key is computed from its slot, so each
+an `Insert` at that moment would; `NewClient` leaves it until later, since workers may
+be registered after it. A `StrictKinds` client records only the jobs of kinds it has a
+worker for, comparing what it would record with what it last wrote every lease renewal
+interval, so a job is recorded once its worker is registered; until then the job is
+scheduled only from the client's own set while it leads, where each insert fails as
+an `Insert` would. A periodic job's `UniqueReplace` acts as `UniqueSkip`. A job's `UniqueOpts.ByPeriod` key is computed from its slot, so each
 back-filled or retried slot keys its own period. A `RunOnStart` insert whose reply is
 lost after it committed is inserted again when retried, since its slot is the database
-time of the try. A client
-that never leads (`NeverLead`, or one with no queues) accepts the jobs but never
-schedules them.
+time of the try. A client that never leads (`NeverLead`, or one with no queues) never
+schedules jobs itself.
 
 ### 7.10 Retention
 Finalized jobs live in `hopper_job_history`, partitioned by outcome and then by time.

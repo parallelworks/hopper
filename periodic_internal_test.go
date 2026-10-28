@@ -35,6 +35,15 @@ type periodicExec struct {
 	last           map[string]time.Time
 	nowReads       int
 	inserts        []driver.PeriodicInsertParams
+	registrations  []driver.PeriodicRegistrationRow
+	// onInsert, if set, is called after each insert.
+	onInsert func()
+}
+
+func (e *periodicExec) PeriodicRegistrations(context.Context) ([]driver.PeriodicRegistrationRow, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.registrations), nil
 }
 
 func (e *periodicExec) Now(context.Context) (time.Time, error) {
@@ -71,6 +80,9 @@ func (e *periodicExec) PeriodicInsert(_ context.Context, p driver.PeriodicInsert
 		return nil, false, errors.New("connection reset")
 	}
 	e.inserts = append(e.inserts, p)
+	if e.onInsert != nil {
+		defer e.onInsert()
+	}
 	return &driver.JobRow{Queue: p.Job.Queue}, true, nil
 }
 

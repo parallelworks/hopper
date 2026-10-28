@@ -178,6 +178,18 @@ func sameStates(a, b []driver.JobState) bool {
 	return len(a) == len(b) && !slices.ContainsFunc(a, func(s driver.JobState) bool { return !slices.Contains(b, s) })
 }
 
+// effectiveOpts returns the args' own InsertOpts with p.Opts applied on top.
+func (p InsertParams) effectiveOpts() InsertOpts {
+	var opts InsertOpts
+	if a, ok := p.Args.(JobArgsWithInsertOpts); ok {
+		opts = a.InsertOpts()
+	}
+	if p.Opts != nil {
+		opts = opts.merge(*p.Opts)
+	}
+	return opts
+}
+
 func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.JobInsertParams, driver.ConflictAction, error) {
 	if p.Args == nil {
 		return driver.JobInsertParams{}, 0, errors.New("hopper: Args must not be nil")
@@ -192,13 +204,7 @@ func (c *Client[TTx]) buildInsertParams(p InsertParams, now time.Time) (driver.J
 		}
 	}
 
-	var opts InsertOpts
-	if a, ok := p.Args.(JobArgsWithInsertOpts); ok {
-		opts = a.InsertOpts()
-	}
-	if p.Opts != nil {
-		opts = opts.merge(*p.Opts)
-	}
+	opts := p.effectiveOpts()
 	if opts.Queue == "" {
 		opts.Queue = QueueDefault
 	}

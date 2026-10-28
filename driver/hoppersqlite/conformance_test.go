@@ -3,6 +3,7 @@ package hoppersqlite_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"log/slog"
 	"path/filepath"
 	"strconv"
@@ -157,4 +158,48 @@ func (fixture) WaitForLockWait(_ context.Context, t *testing.T, d driver.Driver[
 func TestConformance(t *testing.T) {
 	t.Parallel()
 	drivertest.Run(t, fixture{})
+}
+
+// A client's registrations go with its row, whether it stops or the leader
+// prunes its expired lease, and none are recorded for a client already gone.
+func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
+	ctx := context.Background()
+	d := open(t)
+	exec := d.Executor()
+	regs := []driver.PeriodicRegistration{{Name: "j", Definition: json.RawMessage(`{}`), Digest: "d"}}
+	register := func() int64 {
+		id, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "h", TTL: time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: id, Registrations: regs}); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	rows := func() int { return count(ctx, t, d, "SELECT count(*) FROM hopper_periodic_registrations") }
+
+	expired, deleted := register(), register()
+	fixture{}.ExpireLease(ctx, t, d, expired)
+	if _, err := exec.ClientPruneExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := rows(); n != 1 {
+		t.Errorf("%d registrations after one of two clients was pruned, want 1", n)
+	}
+	if err := exec.ClientDelete(ctx, deleted); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PeriodicRegister(ctx, driver.PeriodicRegisterParams{ClientID: deleted, Registrations: regs}); err != nil {
+		t.Fatal(err)
+	}
+	if n := rows(); n != 0 {
+		t.Errorf("%d registrations after both clients were gone", n)
+	}
+
+	execSQL(ctx, t, d, `INSERT INTO hopper_periodic_registrations (client_id, name, definition, digest) VALUES (-1, 'left', '{}', 'd')`)
+	register()
+	if n := rows(); n != 1 {
+		t.Errorf("%d registrations, want only the live client's: a gone client's survived another client's write", n)
+	}
 }

@@ -94,16 +94,28 @@ func (o *UniqueOpts) key(args JobArgs, encodedArgs []byte, queue string, now tim
 		parts = append(parts, "q="+queue)
 	}
 	if o.ByPeriod > 0 {
-		parts = append(parts, "p="+now.UTC().Truncate(o.ByPeriod).Format(time.RFC3339))
+		parts = append(parts, periodPart(now, o.ByPeriod))
 	}
 	key := "*"
 	if len(parts) > 0 {
 		key = strings.Join(parts, uniqueKeySeparator)
 	}
-	if len(key) > maxUniqueKey {
-		return "", fmt.Errorf("hopper: unique key of %d bytes exceeds the %d byte limit", len(key), maxUniqueKey)
+	if err := checkUniqueKey(key); err != nil {
+		return "", err
 	}
 	return key, nil
+}
+
+// periodPart is the key part of a ByPeriod key at t, which comes last.
+func periodPart(t time.Time, period time.Duration) string {
+	return "p=" + t.UTC().Truncate(period).Format(time.RFC3339)
+}
+
+func checkUniqueKey(key string) error {
+	if len(key) > maxUniqueKey {
+		return fmt.Errorf("hopper: unique key of %d bytes exceeds the %d byte limit", len(key), maxUniqueKey)
+	}
+	return nil
 }
 
 // uniqueArgs returns the args' contribution to the key: the tagged fields as

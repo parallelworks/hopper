@@ -31,6 +31,8 @@ type Client[TTx any] struct {
 	workers  *Workers
 	notifier *notifier
 	periodic *PeriodicJobs
+	// recorded is what the client last wrote of its periodic jobs.
+	recorded periodicRecord
 
 	// clientID is the lease row ID while running. It changes if the lease is
 	// lost and re-registered.
@@ -114,7 +116,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		workers:     resolved.Workers,
 		leaderPoke:  make(chan struct{}, 1),
 		streamPoke:  make(chan struct{}, 1),
-		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, !resolved.leads()),
+		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
 		events:      newEventBus(),
 		running:     map[JobID]*runningJob{},
 		doneWaiters: map[JobID][]chan struct{}{},
@@ -131,12 +133,23 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 	// so an error or a panic here cannot leave a client without it.
 	strict := c.cfg.StrictKinds
 	c.cfg.StrictKinds = false
+	c.periodic.define = c.periodicDefinition
 	for _, r := range c.periodic.jobs {
 		if _, err := c.periodicParams(&r.job, time.Now()); err != nil {
 			return nil, fmt.Errorf("hopper: periodic job %q: %w", r.job.Name, err)
 		}
+		if err := c.periodic.setDefinition(r); err != nil {
+			return nil, err
+		}
 	}
 	c.cfg.StrictKinds = strict
+	c.periodic.recordable = func(r *registeredPeriodic) bool {
+		if !c.cfg.StrictKinds {
+			return true
+		}
+		_, ok := c.workers.lookup(r.job.Args.Kind())
+		return ok
+	}
 	c.notifier = newNotifier(c.exec, c.logger, c.tuning.notifyInterval)
 	return c, nil
 }
@@ -209,10 +222,14 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	if c.caps.Listen {
 		c.listenWG.Go(func() { c.listenLoop(c.bgCtx) })
 	}
+	// Recorded before leading, so the term's first read has this client's
+	// own jobs rather than only those of older clients.
+	c.recordPeriodic(ctx)
 	if c.cfg.leads() {
 		c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
 	}
 	c.leaseWG.Go(func() { c.leaseLoop(c.bgCtx) })
+	c.leaseWG.Go(func() { c.registrationLoop(c.bgCtx) })
 
 	c.state = clientStarted
 	c.logger.InfoContext(ctx, "hopper: client started", "client_id", id, "queues", slices.Sorted(maps.Keys(c.cfg.Queues)))
@@ -615,5 +632,8 @@ func (c *Client[TTx]) fence(ctx context.Context, id int64) {
 	}
 	c.clientID.Store(newID)
 	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // canceled by fence or Stop
+	// Recorded before the leader is woken, so a term this client wins
+	// first reads its own jobs under the new lease.
+	c.recordPeriodic(ctx)
 	c.pokeLeader()
 }

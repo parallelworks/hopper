@@ -73,6 +73,9 @@ func (e *executor) ClientRenew(ctx context.Context, params driver.ClientRenewPar
 // ClientDelete implements driver.Executor.
 func (e *executor) ClientDelete(ctx context.Context, clientID int64) error {
 	err := e.write(ctx, func(x *w) error {
+		if _, err := x.ExecContext(ctx, `DELETE FROM hopper_periodic_registrations WHERE client_id = ?`, clientID); err != nil {
+			return err
+		}
 		_, err := x.ExecContext(ctx, `DELETE FROM hopper_clients WHERE id = ?`, clientID)
 		return err
 	})
@@ -86,7 +89,12 @@ func (e *executor) ClientDelete(ctx context.Context, clientID int64) error {
 func (e *executor) ClientPruneExpired(ctx context.Context) (int64, error) {
 	var n int64
 	err := e.write(ctx, func(x *w) error {
-		res, err := x.ExecContext(ctx, `DELETE FROM hopper_clients WHERE expires_at < ?`, x.us())
+		now := x.us()
+		if _, err := x.ExecContext(ctx, `DELETE FROM hopper_periodic_registrations
+			WHERE client_id IN (SELECT id FROM hopper_clients WHERE expires_at < ?)`, now); err != nil {
+			return err
+		}
+		res, err := x.ExecContext(ctx, `DELETE FROM hopper_clients WHERE expires_at < ?`, now)
 		if err != nil {
 			return err
 		}
@@ -329,6 +337,55 @@ func (e *executor) PeriodicLastSlots(ctx context.Context) (map[string]time.Time,
 		out[s.name] = time.UnixMicro(s.at).UTC()
 	}
 	return out, nil
+}
+
+// PeriodicRegister implements driver.Executor.
+func (e *executor) PeriodicRegister(ctx context.Context, params driver.PeriodicRegisterParams) error {
+	err := e.write(ctx, func(x *w) error {
+		if _, err := x.ExecContext(ctx, `DELETE FROM hopper_periodic_registrations
+			WHERE client_id = ? OR client_id NOT IN (SELECT id FROM hopper_clients)`, params.ClientID); err != nil {
+			return err
+		}
+		var live bool
+		if err := x.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM hopper_clients WHERE id = ? AND expires_at > ?)`,
+			params.ClientID, x.us()).Scan(&live); err != nil || !live {
+			return err
+		}
+		for _, r := range params.Registrations {
+			if _, err := x.ExecContext(ctx, `INSERT INTO hopper_periodic_registrations (client_id, name, definition, digest) VALUES (?, ?, ?, ?)`,
+				params.ClientID, r.Name, string(r.Definition), r.Digest); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("hopper: register periodic jobs: %w", err)
+	}
+	return nil
+}
+
+// PeriodicRegistrations implements driver.Executor.
+func (e *executor) PeriodicRegistrations(ctx context.Context) ([]driver.PeriodicRegistrationRow, error) {
+	rows, err := queryAll(ctx, e.read(), func(r scanner) (driver.PeriodicRegistrationRow, error) {
+		var (
+			row        driver.PeriodicRegistrationRow
+			startedAt  int64
+			definition string
+		)
+		err := r.Scan(&row.ClientID, &startedAt, &row.Name, &definition, &row.Digest)
+		row.ClientStartedAt = time.UnixMicro(startedAt).UTC()
+		row.Definition = json.RawMessage(definition)
+		return row, err
+	}, `SELECT c.id, c.started_at, r.name, r.definition, r.digest
+		FROM hopper_periodic_registrations r
+		JOIN hopper_clients c ON c.id = r.client_id
+		WHERE c.expires_at > ?
+		ORDER BY r.name, c.started_at DESC, c.id DESC`, e.clock().UnixMicro())
+	if err != nil {
+		return nil, fmt.Errorf("hopper: periodic registrations: %w", err)
+	}
+	return rows, nil
 }
 
 // Stats implements driver.Executor, from one snapshot of the database.

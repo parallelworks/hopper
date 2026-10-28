@@ -168,6 +168,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"JobDeleteRacesRetry", testJobDeleteRacesRetry[TTx]},
 		{"Queues", testQueues[TTx]},
 		{"Periodic", testPeriodic[TTx]},
+		{"PeriodicRegistrations", testPeriodicRegistrations[TTx]},
 		{"Stats", testStats[TTx]},
 		{"Notify", testNotify[TTx]},
 		{"HistoryMaintain", testHistoryMaintain[TTx]},
