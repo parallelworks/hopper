@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/parallelworks/hopper/driver"
 )
@@ -154,8 +152,8 @@ func (c *Client[TTx]) insertWorkflow(ctx context.Context, exec driver.Executor, 
 	for i, s := range wf.steps {
 		params[i] = s.params
 		if s.opts.Name != "" {
-			if !utf8.ValidString(s.opts.Name) || strings.ContainsRune(s.opts.Name, 0) {
-				return nil, fmt.Errorf("hopper: step %d: name %q is not valid UTF-8 text", i, s.opts.Name)
+			if !storableName(s.opts.Name) {
+				return nil, fmt.Errorf("hopper: step %d: name %q holds a NUL or invalid UTF-8, which PostgreSQL cannot store", i, s.opts.Name)
 			}
 			if j, dup := names[s.opts.Name]; dup {
 				return nil, fmt.Errorf("hopper: steps %d and %d are both named %q", j, i, s.opts.Name)

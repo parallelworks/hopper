@@ -172,17 +172,20 @@ func (e *executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 	if params.IDs != nil || !params.Results {
 		return driver.BatchSettleResult{}, nil
 	}
-	const orphans = `SELECT o.batch_id FROM hopper_job_results o
+	// Up to Limit results, as on Postgres, not every result of Limit
+	// workflows, so that one write holds the lock for a bounded time.
+	const orphans = `FROM hopper_job_results o
 		WHERE NOT EXISTS (SELECT 1 FROM hopper_batches b WHERE b.id = o.batch_id AND b.completed_at IS NULL)`
 	var found bool
-	if err := e.read().QueryRowContext(ctx, `SELECT EXISTS (`+orphans+`)`).Scan(&found); err != nil {
+	if err := e.read().QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 `+orphans+`)`).Scan(&found); err != nil {
 		return driver.BatchSettleResult{}, fmt.Errorf("hopper: settle batches: %w", err)
 	}
 	if !found {
 		return driver.BatchSettleResult{}, nil
 	}
 	err := e.write(ctx, func(x *w) error {
-		_, err := x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id IN (`+orphans+` LIMIT ?)`, max(params.Limit, 1))
+		_, err := x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE (batch_id, job_id) IN (
+			SELECT o.batch_id, o.job_id `+orphans+` LIMIT ?)`, max(params.Limit, 1))
 		return err
 	})
 	if err != nil {

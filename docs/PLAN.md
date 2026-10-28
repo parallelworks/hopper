@@ -2444,8 +2444,8 @@ observability without new machinery.
     `canceled` or `discarded`) and its output; `JobRow.Dependency(step)` finds one by
     name. So a step behind an `ignore` edge sees how its dependencies ended, and reads
     what they produced without a round trip of its own. The finalize tail copies the
-    state and output of each finished job that still has a dependent (other than one
-    finishing in the same statement) into `hopper_job_results`, keyed by workflow and job, in
+    state and output of each finished job that still has a dependent into
+    `hopper_job_results`, keyed by workflow and job, in
     the statement that deletes it from the live table: every snapshot sees a
     dependency either live or with its result, and a fan-out writes the output once,
     not once per dependent, with no lock another finalize waits for. The rows are
@@ -2453,7 +2453,9 @@ observability without new machinery.
     tail's or `BatchSettle`'s), which needs every job, dependents included, finished;
     a refcount delete when the last dependent finishes would race as two last batch
     jobs do. History's partition drops and `DeleteCompleted` do not reach them, and a
-    step that is retried or snoozed is claimed with them again. Once per maintenance
+    step that is retried or snoozed is claimed with them again. `JobRetry` of a finished
+    dependency deletes its result, so that while it is live again its dependents are
+    claimed without it. Once per maintenance
     interval the leader's batch settle deletes those of workflows that completed or are
     gone, which a client of an earlier release, completing a workflow, leaves; it is
     not run on every pass because it reads the whole table. A step's name is copied to each of
@@ -2462,9 +2464,10 @@ observability without new machinery.
     - Every claim statement (by queue, partitioned, limited and by ID) reads the
       dependencies in its outer select, `CASE WHEN batch_id IS NOT NULL THEN (...)`,
       a correlated subquery over the job's edges and their results by primary key,
-      aggregated to one JSON value. Each lookup (the result, and the live row of a
-      dependency without one) is a scalar subquery on a primary key, which a join or
-      `NOT EXISTS` would plan as a hash over the whole table on every claim. Postgres evaluates it only for a claimed job in a
+      aggregated to one JSON value. The result is a lateral subquery and the live row of
+      a dependency without one a scalar subquery, each on a primary key and kept from
+      being flattened: as a plain join or `NOT EXISTS` the planner hashed the whole
+      table on every claim. Postgres evaluates it only for a claimed job in a
       batch, so a job outside one costs the `CASE` and nothing else. A dependency gone
       from the live table without a result, which finished before the upgrade or on a
       client of an earlier release during a rolling deploy, is reported with no state

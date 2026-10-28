@@ -409,20 +409,20 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 
 	// Record the result of each job that still has a dependent, for its
 	// dependents' claims. countBatch deletes a workflow's results when it
-	// completes.
+	// completes. The edges do not change until the end of the tail, so each
+	// job's dependents are read once, here, for the promotion below too.
 	finishing := make(map[driver.JobID]bool, len(done))
 	for _, f := range done {
 		finishing[f.row.job.ID] = true
 	}
-	for _, f := range done {
-		if f.row.job.BatchID.IsZero() {
-			continue
-		}
-		dependents, err := x.ids(ctx, "SELECT job_id FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
+	dependents := make([][]driver.JobID, len(done))
+	for i, f := range done {
+		deps, err := x.ids(ctx, "SELECT job_id FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
 		if err != nil {
 			return nil, err
 		}
-		if !slices.ContainsFunc(dependents, func(id driver.JobID) bool { return !finishing[id] }) {
+		dependents[i] = deps
+		if f.row.job.BatchID.IsZero() || !slices.ContainsFunc(deps, func(id driver.JobID) bool { return !finishing[id] }) {
 			continue
 		}
 		if _, err := x.ExecContext(ctx, `
@@ -463,12 +463,8 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 	// Promote the dependents whose dependencies have all finished, and drop
 	// the edges of the jobs that finished.
 	considered := map[driver.JobID]bool{}
-	for _, f := range done {
-		deps, err := x.ids(ctx, "SELECT job_id FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
-		if err != nil {
-			return nil, err
-		}
-		for _, dep := range deps {
+	for i := range done {
+		for _, dep := range dependents[i] {
 			if considered[dep] || cascaded[dep] {
 				continue
 			}

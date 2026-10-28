@@ -393,9 +393,11 @@ snoozed gets them again.
 parse := wf.Add(Parse{}, &hopper.StepOpts{Name: "parse", After: []hopper.Step{fetch}})
 
 // In Index's worker:
+var doc ParsedDoc
 if dep, ok := job.Dependency("parse"); ok && dep.State == hopper.JobStateCompleted {
-	var doc ParsedDoc
-	err := json.Unmarshal(dep.Output, &doc)
+	if err := json.Unmarshal(dep.Output, &doc); err != nil {
+		return err
+	}
 }
 ```
 

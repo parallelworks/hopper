@@ -255,6 +255,9 @@ func Work[T hopper.JobArgs](ctx context.Context, tb testing.TB, workers *hopper.
 	}
 	if len(opts.Dependencies) > 0 {
 		row.Dependencies = slices.Clone(opts.Dependencies)
+		for i := range row.Dependencies {
+			row.Dependencies[i].Output = slices.Clone(row.Dependencies[i].Output)
+		}
 	}
 	return workers.Work(ctx, row, hopper.JSONCodec{})
 }

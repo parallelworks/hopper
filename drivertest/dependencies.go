@@ -385,3 +385,37 @@ func testDependencyResultsOrphans[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	checkDependencies(t, claimOne(ctx, t, exec, clientID, wf.Jobs[1].Job.ID), wantDependency{"build", driver.JobStateCompleted, ""})
 }
+
+// testDependencyResultsRetried checks that a dependency retried from history
+// is not reported finished with its old result while it is live again.
+func testDependencyResultsRetried[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+
+	wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Name: "retried", Jobs: params("step", 2), Steps: []string{"build", "report"},
+		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, report := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID
+	claimOne(ctx, t, exec, clientID, build)
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: build, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`{"n":1}`)})
+	checkDependencies(t, claimOne(ctx, t, exec, clientID, report), wantDependency{"build", driver.JobStateCompleted, `{"n":1}`})
+	finalizeCurrent(ctx, t, exec, driver.JobFinalize{
+		ID: report, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour,
+		Error: &driver.AttemptError{Attempt: 1, Error: "retry"},
+	})
+
+	if _, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: build}); err != nil {
+		t.Fatal(err)
+	}
+	claimOne(ctx, t, exec, clientID, build)
+	f.MakeClaimable(ctx, t, d, report)
+	if j := claimOne(ctx, t, exec, clientID, report); len(j.Dependencies) != 0 {
+		t.Errorf("claimed with a retried dependency live again, dependencies = %+v, want none", j.Dependencies)
+	}
+}

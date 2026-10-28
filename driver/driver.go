@@ -570,8 +570,12 @@ type Dependency struct {
 	Output json.RawMessage
 }
 
-// Dependency returns the dependency with the given step name.
+// Dependency returns the dependency with the given step name. An empty name
+// names no step, so it finds none, not the first unnamed dependency.
 func (r *JobRow) Dependency(step string) (Dependency, bool) {
+	if step == "" {
+		return Dependency{}, false
+	}
 	for _, d := range r.Dependencies {
 		if d.Step == step {
 			return d, true

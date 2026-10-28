@@ -118,8 +118,8 @@ func TestWorkflowStepNamesAreChecked(t *testing.T) {
 		err   string
 	}{
 		{[]string{"a", "a"}, "both named"},
-		{[]string{"a\x00b"}, "not valid UTF-8 text"},
-		{[]string{"\xff"}, "not valid UTF-8 text"},
+		{[]string{"a\x00b"}, "NUL or invalid UTF-8"},
+		{[]string{"\xff"}, "NUL or invalid UTF-8"},
 	} {
 		wf := hopper.NewWorkflow("names", nil)
 		for _, n := range tc.names {

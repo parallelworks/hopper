@@ -186,18 +186,18 @@ edges AS (
 }
 
 // resultsSQL records the final state and output of each job of done that
-// still has a dependent, other than one finishing in the same statement,
-// for its dependents' claims, and deletes the results of the workflows the
-// statement completes, whose jobs have all finished. A job of a workflow
-// completing in the statement has no dependent left, so it records none;
-// a job retried from history and finished again replaces its result.
+// still has a dependent, for its dependents' claims, and deletes the
+// results of the workflows the statement completes, whose jobs have all
+// finished. A job of a workflow completing in the statement has no
+// dependent left, so it records none. Whether a job has a dependent is a
+// probe of the depends_on index per job, a scalar subquery: a filter on an
+// array of the statement's jobs compared every pair. A job retried from
+// history and finished again replaces its result.
 const resultsSQL = `results AS (
   INSERT INTO {{schema}}.hopper_job_results (job_id, batch_id, state, output)
   SELECT d.id, d.batch_id, d.final_state::{{schema}}.hopper_job_state, d.output FROM done d
   WHERE d.batch_id IS NOT NULL AND d.batch_id <> ALL (ARRAY(SELECT id FROM batches))
-    AND d.id = ANY (ARRAY(
-      SELECT e.depends_on FROM {{schema}}.hopper_job_deps e
-      WHERE e.depends_on = ANY (ARRAY(SELECT id FROM done)) AND e.job_id <> ALL (ARRAY(SELECT id FROM done))))
+    AND (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id LIMIT 1) IS NOT NULL
   ON CONFLICT (batch_id, job_id) DO UPDATE SET state = EXCLUDED.state, output = EXCLUDED.output,
     finalized_at = EXCLUDED.finalized_at
   RETURNING job_id

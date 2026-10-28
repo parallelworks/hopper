@@ -199,6 +199,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"DependencyResultsConcurrent", testDependencyResultsConcurrent[TTx]},
 		{"DependencyResultsLeaseExpiry", testDependencyResultsLeaseExpiry[TTx]},
 		{"DependencyResultsOrphans", testDependencyResultsOrphans[TTx]},
+		{"DependencyResultsRetried", testDependencyResultsRetried[TTx]},
 		{"Streams", testStreams[TTx]},
 		{"StreamsRetention", testStreamsRetention[TTx]},
 		{"Maintain", testMaintain[TTx]},
