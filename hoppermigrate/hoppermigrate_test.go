@@ -34,7 +34,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 20
+	const latest = 21
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -1217,7 +1217,7 @@ func TestJobLeasesUpgradeTakesNoJobLock(t *testing.T) {
 	}
 }
 
-// TestDependencyResultsUpgrade migrates to v20 with a workflow in flight,
+// TestDependencyResultsUpgrade migrates to v21 with a workflow in flight,
 // written as the previous release writes one: a step that finished before
 // the upgrade, its dependent promoted, and a step after that. While a
 // transaction holds hopper_job_deps, as a finalize does, the migration
@@ -1232,7 +1232,7 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 	d := testdb.Driver(pool)
 	exec := d.Executor()
 	logger := slog.New(slog.DiscardHandler)
-	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 19}); err != nil {
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 20}); err != nil {
 		t.Fatal(err)
 	}
 	q := func(query string, args ...any) {
@@ -1274,13 +1274,13 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 	}
 	upgraded := make(chan error, 1)
 	go func() {
-		_, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 20})
+		_, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 21})
 		upgraded <- err
 	}()
 	time.Sleep(300 * time.Millisecond)
 	select {
 	case err := <-upgraded:
-		t.Fatalf("v20 completed while a transaction held hopper_job_deps: %v", err)
+		t.Fatalf("v21 completed while a transaction held hopper_job_deps: %v", err)
 	default:
 	}
 	sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -1320,7 +1320,7 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 		t.Errorf("dependencies of the last step = %+v", deps)
 	}
 
-	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 19}); err != nil {
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 20}); err != nil {
 		t.Fatal(err)
 	}
 	var left int

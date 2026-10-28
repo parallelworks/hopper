@@ -696,7 +696,7 @@ leader keeps with history's) and the triggers that maintain them (§7.2). Schema
 adds `fence` to `hopper_jobs` and history (§7.3), in the loop v17's columns took.
 Schema v19 adds `hopper_job_leases (id, token, fence, ttl, renewed_at, expires_at)` for
 job leases (§7.14), a plain `CREATE TABLE` that takes no lock on `hopper_jobs` or
-history. Schema v20 adds `hopper_job_results (job_id, batch_id, state, output,
+history. Schema v21 adds `hopper_job_results (job_id, batch_id, state, output,
 finalized_at)`, keyed by `(batch_id, job_id)`, for the dependencies a claimed workflow
 step carries (§11), `step` on `hopper_job_deps` (the name of the edge's dependency) and
 `steps` on `hopper_batches` (a workflow's step names by job ID). The columns take v17's

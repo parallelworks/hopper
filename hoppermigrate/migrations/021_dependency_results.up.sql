@@ -1,4 +1,4 @@
--- hopper schema v20: dependency results, for workflow steps.
+-- hopper schema v21: dependency results, for workflow steps.
 --
 -- A claimed workflow step carries its dependencies' final states and
 -- outputs. The statement that finalizes a job that still has dependents
