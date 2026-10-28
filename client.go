@@ -31,6 +31,8 @@ type Client[TTx any] struct {
 	workers  *Workers
 	notifier *notifier
 	periodic *PeriodicJobs
+	// recorded is what the client last wrote of its periodic jobs.
+	recorded periodicRecord
 
 	// clientID is the lease row ID while running. It changes if the lease is
 	// lost and re-registered.
@@ -222,13 +224,12 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	}
 	// Recorded before leading, so the term's first read has this client's
 	// own jobs rather than only those of older clients.
-	var record periodicRecord
-	c.recordPeriodic(ctx, &record)
+	c.recordPeriodic(ctx)
 	if c.cfg.leads() {
 		c.leaderWG.Go(func() { c.leaderLoop(c.claimCtx) })
 	}
 	c.leaseWG.Go(func() { c.leaseLoop(c.bgCtx) })
-	c.leaseWG.Go(func() { c.registrationLoop(c.bgCtx, &record) })
+	c.leaseWG.Go(func() { c.registrationLoop(c.bgCtx) })
 
 	c.state = clientStarted
 	c.logger.InfoContext(ctx, "hopper: client started", "client_id", id, "queues", slices.Sorted(maps.Keys(c.cfg.Queues)))
@@ -631,6 +632,8 @@ func (c *Client[TTx]) fence(ctx context.Context, id int64) {
 	}
 	c.clientID.Store(newID)
 	c.genCtx, c.genCancel = context.WithCancel(c.workCtx) //nolint:gosec // canceled by fence or Stop
+	// Recorded before the leader is woken, so a term this client wins
+	// first reads its own jobs under the new lease.
+	c.recordPeriodic(ctx)
 	c.pokeLeader()
-	c.periodic.record()
 }

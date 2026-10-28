@@ -354,10 +354,10 @@ recorded, and a `Cron` only in a zone that loads by its name, so not in
 differs each time it is built, as with an encrypting codec with a random
 nonce, a job whose insert sets `ScheduledAt`, or one whose name, args or
 options hold a NUL or invalid UTF-8. Any other job runs only while its own
-client leads. A
-`Cron` in a named zone runs only while a client that can load the zone
-leads, so give every program that can lead the zone database, from the
-system or by importing `time/tzdata`.
+client leads and no other client records its name. A `Cron` in a named zone
+runs only while a client that can load the zone leads, so give every program
+that can lead the zone database, from the system or by importing
+`time/tzdata`.
 
 ## Batches and workflows
 

@@ -184,13 +184,18 @@ func TestPeriodicDefinitionLeavesOutUnstableOrNULArgs(t *testing.T) {
 	}
 }
 
-// A nil schedule pointer is no schedule, refused when the job is added
-// rather than a panic when it is recorded or scheduled.
+// scheduleFunc is a Schedule that a function computes.
+type scheduleFunc func(time.Time) time.Time
+
+func (f scheduleFunc) Next(t time.Time) time.Time { return f(t) }
+
+// A nil schedule pointer or function is no schedule, refused when the job
+// is added rather than a panic when it is recorded or scheduled.
 func TestPeriodicJobWithNilSchedulePointer(t *testing.T) {
-	for name, s := range map[string]Schedule{"cron": (*CronSchedule)(nil), "interval": (*IntervalSchedule)(nil)} {
+	for name, s := range map[string]Schedule{"cron": (*CronSchedule)(nil), "interval": (*IntervalSchedule)(nil), "func": scheduleFunc(nil)} {
 		job := PeriodicJob{Schedule: s, Args: tickArgs{}}
 		if err := job.resolve(); err == nil {
-			t.Errorf("%s: a job with a nil schedule pointer resolved", name)
+			t.Errorf("%s: a job with a nil schedule resolved", name)
 		}
 	}
 }
@@ -409,5 +414,38 @@ func TestEffectivePeriodicSkipsOwnRowItNoLongerRecords(t *testing.T) {
 	}
 	if regs[0].digest != other.Digest {
 		t.Errorf("scheduled the definition of digest %q, want the other client's, %q", regs[0].digest, other.Digest)
+	}
+}
+
+// stampArgs takes its MaxAttempts from n each time its insert is built.
+type stampArgs struct{ n *atomic.Int64 }
+
+func (stampArgs) Kind() string { return "stamp" }
+
+func (a stampArgs) InsertOpts() InsertOpts { return InsertOpts{MaxAttempts: int(a.n.Load())} }
+
+// A job the leader registers with the definition it schedules is built from
+// its own args at each slot even when a newer client's row of that
+// definition is read first, as a leader built its own jobs before.
+func TestPeriodicLoopBuildsOwnJobBehindANewerClient(t *testing.T) {
+	exec := &periodicExec{}
+	attempts := new(atomic.Int64)
+	attempts.Store(1)
+	c := newPeriodicTestClient(t, exec, Every(time.Hour, stampArgs{n: attempts}, &PeriodicOpts{RunOnStart: true}))
+	c.clientID.Store(1)
+	r := ownDefinition(t, c)
+	started := time.Now()
+	own := driver.PeriodicRegistrationRow{ClientID: 1, ClientStartedAt: started, PeriodicRegistration: driver.PeriodicRegistration{Name: "stamp", Definition: json.RawMessage(r.def), Digest: r.digest}}
+	newer := own
+	newer.ClientID, newer.ClientStartedAt = 2, started.Add(time.Second)
+	exec.set(func(e *periodicExec) { e.registrations = []driver.PeriodicRegistrationRow{newer, own} })
+	attempts.Store(5)
+	runPeriodicLoop(t, c)
+	eventually(t, func() bool { return exec.inserted("stamp") == 1 })
+	exec.mu.Lock()
+	got := exec.inserts[0].Job.MaxAttempts
+	exec.mu.Unlock()
+	if got != 5 {
+		t.Errorf("the leader inserted MaxAttempts %d, frozen in the definition, want 5 from its own args", got)
 	}
 }

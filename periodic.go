@@ -106,7 +106,7 @@ func (p *PeriodicJob) resolve() error {
 	if p.Args == nil {
 		return errors.New("hopper: periodic job has nil Args")
 	}
-	if s := reflect.ValueOf(p.Schedule); !s.IsValid() || s.Kind() == reflect.Pointer && s.IsNil() {
+	if s := reflect.ValueOf(p.Schedule); !s.IsValid() || (s.Kind() == reflect.Pointer || s.Kind() == reflect.Func) && s.IsNil() {
 		return fmt.Errorf("hopper: periodic job for %q has no Schedule", p.Args.Kind())
 	}
 	if p.Opts != nil && p.Opts.Name != "" {
@@ -169,13 +169,13 @@ func resolvePeriodic(jobs []PeriodicJob) ([]PeriodicJob, error) {
 // another client. A job whose schedule cannot be recorded, one other than
 // Cron's or Every's, or a Cron in time.Local or in a zone that does not load
 // by its name, such as a time.FixedZone, is scheduled only from its own
-// client, while that client leads. So is a job whose insert differs each
-// time it is built, as with a Codec that encrypts with a random nonce, a
-// job whose insert sets ScheduledAt, and one whose name, args or options
-// hold a NUL or invalid UTF-8. A Cron in a named zone runs only while a
-// client that can load that zone leads, so every client that can lead needs
-// the zone database. A client with no queues holds no lease and records
-// nothing. It is safe for concurrent use.
+// client, while that client leads and no other client records its name. So
+// is a job whose insert differs each time it is built, as with a Codec that
+// encrypts with a random nonce, a job whose insert sets ScheduledAt, and
+// one whose name, args or options hold a NUL or invalid UTF-8. A Cron in a
+// named zone runs only while a client that can load that zone leads, so
+// every client that can lead needs the zone database. A client with no
+// queues holds no lease and records nothing. It is safe for concurrent use.
 type PeriodicJobs struct {
 	logger     *slog.Logger
 	insertOnly bool

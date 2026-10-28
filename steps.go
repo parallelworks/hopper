@@ -249,7 +249,7 @@ func completedInTx(ctx context.Context) bool {
 
 // storableName reports whether PostgreSQL can store name as text. A step or
 // periodic job name is matched exactly, so it is refused rather than
-// replaced the way storableText replaces an error message.
+// replaced the way jobcodec.StorableText replaces an error message.
 func storableName(name string) bool {
 	return utf8.ValidString(name) && !strings.ContainsRune(name, 0)
 }

@@ -166,8 +166,7 @@ func TestNewLeaseRecordsPeriodicJobsAtOnce(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Go(func() { c.leaseLoop(ctx) }) // renews at 5s and loses the lease
 		time.Sleep(time.Second)
-		var record periodicRecord
-		wg.Go(func() { c.registrationLoop(ctx, &record) }) // ticks at 6s, 11s
+		wg.Go(func() { c.registrationLoop(ctx) }) // ticks at 6s, 11s
 		time.Sleep(5*time.Second + time.Millisecond)
 		cancel()
 		wg.Wait()

@@ -1689,7 +1689,9 @@ the definition of the newest live client that registers it, by the client's star
 and logs once when live clients define a name differently, as during a rolling deploy;
 for itself it reads its in-memory set rather than its rows, so its changes to the names
 it recorded apply at once, while a name it adds that another client records waits for its
-write and the next read. It reads the rows of clients whose lease has not expired at the start of a term,
+write and the next read. A job the leader registers with the definition it schedules is
+built from its own args at each slot, whichever client's row is the newest, as a leader
+built its jobs before v20. It reads the rows of clients whose lease has not expired at the start of a term,
 before its first pass, and then every leader interval, waking the periodic loop only
 when they changed. A job keeps its registration in the loop while its definition is
 unchanged, whichever client it comes from, so a job whose registering client stops while
@@ -1711,7 +1713,8 @@ nonce, whose digests would never match across replicas), a job whose insert sets
 and which a coarse clock can read the same twice), or one whose name or
 definition holds a NUL or invalid UTF-8 (which Postgres refuses, and which would fail the
 client's whole write), is scheduled only
-from its own client's set, while that client leads, as before v20. A definition the leader
+from its own client's set, while that client leads and no other client records the name,
+as before v20. A definition the leader
 cannot read, such as one of a later definition version, or a `Cron` in a zone the leader
 cannot load, is skipped with a log, and the leader schedules its own job of that name if
 it has one. So every client that can lead needs the zone database of the zones other

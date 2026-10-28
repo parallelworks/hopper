@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -62,12 +63,10 @@ type definedUnique struct {
 // that cannot be stored, which only its own client schedules: one whose
 // schedule cannot be, whose insert differs each time it is built, as with
 // a Codec that encrypts with a random nonce, whose insert sets ScheduledAt,
-// which is usually read from the clock and would be frozen at Add, or whose name or definition has a NUL or invalid UTF-8,
-// which Postgres refuses and encoding/json replaces in a string.
+// which is usually read from the clock and would be frozen at Add, or whose
+// name or definition has a NUL or invalid UTF-8, which Postgres refuses and
+// encoding/json replaces in a string.
 func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error) {
-	if !storableName(p.Name) {
-		return nil, nil
-	}
 	d := periodicDefinition{Version: periodicDefinitionVersion}
 	switch s := p.Schedule.(type) {
 	case *CronSchedule:
@@ -94,7 +93,7 @@ func (c *Client[TTx]) periodicDefinition(p *PeriodicJob) (json.RawMessage, error
 	if err != nil || !reflect.DeepEqual(again, job) || !job.ScheduledAt.IsZero() {
 		return nil, err
 	}
-	if slices.ContainsFunc([]string{job.Kind, job.Queue, job.OrderingKey, job.PartitionKey, job.UniqueKey}, func(s string) bool { return !utf8.ValidString(s) }) {
+	if slices.ContainsFunc([]string{p.Name, job.Kind, job.Queue, job.OrderingKey, job.PartitionKey, job.UniqueKey}, func(s string) bool { return !storableName(s) }) {
 		return nil, nil
 	}
 	d.Job = definedJob{
@@ -260,15 +259,20 @@ func (j definedJob) params(slot time.Time) (driver.JobInsertParams, error) {
 
 // periodicRecord is what a client last recorded of its periodic jobs.
 type periodicRecord struct {
+	mu       sync.Mutex
 	clientID int64
 	regs     []driver.PeriodicRegistration
 	lastErr  string
 }
 
-// recordPeriodic writes the client's periodic jobs unless r already holds
-// them. They are compared each time rather than on change alone, since a
-// worker registered later changes what a StrictKinds client records.
-func (c *Client[TTx]) recordPeriodic(ctx context.Context, r *periodicRecord) {
+// recordPeriodic writes the client's periodic jobs unless it last wrote
+// them under its current lease. They are compared each time rather than on
+// change alone, since a worker registered later changes what a StrictKinds
+// client records.
+func (c *Client[TTx]) recordPeriodic(ctx context.Context) {
+	r := &c.recorded
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	id := c.clientID.Load()
 	regs := c.periodic.registrations()
 	if id == r.clientID && slices.EqualFunc(regs, r.regs, sameRegistration) {
@@ -290,11 +294,11 @@ func (c *Client[TTx]) recordPeriodic(ctx context.Context, r *periodicRecord) {
 // that whichever client leads schedules them. It writes again when the jobs
 // change or the client registers a new lease, and retries a failed write
 // every lease renewal interval.
-func (c *Client[TTx]) registrationLoop(ctx context.Context, r *periodicRecord) {
+func (c *Client[TTx]) registrationLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaseRenew)
 	defer ticker.Stop()
 	for {
-		c.recordPeriodic(ctx, r)
+		c.recordPeriodic(ctx)
 		select {
 		case <-ctx.Done():
 			return
@@ -381,7 +385,9 @@ func (c *Client[TTx]) watchStored(ctx context.Context, last map[string][]storedD
 // the leader reads its own set, not what it recorded, so that its changes
 // to the names it recorded apply at once. Its jobs not recorded yet, or
 // whose schedule cannot be stored, come from its own set too, unless
-// another client records that name. A stored job keeps its registration
+// another client records that name. A job the leader registers with the
+// definition it schedules is built from its own args at each slot, whichever
+// client's row is the newest. A stored job keeps its registration
 // while its definition is unchanged, whichever client it comes from, so a
 // job moving between clients is not started again.
 func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) []*registeredPeriodic {
@@ -411,7 +417,10 @@ func (c *Client[TTx]) effectivePeriodic(ctx context.Context, st *periodicState) 
 				break
 			}
 		}
-		if _, ok := wanted[name]; ok {
+		if d, ok := wanted[name]; ok {
+			if r, ok := own[name]; ok && r.digest == d.digest && c.periodic.records(r) {
+				owner[name] = r
+			}
 			continue
 		}
 		if source == nil {
