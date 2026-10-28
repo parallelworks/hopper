@@ -6,6 +6,27 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.9.0](https://github.com/parallelworks/hopper/compare/v0.8.0...v0.9.0) (2026-10-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **client:** the leader schedules the periodic jobs of every live client ([#90](https://github.com/parallelworks/hopper/issues/90))
+
+### Features
+
+* **client:** per-job leases, claimed by job ID ([#83](https://github.com/parallelworks/hopper/issues/83)) ([bb40488](https://github.com/parallelworks/hopper/commit/bb404882af858d2674e366aac966efba74f83ee0))
+* **client:** the leader schedules the periodic jobs of every live client ([#90](https://github.com/parallelworks/hopper/issues/90)) ([3f06f1e](https://github.com/parallelworks/hopper/commit/3f06f1e32548d99f566bf2f2365fb31fee3e13e1))
+* **leader:** job leases outlast a cluster restart by a grace period ([#93](https://github.com/parallelworks/hopper/issues/93)) ([a30960d](https://github.com/parallelworks/hopper/commit/a30960d5c6b0ecd2b83ccfaece4fa0a075b5c97f))
+
+
+### Bug fixes
+
+* **client:** Stop returned while a notification its notifier's timer had begun was still being sent, which then ran after Stop ([#92](https://github.com/parallelworks/hopper/issues/92)) ([bbcffb3](https://github.com/parallelworks/hopper/commit/bbcffb3249876dc5daf6a126dff0c1dbc3bdc235))
+* **client:** Stop's wait for running jobs read the client's producers without the lock that Queues().Remove holds while it deletes one ([#84](https://github.com/parallelworks/hopper/issues/84)) ([bb9980c](https://github.com/parallelworks/hopper/commit/bb9980cbcd738df6517d90d26e77ce27b5a99034))
+* **hoppersqlite:** a new connection's setup failed with SQLITE_BUSY while another connection held the database, as when several processes open a new database at once ([#86](https://github.com/parallelworks/hopper/issues/86)) ([bb54c90](https://github.com/parallelworks/hopper/commit/bb54c90542194e2873f62a9df8df26f19f71c0fb))
+* **hoppersqlite:** a process whose host's clock was set far ahead and then corrected kept the time it had read until the clock caught up ([#87](https://github.com/parallelworks/hopper/issues/87)) ([a618b75](https://github.com/parallelworks/hopper/commit/a618b7581edeacbdc21ffa2fc182ff6404e37696))
+
 ## [0.8.0](https://github.com/parallelworks/hopper/compare/v0.7.0...v0.8.0) (2026-10-26)
 
 
