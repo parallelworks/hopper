@@ -292,6 +292,28 @@ func TestJobLogFollowRejectsInvalidOptions(t *testing.T) {
 	}
 }
 
+func TestJobLogFollowResumesWithoutReset(t *testing.T) {
+	store := &managedTestStore{}
+	c, e := managedClient(t, store, nil)
+	id := JobID{15: 1}
+	store.put(id, 1, 1, "prefix suffix", e.now)
+	opts := &LogFollowOpts{LogReadOpts: LogReadOpts{Cursor: LogCursor{Fence: 1, Offset: 6}}, PollInterval: time.Hour}
+	seen := false
+	for update, err := range c.JobLogFollow(t.Context(), id, opts) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if update.Reset || update.Log != " suffix" || update.Cursor.Offset != 13 {
+			t.Fatalf("resume = %+v", update)
+		}
+		seen = true
+		break
+	}
+	if !seen {
+		t.Fatal("no resumed output")
+	}
+}
+
 func TestLogNotificationsCoalesceAndScope(t *testing.T) {
 	var n LogNotifications
 	ctx, cancel := context.WithCancel(t.Context())

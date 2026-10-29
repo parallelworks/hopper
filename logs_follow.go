@@ -88,7 +88,7 @@ func (c *Client[TTx]) JobLogFollow(ctx context.Context, id JobID, opts *LogFollo
 				yield(LogUpdate{}, err)
 				return
 			default:
-				reset := !seen || missing || chunk.Run.Fence != p.Cursor.Fence || chunk.Offset != p.Cursor.Offset
+				reset := missing || chunk.Run.Fence != p.Cursor.Fence || chunk.Offset != p.Cursor.Offset
 				previous, seen, missing = chunk.Run, true, false
 				p.Cursor = chunk.Cursor
 				if reset || chunk.Log != "" {
