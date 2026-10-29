@@ -18,7 +18,8 @@ opts into the new capabilities.
 - Reconcile from the store's durable inventory in bounded batches. Use the existing
   driver `Now` and filtered `JobList` methods to read database time and live/history
   states in batches. No schema changes or writes on insert, claim or finalize.
-- Run reconciliation in its own leader-term loop. Protect the current running claim,
+- Run reconciliation in its own leader-term loop, draining bounded pages before
+  waiting between scans. Protect the current running claim,
   recently modified objects and objects newer than the job snapshot. Deletion is
   conditional on the inventory object's version and cannot delete a newer execution.
 - Advance the scan cursor only after a successful batch. Deletions are idempotent;

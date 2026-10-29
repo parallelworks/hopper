@@ -124,7 +124,7 @@ func listLogRuns(ctx context.Context, s LogStoreLister, params LogListParams) (L
 	if err != nil {
 		return LogRunPage{}, fmt.Errorf("hopper: list log executions: %w", err)
 	}
-	if len(page.Runs) > params.Limit || page.Next != "" && page.Next == params.After {
+	if len(page.Runs) > params.Limit || page.Next != "" && (page.Next == params.After || len(page.Runs) == 0) {
 		return LogRunPage{}, errors.New("hopper: store returned an invalid log page")
 	}
 	for i, run := range page.Runs {

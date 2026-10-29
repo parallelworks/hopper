@@ -550,3 +550,38 @@ func TestLogRetentionBatchTimeoutIsIndependent(t *testing.T) {
 		t.Fatal("maintenance did not stop")
 	}
 }
+
+func TestLogRetentionDrainsInventoryPages(t *testing.T) {
+	store := &managedTestStore{}
+	c, e := managedClient(t, store, &LogRetentionConfig{BatchSize: 1, Interval: time.Hour})
+	for i := byte(1); i <= 5; i++ {
+		store.put(JobID{15: i}, 1, 1, "old", e.now.Add(-2*time.Hour))
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { c.logRetentionLoop(ctx); close(done) }()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for {
+		store.mu.Lock()
+		left := len(store.runs)
+		store.mu.Unlock()
+		if left == 0 {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("inventory pages waited for the scan interval")
+		case <-poll.C:
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("maintenance did not stop")
+	}
+}

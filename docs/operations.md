@@ -49,7 +49,8 @@ List globally in job ID ascending/fence descending order using stable seek
 cursors. The same fence is never reused, even after a snooze or retry.
 
 All leader-eligible clients must use the same shared store and policy. Cleanup
-runs separately from other leader duties, one bounded page per minute by default.
+runs separately from other leader duties, draining bounded pages until the scan
+ends, then waiting a minute by default before starting again.
 The batch timeout defaults to 30 seconds, independently of the polling interval.
 Jobs are looked up in batches rather than once per stored directory. Completed
 and failed log lifetimes inherit job-history settings (24 hours and seven days by

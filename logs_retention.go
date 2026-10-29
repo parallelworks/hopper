@@ -28,7 +28,8 @@ type LogRetentionConfig struct {
 	MaxRunBytes int64
 	// GracePeriod protects recent writes, including logs of jobs already removed.
 	GracePeriod time.Duration
-	Interval    time.Duration
+	// Interval delays between complete inventory scans; default one minute.
+	Interval time.Duration
 	// Timeout bounds one batch independently of its scheduling interval; default 30s.
 	Timeout   time.Duration
 	BatchSize int
@@ -244,13 +245,16 @@ func (c *Client[TTx]) logRetentionLoop(ctx context.Context) {
 	if policy == nil {
 		return
 	}
-	ticker := time.NewTicker(policy.Interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(policy.Interval)
+	defer timer.Stop()
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		if c.logRetention.busy.CompareAndSwap(false, true) {
+			done := make(chan bool, 1)
 			// A store that ignores cancellation can strand one call, never leader renewal or shutdown.
 			go func() {
-				defer c.logRetention.busy.Store(false)
 				passCtx, cancel := context.WithTimeout(ctx, policy.Timeout)
 				defer cancel()
 				result, err := c.MaintainJobLogs(passCtx)
@@ -259,12 +263,23 @@ func (c *Client[TTx]) logRetentionLoop(ctx context.Context) {
 				} else if result.Deleted > 0 {
 					c.logger.InfoContext(ctx, "hopper: maintained external logs", "deleted", result.Deleted, "bytes", result.DeletedBytes)
 				}
+				c.logRetention.busy.Store(false)
+				done <- err == nil && result.More
 			}()
+			select {
+			case <-ctx.Done():
+				return
+			case more := <-done:
+				if more {
+					continue
+				}
+			}
 		}
+		timer.Reset(policy.Interval)
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
