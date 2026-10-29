@@ -76,6 +76,50 @@ and `JobLogRead` reads at most the requested byte limit. Retain the returned
 claims. A nil read option tails the latest execution; a zero offset starts from
 the beginning. These APIs leave older inline logs to `JobLogs`.
 
+### Following output
+
+`JobLogFollow` reads bounded chunks and waits between reads:
+
+~~~go
+for update, err := range client.JobLogFollow(ctx, id, nil) {
+    if err != nil {
+        return err
+    }
+    if update.Missing {
+        clearLog()
+        continue
+    }
+    if update.Reset {
+        replaceLog(update.Log)
+    } else {
+        appendLog(update.Log)
+    }
+    cursor = update.Cursor
+}
+~~~
+
+Supply `LogFollowOpts.LogReadOpts.Cursor` to resume from a saved cursor, or its
+`Fence` to stay on an earlier execution. Nil options tail the latest execution;
+an explicit zero offset starts at its beginning. Cancel `ctx` or break the loop
+to release its subscription. Missing output can later reappear; normal read
+errors end the iterator. Slow consumers do not block workers or accumulate log
+chunks inside Hopper.
+
+Stores can implement `LogStoreWatcher` to wake followers immediately. Subscribe
+before returning and release resources when the supplied context ends. Publish
+only after a mutation is visible to readers, including new executions and
+retention deletion. Signals are hints, not bytes; a lost or coalesced signal is
+recovered by polling, which stays active at `PollInterval` (one second by
+default). Missing watchers, subscription errors and closed subscriptions fall
+back to polling. Retrying a failed subscription requires starting a new follower.
+
+Embedding `hopper.LogNotifications` provides this contract within one process.
+Call `Notify(jobID)` after persisting an append, opening or closing an execution,
+or conditionally deleting one. It coalesces changes into one pending hint per
+subscriber. A shared backend can instead implement its own cross-process feed.
+The helper does not signal other processes; those changes remain visible through
+polling without new database notification writes.
+
 ## Postgres
 
 - **Version:** 14 or later. Job IDs use `uuidv7()` on 18 and a compatible
