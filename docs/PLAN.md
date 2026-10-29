@@ -1475,6 +1475,28 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   and observed retained bytes/runs after a complete inventory scan. The inventory
   is an observation across a scan, not a transactional capacity measurement;
   hard storage quotas remain the backend's responsibility.
+- **Following external logs.** `JobLogFollow` is a context-bound iterator over
+  bounded `JobLogRead` chunks. A nil option tails the latest execution; callers
+  can instead provide a starting `LogCursor` or select a fixed fence. `LogUpdate`
+  marks replacements with `Reset` and absent or expired output with `Missing`.
+  Missing output is reported once per transition and can later reappear as a
+  new execution; ordinary storage read errors end the iterator with an error.
+  Reading a full chunk immediately continues from its cursor rather than
+  waiting for a signal. A slow consumer exerts back-pressure on its own iterator,
+  not the worker, and cancellation or a consumer break releases its subscription.
+  An optional `LogStoreWatcher` subscribes before the first read, so an append
+  between reading and waiting can wake the follower. Hints carry no log data and
+  may coalesce or be missed. Polling (one second by default) remains active with
+  a watcher; absent, failed or closed subscriptions fall back to it. Failed or
+  closed subscription contexts are canceled, and a watcher error is logged once
+  rather than failing an otherwise readable stream. Backend methods must honor
+  cancellation. The follower never writes notification rows or buffers complete
+  executions.
+  `LogNotifications` is a zero-value-ready, in-process helper a store can embed.
+  Each subscriber has one hint slot; `Notify` never waits for a reader. The store
+  calls it after a visible append, new execution, close or successful deletion.
+  Writers in other processes require a backend-specific subscription feed to
+  signal immediately; the polling fallback still sees their output.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure

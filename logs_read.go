@@ -149,19 +149,31 @@ func (c *Client[TTx]) JobLogRead(ctx context.Context, id JobID, opts *LogReadOpt
 	if !lists || !reads {
 		return LogReadResult{}, ErrNotSupported
 	}
+	p, err := withLogReadOpts(id, opts)
+	if err != nil {
+		return LogReadResult{}, err
+	}
+	return readJobLog(ctx, lister, reader, id, p)
+}
+
+func withLogReadOpts(id JobID, opts *LogReadOpts) (LogReadOpts, error) {
 	p := LogReadOpts{Cursor: LogCursor{Offset: -1}}
 	if opts != nil {
 		p = *opts
 	}
 	if id.IsZero() || p.Fence < 0 || p.Cursor.Fence < 0 || p.Cursor.Offset < -1 {
-		return LogReadResult{}, errors.New("hopper: invalid log read cursor")
+		return p, errors.New("hopper: invalid log read cursor")
 	}
 	if p.Limit == 0 {
 		p.Limit = DefaultLogReadBytes
 	}
 	if p.Limit < 1 || p.Limit > MaxLogReadBytes {
-		return LogReadResult{}, fmt.Errorf("hopper: log read limit must be between 1 and %d", MaxLogReadBytes)
+		return p, fmt.Errorf("hopper: log read limit must be between 1 and %d", MaxLogReadBytes)
 	}
+	return p, nil
+}
+
+func readJobLog(ctx context.Context, lister LogStoreLister, reader LogStoreReader, id JobID, p LogReadOpts) (LogReadResult, error) {
 	page, err := listLogRuns(ctx, lister, LogListParams{JobID: id, Fence: p.Fence, Limit: 1})
 	if err != nil {
 		return LogReadResult{}, err
