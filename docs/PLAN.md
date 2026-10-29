@@ -1382,7 +1382,9 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   `Write`. An attempt that logs nothing opens no writer and starts no goroutine. Up
   to 256 KiB of lines wait for a store that falls behind; past that, lines are
   dropped and a line counting them follows, so a slow or hung store costs lines, never
-  the worker's time. `job` is the row as claimed, a copy the worker cannot change
+  the worker's time. Once a configured external byte cap is reached, later
+  records skip external formatting and queueing while service logging continues.
+  `job` is the row as claimed, a copy the worker cannot change
   under the store. The context carries the values of the context the worker first
   called `Logger` with (a trace span its middleware started, say), but not its
   cancellation, deadline or attempt (a store that logs with `hopper.Logger` must not
@@ -1481,8 +1483,9 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   marks replacements with `Reset` and absent or expired output with `Missing`.
   Missing output is reported once per transition and can later reappear as a
   new execution; ordinary storage read errors end the iterator with an error.
-  Reading a full chunk immediately continues from its cursor rather than
-  waiting for a signal. A slow consumer exerts back-pressure on its own iterator,
+  A chunk with unread bytes immediately continues from its cursor. Once the
+  returned offset reaches the reported size, the follower waits for a hint or
+  poll instead of listing and reading again to discover an empty chunk. A slow consumer exerts back-pressure on its own iterator,
   not the worker, and cancellation or a consumer break releases its subscription.
   An optional `LogStoreWatcher` subscribes before the first read, so an append
   between reading and waiting can wake the follower. Hints carry no log data and
