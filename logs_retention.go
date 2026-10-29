@@ -29,7 +29,9 @@ type LogRetentionConfig struct {
 	// GracePeriod protects recent writes, including logs of jobs already removed.
 	GracePeriod time.Duration
 	Interval    time.Duration
-	BatchSize   int
+	// Timeout bounds one batch independently of its scheduling interval; default 30s.
+	Timeout   time.Duration
+	BatchSize int
 }
 
 // LogRetentionResult reports one bounded inventory pass, measured at database time.
@@ -90,11 +92,14 @@ func withLogRetentionDefaults(cfg *LogRetentionConfig, logs JobLogsConfig) (*Log
 	if out.Interval == 0 {
 		out.Interval = time.Minute
 	}
+	if out.Timeout == 0 {
+		out.Timeout = 30 * time.Second
+	}
 	if out.BatchSize == 0 {
 		out.BatchSize = DefaultLogListSize
 	}
-	if out.GracePeriod < 0 || out.Interval < 0 || out.BatchSize < 1 || out.BatchSize > MaxLogListSize {
-		return nil, errors.New("hopper: invalid log retention grace, interval or batch size")
+	if out.GracePeriod < 0 || out.Interval < 0 || out.Timeout < 0 || out.BatchSize < 1 || out.BatchSize > MaxLogListSize {
+		return nil, errors.New("hopper: invalid log retention grace, interval, timeout or batch size")
 	}
 	return &out, nil
 }
@@ -246,7 +251,7 @@ func (c *Client[TTx]) logRetentionLoop(ctx context.Context) {
 			// A store that ignores cancellation can strand one call, never leader renewal or shutdown.
 			go func() {
 				defer c.logRetention.busy.Store(false)
-				passCtx, cancel := context.WithTimeout(ctx, policy.Interval)
+				passCtx, cancel := context.WithTimeout(ctx, policy.Timeout)
 				defer cancel()
 				result, err := c.MaintainJobLogs(passCtx)
 				if err != nil && ctx.Err() == nil {

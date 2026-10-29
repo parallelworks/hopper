@@ -442,6 +442,7 @@ func TestLogRetentionConfigValidation(t *testing.T) {
 		{store: &memOnlyStore{}},
 		{store: &managedTestStore{}, policy: LogRetentionConfig{GracePeriod: -1}},
 		{store: &managedTestStore{}, policy: LogRetentionConfig{Interval: -1}},
+		{store: &managedTestStore{}, policy: LogRetentionConfig{Timeout: -1}},
 		{store: &managedTestStore{}, policy: LogRetentionConfig{BatchSize: MaxLogListSize + 1}},
 	} {
 		_, err := NewClient(managedTestDriver{}, &Config{JobLogs: JobLogsConfig{Store: tc.store, Retention: &tc.policy}})
@@ -511,4 +512,41 @@ func ExampleLogRetentionConfig() {
 	policy := LogRetentionConfig{MaxRuns: 10, MaxRunBytes: 1 << 20, GracePeriod: time.Hour}
 	fmt.Println(policy.MaxRuns, policy.MaxRunBytes)
 	// Output: 10 1048576
+}
+
+type deadlineManagedStore struct {
+	*managedTestStore
+	deadlines chan time.Time
+}
+
+func (s *deadlineManagedStore) List(ctx context.Context, p LogListParams) (LogRunPage, error) {
+	deadline, _ := ctx.Deadline()
+	select {
+	case s.deadlines <- deadline:
+	default:
+	}
+	return s.managedTestStore.List(ctx, p)
+}
+
+func TestLogRetentionBatchTimeoutIsIndependent(t *testing.T) {
+	store := &deadlineManagedStore{managedTestStore: &managedTestStore{}, deadlines: make(chan time.Time, 1)}
+	c, _ := managedClient(t, store, &LogRetentionConfig{Interval: time.Millisecond})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { c.logRetentionLoop(ctx); close(done) }()
+	select {
+	case deadline := <-store.deadlines:
+		if !deadline.After(time.Now().Add(time.Second)) {
+			t.Fatal("batch deadline was coupled to its polling interval")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("maintenance did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("maintenance did not stop")
+	}
 }

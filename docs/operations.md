@@ -50,6 +50,7 @@ cursors. The same fence is never reused, even after a snooze or retry.
 
 All leader-eligible clients must use the same shared store and policy. Cleanup
 runs separately from other leader duties, one bounded page per minute by default.
+The batch timeout defaults to 30 seconds, independently of the polling interval.
 Jobs are looked up in batches rather than once per stored directory. Completed
 and failed log lifetimes inherit job-history settings (24 hours and seven days by
 default); negative values keep logs while the job exists. Missing jobs are cleaned

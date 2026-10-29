@@ -1437,7 +1437,8 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   skip entries. Listing globally uses the same job ID/fence order as listing one
   job, allowing execution counts to span pages with bounded memory.
   A leader-term loop, separate from lease renewal, rescue and history maintenance,
-  reconciles one page per interval (default one minute). It reads database time
+  reconciles one page per interval (default one minute), with an independent
+  per-batch timeout (default 30 seconds). It reads database time
   with `Executor.Now` and jobs with one batched `JobList` filter, including
   history. It adds no insert, claim or finalize writes, schema, or cleanup
   outbox. The inventory is the durable source of pending cleanup: a new process
