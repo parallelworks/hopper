@@ -96,7 +96,7 @@ func (c *Client[TTx]) JobLogFollow(ctx context.Context, id JobID, opts *LogFollo
 						return
 					}
 				}
-				if chunk.Log != "" {
+				if chunk.Log != "" && chunk.NextOffset < chunk.Size {
 					continue
 				}
 			}

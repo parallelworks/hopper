@@ -162,8 +162,9 @@ func (a *attempt) newLogger(ctx context.Context) {
 	base := a.baseLogger.With("job_id", a.completion.ID, "kind", a.row.Kind, "attempt", a.attempt)
 	a.logger = base
 	var (
-		out  io.Writer
-		kept *logBuffer
+		out    io.Writer
+		kept   *logBuffer
+		stored *storeWriter
 	)
 	switch {
 	case a.logs.Store != nil:
@@ -173,6 +174,7 @@ func (a *attempt) newLogger(ctx context.Context) {
 		storeCtx = context.WithValue(storeCtx, inlineAttemptKey{}, (*attempt)(nil))
 		storeCtx = context.WithValue(storeCtx, inlineKey{}, nil)
 		sw := newStoreWriter(a.logs.Store, storeCtx, a.row, base)
+		stored = sw
 		if a.logs.Retention != nil {
 			sw.maxBytes = a.logs.Retention.MaxRunBytes
 		}
@@ -197,7 +199,7 @@ func (a *attempt) newLogger(ctx context.Context) {
 		return
 	}
 	text := slog.NewTextHandler(out, &slog.HandlerOptions{Level: a.logs.Level, ReplaceAttr: a.logs.ReplaceAttr})
-	a.logger = slog.New(attemptHandler{base: base.Handler(), text: text, kept: kept})
+	a.logger = slog.New(attemptHandler{base: base.Handler(), text: text, kept: kept, stored: stored})
 }
 
 // attemptHandler sends an attempt's lines to Config.Logger's handler and
@@ -209,10 +211,15 @@ func (a *attempt) newLogger(ctx context.Context) {
 type attemptHandler struct {
 	base, text slog.Handler
 	kept       *logBuffer
+	stored     *storeWriter
 }
 
 func (h attemptHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.base.Enabled(ctx, level) || h.text.Enabled(ctx, level)
+	return h.base.Enabled(ctx, level) || !h.storeFull() && h.text.Enabled(ctx, level)
+}
+
+func (h attemptHandler) storeFull() bool {
+	return h.stored != nil && h.stored.full.Load()
 }
 
 func (h attemptHandler) Handle(ctx context.Context, r slog.Record) error {
@@ -220,7 +227,7 @@ func (h attemptHandler) Handle(ctx context.Context, r slog.Record) error {
 	if h.base.Enabled(ctx, r.Level) {
 		baseErr = h.base.Handle(ctx, r)
 	}
-	if h.text.Enabled(ctx, r.Level) && (h.kept == nil || !h.kept.dropIfFull()) {
+	if !h.storeFull() && h.text.Enabled(ctx, r.Level) && (h.kept == nil || !h.kept.dropIfFull()) {
 		textErr = h.text.Handle(ctx, r)
 	}
 	return errors.Join(baseErr, textErr)
@@ -230,14 +237,14 @@ func (h attemptHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	text := h.text
 	// A full log formats no more lines, so it need not format their
 	// attributes either.
-	if h.kept == nil || h.kept.dropped.Load() == 0 {
+	if !h.storeFull() && (h.kept == nil || h.kept.dropped.Load() == 0) {
 		text = text.WithAttrs(attrs)
 	}
-	return attemptHandler{base: h.base.WithAttrs(attrs), text: text, kept: h.kept}
+	return attemptHandler{base: h.base.WithAttrs(attrs), text: text, kept: h.kept, stored: h.stored}
 }
 
 func (h attemptHandler) WithGroup(name string) slog.Handler {
-	return attemptHandler{base: h.base.WithGroup(name), text: h.text.WithGroup(name), kept: h.kept}
+	return attemptHandler{base: h.base.WithGroup(name), text: h.text.WithGroup(name), kept: h.kept, stored: h.stored}
 }
 
 // closeLog ends the attempt's log in the store, if it has one, and keeps
@@ -286,6 +293,7 @@ type storeWriter struct {
 	row      *driver.JobRow
 	logger   *slog.Logger
 	maxBytes int64
+	full     atomic.Bool
 
 	mu      sync.Mutex
 	queue   [][]byte
@@ -306,6 +314,9 @@ func newStoreWriter(store LogStore, ctx context.Context, row *driver.JobRow, log
 }
 
 func (s *storeWriter) Write(p []byte) (int, error) {
+	if s.full.Load() {
+		return len(p), nil
+	}
 	s.mu.Lock()
 	switch {
 	case s.ended:
@@ -353,7 +364,7 @@ func (s *storeWriter) run() {
 			lines = append(lines, fmt.Appendf(nil, "hopper: %d lines dropped: the store fell behind\n", dropped))
 		}
 		for _, line := range lines {
-			if failed {
+			if failed || s.full.Load() {
 				break
 			}
 			if w == nil {
@@ -393,7 +404,7 @@ func (s *storeWriter) open() (w io.WriteCloser, err error) {
 		err = errors.New("the store returned no writer")
 	}
 	if err == nil && s.maxBytes > 0 {
-		w = &limitedLogWriter{WriteCloser: w, max: s.maxBytes}
+		w = &limitedLogWriter{WriteCloser: w, max: s.maxBytes, onLimit: func() { s.full.Store(true) }}
 	}
 	return w, err
 }
@@ -522,6 +533,7 @@ type limitedLogWriter struct {
 	io.WriteCloser
 	max, written int64
 	truncated    bool
+	onLimit      func()
 }
 
 func (w *limitedLogWriter) Write(p []byte) (int, error) {
@@ -530,6 +542,9 @@ func (w *limitedLogWriter) Write(p []byte) (int, error) {
 	}
 	if int64(len(p)) > w.max-w.written {
 		w.truncated = true
+		if w.onLimit != nil {
+			w.onLimit()
+		}
 		_, err := w.WriteCloser.Write([]byte(logStoreLimitMessage))
 		return len(p), err
 	}

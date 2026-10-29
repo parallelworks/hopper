@@ -18,7 +18,7 @@ type followTestReader struct {
 
 func (s *followTestReader) Read(ctx context.Context, p LogReadParams) (LogChunk, error) {
 	chunk, err := s.managedTestStore.Read(ctx, p)
-	if err == nil && chunk.Log == "" {
+	if err == nil && chunk.NextOffset == chunk.Size {
 		select {
 		case s.idle <- struct{}{}:
 		default:
