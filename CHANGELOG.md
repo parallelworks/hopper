@@ -6,6 +6,15 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.10.0](https://github.com/parallelworks/hopper/compare/v0.9.0...v0.10.0) (2026-10-29)
+
+
+### Features
+
+* **client:** a claimed workflow job gets its dependencies' outputs and states ([#94](https://github.com/parallelworks/hopper/issues/94)) ([8faa5a2](https://github.com/parallelworks/hopper/commit/8faa5a2b82af95252cb3a67075404d6410948c36))
+* **logs:** execution reads and managed external log retention ([#98](https://github.com/parallelworks/hopper/issues/98)) ([d0dae12](https://github.com/parallelworks/hopper/commit/d0dae121912602f455b3683e7fe0e9ccb54c9984))
+* **logs:** notifications and resumable live following ([#99](https://github.com/parallelworks/hopper/issues/99)) ([63ea6a0](https://github.com/parallelworks/hopper/commit/63ea6a0dc36621fb677e6819d9c773d9fcb27354))
+
 ## [0.9.0](https://github.com/parallelworks/hopper/compare/v0.8.0...v0.9.0) (2026-10-28)
 
 
