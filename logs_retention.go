@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,7 +60,7 @@ type LogRetentionStats struct {
 }
 
 type logRetentionState struct {
-	mu                  sync.Mutex
+	gate                chan struct{}
 	busy                atomic.Bool
 	stats               atomic.Pointer[LogRetentionStats]
 	after               string
@@ -69,6 +68,20 @@ type logRetentionState struct {
 	rank                int
 	scanRuns, scanBytes int64
 }
+
+func (s *logRetentionState) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case s.gate <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *logRetentionState) release() { <-s.gate }
 
 func withLogRetentionDefaults(cfg *LogRetentionConfig, logs JobLogsConfig) (*LogRetentionConfig, error) {
 	if cfg == nil {
@@ -120,8 +133,10 @@ func (c *Client[TTx]) MaintainJobLogs(ctx context.Context) (result LogRetentionR
 		return result, ErrNotSupported
 	}
 	state := &c.logRetention
-	state.mu.Lock()
-	defer state.mu.Unlock()
+	if err = state.acquire(ctx); err != nil {
+		return result, err
+	}
+	defer state.release()
 	defer func() {
 		stats := c.LogRetentionStats()
 		stats.Last = result

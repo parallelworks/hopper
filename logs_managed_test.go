@@ -477,12 +477,13 @@ func TestLogRunInventoryRejectsInvalidOrder(t *testing.T) {
 
 type blockedManagedStore struct {
 	*managedTestStore
-	started chan struct{}
-	release chan struct{}
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
 }
 
 func (s *blockedManagedStore) List(ctx context.Context, p LogListParams) (LogRunPage, error) {
-	close(s.started)
+	s.startOnce.Do(func() { close(s.started) })
 	<-s.release
 	return s.managedTestStore.List(ctx, p)
 }
@@ -506,6 +507,118 @@ func TestLogRetentionBlockedStoreDoesNotBlockTerm(t *testing.T) {
 	}
 	_ = c.LogRetentionStats()
 	close(store.release)
+}
+
+func TestLogRetentionQueuedCallsHonorContext(t *testing.T) {
+	for _, canceled := range []bool{true, false} {
+		name := "deadline"
+		if canceled {
+			name = "already canceled"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := &blockedManagedStore{managedTestStore: &managedTestStore{}, started: make(chan struct{}), release: make(chan struct{})}
+			c, _ := managedClient(t, store, &LogRetentionConfig{})
+			firstDone := make(chan error, 1)
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(store.release) }) }
+			t.Cleanup(release)
+			go func() { _, err := c.MaintainJobLogs(t.Context()); firstDone <- err }()
+			select {
+			case <-store.started:
+			case <-time.After(time.Second):
+				t.Fatal("first maintenance did not start")
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+			defer cancel()
+			want := context.DeadlineExceeded
+			if canceled {
+				cancel()
+				want = context.Canceled
+			}
+			secondDone := make(chan error, 1)
+			go func() { _, err := c.MaintainJobLogs(ctx); secondDone <- err }()
+			select {
+			case err := <-secondDone:
+				if !errors.Is(err, want) {
+					t.Fatalf("queued maintenance = %v, want %v", err, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("queued maintenance ignored cancellation")
+			}
+			select {
+			case err := <-firstDone:
+				t.Fatalf("blocked maintenance ended before its store was released: %v", err)
+			default:
+			}
+			release()
+			select {
+			case err := <-firstDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("first maintenance did not finish")
+			}
+			recoveryCtx, recoveryCancel := context.WithTimeout(t.Context(), time.Second)
+			defer recoveryCancel()
+			if _, err := c.MaintainJobLogs(recoveryCtx); err != nil {
+				t.Fatalf("canceled waiter left maintenance blocked: %v", err)
+			}
+		})
+	}
+}
+
+type retentionLogWriter chan string
+
+func (w retentionLogWriter) Write(p []byte) (int, error) {
+	select {
+	case w <- string(p):
+	default:
+	}
+	return len(p), nil
+}
+
+func TestLogRetentionQueuedAutomaticBatchHonorsTimeout(t *testing.T) {
+	store := &blockedManagedStore{managedTestStore: &managedTestStore{}, started: make(chan struct{}), release: make(chan struct{})}
+	c, _ := managedClient(t, store, &LogRetentionConfig{Interval: time.Hour, Timeout: 10 * time.Millisecond})
+	logs := make(retentionLogWriter, 1)
+	c.logger = slog.New(slog.NewTextHandler(logs, nil))
+	firstDone := make(chan error, 1)
+	go func() { _, err := c.MaintainJobLogs(t.Context()); firstDone <- err }()
+	t.Cleanup(func() {
+		close(store.release)
+		select {
+		case err := <-firstDone:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("manual maintenance did not finish")
+		}
+	})
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("manual maintenance did not start")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	loopDone := make(chan struct{})
+	go func() { c.logRetentionLoop(ctx); close(loopDone) }()
+	select {
+	case message := <-logs:
+		if !strings.Contains(message, context.DeadlineExceeded.Error()) {
+			t.Fatalf("automatic batch = %s", message)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("automatic batch timeout did not bound its gate wait")
+	}
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("automatic maintenance did not stop")
+	}
 }
 
 func ExampleLogRetentionConfig() {

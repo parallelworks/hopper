@@ -125,9 +125,11 @@ func TestManagedLogsLeaderReplacement(t *testing.T) {
 	store.put(id, 2, 1, "orphan after leadership change", time.Now().Add(-2*time.Hour))
 	waitManagedInventoryEmpty(t, store)
 	// The deletion is visible just before the pass publishes its statistics.
-	second.logRetention.mu.Lock()
+	if err := second.logRetention.acquire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	stats := second.LogRetentionStats()
-	second.logRetention.mu.Unlock()
+	second.logRetention.release()
 	if stats.Deleted == 0 {
 		t.Fatal("replacement leader did not run maintenance")
 	}

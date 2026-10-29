@@ -111,19 +111,20 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		return nil, err
 	}
 	c := &Client[TTx]{
-		driver:      d,
-		exec:        d.Executor(),
-		caps:        d.Capabilities(),
-		cfg:         resolved,
-		tuning:      defaultTuning.withLease(resolved.LeaseTTL),
-		logger:      resolved.Logger,
-		workers:     resolved.Workers,
-		leaderPoke:  make(chan struct{}, 1),
-		streamPoke:  make(chan struct{}, 1),
-		periodic:    newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
-		events:      newEventBus(),
-		running:     map[JobID]*runningJob{},
-		doneWaiters: map[JobID][]chan struct{}{},
+		driver:       d,
+		exec:         d.Executor(),
+		caps:         d.Capabilities(),
+		cfg:          resolved,
+		tuning:       defaultTuning.withLease(resolved.LeaseTTL),
+		logger:       resolved.Logger,
+		workers:      resolved.Workers,
+		leaderPoke:   make(chan struct{}, 1),
+		streamPoke:   make(chan struct{}, 1),
+		periodic:     newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
+		events:       newEventBus(),
+		running:      map[JobID]*runningJob{},
+		doneWaiters:  map[JobID][]chan struct{}{},
+		logRetention: logRetentionState{gate: make(chan struct{}, 1)},
 	}
 	if c.workers == nil {
 		c.workers = NewWorkers()

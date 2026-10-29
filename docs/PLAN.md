@@ -1440,7 +1440,9 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   reconciles bounded pages until the scan ends, then waits an interval (default
   one minute) before starting again. Each batch has an independent timeout
   (default 30 seconds), so a long scan neither starves old inventory pages nor
-  blocks leader renewal. It reads database time
+  blocks leader renewal. Explicit and automatic maintenance share a
+  cancellation-aware gate, so the batch deadline also bounds waiting for another
+  pass. It reads database time
   with `Executor.Now` and jobs with one batched `JobList` filter, including
   history. It adds no insert, claim or finalize writes, schema, or cleanup
   outbox. The inventory is the durable source of pending cleanup: a new process
