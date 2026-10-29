@@ -80,7 +80,8 @@ type Client[TTx any] struct {
 	keptLogged     time.Time
 	streamPoke     chan struct{}
 
-	events *eventBus
+	events       *eventBus
+	logRetention logRetentionState
 
 	// running maps jobs running on this client to their latest claim here.
 	runningMu sync.Mutex

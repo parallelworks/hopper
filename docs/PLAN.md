@@ -1411,11 +1411,65 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   still matches for a job that is gone), and hopperui shows the job with a note
   where the logs would be; a store's `ErrNotFound` means it has none. The CLI, which
   has no store, shows only the column. `MaxBytes` neither applies nor is checked, and
-  retention is the store's: hopper does not remove a job's logs from it. A failed or
+  retention is the store's unless `JobLogs.Retention` opts into the managed
+  inventory described below. A failed or
   panicking `Writer`, `Write` or `Close`, or a nil writer, is logged to
   `Config.Logger` once and drops the rest of that attempt's lines; it never changes
-  the job's outcome. The interface stays small on purpose: a live tail is the
-  store's to offer, from what it has been written.
+  the job's outcome.
+- **Execution reads and managed log retention.** The original `LogStore` stays
+  compatible. A `LogStoreLister` adds a bounded, durable inventory and a
+  `LogStoreReader` adds bounded byte reads. `JobLogRuns` lists retained executions,
+  including every retained snooze, by job ID ascending and fence descending.
+  `JobLogRead` selects a fence or the latest execution, and its `LogCursor` binds
+  an offset to that fence: following a new claim resets the offset to its tail.
+  These APIs read only the external store, return `ErrNotSupported` without the
+  capabilities, and leave `JobLogs`' inline compatibility and snooze collapsing
+  unchanged. The read limit defaults to 64 KiB and cannot exceed 1 MiB; inventory
+  pages default to 100 runs and cannot exceed 1000. A store validates its seek
+  cursor, returns exact execution metadata for a fence filter, and bounds its
+  own I/O. The client checks page ordering, identities, byte counts and offsets.
+  A missing execution is `ErrNotFound`.
+  `JobLogs.Retention` additionally requires `LogStorePruner`. An inventory run has
+  a modification time and a version that changes on every append or replacement.
+  `Delete` atomically compares that version, deleting only that execution; a
+  missing or changed run returns false. The job ID and fence are never reused.
+  Inventory pages use stable seek cursors, so deleting a preceding page does not
+  skip entries. Listing globally uses the same job ID/fence order as listing one
+  job, allowing execution counts to span pages with bounded memory.
+  A leader-term loop, separate from lease renewal, rescue and history maintenance,
+  reconciles one page per interval (default one minute). It reads database time
+  with `Executor.Now` and jobs with one batched `JobList` filter, including
+  history. It adds no insert, claim or finalize writes, schema, or cleanup
+  outbox. The inventory is the durable source of pending cleanup: a new process
+  starts again, and a failed batch keeps its previous cursor. A successful
+  deletion is idempotent, so replay after a partial failure is safe. Explicit
+  deletion, `DeleteCompleted` and history partition drops all become missing
+  jobs without needing a callback for each deleted row.
+  A run modified in the grace period (default one hour), the current running
+  fence, a fence newer than the job snapshot, or all runs of a legacy job whose
+  fence is zero are preserved. Other runs of missing jobs are deleted. A live
+  job keeps its latest `MaxRuns` executions (default `JobLogs.MaxAttempts`);
+  older ones become eligible after the grace period. Finalized logs also expire
+  after `CompletedRetention` or `FailedRetention`, measured from the job's
+  database finalization time. Zero inherits the corresponding history setting;
+  a negative value disables age expiry while the job exists. Log expiry may
+  therefore precede a deferred history partition drop. A retry's new fence
+  cannot be deleted by a cleanup decision about an earlier fence.
+  `MaxRunBytes` defaults to 1 MiB and limits whole lines handed to each execution's
+  writer, with one truncation marker; later lines still reach the service
+  logger. A negative byte or execution limit is unlimited. Byte limits apply to
+  new writes through this client; old clients and direct remote writers must
+  enforce their own limits, and existing objects are not rewritten.
+  All clients that can lead must configure the same inventory and retention
+  policy. `NeverLead` clients never run automatic cleanup. `MaintainJobLogs`
+  also performs a single batch explicitly, without starting the client.
+  Storage failures and panics are reported and retried, without changing job
+  outcomes. A store that ignores cancellation can strand at most one automatic
+  call per client; it cannot block a term ending or renewal.
+  `LogRetentionStats` exposes the latest pass, cumulative deletions and failures,
+  and observed retained bytes/runs after a complete inventory scan. The inventory
+  is an observation across a scan, not a transactional capacity measurement;
+  hard storage quotas remain the backend's responsibility.
 - The finalizer's write runs on a context the stop signal cannot cancel: a result that
   reached the finalizer belongs to a job that has finished. While the client is running,
   a failed flush is retried with backoff and the buffered results apply back-pressure

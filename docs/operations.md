@@ -22,6 +22,58 @@
   a batch whose last jobs a client could not settle (it stopped right after
   finalizing them) never completes.
 
+## External job logs
+
+An existing `JobLogs.Store` keeps its own retention unless the application opts
+into managed retention:
+
+~~~go
+JobLogs: hopper.JobLogsConfig{
+    Store: store,
+    Retention: &hopper.LogRetentionConfig{
+        MaxRuns: 10,
+        MaxRunBytes: 1 << 20,
+        GracePeriod: time.Hour,
+    },
+},
+~~~
+
+The store must implement `LogStoreLister` and `LogStorePruner`. Every inventory
+entry identifies a job and claim fence, has a modification time, and supplies a
+version that changes whenever its content changes. Deletion must atomically check
+that version; a compare followed by an unconditional deletion is insufficient.
+For an append-only filesystem store, writers can hold a shared lock for their
+lifetime and deletion can take an exclusive lock while checking the version and
+unlinking. Every writer must honor that protocol before managed cleanup is enabled.
+List globally in job ID ascending/fence descending order using stable seek
+cursors. The same fence is never reused, even after a snooze or retry.
+
+All leader-eligible clients must use the same shared store and policy. Cleanup
+runs separately from other leader duties, one bounded page per minute by default.
+Jobs are looked up in batches rather than once per stored directory. Completed
+and failed log lifetimes inherit job-history settings (24 hours and seven days by
+default); negative values keep logs while the job exists. Missing jobs are cleaned
+up after the modification grace, including explicit deletion and `DeleteCompleted`.
+Active claims, recent writes and unknown newer fences are protected.
+
+`MaxRuns` is a background retention target, subject to the grace and active-run
+protections. `MaxRunBytes` bounds new writes by this client, plus one truncation
+marker; it does not rewrite existing data or bound writes made by other programs.
+Direct remote writers and older clients must apply their own byte limits.
+
+Expose `client.LogRetentionStats()` through the application's metrics. Check
+`Failures`, `LastError`, `DeletedBytes`, `InventoryBytes` and `InventoryAt`; the
+inventory totals describe the last complete scan and can lag concurrent writes.
+Size the volume or bucket for the job rate, retention window and per-job limits.
+This accounting is not a global storage quota. Backend lifecycle rules must not
+delete active logs sooner than the application's policy.
+
+For live reads, implement `LogStoreReader` as well. `JobLogRuns` exposes executions
+and `JobLogRead` reads at most the requested byte limit. Retain the returned
+`LogCursor` for the next read; its fence prevents joining output from different
+claims. A nil read option tails the latest execution; a zero offset starts from
+the beginning. These APIs leave older inline logs to `JobLogs`.
+
 ## Postgres
 
 - **Version:** 14 or later. Job IDs use `uuidv7()` on 18 and a compatible
