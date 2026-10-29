@@ -92,6 +92,7 @@ func (c *Client[TTx]) startTerm(ctx context.Context) *leaderTerm {
 	wg.Go(func() { c.streamLoop(termCtx) })
 	wg.Go(func() { c.liveLoop(termCtx) })
 	wg.Go(func() { c.indexLoop(termCtx, t.maintained) })
+	wg.Go(func() { c.logRetentionLoop(termCtx) })
 	go func() {
 		defer close(t.done)
 		wg.Wait()

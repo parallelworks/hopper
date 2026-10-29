@@ -22,8 +22,8 @@ type AttemptLog = driver.AttemptLog
 // that runs a job's work elsewhere. Logs are keyed by job ID and attempt:
 // hopper writes nothing of them to the database, so they survive the
 // client's crash, and a remote process writes an attempt's lines under the
-// ID and attempt its job was claimed with. The store keeps them for as long
-// as it chooses; hopper does not remove them with the job.
+// ID and attempt its job was claimed with. The store chooses retention unless
+// JobLogs.Retention opts its versioned inventory into managed cleanup.
 //
 // Its methods are called from many goroutines at once.
 type LogStore interface {
@@ -69,8 +69,10 @@ type JobLogsConfig struct {
 	// instead of the job's row in the database, and Client.JobLogs reads
 	// them from it, after any the job's row holds. MaxBytes then neither
 	// applies nor is checked, and MaxAttempts bounds what Client.JobLogs
-	// returns: what the store keeps is its own choice.
+	// returns. Retention optionally manages the store's execution count, age and writes.
 	Store LogStore
+	// Retention opts a versioned inventory store into managed cleanup and write limits.
+	Retention *LogRetentionConfig
 	// MaxBytes is how much of an attempt's log is kept. Once a line would
 	// pass it, that line and the rest are dropped, and the log ends with a
 	// line that counts them. Defaults to 32 KiB, and is at most 1 MiB,
@@ -171,6 +173,9 @@ func (a *attempt) newLogger(ctx context.Context) {
 		storeCtx = context.WithValue(storeCtx, inlineAttemptKey{}, (*attempt)(nil))
 		storeCtx = context.WithValue(storeCtx, inlineKey{}, nil)
 		sw := newStoreWriter(a.logs.Store, storeCtx, a.row, base)
+		if a.logs.Retention != nil {
+			sw.maxBytes = a.logs.Retention.MaxRunBytes
+		}
 		a.mu.Lock()
 		ended := a.logEnded
 		if !ended {
@@ -275,11 +280,12 @@ const storePending = 256 << 10
 // queue is full are dropped and counted. After a failure, the store gets
 // no more of the attempt's lines.
 type storeWriter struct {
-	store  LogStore
-	ctx    context.Context
-	cancel context.CancelFunc
-	row    *driver.JobRow
-	logger *slog.Logger
+	store    LogStore
+	ctx      context.Context
+	cancel   context.CancelFunc
+	row      *driver.JobRow
+	logger   *slog.Logger
+	maxBytes int64
 
 	mu      sync.Mutex
 	queue   [][]byte
@@ -385,6 +391,9 @@ func (s *storeWriter) open() (w io.WriteCloser, err error) {
 	})
 	if err == nil && w == nil {
 		err = errors.New("the store returned no writer")
+	}
+	if err == nil && s.maxBytes > 0 {
+		w = &limitedLogWriter{WriteCloser: w, max: s.maxBytes}
 	}
 	return w, err
 }
@@ -500,5 +509,31 @@ func withJobLogDefaults(cfg JobLogsConfig) (JobLogsConfig, error) {
 	if cfg.Store == nil && cfg.MaxBytes > 0 && cfg.MaxBytes*cfg.MaxAttempts > MaxJobLogTotalBytes {
 		return cfg, fmt.Errorf("hopper: Config.JobLogs.MaxBytes times MaxAttempts must be at most %d", MaxJobLogTotalBytes)
 	}
+	var err error
+	if cfg.Retention, err = withLogRetentionDefaults(cfg.Retention, cfg); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
+}
+
+const logStoreLimitMessage = "hopper: log byte limit reached; subsequent output omitted\n"
+
+type limitedLogWriter struct {
+	io.WriteCloser
+	max, written int64
+	truncated    bool
+}
+
+func (w *limitedLogWriter) Write(p []byte) (int, error) {
+	if w.truncated {
+		return len(p), nil
+	}
+	if int64(len(p)) > w.max-w.written {
+		w.truncated = true
+		_, err := w.WriteCloser.Write([]byte(logStoreLimitMessage))
+		return len(p), err
+	}
+	n, err := w.WriteCloser.Write(p)
+	w.written += int64(n)
+	return n, err
 }
