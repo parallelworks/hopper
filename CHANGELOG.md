@@ -6,6 +6,13 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.10.1](https://github.com/parallelworks/hopper/compare/v0.10.0...v0.10.1) (2026-10-29)
+
+
+### Performance
+
+* **logs:** skip redundant reads and capped output work ([#100](https://github.com/parallelworks/hopper/issues/100)) ([3fac7d1](https://github.com/parallelworks/hopper/commit/3fac7d1dafbd7a12300870f5a0a68c7f567f3ec6))
+
 ## [0.10.0](https://github.com/parallelworks/hopper/compare/v0.9.0...v0.10.0) (2026-10-29)
 
 
