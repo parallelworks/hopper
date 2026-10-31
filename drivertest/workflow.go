@@ -634,3 +634,121 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("edges left = %d, want 0", n)
 	}
 }
+
+// testWorkflowCascadeHeld checks that the leader's statements that finalize
+// jobs, the discard of jobs past their TTL, the expiry of job leases and the
+// rescue's finalize, each of which skips the jobs another transaction
+// holds, do not wait for the caller's
+// transaction that holds a row their cascade reaches: a dependent of two
+// steps that a JobCancelTx or a CompleteTx of the other step, held open,
+// has canceled by cascade. The leader runs them in its loop, so a wait
+// would hold up its other duties and its lease's renewal for as long as
+// the caller kept the transaction open. The statement gives up on its jobs
+// instead, which the next pass, once the transaction has rolled back,
+// finalizes, canceling the dependent.
+func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
+	for _, duty := range []string{"discard expired", "lease expiry", "rescue"} {
+		t.Run(duty, func(t *testing.T) {
+			ctx := context.Background()
+			d := f.NewDriver(t)
+			if singleWriter(d) {
+				t.Skip("on an engine that runs one writer at a time, every write waits for an open transaction")
+			}
+			exec := d.Executor()
+			// The expiry's client is the cluster's first: a lease is due no
+			// earlier than its TTL past the start of a client that started
+			// after its last renewal.
+			var clientID int64
+			if duty != "lease expiry" {
+				clientID = register(ctx, t, exec)
+			}
+			jobs := params("step", 3)
+			switch duty {
+			case "discard expired":
+				jobs[1].TTL = 100 * time.Millisecond
+			case "lease expiry":
+				jobs[1].MaxAttempts = 1
+			}
+			wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+				Name: "fan-in", Jobs: jobs,
+				Deps: []driver.JobDependency{{Job: 2, DependsOn: 0}, {Job: 2, DependsOn: 1}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, b, dep := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID, wf.Jobs[2].Job.ID
+			failed := func(id driver.JobID) []driver.JobFinalize {
+				return withFences(ctx, t, exec, []driver.JobFinalize{{
+					ID: id, AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true,
+					Error: &driver.AttemptError{Attempt: 1, Error: "boom"},
+				}})
+			}
+			var expirerID int64
+			switch duty {
+			case "discard expired":
+				time.Sleep(500 * time.Millisecond)
+			case "lease expiry":
+				expirerID = expirer(ctx, t, f, d)
+				claimByID(ctx, t, exec, b)
+				f.ExpireJobLease(ctx, t, d, b)
+			case "rescue":
+				if running := claim(ctx, t, exec, clientID, 2); len(running) != 2 {
+					t.Fatalf("claimed %d steps, want both", len(running))
+				}
+			}
+
+			tx, _, rollback := f.Begin(ctx, t, d)
+			t.Cleanup(func() { _ = rollback() })
+			if duty == "rescue" {
+				_, err = d.UnwrapTx(tx).JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: failed(a)})
+			} else {
+				_, err = d.UnwrapTx(tx).JobCancel(ctx, a)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			run := func() int {
+				t.Helper()
+				lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				var (
+					n   int
+					err error
+				)
+				switch duty {
+				case "discard expired":
+					var discarded []*driver.JobRow
+					discarded, err = exec.JobDiscardExpired(lctx, 10)
+					n = len(discarded)
+				case "lease expiry":
+					var expired []*driver.JobRow
+					expired, err = exec.JobExpireLeases(lctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: expirerID})
+					n = len(expired)
+				case "rescue":
+					var applied []driver.JobFinalized
+					applied, err = exec.JobFinalizeMany(lctx, driver.JobFinalizeParams{Jobs: failed(b), SkipLocked: true})
+					n = len(applied)
+				}
+				if err != nil {
+					t.Fatalf("%s while a transaction that canceled the dependent is held open: %v", duty, err)
+				}
+				return n
+			}
+			if n := run(); n != 0 {
+				t.Fatalf("%s while a transaction that canceled the dependent is held open finalized %d jobs; want it to give up", duty, n)
+			}
+			if err := rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if n := run(); n != 1 {
+				t.Fatalf("%s once the transaction rolled back finalized %d jobs, want 1", duty, n)
+			}
+			if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateCanceled {
+				t.Fatalf("dependent = %+v, %v; want it canceled by the cascade", j, err)
+			}
+			if j, err := exec.JobGet(ctx, a); err != nil || j.State.Terminal() {
+				t.Fatalf("step whose cancel rolled back = %+v, %v; want it live", j, err)
+			}
+		})
+	}
+}

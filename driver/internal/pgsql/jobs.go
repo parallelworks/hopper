@@ -833,7 +833,22 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 			query = jobFinalizeLeasePlainSQL
 		}
 	}
-	applied, err := scanFinalized(e.Conn.Query(ctx, query, args...))
+	var applied []driver.JobFinalized
+	run := func(c Conn) (err error) {
+		applied, err = scanFinalized(c.Query(ctx, query, args...))
+		return err
+	}
+	var err error
+	if params.SkipLocked && !params.NoBatches {
+		// Besides the jobs it skips, the statement may reach rows another
+		// transaction holds, such as a dependent that a JobCancelTx held
+		// open has canceled by cascade; past a brief wait for them it
+		// skips every job. Jobs of no batch have no dependents, and their
+		// statement reaches no other job's rows.
+		err = e.briefly(ctx, run)
+	} else {
+		err = run(e.Conn)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("hopper: finalize jobs: %w", err)
 	}
@@ -1880,9 +1895,14 @@ WITH RECURSIVE finished AS (
 ` + finalizeTailSQL("$2", "$3") + `
 SELECT ` + finishedSelectColumns + ` FROM finished`
 
-// JobDiscardExpired implements driver.Executor.
+// JobDiscardExpired implements driver.Executor. It waits only briefly for
+// rows another transaction holds (briefly), discarding nothing if it has to.
 func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.JobRow, error) {
-	jobs, err := historyJobs(e.Conn.Query(ctx, jobDiscardExpiredSQL, max(limit, 1), driver.ChannelDone, driver.ChannelInsert))
+	var jobs []*driver.JobRow
+	err := e.briefly(ctx, func(c Conn) (err error) {
+		jobs, err = historyJobs(c.Query(ctx, jobDiscardExpiredSQL, max(limit, 1), driver.ChannelDone, driver.ChannelInsert))
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("hopper: discard expired jobs: %w", err)
 	}

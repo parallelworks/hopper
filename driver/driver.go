@@ -234,7 +234,13 @@ type Executor interface {
 	// finalized jobs are left alone.
 	JobRetryOrderingKey(ctx context.Context, params JobRetryOrderingKeyParams) (int, error)
 	// JobDiscardExpired moves waiting jobs whose TTL has passed to history
-	// as discarded, and returns them.
+	// as discarded, and returns them. The leader runs it in its loop, so,
+	// like JobExpireLeases and a finalize with SkipLocked, it skips the jobs
+	// another transaction holds, and waits only briefly for any other row
+	// one holds that its statement reaches, such as a dependent it cancels
+	// by cascade, and then discards none: the next call takes them. On a
+	// SingleWriter engine it waits for another transaction's writes, as
+	// every write does.
 	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)
 	// JobRescueCandidates returns running jobs whose owning client has no
 	// unexpired lease, plus, if StuckAfter is positive, running jobs claimed
@@ -269,7 +275,8 @@ type Executor interface {
 	// after the lease was last renewed (and no later than now), at the first
 	// such start plus the larger of its TTL and params.Grace, if that is
 	// later. It expires nothing unless the lease of client params.ClientID
-	// is live. It returns the jobs as they are afterwards.
+	// is live. It returns the jobs as they are afterwards. It waits for
+	// rows another transaction holds as JobDiscardExpired does.
 	JobExpireLeases(ctx context.Context, params JobExpireLeasesParams) ([]*JobRow, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
@@ -1062,7 +1069,10 @@ type JobFinalizeParams struct {
 	NoBatches bool
 	// SkipLocked skips the jobs whose rows another transaction holds, such
 	// as a worker's CompleteTx that has not ended, instead of waiting for
-	// it. A skipped job is not among the applied. On a SingleWriter engine
+	// it. A skipped job is not among the applied. A statement waits only
+	// briefly for any other row another transaction holds that it reaches,
+	// such as a dependent it cancels by cascade that a JobCancelTx held open
+	// has canceled, and then skips every job. On a SingleWriter engine
 	// every job is skipped while another transaction writes. It does not
 	// apply to the results of leased jobs.
 	SkipLocked bool

@@ -15,6 +15,7 @@ package pgsql
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // ErrNoRows is returned by Row.Scan when the query matched nothing.
@@ -79,6 +80,42 @@ func (e *Executor) withTx(ctx context.Context, fn func(tx Tx) error) (err error)
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// heldLockTimeout bounds how long a statement of the leader's loop that
+// finalizes jobs (JobDiscardExpired, JobExpireLeases, and JobFinalizeMany
+// with SkipLocked, which its rescue runs) waits for a row another
+// transaction holds. Each skips the jobs it would finalize that another
+// transaction holds, but its cascade, promotion and batch updates reach
+// other rows, which a caller's transaction may hold for as long as it stays
+// open: a dependent that a JobCancelTx or JobDeleteTx held open has canceled
+// or deleted. A wait as long as the caller's transaction would hold up the
+// leader's other duties and its lease's renewal. Skipping such a row
+// instead would be wrong: a cascade that skipped a dependent the caller's
+// transaction then rolled back would leave it pending behind a failed
+// dependency. The statement gives up instead, and its jobs are tried again
+// on the next pass.
+const heldLockTimeout = 500 * time.Millisecond
+
+// briefly runs fn in a transaction of its own whose lock waits are bounded
+// by heldLockTimeout. A wait that runs out rolls fn's statements back and
+// is no error: fn's caller then reports nothing done, as fn left its results.
+// On an executor in a caller's transaction, fn runs in it, unbounded, since
+// a timeout set there would last the caller's whole transaction.
+func (e *Executor) briefly(ctx context.Context, fn func(Conn) error) error {
+	if e.InTx {
+		return fn(e.Conn)
+	}
+	err := e.withTx(ctx, func(tx Tx) error {
+		if err := setLockTimeout(ctx, tx, lockTimeoutSetting(heldLockTimeout)); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
+	if lockNotAvailable(err) {
+		return nil
+	}
+	return err
 }
 
 // collect returns a consumer that reads every row of a query result through
