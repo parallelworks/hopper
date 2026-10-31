@@ -1651,7 +1651,7 @@ promoting workflow jobs whose last dependencies finished in concurrent transacti
 The duties in the leader loop run one after another on the loop that renews the
 leader's lease, so none of them waits for a transaction a caller holds open, which may
 stay open for as long as the caller likes: a `JobRetryTx`, `JobCancelTx` or
-`JobDeleteTx`, a `CompleteTx`, a `LeaseClaimTx` or an `InsertTx`. A wait as long as
+`JobDeleteTx`, a `CompleteTx`, a `Leases.ClaimTx` or an `InsertTx`. A wait as long as
 that transaction would hold up the other duties and, past the leader's TTL, cost the
 leadership, whose next holder would wait the same way. Each duty skips the rows such a
 transaction holds that it would change itself (`FOR UPDATE SKIP LOCKED`), and takes
@@ -1675,7 +1675,8 @@ deferred the same way (§7.10). A client's finalizer, whose write of the results
 batch jobs skipping held rows (`SkipLocked`) runs the same way, gets
 `driver.ErrRowsHeld` from a write that gave up, and writes the results again in
 halves, so that only the result whose statement reaches the held row waits, tried again
-later as one whose own row is held is.
+later as one whose own row is held is. Since each of its tries waits out the bound and
+holds up the client's other writes meanwhile, the tries back off, from 250 ms to 2 s.
 
 The index build (`HistoryIndex`) runs in its own loop of the leader's term, once the
 term's first history maintenance has created the partitions ahead and then every

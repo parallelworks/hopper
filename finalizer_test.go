@@ -327,11 +327,24 @@ func TestFinalizerSplitsBatchOnRowsHeld(t *testing.T) {
 	}
 	select {
 	case p := <-f.in:
-		if p.result.ID != exec.held || p.waits != 1 {
-			t.Errorf("result of job %v tried again after %d waits, want job %v after 1", p.result.ID, p.waits, exec.held)
+		if p.result.ID != exec.held || p.waits != 1 || p.rowsHeld {
+			t.Errorf("result of job %v tried again after %d waits (rowsHeld %t), want job %v after 1, cleared", p.result.ID, p.waits, p.rowsHeld, exec.held)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the result whose statement reached the held row was not tried again")
+	}
+}
+
+// A result whose writes keep giving up on a held row of another job waits
+// longer before each try, since each holds up the client's other writes.
+func TestRowsHeldRetryBacksOff(t *testing.T) {
+	var got []time.Duration
+	for waits := 1; waits <= 6; waits++ {
+		got = append(got, rowsHeldRetry(waits))
+	}
+	want := []time.Duration{heldRetry, 2 * heldRetry, 4 * heldRetry, 8 * heldRetry, 8 * heldRetry, 8 * heldRetry}
+	if !slices.Equal(got, want) {
+		t.Errorf("retry delays %v, want %v", got, want)
 	}
 }
 

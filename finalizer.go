@@ -90,6 +90,10 @@ type pending struct {
 	// waits counts the flushes that found the worker's transaction still
 	// open.
 	waits int
+	// rowsHeld reports that the result's last write gave up on a row of
+	// another job that a transaction holds (driver.ErrRowsHeld), such as a
+	// dependent its cascade reaches.
+	rowsHeld bool
 	// handedIn is when a submit during the stop's final drain handed the
 	// result in: one handed in past the drain's deadline is dropped.
 	handedIn time.Time
@@ -365,6 +369,15 @@ const flushTimeout = 30 * time.Second
 // still open waits before the finalizer tries it again.
 const heldRetry = 250 * time.Millisecond
 
+// rowsHeldRetry is how long a result whose write gave up on a row of
+// another job (pending.rowsHeld) waits before its waits-th try: from
+// heldRetry, doubling to 2s. Unlike a held row of its own, which the write
+// skips at once, each try waits out the engine's brief bound for the row,
+// and holds up the client's other writes meanwhile.
+func rowsHeldRetry(waits int) time.Duration {
+	return heldRetry << min(max(waits-1, 0), 3)
+}
+
 // heldWait bounds a finalize statement that waits for held rows before
 // the batch is written again skipping them (write).
 const heldWait = 2 * time.Second
@@ -453,14 +466,15 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 			// canceled by cascade. Halves are written again, so that the
 			// transaction holds up only the result that reaches the row,
 			// which is then tried again later, as a result whose own row is
-			// held is. One that turns out finished meanwhile is followed up
-			// as an applied one is.
+			// held is, backing off (rowsHeldRetry). One that turns out
+			// finished meanwhile is followed up as an applied one is.
 			if len(batch) > 1 {
 				half := len(batch) / 2
 				f.write(ctx, batch[:half], skipLocked)
 				f.write(ctx, batch[half:], skipLocked)
 				return
 			}
+			batch[0].rowsHeld = true
 			f.followUp(ctx, f.afterFlush(ctx, batch, nil))
 			return
 		}
@@ -576,6 +590,8 @@ func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
 	}
 	if p.waits++; p.waits == 1 {
 		switch {
+		case p.rowsHeld:
+			f.logger.WarnContext(ctx, "hopper: another transaction holds a row a finished job's result reaches, such as a dependent that a JobCancelTx that has not committed canceled; the job's result waits for it", "job_id", p.result.ID)
 		case p.completedTx != nil:
 			f.logger.WarnContext(ctx, "hopper: the transaction a worker completed its job in is still open after the worker returned; the job's result waits for it", "job_id", p.result.ID)
 		case p.heldByTx:
@@ -591,6 +607,10 @@ func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
 		f.submitDone()
 		return p, false
 	}
-	time.AfterFunc(heldRetry, func() { f.deliver(p) })
+	delay := heldRetry
+	if p.rowsHeld {
+		delay, p.rowsHeld = rowsHeldRetry(p.waits), false
+	}
+	time.AfterFunc(delay, func() { f.deliver(p) })
 	return p, false
 }
