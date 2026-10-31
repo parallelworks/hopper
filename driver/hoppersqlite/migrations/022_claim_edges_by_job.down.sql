@@ -1,0 +1,1 @@
+-- Nothing to revert: v22 changes nothing on SQLite.

@@ -34,7 +34,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 21
+	const latest = 22
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -1369,5 +1369,82 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 	}
 	if left != 0 || table != nil {
 		t.Errorf("after down: %d step columns and table %v left", left, table)
+	}
+}
+
+// v22 drops the partial index on the edges that read by dependent, without
+// touching the edges, and its down script builds it back. While a
+// transaction holds hopper_job_deps it waits in its retry loop, and
+// statements on hopper_jobs go on meanwhile.
+func TestClaimEdgesUpgrade(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 21}); err != nil {
+		t.Fatal(err)
+	}
+	indexed := func() bool {
+		t.Helper()
+		var ok bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass('hopper_job_deps_reads_job') IS NOT NULL`).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if !indexed() {
+		t.Fatal("v21 has no hopper_job_deps_reads_job")
+	}
+	var job driver.JobID
+	if err := pool.QueryRow(ctx, `INSERT INTO hopper_jobs (kind, state) VALUES ('step', 'available') RETURNING id`).Scan(&job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_job_deps (job_id, depends_on, reads) VALUES (hopper_uuidv7(), $1, true)`, job); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // ended below
+	if _, err := tx.Exec(ctx, `DELETE FROM hopper_job_deps WHERE false`); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := make(chan error, 1)
+	go func() {
+		_, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 22})
+		upgraded <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-upgraded:
+		t.Fatalf("v22 completed while a transaction held hopper_job_deps: %v", err)
+	default:
+	}
+	sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	if _, err := pool.Exec(sctx, `SELECT id FROM hopper_jobs WHERE id = $1 FOR UPDATE`, job); err != nil {
+		t.Errorf("a statement on hopper_jobs during the migration: %v", err)
+	}
+	cancel()
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-upgraded; err != nil {
+		t.Fatal(err)
+	}
+	if indexed() {
+		t.Error("v22 kept hopper_job_deps_reads_job")
+	}
+	var edges int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM hopper_job_deps WHERE reads`).Scan(&edges); err != nil || edges != 1 {
+		t.Errorf("edges that read after v22 = %d, %v; want the one", edges, err)
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 21}); err != nil {
+		t.Fatal(err)
+	}
+	if !indexed() {
+		t.Error("v22's down script did not build hopper_job_deps_reads_job back")
 	}
 }

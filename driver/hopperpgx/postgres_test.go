@@ -1402,8 +1402,16 @@ func TestClaimDependenciesIgnoreStaleStatistics(t *testing.T) {
 	}
 	defer conn.Release()
 	// A node's own fields come before its child plans, so the match stays
-	// inside the node.
-	scan := regexp.MustCompile(`"Node Type": "(Seq Scan|Index Scan|Index Only Scan|Bitmap Heap Scan)",[^{}]*?"Relation Name": "hopper_job_deps"[^{}]*`)
+	// inside the node. A bitmap heap scan's key is in the bitmap index
+	// scans under it, which name the index and not the table. A key is a
+	// condition on the index's first column: one on depends_on alone walks
+	// the primary key whole.
+	scan := regexp.MustCompile(`"Node Type": "(?:Seq Scan|Index Scan|Index Only Scan|Bitmap Index Scan)",[^{}]*?(?:"Index Name": "(hopper_job_deps\w*)"|"Relation Name": "hopper_job_deps")[^{}]*`)
+	cond := regexp.MustCompile(`"Index Cond": "([^"]*)"`)
+	first := map[string]string{
+		"hopper_job_deps_pkey": "job_id", "hopper_job_deps_reads_job": "job_id",
+		"hopper_job_deps_depends_on": "depends_on", "hopper_job_deps_reads_depends_on": "depends_on",
+	}
 	explained := 0
 	for i, q := range statements {
 		if !strings.Contains(q, "hopper_job_deps") {
@@ -1412,9 +1420,10 @@ func TestClaimDependenciesIgnoreStaleStatistics(t *testing.T) {
 		explained++
 		for _, mode := range []string{"force_generic_plan", "force_custom_plan"} {
 			plan := explainPrepared(t, ctx, conn, mode, q, args[i])
-			for _, m := range scan.FindAllString(plan, -1) {
-				if !strings.Contains(m, `"Index Cond"`) {
-					t.Errorf("%s plan reads hopper_job_deps without a key to look up:\n%s\n%s", mode, m, q)
+			for _, m := range scan.FindAllStringSubmatch(plan, -1) {
+				col, ok := first[m[1]]
+				if c := cond.FindStringSubmatch(m[0]); !ok || c == nil || !strings.Contains(c[1], "("+col+" = ") {
+					t.Errorf("%s plan reads hopper_job_deps without a key to look up:\n%s\n%s", mode, m[0], q)
 				}
 			}
 		}
@@ -1435,7 +1444,11 @@ func explainPrepared(t *testing.T, ctx context.Context, conn *pgxpool.Conn, mode
 	if _, err := conn.Exec(ctx, "PREPARE explained AS "+query); err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Exec(ctx, "DEALLOCATE explained") //nolint:errcheck // the connection's last use
+	defer func() {
+		if _, err := conn.Exec(ctx, "DEALLOCATE explained"); err != nil {
+			t.Errorf("deallocate: %v", err)
+		}
+	}()
 	var types []string
 	if err := conn.QueryRow(ctx, "SELECT parameter_types::text[] FROM pg_prepared_statements WHERE name = 'explained'").Scan(&types); err != nil {
 		t.Fatal(err)

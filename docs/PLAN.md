@@ -705,7 +705,13 @@ edge whose dependent reads its dependencies, and a workflow with any such edge; 
 otherwise), with partial indexes on the edges that read, by dependent and by dependency.
 The columns and indexes take v17's loop on `hopper_job_deps` and `hopper_batches`, in
 the order a finalize names them; the indexes cover none of the existing edges, and
-neither `hopper_jobs` nor history is locked, so claims never wait for it.
+neither `hopper_jobs` nor history is locked, so claims never wait for it. Schema v22
+drops the partial index by dependent on Postgres, in the same loop: the claim reads a
+job's edges by the primary key instead (§11), and, left in place, the index made the
+finalize's probe for a dependent that reads ambiguous, since statistics taken while no
+edge read make both partial indexes look empty, and the planner then walked it whole,
+filtered by the dependency. SQLite's claim still uses its index of that name, and v22
+changes nothing there.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -2658,8 +2664,9 @@ observability without new machinery.
       then walked the one keyed by dependency whole, filtering it by the claimed job,
       so that every claim read every edge that reads (hopperbench's `workflow-outputs`
       ran fifteen times slower after `workflow`). The tail's probe for a dependent that
-      reads goes through the partial index by dependency, so a workflow that never
-      asks records nothing, deletes nothing and costs what it did before. A dependency gone
+      reads goes through the partial index by dependency, the only partial index on
+      the edges since v22, so a workflow that never asks records nothing and deletes
+      nothing, and its finalizes cost what they did before. A dependency gone
       from the live table without a result, which finished before the upgrade or on a
       client of an earlier release during a rolling deploy, is reported with no state
       rather than left out.

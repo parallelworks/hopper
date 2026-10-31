@@ -1,0 +1,5 @@
+-- hopper schema v22: Postgres drops its partial index on the edges that read
+-- by dependent, which its claim no longer uses and whose stale statistics
+-- could have its finalize walk the index whole. SQLite's claim still finds a
+-- job's edges that read through its index of that name, and SQLite has no
+-- partial index on them by dependency to confuse it with, so it keeps it.
