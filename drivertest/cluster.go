@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -999,47 +998,67 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f PostgresFixture
 	// Retention dropping partitions while the leader builds the others'.
 	for round := range 4 {
 		old := redeclare("20000102", "20000103", "20000104", "20000105")
-		var wg sync.WaitGroup
+		var (
+			wg      sync.WaitGroup
+			indexes driver.HistoryIndexResult
+		)
 		errs := make(chan error, 2)
-		indexed := make(chan struct{})
+		indexEnded := make(chan struct{})
 		wg.Go(func() {
-			defer close(indexed)
-			if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+			defer close(indexEnded)
+			var err error
+			if indexes, err = exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
 				errs <- err
 			}
 		})
-		// Retention runs until a pass after the index pass has ended keeps
-		// and defers nothing: a partition kept for a build goes on a later
-		// pass, and a build waits for every older snapshot in the database,
-		// so how long the index pass takes depends on other sessions.
+		// Retention races the index pass until a pass keeps and defers
+		// nothing, or the index pass ends.
 		wg.Go(func() {
-			deadline := time.Now().Add(2 * time.Minute)
 			for {
-				done := false
-				select {
-				case <-indexed:
-					done = true
-				default:
-				}
 				res, err := exec.HistoryMaintain(ctx, keep)
 				if err != nil {
 					errs <- err
 					return
 				}
-				if done && len(res.Deferred)+len(res.Kept) == 0 {
+				if len(res.Deferred)+len(res.Kept) == 0 {
 					return
 				}
-				if time.Now().After(deadline) {
-					errs <- fmt.Errorf("round %d: retention still keeps or defers partitions: %+v", round, res)
+				select {
+				case <-indexEnded:
 					return
+				case <-time.After(10 * time.Millisecond):
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
 		})
 		wg.Wait()
 		close(errs)
 		for err := range errs {
 			t.Fatal(err)
+		}
+		// Then passes run until the index pass defers nothing and retention
+		// keeps and defers nothing: a build deferred behind a drop, and a
+		// partition kept for a build, go on a later pass. The deadline, a
+		// guard against hanging, starts only once the index pass has ended:
+		// a build waits for every older snapshot in the database, so how
+		// long the pass takes depends on other sessions.
+		for deadline := time.Now().Add(2 * time.Minute); ; time.Sleep(10 * time.Millisecond) {
+			if len(indexes.Deferred) > 0 {
+				next, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				indexes = next
+			}
+			res, err := exec.HistoryMaintain(ctx, keep)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(indexes.Deferred)+len(res.Kept)+len(failedOnly(res.Deferred)) == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: after the index pass, indexing = %+v, retention = %+v", round, indexes, res)
+			}
 		}
 		if v := f.QueryText(ctx, t, d, "SELECT count(to_regclass(n))::text FROM unnest($1::text[]) n", old); v != "0" {
 			t.Fatalf("round %d: %s partitions past retention left", round, v)
