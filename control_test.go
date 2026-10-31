@@ -634,7 +634,7 @@ func TestPeriodicJobsRunOnceAcrossLeaders(t *testing.T) {
 		t.Errorf("RunOnStart jobs = %d, want 1", got)
 	}
 	for _, n := range []string{"1", "2"} {
-		got := h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = $1", n) + h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = $1", n)
+		got := h.countN(n)
 		if got < 2 || got > 4 {
 			t.Errorf("schedule %s produced %d jobs in ~3.5s, want 3±1", n, got)
 		}

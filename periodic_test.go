@@ -257,9 +257,18 @@ func TestPeriodicJobsConcurrentChanges(t *testing.T) {
 	a, b := h.started(noopWorkers(), 4), h.started(noopWorkers(), 4)
 	waitFor(t, func() bool { return a.IsLeader() || b.IsLeader() })
 
+	// The leader computes the slots on the database clock, so the slots
+	// elapsed are measured on it too.
+	dbNow := func() time.Time {
+		var now time.Time
+		if err := h.pool.QueryRow(context.Background(), "SELECT now()").Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		return now
+	}
 	const interval = 100 * time.Millisecond
-	start := time.Now()
-	stop := start.Add(3 * time.Second)
+	start := dbNow()
+	stop := time.Now().Add(3 * time.Second)
 	var wg sync.WaitGroup
 	for _, c := range []*hopper.Client[pgxTx]{a, b} {
 		for g := range 4 {
@@ -291,13 +300,13 @@ func TestPeriodicJobsConcurrentChanges(t *testing.T) {
 	for i := range got {
 		got[i] = h.countN(strconv.Itoa(10 + i))
 	}
-	slots := int(time.Since(start)/interval) + 1
+	slots := int(dbNow().Sub(start)/interval) + 1
 	var total int
-	for i, got := range got {
-		if got > slots {
-			t.Errorf("p%d inserted %d jobs in %d slots", i, got, slots)
+	for i, n := range got {
+		if n > slots {
+			t.Errorf("p%d inserted %d jobs in %d slots", i, n, slots)
 		}
-		total += got
+		total += n
 	}
 	if total == 0 {
 		t.Error("no periodic job was inserted")
