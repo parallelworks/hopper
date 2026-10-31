@@ -251,6 +251,8 @@ func TestPauseAndResume(t *testing.T) {
 	if err := c.Queues().Pause(ctx, hopper.QueueDefault); err != nil {
 		t.Fatal(err)
 	}
+	// Renewals cross the pause, and a claim that began before it ends.
+	time.Sleep(fastTuning.LeaseRenew * 2)
 	if _, err := c.Insert(ctx, noop{}, nil); err != nil {
 		t.Fatal(err)
 	}

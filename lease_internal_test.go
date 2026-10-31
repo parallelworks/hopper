@@ -277,8 +277,9 @@ func (e *staleRenewExec) setQueuePaused(name string, paused bool) error {
 // renewal applies the queues' state again, that a notification is checked
 // against the queues, as one from another schema in the database names a
 // queue of the same name, that a notification's re-read that a local
-// change or a renewal overtook reads again rather than undo it, and that
-// this client's own resume does not undo a pause that committed after it.
+// change or a renewal overtook reads again rather than undo it, that this
+// client's own resume does not undo a pause that committed after it, and
+// that a re-read overtaken on every reading still reads only twice.
 func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -377,6 +378,34 @@ func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 		exec.mu.Unlock()
 		c.control(ctx, "limit:"+QueueDefault)
 		check("after a re-read overtaken by a renewal", true, false)
+
+		// A re-read overtaken on every reading stops once the reading of a
+		// renewal that began after it did has been applied, which has the
+		// change the re-read is for: its second reading's.
+		exec.set(nil, def)
+		reads := 0
+		var overtake func()
+		overtake = func() {
+			reads++
+			// A renewal that began during this reading, and was applied.
+			c.applyRenewed(c.controlSeq.Load(), nil, def)
+			if reads < 5 {
+				exec.mu.Lock()
+				exec.listed = overtake
+				exec.mu.Unlock()
+			}
+		}
+		exec.mu.Lock()
+		exec.listed = overtake
+		exec.mu.Unlock()
+		c.control(ctx, "limit:"+QueueDefault)
+		check("after a re-read overtaken on every reading", false, true)
+		if reads != 2 {
+			t.Errorf("a re-read overtaken on every reading read %d times; want 2", reads)
+		}
+		exec.mu.Lock()
+		exec.listed = nil
+		exec.mu.Unlock()
 
 		cancel()
 		<-done

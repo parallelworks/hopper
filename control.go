@@ -334,8 +334,9 @@ func (q *QueueControl[TTx]) List(ctx context.Context) ([]*QueueRow, error) {
 type QueueLimits = driver.QueueLimits
 
 // SetLimits replaces a queue's cluster-wide limits. Zero values remove a
-// limit. Clients learn of the change through a notification and on their
-// next lease renewal.
+// limit. This client, if it works the queue, applies the change before
+// SetLimits returns; others learn of it through a notification and on
+// their next lease renewal.
 func (q *QueueControl[TTx]) SetLimits(ctx context.Context, name string, limits QueueLimits) error {
 	if name == "" {
 		return errors.New("hopper: queue name is required")
@@ -550,11 +551,21 @@ func (c *Client[TTx]) cancelLocal(id JobID) {
 func (c *Client[TTx]) applyRenewed(seq uint64, paused, limited []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.applyQueueState(seq, paused, limited)
+}
+
+// applyQueueState applies the lists of paused and limited queues that a
+// renewal or a re-read read after reading controlSeq as seq, and reports
+// whether it did: it does not if the queues' state was applied since. The
+// caller holds c.mu.
+func (c *Client[TTx]) applyQueueState(seq uint64, paused, limited []string) bool {
 	if c.controlSeq.Load() != seq {
-		return
+		return false
 	}
 	c.controlSeq.Add(1)
+	c.appliedFrom = seq
 	c.setQueueState(paused, limited)
+	return true
 }
 
 // refreshQueue is refreshQueueState after a pause, resume or limit change
@@ -576,10 +587,17 @@ func (c *Client[TTx]) refreshQueue(ctx context.Context, queue string) error {
 // SetLimits after their write, rather than apply the change they made: a
 // newer change to the queue may have committed and been applied already.
 // Like a renewal's, a reading may predate a change applied while it was in
-// flight; it is then read again rather than applied.
+// flight; it is then not applied. Nor need it be once the reading of a
+// renewal or another re-read that read controlSeq after it moved past the
+// value this re-read first read has been applied: that reading began after
+// this re-read did, so after the change it is for, and what is applied
+// later is newer still. Otherwise it reads again. The first application to
+// overtake its second reading is such a reading, unless it is a
+// Queues().Add, so a re-read reads at most twice, and once more for each
+// Add that overtakes it, however often the queues change.
 func (c *Client[TTx]) refreshQueueState(ctx context.Context) error {
-	for {
-		seq := c.controlSeq.Load()
+	first := c.controlSeq.Load()
+	for seq := first; ; seq = c.controlSeq.Load() {
 		queues, err := c.exec.QueueList(ctx)
 		if err != nil {
 			return err
@@ -594,13 +612,9 @@ func (c *Client[TTx]) refreshQueueState(ctx context.Context) error {
 			}
 		}
 		c.mu.Lock()
-		current := c.controlSeq.Load() == seq
-		if current {
-			c.controlSeq.Add(1)
-			c.setQueueState(paused, limited)
-		}
+		done := c.applyQueueState(seq, paused, limited) || c.appliedFrom > first
 		c.mu.Unlock()
-		if current {
+		if done {
 			return nil
 		}
 	}

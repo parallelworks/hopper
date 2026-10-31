@@ -60,9 +60,11 @@ type Client[TTx any] struct {
 	// controlSeq counts applications of the queues' pause and limit state
 	// to the producers; it changes only under mu. A renewal or a re-read
 	// that another application overtook does not apply its reading, which
-	// may be older.
-	controlSeq atomic.Uint64
-	finalizer  *finalizer
+	// may be older. appliedFrom, under mu, is the controlSeq that the
+	// renewal or re-read last applied read before its statement.
+	controlSeq  atomic.Uint64
+	appliedFrom uint64
+	finalizer   *finalizer
 	// Loops by the phase that stops them: producers and the leader stop
 	// with claiming; the listener and the lease loop run until the end.
 	producerWG sync.WaitGroup
