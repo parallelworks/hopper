@@ -1896,14 +1896,12 @@ WITH RECURSIVE finished AS (
 SELECT ` + finishedSelectColumns + ` FROM finished`
 
 // JobDiscardExpired implements driver.Executor. It waits only briefly for
-// rows another transaction holds (briefly), discarding nothing if it has to.
+// rows another transaction holds (briefly), discarding nothing, with
+// driver.ErrRowsHeld, if it has to.
 func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.JobRow, error) {
 	jobs, err := briefly(ctx, e, func(c Conn) ([]*driver.JobRow, error) {
 		return historyJobs(c.Query(ctx, jobDiscardExpiredSQL, max(limit, 1), driver.ChannelDone, driver.ChannelInsert))
 	})
-	if errors.Is(err, driver.ErrRowsHeld) {
-		return nil, nil
-	}
 	if err != nil {
 		return nil, fmt.Errorf("hopper: discard expired jobs: %w", err)
 	}

@@ -272,6 +272,10 @@ func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
 		jobs, err := c.exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{
 			Limit: c.tuning.rescueBatch, ClientID: c.clientID.Load(), Grace: c.cfg.JobLeaseGrace,
 		})
+		if errors.Is(err, driver.ErrRowsHeld) {
+			c.logger.WarnContext(ctx, "hopper: job lease expiry deferred: another transaction holds a row it reaches")
+			return
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: expire job leases", "error", err)
@@ -307,6 +311,10 @@ func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
 func (c *Client[TTx]) expire(ctx context.Context) {
 	for {
 		jobs, err := c.exec.JobDiscardExpired(ctx, c.tuning.rescueBatch)
+		if errors.Is(err, driver.ErrRowsHeld) {
+			c.logger.WarnContext(ctx, "hopper: discard of expired jobs deferred: another transaction holds a row it reaches")
+			return
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: discard expired jobs", "error", err)

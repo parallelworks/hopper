@@ -101,8 +101,10 @@ func (e *Executor) withTx(ctx context.Context, fn func(tx Tx) error) (err error)
 //
 // BatchSettle with IDs runs briefly too, and the bound is below
 // deadlock_timeout's default, so that a settle that would deadlock with a
-// finalize completing several batches gives up first, and leaves the batch
-// to the leader.
+// finalize completing several batches gives up before the deadlock is
+// detected, and leaves the batch to the leader. Against a finalize that
+// runs briefly too, whichever of the two waited first gives up: a finalize
+// that does finalizes none of its jobs, which are tried again.
 const heldLockTimeout = "500ms"
 
 // briefly runs fn in a transaction of its own whose lock waits are bounded

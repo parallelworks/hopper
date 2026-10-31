@@ -721,16 +721,20 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 					var discarded []*driver.JobRow
 					discarded, err = exec.JobDiscardExpired(lctx, 10)
 					n = len(discarded)
+					if errors.Is(err, driver.ErrRowsHeld) {
+						gaveUp, err = true, nil
+					}
 				case "lease expiry":
 					var expired []*driver.JobRow
 					expired, err = exec.JobExpireLeases(lctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: expirerID})
 					n = len(expired)
+					if errors.Is(err, driver.ErrRowsHeld) {
+						gaveUp, err = true, nil
+					}
 				case "rescue":
 					var applied []driver.JobFinalized
 					applied, err = exec.JobFinalizeMany(lctx, driver.JobFinalizeParams{Jobs: failed(b), SkipLocked: true})
 					n = len(applied)
-					// It gives up with ErrRowsHeld, so that the finalizer
-					// writes the batch again in halves.
 					if errors.Is(err, driver.ErrRowsHeld) {
 						gaveUp, err = true, nil
 					}
@@ -740,7 +744,9 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 				}
 				return n
 			}
-			if n := run(); n != 0 || duty == "rescue" && !gaveUp {
+			// Each gives up with ErrRowsHeld, which the leader logs, and
+			// for which the finalizer writes a batch again in halves.
+			if n := run(); n != 0 || !gaveUp {
 				t.Fatalf("%s while a transaction that canceled the dependent is held open finalized %d jobs (ErrRowsHeld: %t); want it to give up", duty, n, gaveUp)
 			}
 			if err := rollback(); err != nil {

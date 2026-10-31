@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -260,6 +261,94 @@ func TestFinalizerSkipsRowsHeldByTx(t *testing.T) {
 	exec.mu.Unlock()
 	if len(sizes) != 2 || sizes[0] != 1 || sizes[1] != 1 || skipped[0] || !skipped[1] {
 		t.Errorf("statements of sizes %v skipping held rows %v, want a plain one and one that skips", sizes, skipped)
+	}
+}
+
+// rowsHeldExec gives up, with ErrRowsHeld, on every statement that writes
+// the result of job held, as one whose cascade reaches a row a caller's
+// transaction holds does, and applies the others. JobGet reads a job as get
+// returns it.
+type rowsHeldExec struct {
+	held    driver.JobID
+	get     func(driver.JobID) (*driver.JobRow, error)
+	sizes   []int
+	settled [][]driver.JobID
+}
+
+func (e *rowsHeldExec) BatchSettle(_ context.Context, params driver.BatchSettleParams) (driver.BatchSettleResult, error) {
+	e.settled = append(e.settled, params.IDs)
+	return driver.BatchSettleResult{}, nil
+}
+
+func (e *rowsHeldExec) WorkflowPromoteReady(context.Context, driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
+	return driver.WorkflowPromoteResult{}, nil
+}
+
+func (e *rowsHeldExec) JobGet(_ context.Context, id driver.JobID) (*driver.JobRow, error) {
+	return e.get(id)
+}
+
+func (e *rowsHeldExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
+	e.sizes = append(e.sizes, len(params.Jobs))
+	applied := make([]driver.JobFinalized, 0, len(params.Jobs))
+	for _, r := range params.Jobs {
+		if r.ID == e.held {
+			return nil, fmt.Errorf("hopper: finalize jobs: %w", driver.ErrRowsHeld)
+		}
+		applied = append(applied, driver.JobFinalized{ID: r.ID, Fence: r.Fence})
+	}
+	return applied, nil
+}
+
+// A statement that gives up on a row of another job a caller's transaction
+// holds (ErrRowsHeld) is written again in halves, so that only the result
+// whose statement reaches the row waits, tried again later as a result
+// whose own row is held is.
+func TestFinalizerSplitsBatchOnRowsHeld(t *testing.T) {
+	exec := &rowsHeldExec{held: driver.JobID{3}, get: func(id driver.JobID) (*driver.JobRow, error) {
+		return &driver.JobRow{ID: id, State: driver.JobStateRunning}, nil
+	}}
+	var applied []driver.JobID
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeBatch: 4, finalizeBuffer: 4}, 0, func(string) {},
+		func(_ *driver.JobRow, r driver.JobFinalize) { applied = append(applied, r.ID) })
+	batch := make([]pending, 4)
+	for i := range batch {
+		batch[i] = pending{
+			job:    &driver.JobRow{Queue: "default", BatchID: driver.JobID{9}},
+			result: driver.JobFinalize{ID: driver.JobID{byte(i)}, State: driver.JobStateCompleted},
+		}
+	}
+	f.write(context.Background(), batch, true)
+	if !slices.Equal(exec.sizes, []int{4, 2, 2, 1, 1}) {
+		t.Errorf("statements of sizes %v, want the batch, its halves, and the halves of the half with the held result", exec.sizes)
+	}
+	if want := []driver.JobID{{0}, {1}, {2}}; !slices.Equal(applied, want) {
+		t.Errorf("applied %v, want %v", applied, want)
+	}
+	select {
+	case p := <-f.in:
+		if p.result.ID != exec.held || p.waits != 1 {
+			t.Errorf("result of job %v tried again after %d waits, want job %v after 1", p.result.ID, p.waits, exec.held)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the result whose statement reached the held row was not tried again")
+	}
+}
+
+// A result whose statement gave up on a held row (ErrRowsHeld), and whose
+// job the worker's CompleteTx turns out to have finished meanwhile, is
+// followed up as an applied one is: its batch is settled.
+func TestFinalizerFollowsUpFinishedAfterRowsHeld(t *testing.T) {
+	id, batch := driver.JobID{1}, driver.JobID{9}
+	exec := &rowsHeldExec{held: id, get: func(driver.JobID) (*driver.JobRow, error) { return nil, driver.ErrNotFound }}
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeBatch: 1, finalizeBuffer: 1}, 0, func(string) {},
+		func(*driver.JobRow, driver.JobFinalize) {})
+	completed := driver.JobFinalize{ID: id, State: driver.JobStateCompleted}
+	f.write(context.Background(), []pending{{
+		job: &driver.JobRow{ID: id, Queue: "default", BatchID: batch}, result: completed, completedTx: &completed,
+	}}, true)
+	if len(exec.settled) != 1 || !slices.Equal(exec.settled[0], []driver.JobID{batch}) {
+		t.Errorf("batches settled %v, want [[%v]]", exec.settled, batch)
 	}
 }
 

@@ -453,14 +453,15 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 			// canceled by cascade. Halves are written again, so that the
 			// transaction holds up only the result that reaches the row,
 			// which is then tried again later, as a result whose own row is
-			// held is.
+			// held is. One that turns out finished meanwhile is followed up
+			// as an applied one is.
 			if len(batch) > 1 {
 				half := len(batch) / 2
 				f.write(ctx, batch[:half], skipLocked)
 				f.write(ctx, batch[half:], skipLocked)
 				return
 			}
-			f.afterFlush(ctx, batch, nil)
+			f.followUp(ctx, f.afterFlush(ctx, batch, nil))
 			return
 		}
 		if ctx.Err() != nil {

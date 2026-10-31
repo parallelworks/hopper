@@ -1666,8 +1666,11 @@ Skipping that row would be wrong, since a transaction that then rolled back woul
 leave the dependent pending behind a failed dependency, and the promotion sweep would
 run it. These statements run instead in a transaction of their own under a 500 ms
 `lock_timeout`: one that cannot get a row in time finalizes none of its jobs, which the
-next pass tries again, so while the transaction stays open the jobs of that pass's
-batch wait with the one that reaches its row. A partition's creation or drop is
+next pass tries again, with `driver.ErrRowsHeld`, which the leader logs as a warning.
+Each pass reads its jobs in the same order, oldest first, so while the transaction
+stays open that duty makes no progress on its batch at all, the jobs behind the one
+that reaches the held row included, until the transaction ends; the leader's other
+duties and its lease renewal go on. Before, the whole loop waited. A partition's creation or drop is
 deferred the same way (§7.10). A client's finalizer, whose write of the results of
 batch jobs skipping held rows (`SkipLocked`) runs the same way, gets
 `driver.ErrRowsHeld` from a write that gave up, and writes the results again in
@@ -2518,7 +2521,9 @@ observability without new machinery.
     for a batch row another settle holds, so of the two the one settling second sees
     the other's progress and completes the batch.
     The wait is bounded (`lock_timeout` 500 ms, below `deadlock_timeout`, so a settle that
-    would deadlock with a finalize completing several batches gives up first); a
+    would deadlock with a finalize completing several batches gives up before the deadlock
+    is detected; against a finalize under the same bound (§7.8), whichever waited first
+    gives up, and a finalize that does is tried again); a
     batch it cannot get is left to the leader, which on every pass sweeps batches
     with progress rows in ID order (`SKIP LOCKED`, resuming where a pass stopped)
     and deletes progress rows whose batch no longer exists. The sweep covers a
