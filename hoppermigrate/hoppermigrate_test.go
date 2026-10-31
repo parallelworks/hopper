@@ -1374,8 +1374,9 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 
 // v22 drops the partial index on the edges that read by dependent, without
 // touching the edges, and its down script builds it back. While a
-// transaction holds hopper_job_deps it waits in its retry loop, and
-// statements on hopper_jobs go on meanwhile.
+// transaction holds hopper_job_deps it waits in its retry loop, and a
+// claim's read of hopper_job_deps and a finalize's write to it go on
+// meanwhile.
 func TestClaimEdgesUpgrade(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1423,11 +1424,16 @@ func TestClaimEdgesUpgrade(t *testing.T) {
 		t.Fatalf("v22 completed while a transaction held hopper_job_deps: %v", err)
 	default:
 	}
-	sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	if _, err := pool.Exec(sctx, `SELECT id FROM hopper_jobs WHERE id = $1 FOR UPDATE`, job); err != nil {
-		t.Errorf("a statement on hopper_jobs during the migration: %v", err)
+	// Every claim reads hopper_job_deps, this release's and the previous
+	// one's, and a finalize deletes from it. A DROP INDEX queued for its
+	// lock without the loop would hold both up until the transaction ends.
+	for _, q := range []string{`SELECT count(*) FROM hopper_job_deps`, `DELETE FROM hopper_job_deps WHERE false`} {
+		sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		if _, err := pool.Exec(sctx, q); err != nil {
+			t.Errorf("%s during the migration: %v", q, err)
+		}
+		cancel()
 	}
-	cancel()
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}

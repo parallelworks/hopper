@@ -10,9 +10,10 @@
 -- filtering it by the dependency, on every finalize of a workflow job.
 --
 -- DROP INDEX takes an ACCESS EXCLUSIVE lock on hopper_job_deps, which
--- finalizes use, so it tries as v21 does: with a short lock_timeout per
--- try, in a loop. Neither hopper_jobs nor history is locked, so claims
--- never wait for this migration.
+-- finalizes use and every claim reads (for its dependencies, in this
+-- release and the previous one), so it tries as v21 does: with a short
+-- lock_timeout per try, in a loop, and claims and finalizes wait at most
+-- one try at a time. Neither hopper_jobs nor history is locked.
 
 DO $$
 DECLARE

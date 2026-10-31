@@ -1368,6 +1368,12 @@ func TestClaimDependenciesIgnoreStaleStatistics(t *testing.T) {
 			for s := 1; s <= 8; s++ {
 				p.Deps = append(p.Deps, driver.JobDependency{Job: s, DependsOn: 0, Reads: reads}, driver.JobDependency{Job: 9, DependsOn: s, Reads: reads})
 			}
+			if reads {
+				// Claimed first, so that the claims below take these.
+				for i := range p.Jobs {
+					p.Jobs[i].Priority = 1
+				}
+			}
 			if _, err := exec.WorkflowInsert(ctx, p); err != nil {
 				t.Fatal(err)
 			}
@@ -1379,10 +1385,12 @@ func TestClaimDependenciesIgnoreStaleStatistics(t *testing.T) {
 	}
 	workflows(300, true)
 
+	// The first steps of 100 workflows that read, whose finalize records
+	// their results for the steps after them, and those steps' claim.
 	log := &statementLog{}
 	traced := tracedDriver(t, pool, log).Executor()
 	clientID := register(t, ctx, exec)
-	claimed, err := traced.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 100})
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 100})
 	if err != nil || len(claimed.Jobs) != 100 {
 		t.Fatalf("claim = %d jobs, %v", len(claimed.Jobs), err)
 	}
@@ -1392,6 +1400,15 @@ func TestClaimDependenciesIgnoreStaleStatistics(t *testing.T) {
 	}
 	if applied, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results}); err != nil || len(applied) != 100 {
 		t.Fatalf("finalize = %d, %v", len(applied), err)
+	}
+	claimed, err = traced.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 100})
+	if err != nil || len(claimed.Jobs) != 100 {
+		t.Fatalf("claim of the steps that read = %d jobs, %v", len(claimed.Jobs), err)
+	}
+	for _, j := range claimed.Jobs {
+		if len(j.Dependencies) != 1 || j.Dependencies[0].State != driver.JobStateCompleted {
+			t.Fatalf("a step that reads claimed with dependencies %+v; want its finished first step", j.Dependencies)
+		}
 	}
 	log.mu.Lock()
 	statements, args := log.sql, log.args
@@ -1429,7 +1446,7 @@ func TestClaimDependenciesIgnoreStaleStatistics(t *testing.T) {
 		}
 	}
 	if explained != 2 {
-		t.Errorf("explained %d statements, want the claim and the finalize", explained)
+		t.Errorf("explained %d statements, want the finalize and the claim", explained)
 	}
 }
 
