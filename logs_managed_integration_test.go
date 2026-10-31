@@ -36,13 +36,7 @@ func TestManagedLogsPostgresLifecycle(t *testing.T) {
 	startManagedClient(t, c)
 	// A leader term starts with a pass, and the next waits an hour. Each
 	// cleanup below is then the explicit call's.
-	deadline := time.Now().Add(15 * time.Second)
-	for s := c.LogRetentionStats(); !c.IsLeader() || s.Passes+s.Failures == 0; s = c.LogRetentionStats() {
-		if time.Now().After(deadline) {
-			t.Fatalf("no retention pass at the start of the term: %+v", s)
-		}
-		time.Sleep(time.Millisecond)
-	}
+	eventually(t, func() bool { s := c.LogRetentionStats(); return s.Passes+s.Failures > 0 })
 	for _, test := range []struct{ queue, action string }{{"kept", "delete"}, {"ephemeral", "delete-completed"}, {"kept", "history-expiry"}} {
 		queue := test.queue
 		inserted, err := c.Insert(t.Context(), managedLogArgs{}, &InsertOpts{Queue: queue, Await: true})
