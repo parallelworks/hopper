@@ -34,8 +34,9 @@ func periodicNames(jobs []hopper.PeriodicJob) []string {
 
 // countN counts the jobs, live and finished, whose args' N is n.
 func (h *harness) countN(n string) int {
-	return h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = $1", n) +
-		h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = $1", n)
+	// One statement, so a job finishing between two counts is not counted in both tables.
+	return h.count(`SELECT count(*) FROM (SELECT id FROM hopper_jobs WHERE args->>'n' = $1
+		UNION ALL SELECT id FROM hopper_job_history WHERE args->>'n' = $1) j`, n)
 }
 
 func TestPeriodicJobsRegistry(t *testing.T) {
@@ -256,9 +257,18 @@ func TestPeriodicJobsConcurrentChanges(t *testing.T) {
 	a, b := h.started(noopWorkers(), 4), h.started(noopWorkers(), 4)
 	waitFor(t, func() bool { return a.IsLeader() || b.IsLeader() })
 
+	// The leader computes the slots on the database clock, so the slots
+	// elapsed are measured on it too.
+	dbNow := func() time.Time {
+		var now time.Time
+		if err := h.pool.QueryRow(context.Background(), "SELECT now()").Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		return now
+	}
 	const interval = 100 * time.Millisecond
-	start := time.Now()
-	stop := start.Add(3 * time.Second)
+	start := dbNow()
+	stop := time.Now().Add(3 * time.Second)
 	var wg sync.WaitGroup
 	for _, c := range []*hopper.Client[pgxTx]{a, b} {
 		for g := range 4 {
@@ -283,16 +293,20 @@ func TestPeriodicJobsConcurrentChanges(t *testing.T) {
 	wg.Wait()
 	a.PeriodicJobs().Clear()
 	b.PeriodicJobs().Clear()
-	time.Sleep(200 * time.Millisecond)
-	slots := int(time.Since(start)/interval) + 1
 
+	// The leader may insert slots until another client's Clear reaches it,
+	// so the slots are counted up to after the jobs are.
+	var got [3]int
+	for i := range got {
+		got[i] = h.countN(strconv.Itoa(10 + i))
+	}
+	slots := int(dbNow().Sub(start)/interval) + 1
 	var total int
-	for n := 10; n < 13; n++ {
-		got := h.countN(strconv.Itoa(n))
-		if got > slots {
-			t.Errorf("p%d inserted %d jobs in %d slots", n-10, got, slots)
+	for i, n := range got {
+		if n > slots {
+			t.Errorf("p%d inserted %d jobs in %d slots", i, n, slots)
 		}
-		total += got
+		total += n
 	}
 	if total == 0 {
 		t.Error("no periodic job was inserted")
