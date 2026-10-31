@@ -278,8 +278,11 @@ func (e *staleRenewExec) setQueuePaused(name string, paused bool) error {
 // against the queues, as one from another schema in the database names a
 // queue of the same name, that a notification's re-read that a local
 // change or a renewal overtook reads again rather than undo it, that this
-// client's own resume does not undo a pause that committed after it, and
-// that a re-read overtaken on every reading still reads only twice.
+// client's own resume does not undo a pause that committed after it, that a
+// re-read overtaken on every reading still reads only twice, that a re-read
+// overtaken by a renewal that may have begun before its change reads again
+// rather than stop on it, and that this client's own pause and resume are
+// in effect when they return.
 func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -379,9 +382,11 @@ func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 		c.control(ctx, "limit:"+QueueDefault)
 		check("after a re-read overtaken by a renewal", true, false)
 
-		// A re-read overtaken on every reading stops once the reading of a
-		// renewal that began after it did has been applied, which has the
-		// change the re-read is for: its second reading's.
+		// A re-read overtaken on every reading stops once a renewal's
+		// reading has been applied that began after the queues' state was
+		// applied since the re-read began, which has the change the re-read
+		// is for: the one during its second reading. The one during its
+		// first may, as far as the client can tell, have begun before it.
 		exec.set(nil, def)
 		reads := 0
 		var overtake func()
@@ -406,6 +411,34 @@ func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 		exec.mu.Lock()
 		exec.listed = nil
 		exec.mu.Unlock()
+
+		// A renewal that began before another client's pause committed,
+		// and so read the queue going, is applied while the pause's re-read
+		// is in flight. Nothing was applied between the renewal's start and
+		// the re-read's, so for all the client can tell the renewal began
+		// before the pause, as it did: the re-read reads again rather than
+		// stop on it and leave the pause undone.
+		<-exec.began // the renewal begins, and reads the queue going
+		exec.set(def, def)
+		exec.mu.Lock()
+		exec.listed = func() {
+			exec.release <- struct{}{}
+			synctest.Wait()
+		}
+		exec.mu.Unlock()
+		c.control(ctx, "pause:"+QueueDefault)
+		check("after a re-read overtaken by a renewal that began before the pause", true, true)
+
+		// This client's own resume and pause are in effect when they
+		// return, before any notification of them arrives.
+		if err := c.Queues().Resume(ctx, QueueDefault); err != nil {
+			t.Fatal(err)
+		}
+		check("after this client's resume", false, true)
+		if err := c.Queues().Pause(ctx, QueueDefault); err != nil {
+			t.Fatal(err)
+		}
+		check("after this client's pause", true, true)
 
 		cancel()
 		<-done

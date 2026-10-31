@@ -1146,11 +1146,14 @@ RETURNING j.*;
   queues' state was applied while it was in flight, by a re-read, a renewal or
   `Queues().Add`, since it may have read the queues before a change that was applied
   committed: a renewal leaves them to the next renewal, and a re-read reads them again,
-  unless a renewal or another re-read that began after it did was applied meanwhile,
-  which already has the change the re-read is for. A re-read therefore reads at most
-  twice, and once more for each `Queues().Add` that overtakes it, however often the
-  queues change. `Queues().Add` and `Remove` start and stop working a queue on one
-  client at runtime. Clients record the queues they work in `hopper_queues` on start.
+  unless what was applied meanwhile is the reading of a renewal or another re-read that
+  began after the queues' state had been applied since the re-read began. That reading
+  began after the re-read did, so it has the change the re-read is for; one that began
+  with nothing applied since the re-read began may have begun before the change, and
+  does not count. A re-read therefore reads at most twice, and once more for each
+  `Queues().Add` that overtakes it, however often the queues change. `Queues().Add` and
+  `Remove` start and stop working a queue on one client at runtime. Clients record the
+  queues they work in `hopper_queues` on start.
 
 ### 7.4 Execute
 - Each queue runs a bounded pool of goroutines. Workers are started only once a slot is

@@ -309,7 +309,9 @@ type QueueControl[TTx any] struct {
 // Pause stops every client from claiming from the queue. Running jobs
 // finish. This client, if it works the queue, applies it before Pause
 // returns; others learn of it through a notification and on every lease
-// renewal.
+// renewal. If this client then fails to read the queues' state back, Pause
+// returns that error with the pause committed, and this client too learns
+// of it through the notification or its next renewal.
 func (q *QueueControl[TTx]) Pause(ctx context.Context, name string) error {
 	if err := q.c.exec.QueuePause(ctx, name); err != nil {
 		return err
@@ -336,7 +338,8 @@ type QueueLimits = driver.QueueLimits
 // SetLimits replaces a queue's cluster-wide limits. Zero values remove a
 // limit. This client, if it works the queue, applies the change before
 // SetLimits returns; others learn of it through a notification and on
-// their next lease renewal.
+// their next lease renewal. As with Pause, an error from reading the
+// queues' state back leaves the change committed.
 func (q *QueueControl[TTx]) SetLimits(ctx context.Context, name string, limits QueueLimits) error {
 	if name == "" {
 		return errors.New("hopper: queue name is required")
