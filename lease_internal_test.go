@@ -190,13 +190,15 @@ func TestNewLeaseRecordsPeriodicJobsAtOnce(t *testing.T) {
 // it with the paused and limited queues as they were when it began, as a
 // renewal whose statement began before a change committed does. A queue
 // listing reads them as they are, then runs listed, if set, once: a change
-// applied while the listing is in flight.
+// applied while the listing is in flight. A pause or resume writes the
+// queue's state, then runs committed, if set, once: a change committed and
+// applied after it, before its caller goes on.
 type staleRenewExec struct {
 	driver.Executor
-	mu              sync.Mutex
-	paused, limited []string
-	listed          func()
-	began, release  chan struct{}
+	mu                sync.Mutex
+	paused, limited   []string
+	listed, committed func()
+	began, release    chan struct{}
 }
 
 func (e *staleRenewExec) ClientRenew(ctx context.Context, _ driver.ClientRenewParams) (driver.ClientRenewResult, error) {
@@ -246,13 +248,37 @@ func (e *staleRenewExec) set(paused, limited []string) {
 	e.mu.Unlock()
 }
 
+func (e *staleRenewExec) QueuePause(_ context.Context, name string) error {
+	return e.setQueuePaused(name, true)
+}
+
+func (e *staleRenewExec) QueueResume(_ context.Context, name string) error {
+	return e.setQueuePaused(name, false)
+}
+
+func (e *staleRenewExec) setQueuePaused(name string, paused bool) error {
+	e.mu.Lock()
+	e.paused = slices.DeleteFunc(slices.Clone(e.paused), func(q string) bool { return q == name })
+	if paused {
+		e.paused = append(e.paused, name)
+	}
+	committed := e.committed
+	e.committed = nil
+	e.mu.Unlock()
+	if committed != nil {
+		committed()
+	}
+	return nil
+}
+
 // TestRenewalDoesNotUndoANewerControlChange checks that a renewal that read
 // the queues before a pause, resume or limit change committed does not undo
 // the change a notification applied while it was in flight, that the next
 // renewal applies the queues' state again, that a notification is checked
 // against the queues, as one from another schema in the database names a
-// queue of the same name, and that a notification's re-read that a local
-// change overtook reads again rather than undo it.
+// queue of the same name, that a notification's re-read that a local
+// change or a renewal overtook reads again rather than undo it, and that
+// this client's own resume does not undo a pause that committed after it.
 func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -315,12 +341,42 @@ func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 		check("after a resume", false, false)
 		exec.mu.Lock()
 		exec.listed = func() {
-			exec.set(def, nil)
-			c.setPaused(QueueDefault, true) // this client's own Pause
+			if err := c.Queues().Pause(ctx, QueueDefault); err != nil {
+				t.Error(err)
+			}
 		}
 		exec.mu.Unlock()
 		c.control(ctx, "limit:"+QueueDefault)
 		check("after a re-read in flight across this client's pause", true, false)
+
+		// This client's resume commits, then another client's pause
+		// commits and its notification is applied before the resume goes
+		// on: the resume does not set the queue going again.
+		exec.mu.Lock()
+		exec.committed = func() {
+			exec.set(def, nil)
+			c.control(ctx, "pause:"+QueueDefault)
+		}
+		exec.mu.Unlock()
+		if err := c.Queues().Resume(ctx, QueueDefault); err != nil {
+			t.Fatal(err)
+		}
+		check("after this client's resume, overtaken by another client's pause", true, false)
+
+		// A re-read that read the queues before another client's pause
+		// committed, overtaken by a renewal that read the pause and applied
+		// it, reads them again rather than set the queue going again.
+		exec.set(nil, nil)
+		c.control(ctx, "resume:"+QueueDefault)
+		check("after a resume", false, false)
+		exec.mu.Lock()
+		exec.listed = func() {
+			exec.set(def, nil) // whose notification this client missed
+			renew(nil)
+		}
+		exec.mu.Unlock()
+		c.control(ctx, "limit:"+QueueDefault)
+		check("after a re-read overtaken by a renewal", true, false)
 
 		cancel()
 		<-done

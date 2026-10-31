@@ -57,9 +57,10 @@ type Client[TTx any] struct {
 	genCancel context.CancelFunc
 
 	producers map[string]*producer
-	// controlSeq counts pause and limit changes applied to the producers
-	// other than from a renewal; it changes only under mu. A renewal or a
-	// re-read that one overtook does not apply its older reading.
+	// controlSeq counts applications of the queues' pause and limit state
+	// to the producers; it changes only under mu. A renewal or a re-read
+	// that another application overtook does not apply its reading, which
+	// may be older.
 	controlSeq atomic.Uint64
 	finalizer  *finalizer
 	// Loops by the phase that stops them: producers and the leader stop

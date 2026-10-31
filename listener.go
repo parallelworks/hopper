@@ -88,18 +88,11 @@ func (c *Client[TTx]) control(ctx context.Context, payload string) {
 			c.cancelLocal(id)
 		}
 	case "pause", "resume", "limit":
-		// A change to a queue this client does not work changes nothing
-		// here. One it does is re-read rather than trusted, as the payload
-		// may come from another schema.
-		c.mu.Lock()
-		_, works := c.producers[arg]
-		c.mu.Unlock()
-		if !works {
-			return
-		}
+		// Re-read rather than trusted, as the payload may come from
+		// another schema.
 		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if err := c.refreshQueueState(rctx); err != nil && ctx.Err() == nil {
+		if err := c.refreshQueue(rctx, arg); err != nil && ctx.Err() == nil {
 			c.logger.WarnContext(ctx, "hopper: read queue state", "error", err)
 		}
 	}
