@@ -339,16 +339,18 @@ func TestPeriodicJobsAcrossPrograms(t *testing.T) {
 	waitFor(t, func() bool { return a.IsLeader() || b.IsLeader() })
 	waitFor(t, func() bool { return jobs("1") >= 2 && jobs("2") >= 2 })
 
-	leader, program, n := a, "a", 1
+	leader, other, program, n := a, b, "a", 1
 	if b.IsLeader() {
-		leader, program, n = b, "b", 2
+		leader, other, program, n = b, a, "b", 2
 	}
 	if err := leader.Stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	start(program, n)
-	other := map[*hopper.Client[pgxTx]]*hopper.Client[pgxTx]{a: b, b: a}[leader]
+	// The other program's client, the only one left, takes the term before
+	// the stopped program's client starts again: started at once, the new
+	// client runs for leader as soon as it starts and may win the term.
 	waitFor(t, other.IsLeader)
+	start(program, n)
 	before1, before2 := jobs("1"), jobs("2")
 	waitFor(t, func() bool { return jobs("1") >= before1+2 && jobs("2") >= before2+2 })
 
