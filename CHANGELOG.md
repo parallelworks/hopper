@@ -6,6 +6,15 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.10.2](https://github.com/parallelworks/hopper/compare/v0.10.1...v0.10.2) (2026-10-31)
+
+
+### Bug fixes
+
+* **client:** a queue's pause was undone by a renewal in flight across it or by another schema's resume of a queue of the same name ([#105](https://github.com/parallelworks/hopper/issues/105)) ([eb5a112](https://github.com/parallelworks/hopper/commit/eb5a112372146c05a50e9ba32d0475b1f9acc321))
+* **client:** a workflow whose failed step is retried and completes runs OnSuccess, not OnFailure ([#97](https://github.com/parallelworks/hopper/issues/97)) ([fd35692](https://github.com/parallelworks/hopper/commit/fd356920aa65b738c6a12d0afbfd150554429f8f))
+* **leader:** history retention and the leader's finalizes no longer wait for a caller's transaction held open ([#104](https://github.com/parallelworks/hopper/issues/104)) ([34d9aa6](https://github.com/parallelworks/hopper/commit/34d9aa6f466461541322ba38169f333301594300))
+
 ## [0.10.1](https://github.com/parallelworks/hopper/compare/v0.10.0...v0.10.1) (2026-10-29)
 
 
