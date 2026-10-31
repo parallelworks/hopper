@@ -259,11 +259,11 @@ var batchSettleIDsSQL = batchSettleSQL(`
 
 // BatchSettle implements driver.Executor.
 func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettleParams) (driver.BatchSettleResult, error) {
-	var (
-		res  driver.BatchSettleResult
-		last nullUUID
-	)
 	if params.IDs == nil {
+		var (
+			res  driver.BatchSettleResult
+			last nullUUID
+		)
 		err := e.Conn.QueryRow(ctx, batchSweepSQL, driver.ChannelInsert, max(params.Limit, 1), uuidParam(params.After)).
 			Scan(&res.Folded, &res.Completed, &last)
 		if err != nil {
@@ -278,19 +278,19 @@ func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 		return res, nil
 	}
 	if len(params.IDs) == 0 {
-		return res, nil
+		return driver.BatchSettleResult{}, nil
 	}
 	// The settle waits for a batch row only briefly (heldLockTimeout), and
 	// a settle that gives up leaves the batch to the leader.
 	ids := uuidArray(params.IDs)
 	res, err := briefly(ctx, e, func(c Conn) (driver.BatchSettleResult, error) {
 		var (
-			r    driver.BatchSettleResult
+			res  driver.BatchSettleResult
 			last nullUUID
 		)
-		err := c.QueryRow(ctx, batchSettleIDsSQL, driver.ChannelInsert, ids).Scan(&r.Folded, &r.Completed, &last)
-		r.Last = last.ID
-		return r, err
+		err := c.QueryRow(ctx, batchSettleIDsSQL, driver.ChannelInsert, ids).Scan(&res.Folded, &res.Completed, &last)
+		res.Last = last.ID
+		return res, err
 	})
 	if errors.Is(err, driver.ErrRowsHeld) {
 		return driver.BatchSettleResult{}, nil

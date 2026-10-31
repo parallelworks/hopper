@@ -638,14 +638,16 @@ func testWorkflowsConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 // testWorkflowCascadeHeld checks that the leader's statements that finalize
 // jobs, the discard of jobs past their TTL, the expiry of job leases and the
 // rescue's finalize, each of which skips the jobs another transaction
-// holds, do not wait for the caller's
-// transaction that holds a row their cascade reaches: a dependent of two
+// holds, do not wait for the caller's transaction that holds a row their
+// cascade reaches: a dependent of two
 // steps that a JobCancelTx or a CompleteTx of the other step, held open,
 // has canceled by cascade. The leader runs them in its loop, so a wait
 // would hold up its other duties and its lease's renewal for as long as
 // the caller kept the transaction open. The statement gives up on its jobs
 // instead, which the next pass, once the transaction has rolled back,
-// finalizes, canceling the dependent.
+// finalizes, canceling the dependent. A client's finalize of the rescue's
+// step, which is not bounded, waits for the transaction instead, and
+// finalizes the step once it rolls back.
 func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 	for _, duty := range []string{"discard expired", "lease expiry", "rescue"} {
 		t.Run(duty, func(t *testing.T) {
@@ -742,21 +744,46 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 			if n := run(); n != 0 || !gaveUp {
 				t.Fatalf("%s while a transaction that canceled the dependent is held open finalized %d jobs (ErrRowsHeld: %t); want it to give up", duty, n, gaveUp)
 			}
+			// A client's finalize, without BriefWait, is not bounded: it
+			// waits for the held row, as it always has, well past the brief
+			// bound, and finalizes the step once the transaction ends. It
+			// is not given a deadline: a statement whose context ends is
+			// canceled on the server only once the driver's cancel request
+			// lands, and one still waiting when the transaction rolls back
+			// would finalize the step meanwhile.
+			type finalized struct {
+				n   int
+				err error
+			}
+			var waited chan finalized
 			if duty == "rescue" {
-				// A client's finalize, without BriefWait, is not bounded:
-				// it waits for the held row, as it always has, here until
-				// its context ends.
-				wctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-				applied, err := exec.JobFinalizeMany(wctx, driver.JobFinalizeParams{Jobs: failed(b), SkipLocked: true})
-				cancel()
-				if errors.Is(err, driver.ErrRowsHeld) || err == nil {
-					t.Fatalf("a client's finalize while a transaction that canceled the dependent is held open = %v, %v; want it to wait until its context ends", applied, err)
+				waited = make(chan finalized, 1)
+				results := failed(b)
+				go func() {
+					applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results, SkipLocked: true})
+					waited <- finalized{len(applied), err}
+				}()
+				f.WaitForLockWait(ctx, t, d)
+				select {
+				case r := <-waited:
+					t.Fatalf("a client's finalize while a transaction that canceled the dependent is held open = %d jobs, %v; want it to wait", r.n, r.err)
+				case <-time.After(2 * time.Second):
 				}
 			}
 			if err := rollback(); err != nil {
 				t.Fatal(err)
 			}
-			if n := run(); n != 1 {
+			var n int
+			if duty == "rescue" {
+				r := <-waited
+				if r.err != nil {
+					t.Fatalf("a client's finalize once the transaction rolled back: %v", r.err)
+				}
+				n = r.n
+			} else {
+				n = run()
+			}
+			if n != 1 {
 				t.Fatalf("%s once the transaction rolled back finalized %d jobs, want 1", duty, n)
 			}
 			if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateCanceled {
