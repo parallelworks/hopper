@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -1000,20 +1001,36 @@ func testHistoryRetentionCompletesIndex[TTx any](t *testing.T, f PostgresFixture
 		old := redeclare("20000102", "20000103", "20000104", "20000105")
 		var wg sync.WaitGroup
 		errs := make(chan error, 2)
+		indexed := make(chan struct{})
 		wg.Go(func() {
+			defer close(indexed)
 			if _, err := exec.HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
 				errs <- err
 			}
 		})
+		// Retention runs until a pass after the index pass has ended keeps
+		// and defers nothing: a partition kept for a build goes on a later
+		// pass, and a build waits for every older snapshot in the database,
+		// so how long the index pass takes depends on other sessions.
 		wg.Go(func() {
-			deadline := time.Now().Add(30 * time.Second)
+			deadline := time.Now().Add(2 * time.Minute)
 			for {
+				done := false
+				select {
+				case <-indexed:
+					done = true
+				default:
+				}
 				res, err := exec.HistoryMaintain(ctx, keep)
 				if err != nil {
 					errs <- err
 					return
 				}
-				if len(res.Deferred)+len(res.Kept) == 0 || time.Now().After(deadline) {
+				if done && len(res.Deferred)+len(res.Kept) == 0 {
+					return
+				}
+				if time.Now().After(deadline) {
+					errs <- fmt.Errorf("round %d: retention still keeps or defers partitions: %+v", round, res)
 					return
 				}
 				time.Sleep(10 * time.Millisecond)
