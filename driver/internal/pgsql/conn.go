@@ -87,7 +87,7 @@ func (e *Executor) withTx(ctx context.Context, fn func(tx Tx) error) (err error)
 // run briefly waits for a row another transaction holds.
 //
 // The leader's loop runs its statements that finalize jobs
-// (JobDiscardExpired, JobExpireLeases, and JobFinalizeMany with SkipLocked,
+// (JobDiscardExpired, JobExpireLeases, and JobFinalizeMany with BriefWait,
 // which its rescue runs) that way. Each skips the jobs it would finalize
 // that another transaction holds, but its cascade, promotion and batch
 // updates reach other rows, which a caller's transaction may hold for as
@@ -102,17 +102,18 @@ func (e *Executor) withTx(ctx context.Context, fn func(tx Tx) error) (err error)
 // BatchSettle with IDs runs briefly too, and the bound is below
 // deadlock_timeout's default, so that a settle that would deadlock with a
 // finalize completing several batches gives up before the deadlock is
-// detected, and leaves the batch to the leader. Against a finalize that
-// runs briefly too, whichever of the two waited first gives up: a finalize
-// that does finalizes none of its jobs, which are tried again.
+// detected, and leaves the batch to the leader. Against a leader's finalize
+// that runs briefly too, whichever of the two waited first gives up: a
+// finalize that does finalizes none of its jobs, which its next pass tries
+// again.
 const heldLockTimeout = "500ms"
 
 // briefly runs fn in a transaction of its own whose lock waits are bounded
 // by heldLockTimeout, and returns fn's result. A wait that runs out rolls
 // the transaction back, and briefly returns T's zero value, nothing done,
-// whatever fn returned, and driver.ErrRowsHeld. That includes a wait in the commit,
-// which takes the lock that serializes NOTIFY's queue after fn has returned
-// its rows. On an executor in a caller's transaction, fn runs in it,
+// whatever fn returned, and driver.ErrRowsHeld. That includes a wait in the
+// commit, which takes the lock that serializes NOTIFY's queue after fn has
+// returned its rows. On an executor in a caller's transaction, fn runs in it,
 // unbounded, since a timeout set there would last the caller's whole
 // transaction.
 func briefly[T any](ctx context.Context, e *Executor, fn func(Conn) (T, error)) (T, error) {

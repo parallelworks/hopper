@@ -184,7 +184,7 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			fin[i] = f
 			queueOf[j.ID] = j.Queue
 		}
-		applied, err := c.exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin, NoBatches: noBatches, SkipLocked: true})
+		applied, err := c.exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin, NoBatches: noBatches, SkipLocked: true, BriefWait: true})
 		if errors.Is(err, driver.ErrRowsHeld) {
 			// A transaction held open holds a row the batch's finalize
 			// reaches, a dependent of one of its jobs: the next pass tries

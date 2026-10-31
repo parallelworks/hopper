@@ -838,13 +838,12 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		applied []driver.JobFinalized
 		err     error
 	)
-	if params.SkipLocked && !params.NoBatches {
-		// Besides the jobs it skips, the statement may reach rows another
-		// transaction holds, such as a dependent that a JobCancelTx held
-		// open has canceled by cascade; past a brief wait for them it
-		// gives up on every job, with driver.ErrRowsHeld. Jobs of no batch
-		// have no dependents, and their statement reaches no other job's
-		// rows.
+	if params.BriefWait && !params.NoBatches {
+		// The statement may reach rows of other jobs another transaction
+		// holds, such as a dependent that a JobCancelTx held open has
+		// canceled by cascade; past a brief wait for them it gives up on
+		// every job, with driver.ErrRowsHeld. Jobs of no batch have no
+		// dependents, and their statement reaches no other job's rows.
 		applied, err = briefly(ctx, e, run)
 	} else {
 		applied, err = run(e.Conn)

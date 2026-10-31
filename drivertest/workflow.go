@@ -727,7 +727,7 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 					n = len(expired)
 				case "rescue":
 					var applied []driver.JobFinalized
-					applied, err = exec.JobFinalizeMany(lctx, driver.JobFinalizeParams{Jobs: failed(b), SkipLocked: true})
+					applied, err = exec.JobFinalizeMany(lctx, driver.JobFinalizeParams{Jobs: failed(b), SkipLocked: true, BriefWait: true})
 					n = len(applied)
 				}
 				if errors.Is(err, driver.ErrRowsHeld) {
@@ -738,10 +738,20 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 				}
 				return n
 			}
-			// Each gives up with ErrRowsHeld, which the leader logs, and
-			// for which the finalizer writes a batch again in halves.
+			// Each gives up with ErrRowsHeld, which the leader logs.
 			if n := run(); n != 0 || !gaveUp {
 				t.Fatalf("%s while a transaction that canceled the dependent is held open finalized %d jobs (ErrRowsHeld: %t); want it to give up", duty, n, gaveUp)
+			}
+			if duty == "rescue" {
+				// A client's finalize, without BriefWait, is not bounded:
+				// it waits for the held row, as it always has, here until
+				// its context ends.
+				wctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				applied, err := exec.JobFinalizeMany(wctx, driver.JobFinalizeParams{Jobs: failed(b), SkipLocked: true})
+				cancel()
+				if errors.Is(err, driver.ErrRowsHeld) || err == nil {
+					t.Fatalf("a client's finalize while a transaction that canceled the dependent is held open = %v, %v; want it to wait until its context ends", applied, err)
+				}
 			}
 			if err := rollback(); err != nil {
 				t.Fatal(err)

@@ -46,7 +46,7 @@ var ErrJobNotClaimable = errors.New("hopper: job is not claimable")
 // transaction holds the job's row.
 var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 
-// ErrRowsHeld is returned by JobFinalizeMany with SkipLocked,
+// ErrRowsHeld is returned by JobFinalizeMany with BriefWait,
 // JobDiscardExpired and JobExpireLeases when the statement gave up waiting
 // for a row another transaction holds that is not one of its jobs' own, such
 // as a dependent it cancels by cascade: it finalized none of them. A smaller
@@ -242,7 +242,7 @@ type Executor interface {
 	JobRetryOrderingKey(ctx context.Context, params JobRetryOrderingKeyParams) (int, error)
 	// JobDiscardExpired moves waiting jobs whose TTL has passed to history
 	// as discarded, and returns them. The leader runs it in its loop, so,
-	// like JobExpireLeases and a finalize with SkipLocked, it skips the jobs
+	// like JobExpireLeases and a finalize with BriefWait, it skips the jobs
 	// another transaction holds, and waits only briefly for any other row
 	// one holds that its statement reaches, such as a dependent it cancels
 	// by cascade, and then discards none and returns ErrRowsHeld: the next
@@ -1081,14 +1081,19 @@ type JobFinalizeParams struct {
 	NoBatches bool
 	// SkipLocked skips the jobs whose rows another transaction holds, such
 	// as a worker's CompleteTx that has not ended, instead of waiting for
-	// it. A skipped job is not among the applied. A statement waits only
-	// briefly for any other row another transaction holds that it reaches,
-	// such as a dependent it cancels by cascade that a JobCancelTx held open
-	// has canceled, and then finalizes none of the jobs and returns
-	// ErrRowsHeld. On a SingleWriter engine
+	// it. A skipped job is not among the applied. On a SingleWriter engine
 	// every job is skipped while another transaction writes. It does not
 	// apply to the results of leased jobs.
 	SkipLocked bool
+	// BriefWait bounds the statement's wait for any other row another
+	// transaction holds that it reaches, such as a dependent it cancels by
+	// cascade that a JobCancelTx held open has canceled: past a brief wait
+	// it finalizes none of the jobs and returns ErrRowsHeld. The leader's
+	// rescue sets it, with SkipLocked, so that no caller's transaction holds
+	// up the leader's loop; a client's finalizer does not, and waits for the
+	// row. It has no effect on a SingleWriter engine, whose SkipLocked
+	// already waits only briefly.
+	BriefWait bool
 	// KeepLogs is the most attempt logs a job keeps, the latest; a job given
 	// another drops its oldest. Zero keeps them all.
 	KeepLogs int

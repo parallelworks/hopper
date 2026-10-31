@@ -1670,15 +1670,14 @@ next pass tries again, with `driver.ErrRowsHeld`, which the leader logs as a war
 Each pass reads its jobs in the same order, oldest first, so while the transaction
 stays open that duty makes no progress on its batch at all, the jobs behind the one
 that reaches the held row included, until the transaction ends; the leader's other
-duties and its lease renewal go on. Before, the whole loop waited. A partition's creation or drop is
-deferred the same way (§7.10). A client's finalizer, whose write of the results of
-batch jobs skipping held rows (`SkipLocked`) runs the same way, gets
-`driver.ErrRowsHeld` from a write that gave up, and writes the results again in
-halves, so that only the result whose statement reaches the held row waits, tried again
-later as one whose own row is held is. Since each of its tries waits out the bound and
-holds up the client's other writes meanwhile, the tries back off, from 250 ms to 2 s,
-and a result tried again is written apart from a flush's fresh results, so that a try
-that gives up again splits only the results tried again.
+duties and its lease renewal go on. Before, the whole loop waited. A partition's
+creation or drop is deferred the same way (§7.10). Only the leader's statements are
+bounded (`JobFinalizeParams.BriefWait` for the rescue's): a client's finalizer still
+waits, as before, for a row of another job that a caller's transaction holds, such as
+a dependent its cascade reaches, up to its flush timeout, after which it writes the
+batch again in halves. That holds up the client's other results meanwhile, a known
+limitation; bounding it too, without the finalizer's retries holding up its other
+writes, is a follow-up.
 
 The index build (`HistoryIndex`) runs in its own loop of the leader's term, once the
 term's first history maintenance has created the partitions ahead and then every
@@ -2525,8 +2524,8 @@ observability without new machinery.
     the other's progress and completes the batch.
     The wait is bounded (`lock_timeout` 500 ms, below `deadlock_timeout`, so a settle that
     would deadlock with a finalize completing several batches gives up before the deadlock
-    is detected; against a finalize under the same bound (§7.8), whichever waited first
-    gives up, and a finalize that does is tried again); a
+    is detected; against a leader's finalize under the same bound (§7.8), whichever
+    waited first gives up, and the leader tries its finalize again on its next pass); a
     batch it cannot get is left to the leader, which on every pass sweeps batches
     with progress rows in ID order (`SKIP LOCKED`, resuming where a pass stopped)
     and deletes progress rows whose batch no longer exists. The sweep covers a
