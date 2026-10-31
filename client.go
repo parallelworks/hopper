@@ -57,7 +57,11 @@ type Client[TTx any] struct {
 	genCancel context.CancelFunc
 
 	producers map[string]*producer
-	finalizer *finalizer
+	// controlSeq counts pause and limit changes applied to the producers
+	// other than from a renewal; it changes only under mu. A renewal that
+	// one overtook does not apply its older reading.
+	controlSeq atomic.Uint64
+	finalizer  *finalizer
 	// Loops by the phase that stops them: producers and the leader stop
 	// with claiming; the listener and the lease loop run until the end.
 	producerWG sync.WaitGroup
@@ -545,6 +549,7 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 		id := c.clientID.Load()
+		seq := c.controlSeq.Load()
 		start := time.Now()
 		rctx, cancel := context.WithTimeout(ctx, c.renewalWait())
 		res, err := c.exec.ClientRenew(rctx, driver.ClientRenewParams{ClientID: id, TTL: c.tuning.leaseTTL})
@@ -565,8 +570,7 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		for _, jobID := range res.CancelRequested {
 			c.cancelLocal(jobID)
 		}
-		c.applyPaused(res.PausedQueues)
-		c.applyLimited(res.LimitedQueues)
+		c.applyRenewed(seq, res.PausedQueues, res.LimitedQueues)
 	}
 }
 
@@ -600,6 +604,7 @@ func (c *Client[TTx]) limitedQueues(ctx context.Context) ([]string, error) {
 func (c *Client[TTx]) applyLimited(limited []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.controlSeq.Add(1)
 	c.setLimited(limited)
 }
 

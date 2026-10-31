@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"slices"
 	"sync"
 	"testing"
@@ -182,5 +183,122 @@ func TestNewLeaseRecordsPeriodicJobsAtOnce(t *testing.T) {
 			}
 		}
 		t.Errorf("the new lease was never recorded: %v", exec.writes)
+	})
+}
+
+// staleRenewExec holds each renewal until the test lets it go, and answers
+// it with the paused and limited queues as they were when it began, as a
+// renewal whose statement began before a change committed does. A queue
+// listing reads them as they are.
+type staleRenewExec struct {
+	driver.Executor
+	mu              sync.Mutex
+	paused, limited []string
+	began, release  chan struct{}
+}
+
+func (e *staleRenewExec) ClientRenew(ctx context.Context, _ driver.ClientRenewParams) (driver.ClientRenewResult, error) {
+	e.mu.Lock()
+	res := driver.ClientRenewResult{Renewed: true, PausedQueues: e.paused, LimitedQueues: e.limited}
+	e.mu.Unlock()
+	e.began <- struct{}{}
+	select {
+	case <-e.release:
+		return res, nil
+	case <-ctx.Done():
+		return driver.ClientRenewResult{}, ctx.Err()
+	}
+}
+
+func (e *staleRenewExec) QueueList(context.Context) ([]*driver.QueueRow, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rows := map[string]*driver.QueueRow{}
+	row := func(name string) *driver.QueueRow {
+		if rows[name] == nil {
+			rows[name] = &driver.QueueRow{Name: name}
+		}
+		return rows[name]
+	}
+	for _, name := range e.paused {
+		row(name).PausedAt = time.Now()
+	}
+	for _, name := range e.limited {
+		row(name).Limits = driver.QueueLimits{Name: name, GlobalLimit: 1}
+	}
+	return slices.Collect(maps.Values(rows)), nil
+}
+
+func (e *staleRenewExec) set(paused, limited []string) {
+	e.mu.Lock()
+	e.paused, e.limited = paused, limited
+	e.mu.Unlock()
+}
+
+// TestRenewalDoesNotUndoANewerControlChange checks that a renewal that read
+// the queues before a pause, resume or limit change committed does not undo
+// the change a notification applied while it was in flight, that the next
+// renewal applies the queues' state again, and that a notification is
+// checked against the queues, as one from another schema in the database
+// names a queue of the same name.
+func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		exec := &staleRenewExec{began: make(chan struct{}), release: make(chan struct{})}
+		logger := slog.New(slog.DiscardHandler)
+		p := &producer{queue: QueueDefault, logger: logger, wake: make(chan struct{}, 1)}
+		c := &Client[struct{}]{exec: exec, logger: logger, tuning: defaultTuning, producers: map[string]*producer{QueueDefault: p}}
+		done := make(chan struct{})
+		go func() { defer close(done); c.leaseLoop(ctx) }()
+
+		renew := func(change func()) {
+			t.Helper()
+			<-exec.began
+			if change != nil {
+				change()
+			}
+			exec.release <- struct{}{}
+			synctest.Wait()
+		}
+		check := func(when string, paused, limited bool) {
+			t.Helper()
+			if p.paused.Load() != paused || p.limited.Load() != limited {
+				t.Errorf("%s: paused %v, limited %v; want %v, %v", when, p.paused.Load(), p.limited.Load(), paused, limited)
+			}
+		}
+		def := []string{QueueDefault}
+
+		renew(func() {
+			exec.set(def, nil)
+			c.control("pause:" + QueueDefault)
+		})
+		check("after a renewal that began before the pause", true, false)
+		renew(nil)
+		check("after the next renewal", true, false)
+
+		renew(func() {
+			exec.set(nil, nil)
+			c.control("resume:" + QueueDefault)
+		})
+		check("after a renewal that began before the resume", false, false)
+
+		renew(func() {
+			exec.set(nil, def)
+			c.control("limit:" + QueueDefault)
+		})
+		check("after a renewal that began before the limit", false, true)
+		renew(nil)
+		check("after the next renewal", false, true)
+
+		c.control("pause:" + QueueDefault)
+		check("after another schema's pause", false, true)
+		exec.set(def, def)
+		c.control("pause:" + QueueDefault)
+		c.control("resume:" + QueueDefault)
+		check("after another schema's resume", true, true)
+
+		cancel()
+		<-done
 	})
 }

@@ -87,16 +87,7 @@ func (c *Client[TTx]) control(payload string) {
 		if id, err := ParseJobID(arg); err == nil {
 			c.cancelLocal(id)
 		}
-	case "pause":
-		c.setPaused(arg, true)
-	case "resume":
-		c.setPaused(arg, false)
-	case "limit":
-		// Re-read the set rather than trust the payload.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if limited, err := c.limitedQueues(ctx); err == nil {
-			c.applyLimited(limited)
-		}
+	case "pause", "resume", "limit":
+		c.refreshQueueState()
 	}
 }

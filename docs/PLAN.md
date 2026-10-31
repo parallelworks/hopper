@@ -1137,9 +1137,12 @@ RETURNING j.*;
   transaction that locks their `hopper_queues` row (§9). Unlimited queues never touch
   that row, so they pay nothing for the feature.
 - **Paused queues** skip claiming. `Queues().Pause` upserts the queue row and sends
-  `pg_notify('hopper_control', 'pause:<queue>')`; clients apply it at once and re-read
-  the set of paused queues on every lease renewal, in the same round trip as the
-  renewal. `Queues().Add` and `Remove` start and stop working a queue on one client at
+  `pg_notify('hopper_control', 'pause:<queue>')`; the pausing client applies it at once,
+  and other clients re-read which queues are paused and limited when the notification
+  arrives, rather than trust its payload, and on every lease renewal, in the same round
+  trip as the renewal. A renewal does not apply what it read if a pause, resume or
+  limit change was applied while it was in flight, since it may have read the queues
+  before that change committed; the next renewal reads them again. `Queues().Add` and `Remove` start and stop working a queue on one client at
   runtime. Clients record the queues they work in `hopper_queues` on start.
 
 ### 7.4 Execute
@@ -2015,7 +2018,9 @@ rates:
   polls and keeps working, and it reconnects the listener with backoff. The listener
   connection is named `hopper-listener:<schema>` in `pg_stat_activity`.
 - **Channels are per database**, not per schema. Two hopper schemas in one database
-  see each other's notifications, which only causes spurious wake-ups.
+  see each other's notifications, which only causes spurious wake-ups: a client checks
+  a control notification's pause, resume or limit against its own schema's queues, and
+  a job ID in a cancel or done notification is unique.
 - **SQLite** has no LISTEN: hoppersqlite writes notifications to a table in the
   notifying transaction, wakes the listeners of its own process when it commits, and
   has listeners in other processes look for new rows every 50ms, when another
