@@ -46,6 +46,14 @@ var ErrJobNotClaimable = errors.New("hopper: job is not claimable")
 // transaction holds the job's row.
 var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 
+// ErrRowsHeld is returned by JobFinalizeMany with BriefWait,
+// JobDiscardExpired and JobExpireLeases when the statement gave up waiting
+// for a row another transaction holds that it does not skip, such as a
+// dependent it cancels by cascade, or the lease of a job JobExpireLeases
+// expires that a renewal holds: it finalized none of them. A smaller set of
+// the jobs may not reach that row.
+var ErrRowsHeld = errors.New("hopper: another transaction holds a row the statement reaches")
+
 // ErrHistoryIndexRepair wraps the error Executor.HistoryIndex returns when
 // only the repair of an index failed: the pass did the rest of its work,
 // which an error without it may have ended before.
@@ -234,7 +242,13 @@ type Executor interface {
 	// finalized jobs are left alone.
 	JobRetryOrderingKey(ctx context.Context, params JobRetryOrderingKeyParams) (int, error)
 	// JobDiscardExpired moves waiting jobs whose TTL has passed to history
-	// as discarded, and returns them.
+	// as discarded, and returns them. The leader runs it in its loop, so,
+	// like JobExpireLeases and a finalize with BriefWait, it skips the jobs
+	// another transaction holds, and waits only briefly for any other row
+	// one holds that its statement reaches, such as a dependent it cancels
+	// by cascade, and then discards none and returns ErrRowsHeld: the next
+	// call takes them. On a SingleWriter engine it waits for another
+	// transaction's writes, as every write does.
 	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)
 	// JobRescueCandidates returns running jobs whose owning client has no
 	// unexpired lease, plus, if StuckAfter is positive, running jobs claimed
@@ -269,7 +283,12 @@ type Executor interface {
 	// after the lease was last renewed (and no later than now), at the first
 	// such start plus the larger of its TTL and params.Grace, if that is
 	// later. It expires nothing unless the lease of client params.ClientID
-	// is live. It returns the jobs as they are afterwards.
+	// is live. It returns the jobs as they are afterwards. It skips the
+	// jobs another transaction holds, and waits only briefly for any other
+	// row one holds, as JobDiscardExpired does, its jobs' lease rows
+	// included, and then expires none and returns ErrRowsHeld. On a
+	// SingleWriter engine it too waits only briefly for another
+	// transaction's writes, and then expires none.
 	JobExpireLeases(ctx context.Context, params JobExpireLeasesParams) ([]*JobRow, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
@@ -1066,6 +1085,17 @@ type JobFinalizeParams struct {
 	// every job is skipped while another transaction writes. It does not
 	// apply to the results of leased jobs.
 	SkipLocked bool
+	// BriefWait bounds the statement's wait for any other row another
+	// transaction holds that it reaches, such as a dependent it cancels by
+	// cascade that a JobCancelTx held open has canceled: past a brief wait
+	// it finalizes none of the jobs and returns ErrRowsHeld. The leader's
+	// rescue sets it, with SkipLocked, so that no caller's transaction holds
+	// up the leader's loop; a client's finalizer does not, and waits for the
+	// row. It has no effect on a SingleWriter engine, whose SkipLocked
+	// already waits only briefly, with NoBatches, whose statement reaches no
+	// other job's rows, or on an Executor in a caller's transaction, where a
+	// bound would last the caller's whole transaction.
+	BriefWait bool
 	// KeepLogs is the most attempt logs a job keeps, the latest; a job given
 	// another drops its oldest. Zero keeps them all.
 	KeepLogs int

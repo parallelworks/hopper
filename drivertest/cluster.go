@@ -1158,6 +1158,70 @@ func testHistoryMaintain[TTx any](t *testing.T, f Fixture[TTx]) {
 	maintainWhileReading(ctx, t, exec)
 }
 
+// testHistoryPruneSkipsHeld checks that retention's prune of history rows
+// past it, which a period's drop does not take, skips a row a control call
+// held open in a caller's transaction has moved out of history (JobRetryTx)
+// or deleted (JobDeleteTx), rather than wait for it: the leader runs it in
+// its loop, so a wait would hold up its other duties and its lease's
+// renewal for as long as the caller kept the transaction open. A row the
+// call leaves, its transaction rolled back, is pruned by a later pass.
+func testHistoryPruneSkipsHeld[TTx any](t *testing.T, f Fixture[TTx]) {
+	for _, call := range []string{"retry", "delete"} {
+		t.Run(call, func(t *testing.T) {
+			ctx := context.Background()
+			d := f.NewDriver(t)
+			if singleWriter(d) {
+				t.Skip("on an engine that runs one writer at a time, every write waits for an open transaction")
+			}
+			exec := d.Executor()
+			const keep = 10 * time.Millisecond
+			p := driver.HistoryMaintainParams{FailedRetention: keep}
+			// The periods ahead are created first, so that the passes below
+			// have only the prune left: the current period's jobs are in the
+			// unit no drop takes.
+			if _, err := exec.HistoryMaintain(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+			insert(ctx, t, exec, params("k", 1))
+			clientID := register(ctx, t, exec)
+			jobs := claim(ctx, t, exec, clientID, 1)
+			id := jobs[0].ID
+			finalizeCurrent(ctx, t, exec, driver.JobFinalize{
+				ID: id, AttemptedBy: clientID, State: driver.JobStateDiscarded, Archive: true,
+				Error: &driver.AttemptError{Attempt: 1, Error: "boom"},
+			})
+			time.Sleep(10 * keep)
+
+			tx, _, rollback := f.Begin(ctx, t, d)
+			t.Cleanup(func() { _ = rollback() })
+			var err error
+			if call == "retry" {
+				_, err = d.UnwrapTx(tx).JobRetry(ctx, driver.JobRetryParams{ID: id})
+			} else {
+				_, err = d.UnwrapTx(tx).JobDelete(ctx, id)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			mctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			res, err := exec.HistoryMaintain(mctx, p)
+			cancel()
+			if err != nil || res.Pruned != 0 {
+				t.Fatalf("maintain while a %s of a job past retention is held open = %+v, %v; want its row skipped", call, res, err)
+			}
+			if err := rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if res, err := exec.HistoryMaintain(ctx, p); err != nil || res.Pruned != 1 {
+				t.Fatalf("maintain once the %s rolled back = %+v, %v; want its row pruned", call, res, err)
+			}
+			if _, err := exec.JobGet(ctx, id); !errors.Is(err, driver.ErrNotFound) {
+				t.Errorf("job after its prune: %v; want ErrNotFound", err)
+			}
+		})
+	}
+}
+
 func testNow[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	now, err := f.NewDriver(t).Executor().Now(ctx)

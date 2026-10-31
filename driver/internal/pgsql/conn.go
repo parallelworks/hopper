@@ -15,6 +15,8 @@ package pgsql
 import (
 	"context"
 	"errors"
+
+	"github.com/parallelworks/hopper/driver"
 )
 
 // ErrNoRows is returned by Row.Scan when the query matched nothing.
@@ -79,6 +81,61 @@ func (e *Executor) withTx(ctx context.Context, fn func(tx Tx) error) (err error)
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// heldLockTimeout, a lockTimeoutSetting value, bounds how long a statement
+// run briefly waits for a row another transaction holds.
+//
+// The leader's loop runs its statements that finalize jobs
+// (JobDiscardExpired, JobExpireLeases, and JobFinalizeMany with BriefWait,
+// which its rescue runs) that way. Each skips the jobs it would finalize
+// that another transaction holds, but its cascade, promotion and batch
+// updates reach other rows, which a caller's transaction may hold for as
+// long as it stays open: a dependent that a JobCancelTx or JobDeleteTx held
+// open has canceled or deleted. A wait as long as the caller's transaction
+// would hold up the leader's other duties and its lease's renewal. Skipping
+// such a row instead would be wrong: a cascade that skipped a dependent the
+// caller's transaction then rolled back would leave it pending behind a
+// failed dependency. The statement gives up instead, and its jobs are tried
+// again on the next pass.
+//
+// BatchSettle with IDs runs briefly too, and the bound is below
+// deadlock_timeout's default, so that a settle that would deadlock with a
+// finalize completing several batches gives up before the deadlock is
+// detected, and leaves the batch to the leader. Against a leader's finalize
+// that runs briefly too, whichever of the two waited first gives up: a
+// finalize that does finalizes none of its jobs, which its next pass tries
+// again.
+const heldLockTimeout = "500ms"
+
+// briefly runs fn in a transaction of its own whose lock waits are bounded
+// by heldLockTimeout, and returns fn's result. A wait that runs out rolls
+// the transaction back, and briefly returns T's zero value, nothing done,
+// whatever fn returned, and driver.ErrRowsHeld. That includes a wait in the
+// commit, which takes the lock that serializes NOTIFY's queue after fn has
+// returned its rows. On an executor in a caller's transaction, fn runs in it,
+// unbounded, since a timeout set there would last the caller's whole
+// transaction.
+func briefly[T any](ctx context.Context, e *Executor, fn func(Conn) (T, error)) (T, error) {
+	if e.InTx {
+		return fn(e.Conn)
+	}
+	var out T
+	err := e.withTx(ctx, func(tx Tx) (err error) {
+		if err = setLockTimeout(ctx, tx, heldLockTimeout); err != nil {
+			return err
+		}
+		out, err = fn(tx)
+		return err
+	})
+	if err != nil {
+		var zero T
+		if lockNotAvailable(err) {
+			return zero, driver.ErrRowsHeld
+		}
+		return zero, err
+	}
+	return out, nil
 }
 
 // collect returns a consumer that reads every row of a query result through
