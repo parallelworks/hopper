@@ -250,6 +250,14 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 // partitions, which stays until its whole period is past, so the tags' prune
 // keeps the rows whose job is still there, and takes those a job left
 // without its trigger (a TRUNCATE of a partition).
+//
+// It skips the rows another transaction holds, which the next pass takes:
+// a JobRetryTx or JobDeleteTx held open deletes its job's history row, and
+// a prune that waited for it would hold up the leader's loop, and its
+// lease's renewal, for as long as the caller kept its transaction open. The
+// rows are locked by a subquery and deleted by their ctid, which a row
+// locked by the statement keeps: the DEFAULT partition is a table, not a
+// partitioned one.
 func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.Duration, res *driver.HistoryMaintainResult) error {
 	if keep <= 0 {
 		return nil
@@ -257,15 +265,18 @@ func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.D
 	table := e.Schema.Table(g.parent + "_default")
 	if g.mirrors != "" {
 		if _, err := e.Conn.Exec(ctx, fmt.Sprintf(`
-			DELETE FROM %s t WHERE finalized_at < now() - make_interval(secs => $1::float8)
-			  AND NOT EXISTS (SELECT 1 FROM %s h WHERE h.state = t.state AND h.finalized_at = t.finalized_at AND h.id = t.id)`,
+			DELETE FROM %[1]s WHERE ctid = ANY (ARRAY(
+			  SELECT ctid FROM %[1]s t WHERE finalized_at < now() - make_interval(secs => $1::float8)
+			    AND NOT EXISTS (SELECT 1 FROM %[2]s h WHERE h.state = t.state AND h.finalized_at = t.finalized_at AND h.id = t.id)
+			  FOR UPDATE OF t SKIP LOCKED))`,
 			table, e.Schema.Table("hopper_job_history")), keep.Seconds()); err != nil {
 			return fmt.Errorf("hopper: prune %s_default: %w", g.parent, err)
 		}
 		return nil
 	}
 	n, err := e.Conn.Exec(ctx,
-		fmt.Sprintf("DELETE FROM %s WHERE %s < now() - make_interval(secs => $1::float8)", table, g.timeColumn),
+		fmt.Sprintf(`DELETE FROM %[1]s WHERE ctid = ANY (ARRAY(
+		  SELECT ctid FROM %[1]s WHERE %[2]s < now() - make_interval(secs => $1::float8) FOR UPDATE SKIP LOCKED))`, table, g.timeColumn),
 		keep.Seconds())
 	if err != nil {
 		return fmt.Errorf("hopper: prune %s_default: %w", g.parent, err)

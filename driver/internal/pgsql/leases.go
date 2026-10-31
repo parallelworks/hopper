@@ -224,10 +224,14 @@ SELECT ` + finishedSelectColumns + ` FROM finished
 UNION ALL
 SELECT ` + strings.Replace(JobColumns(""), ", state,", ", state::text,", 1) + `, NULL::timestamptz, NULL::jsonb FROM retry`
 
-// JobExpireLeases implements driver.Executor.
+// JobExpireLeases implements driver.Executor. It waits only briefly for
+// rows another transaction holds (briefly), expiring nothing, with
+// driver.ErrRowsHeld, if it has to.
 func (e *Executor) JobExpireLeases(ctx context.Context, params driver.JobExpireLeasesParams) ([]*driver.JobRow, error) {
-	jobs, err := historyJobs(e.Conn.Query(ctx, jobExpireLeasesSQL, max(params.Limit, 1), driver.ChannelDone, driver.ChannelInsert,
-		params.ClientID, max(params.Grace, 0).Seconds()))
+	jobs, err := briefly(ctx, e, func(c Conn) ([]*driver.JobRow, error) {
+		return historyJobs(c.Query(ctx, jobExpireLeasesSQL, max(params.Limit, 1), driver.ChannelDone, driver.ChannelInsert,
+			params.ClientID, max(params.Grace, 0).Seconds()))
+	})
 	if err != nil {
 		return nil, fmt.Errorf("hopper: expire job leases: %w", err)
 	}

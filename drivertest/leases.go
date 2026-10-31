@@ -735,7 +735,9 @@ func testExpireRacesRenew[TTx any](t *testing.T, f Fixture[TTx]) {
 	done := make(chan []*driver.JobRow, 1)
 	go func() {
 		jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
-		if err != nil {
+		// An expiry that waited past its brief bound for the renewal
+		// gives up with ErrRowsHeld, which the renewal wins too.
+		if err != nil && !errors.Is(err, driver.ErrRowsHeld) {
 			t.Error(err)
 		}
 		done <- jobs
