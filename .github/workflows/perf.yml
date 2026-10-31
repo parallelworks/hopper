@@ -8,8 +8,9 @@ name: Performance gate
 # side's runs, averaged, is what is compared. Each run drains 300,000 jobs
 # (about ten seconds on a runner): a shorter drain measures start-up
 # effects, such as the leader's first statistics refresh, rather than the
-# hot paths. The workflow scenario, whose jobs each pass through the
-# finalize tail and dependency promotion, drains 100,000 (ten thousand
+# hot paths. The workflow scenarios, whose jobs each pass through the
+# finalize tail and dependency promotion (and, in workflow-outputs, record
+# and read their dependencies' outputs), drain 100,000 (ten thousand
 # workflows), about as long. The reference numbers in
 # docs/PLAN.md §8.2 come from the release hardware, not from here.
 on:
@@ -51,7 +52,7 @@ jobs:
           --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_bench?sslmode=disable
-      SCENARIOS: throughput,insert,copy,workflow
+      SCENARIOS: throughput,insert,copy,workflow,workflow-outputs
       ROUNDS: "6"
       JOBS: "300000"
       WORKFLOW_JOBS: "100000"
@@ -76,7 +77,7 @@ jobs:
           for i in $(seq "$ROUNDS"); do
             for s in ${SCENARIOS//,/ }; do
               jobs=$JOBS
-              if [ "$s" = workflow ]; then jobs=$WORKFLOW_JOBS; fi
+              case "$s" in workflow*) jobs=$WORKFLOW_JOBS;; esac
               "$RUNNER_TEMP/bench-base" -database-url "$DATABASE_URL" -scenarios "$s" -jobs "$jobs" -schema "base_$i" >> base.jsonl
               "$RUNNER_TEMP/bench-head" -database-url "$DATABASE_URL" -scenarios "$s" -jobs "$jobs" -schema "head_$i" >> head.jsonl
             done

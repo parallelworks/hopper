@@ -536,8 +536,10 @@ func (x *w) promoteIfReady(ctx context.Context, id driver.JobID) (bool, error) {
 
 // countBatch counts n jobs of a batch, failed of them canceled or
 // discarded, as finished, and completes the batch, inserting its
-// callbacks, if nothing remains. A batch that has completed already counts
-// them too, as a Postgres batch's settle does.
+// callbacks, if nothing remains. A batch that has completed counts nothing
+// more, as a Postgres batch's settle folds nothing into it: the jobs are
+// re-driven ones that finished after it completed (JobRetry), and its
+// counts stay those its callbacks were given.
 func (x *w) countBatch(ctx context.Context, id driver.JobID, n, failed int) error {
 	var (
 		pending, wasFailed               int
@@ -553,10 +555,13 @@ func (x *w) countBatch(ctx context.Context, id driver.JobID, n, failed int) erro
 	if err != nil {
 		return fmt.Errorf("batch %s: %w", id, err)
 	}
+	if completed.Valid {
+		return nil
+	}
 	pending -= n
 	failed += wasFailed
-	if completed.Valid || pending > 0 {
-		_, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = ?, failed = ? WHERE id = ?`, max(pending, 0), failed, idParam(id))
+	if pending > 0 {
+		_, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = ?, failed = ? WHERE id = ?`, pending, failed, idParam(id))
 		return err
 	}
 	if _, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = 0, failed = ?, completed_at = ? WHERE id = ?`, failed, x.us(), idParam(id)); err != nil {

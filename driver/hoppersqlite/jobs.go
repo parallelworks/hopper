@@ -797,9 +797,10 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 				rowid      int64
 				kind, tags sql.NullString
 				uniqueKey  sql.NullString
+				failed     bool
 			)
-			err := x.QueryRowContext(ctx, `SELECT rowid, kind, unique_key, tags FROM hopper_job_history WHERE id = ? LIMIT 1`, idParam(id)).
-				Scan(&rowid, &kind, &uniqueKey, &tags)
+			err := x.QueryRowContext(ctx, `SELECT rowid, kind, unique_key, tags, state IN ('canceled', 'discarded') FROM hopper_job_history WHERE id = ? LIMIT 1`, idParam(id)).
+				Scan(&rowid, &kind, &uniqueKey, &tags, &failed)
 			if errors.Is(err, sql.ErrNoRows) {
 				return driver.ErrNotFound
 			}
@@ -827,8 +828,11 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 				return nil
 			}
 			// The job counts as pending in its batch again, so that its next
-			// finish does not complete the batch while its dependents run.
-			if _, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = pending + 1 WHERE id = ? AND completed_at IS NULL`, idParam(job.BatchID)); err != nil {
+			// finish does not complete the batch while its dependents run,
+			// and a failure of it no longer counts, so that a batch whose
+			// retried job completes runs OnSuccess, not OnFailure.
+			if _, err := x.ExecContext(ctx, `UPDATE hopper_batches SET pending = pending + 1, failed = failed - ? WHERE id = ? AND completed_at IS NULL`,
+				failed, idParam(job.BatchID)); err != nil {
 				return err
 			}
 			_, err = x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id = ? AND job_id = ?`, idParam(job.BatchID), idParam(id))

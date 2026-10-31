@@ -214,7 +214,10 @@ type Executor interface {
 	// the job's TTL is cleared, as an operator overriding the wait. It returns
 	// ErrJobRunning for a running job and ErrUniqueConflict if a live job
 	// holds the same unique key. The job keeps its progress unless
-	// params.FromStart.
+	// params.FromStart. A job moved back from history counts in its batch,
+	// if the batch has not completed, as pending again and, if it had
+	// failed, no longer as failed. A completed batch's counts never change,
+	// by the retry or by the job's next finish.
 	JobRetry(ctx context.Context, params JobRetryParams) (*JobRow, error)
 	// JobDelete removes a job that is not running and returns it as it was
 	// last stored. A waiting job is canceled as JobCancel does, so its
@@ -319,7 +322,10 @@ type Executor interface {
 	// waiting on each other, so two that finalize a batch's last jobs at
 	// the same time can each miss the other's progress and leave the batch
 	// open. A client settles the batches it has just finalized jobs of, and
-	// the leader sweeps up the rest.
+	// the leader sweeps up the rest. Progress recorded for a batch that has
+	// completed (a JobRetry its completion missed, a re-driven job's later
+	// finish) is dropped, not folded: a completed batch keeps the counts its
+	// callbacks were given.
 	BatchSettle(ctx context.Context, params BatchSettleParams) (BatchSettleResult, error)
 	// BatchGet returns a batch's progress.
 	BatchGet(ctx context.Context, id JobID) (*BatchRow, error)
@@ -882,8 +888,9 @@ type BatchSettleParams struct {
 
 // BatchSettleResult reports what BatchSettle did.
 type BatchSettleResult struct {
-	// Folded counts the batches whose progress was brought up to date, and
-	// Completed those of them that completed.
+	// Folded counts the batches whose progress was brought up to date (for
+	// one that had completed, dropped), and Completed those of them that
+	// completed.
 	Folded, Completed int64
 	// Last is the greatest ID among the batches folded, the After of the
 	// next chunk of a sweep.

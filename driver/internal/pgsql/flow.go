@@ -157,9 +157,12 @@ func (e *Executor) BatchInsert(ctx context.Context, params driver.BatchInsertPar
 }
 
 // batchProgressSelect reads a batch's pending and failed counts, with its
-// progress rows folded in, from a hopper_batches row aliased b.
+// progress rows (batchProgressSQL) folded in, from a hopper_batches row
+// aliased b. A completed batch reads the counts it completed with: the rows
+// it has left, which BatchSettle deletes without folding (batchSettleSQL),
+// are not counted.
 const batchProgressSelect = `CASE WHEN b.completed_at IS NULL THEN greatest(b.pending - p.done, 0) ELSE 0 END AS pending,
-  b.failed + p.failed AS failed`
+  b.failed + CASE WHEN b.completed_at IS NULL THEN p.failed ELSE 0 END AS failed`
 
 // batchSettleSQL folds batches' progress rows into their batch rows and
 // completes, with their callbacks, those with nothing remaining: batches
@@ -169,7 +172,20 @@ const batchProgressSelect = `CASE WHEN b.completed_at IS NULL THEN greatest(b.pe
 // until it commits. Whether a batch was open is read from the row as
 // locked, which nothing else can change before the fold, rather than
 // inferred from completed_at = now(), which a batch completed earlier in the
-// same transaction also satisfies.
+// same transaction also satisfies; only open batches are folded, so a
+// folded batch with completed_at set completed here.
+//
+// The rows of a batch that had completed when locked are deleted without
+// being folded. They are of jobs re-driven from history (JobRetry) that the
+// batch completed without: a retry's own row (done -1, and failed -1 for a
+// failed job) that the statement completing the batch missed, the retry
+// held open in a caller's transaction (JobRetryTx) or committed while that
+// statement ran, and the re-driven job's next finish. The batch completed
+// with the job's earlier outcome and ran the callbacks it called for.
+// Dropping the rows keeps the batch's counts those its callbacks were
+// given, as a retry that finds the batch completed leaves them, rather than
+// taking a failure off a batch whose OnFailure has run, or adding one to a
+// batch whose OnSuccess has.
 func batchSettleSQL(locked string) string {
 	return `
 WITH locked AS (` + locked + `),
@@ -177,7 +193,12 @@ moved AS (
   DELETE FROM {{schema}}.hopper_batch_progress p USING locked l WHERE p.batch_id = l.id
   RETURNING p.batch_id, p.done, p.failed
 ),
-sums AS (SELECT batch_id, sum(done) AS done, sum(failed) AS failed FROM moved GROUP BY batch_id),
+sums AS (
+  SELECT m.batch_id, sum(m.done) AS done, sum(m.failed) AS failed
+  FROM moved m JOIN locked l ON l.id = m.batch_id
+  WHERE l.open
+  GROUP BY m.batch_id
+),
 folded AS (
   UPDATE {{schema}}.hopper_batches b
   SET pending = greatest(b.pending - s.done, 0), failed = b.failed + s.failed,
@@ -185,7 +206,7 @@ folded AS (
   FROM sums s WHERE b.id = s.batch_id
   RETURNING b.id, b.failed, b.on_success, b.on_failure, b.on_complete, b.completed_at, b.reads
 ),
-batches AS (SELECT f.* FROM folded f JOIN locked l ON l.id = f.id WHERE l.open AND f.completed_at IS NOT NULL),
+batches AS (SELECT * FROM folded WHERE completed_at IS NOT NULL),
 ` + resultsClearedSQL + `,
 ` + batchCallbacksSQL("$1") + `
 SELECT (SELECT count(*) FROM locked), (SELECT count(*) FROM batches), (SELECT id FROM locked ORDER BY id DESC LIMIT 1)`
