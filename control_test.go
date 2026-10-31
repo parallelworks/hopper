@@ -271,6 +271,20 @@ func TestPauseAndResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return ran.Load() == 1 })
+
+	// So does another client's pause, through the notification or else a
+	// renewal.
+	if err := other.Queues().Pause(ctx, hopper.QueueDefault); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(fastTuning.LeaseRenew * 2)
+	if _, err := c.Insert(ctx, noop{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(fastTuning.LeaseRenew * 2)
+	if n := ran.Load(); n != 1 {
+		t.Fatalf("ran %d jobs; one ran on a queue another client paused", n)
+	}
 }
 
 // TestRemoveWhileStopping removes queues while the client stops: each call

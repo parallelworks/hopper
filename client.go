@@ -58,8 +58,8 @@ type Client[TTx any] struct {
 
 	producers map[string]*producer
 	// controlSeq counts pause and limit changes applied to the producers
-	// other than from a renewal; it changes only under mu. A renewal that
-	// one overtook does not apply its older reading.
+	// other than from a renewal; it changes only under mu. A renewal or a
+	// re-read that one overtook does not apply its older reading.
 	controlSeq atomic.Uint64
 	finalizer  *finalizer
 	// Loops by the phase that stops them: producers and the leader stop
@@ -582,42 +582,6 @@ func (c *Client[TTx]) renewalWait() time.Duration {
 		wait = max(wait, time.Until(from.Add(c.tuning.leaseTTL)))
 	}
 	return wait
-}
-
-// limitedQueues reads which queues have limits.
-func (c *Client[TTx]) limitedQueues(ctx context.Context) ([]string, error) {
-	queues, err := c.exec.QueueList(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var limited []string
-	for _, q := range queues {
-		if q.Limits.Limited() {
-			limited = append(limited, q.Name)
-		}
-	}
-	return limited, nil
-}
-
-// applyLimited sets every local producer's claim path from the list of
-// limited queues.
-func (c *Client[TTx]) applyLimited(limited []string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.controlSeq.Add(1)
-	c.setLimited(limited)
-}
-
-// setLimited is applyLimited for a caller holding c.mu.
-func (c *Client[TTx]) setLimited(limited []string) {
-	set := make(map[string]struct{}, len(limited))
-	for _, q := range limited {
-		set[q] = struct{}{}
-	}
-	for name, p := range c.producers {
-		_, isLimited := set[name]
-		p.limited.Store(isLimited)
-	}
 }
 
 // fence handles the loss of lease id: it cancels every job running under

@@ -189,11 +189,13 @@ func TestNewLeaseRecordsPeriodicJobsAtOnce(t *testing.T) {
 // staleRenewExec holds each renewal until the test lets it go, and answers
 // it with the paused and limited queues as they were when it began, as a
 // renewal whose statement began before a change committed does. A queue
-// listing reads them as they are.
+// listing reads them as they are, then runs listed, if set, once: a change
+// applied while the listing is in flight.
 type staleRenewExec struct {
 	driver.Executor
 	mu              sync.Mutex
 	paused, limited []string
+	listed          func()
 	began, release  chan struct{}
 }
 
@@ -201,7 +203,11 @@ func (e *staleRenewExec) ClientRenew(ctx context.Context, _ driver.ClientRenewPa
 	e.mu.Lock()
 	res := driver.ClientRenewResult{Renewed: true, PausedQueues: e.paused, LimitedQueues: e.limited}
 	e.mu.Unlock()
-	e.began <- struct{}{}
+	select {
+	case e.began <- struct{}{}:
+	case <-ctx.Done():
+		return driver.ClientRenewResult{}, ctx.Err()
+	}
 	select {
 	case <-e.release:
 		return res, nil
@@ -212,7 +218,6 @@ func (e *staleRenewExec) ClientRenew(ctx context.Context, _ driver.ClientRenewPa
 
 func (e *staleRenewExec) QueueList(context.Context) ([]*driver.QueueRow, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	rows := map[string]*driver.QueueRow{}
 	row := func(name string) *driver.QueueRow {
 		if rows[name] == nil {
@@ -226,6 +231,12 @@ func (e *staleRenewExec) QueueList(context.Context) ([]*driver.QueueRow, error) 
 	for _, name := range e.limited {
 		row(name).Limits = driver.QueueLimits{Name: name, GlobalLimit: 1}
 	}
+	listed := e.listed
+	e.listed = nil
+	e.mu.Unlock()
+	if listed != nil {
+		listed()
+	}
 	return slices.Collect(maps.Values(rows)), nil
 }
 
@@ -238,9 +249,10 @@ func (e *staleRenewExec) set(paused, limited []string) {
 // TestRenewalDoesNotUndoANewerControlChange checks that a renewal that read
 // the queues before a pause, resume or limit change committed does not undo
 // the change a notification applied while it was in flight, that the next
-// renewal applies the queues' state again, and that a notification is
-// checked against the queues, as one from another schema in the database
-// names a queue of the same name.
+// renewal applies the queues' state again, that a notification is checked
+// against the queues, as one from another schema in the database names a
+// queue of the same name, and that a notification's re-read that a local
+// change overtook reads again rather than undo it.
 func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -271,7 +283,7 @@ func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 
 		renew(func() {
 			exec.set(def, nil)
-			c.control("pause:" + QueueDefault)
+			c.control(ctx, "pause:"+QueueDefault)
 		})
 		check("after a renewal that began before the pause", true, false)
 		renew(nil)
@@ -279,24 +291,36 @@ func TestRenewalDoesNotUndoANewerControlChange(t *testing.T) {
 
 		renew(func() {
 			exec.set(nil, nil)
-			c.control("resume:" + QueueDefault)
+			c.control(ctx, "resume:"+QueueDefault)
 		})
 		check("after a renewal that began before the resume", false, false)
 
 		renew(func() {
 			exec.set(nil, def)
-			c.control("limit:" + QueueDefault)
+			c.control(ctx, "limit:"+QueueDefault)
 		})
 		check("after a renewal that began before the limit", false, true)
 		renew(nil)
 		check("after the next renewal", false, true)
 
-		c.control("pause:" + QueueDefault)
+		c.control(ctx, "pause:"+QueueDefault)
 		check("after another schema's pause", false, true)
 		exec.set(def, def)
-		c.control("pause:" + QueueDefault)
-		c.control("resume:" + QueueDefault)
+		c.control(ctx, "pause:"+QueueDefault)
+		c.control(ctx, "resume:"+QueueDefault)
 		check("after another schema's resume", true, true)
+
+		exec.set(nil, nil)
+		c.control(ctx, "resume:"+QueueDefault)
+		check("after a resume", false, false)
+		exec.mu.Lock()
+		exec.listed = func() {
+			exec.set(def, nil)
+			c.setPaused(QueueDefault, true) // this client's own Pause
+		}
+		exec.mu.Unlock()
+		c.control(ctx, "limit:"+QueueDefault)
+		check("after a re-read in flight across this client's pause", true, false)
 
 		cancel()
 		<-done

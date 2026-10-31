@@ -348,12 +348,7 @@ func (q *QueueControl[TTx]) SetLimits(ctx context.Context, name string, limits Q
 	if err := q.c.exec.QueueSetLimits(ctx, limits); err != nil {
 		return err
 	}
-	limited, err := q.c.limitedQueues(ctx)
-	if err != nil {
-		return err
-	}
-	q.c.applyLimited(limited)
-	return nil
+	return q.c.refreshQueueState(ctx)
 }
 
 // Add starts working a queue on this client at runtime, for example a
@@ -572,40 +567,53 @@ func (c *Client[TTx]) applyRenewed(seq uint64, paused, limited []string) {
 
 // refreshQueueState reads which queues are paused and limited and applies
 // it. A control notification calls it rather than trust its payload, since
-// every schema in the database shares the channel.
-func (c *Client[TTx]) refreshQueueState() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	queues, err := c.exec.QueueList(ctx)
-	if err != nil {
-		c.logger.WarnContext(ctx, "hopper: read queue state", "error", err)
-		return
-	}
-	var paused, limited []string
-	for _, q := range queues {
-		if !q.PausedAt.IsZero() {
-			paused = append(paused, q.Name)
+// every schema in the database shares the channel, and so does SetLimits.
+// Like a renewal's, a reading may predate a change applied while it was in
+// flight; it is then read again rather than applied.
+func (c *Client[TTx]) refreshQueueState(ctx context.Context) error {
+	for {
+		seq := c.controlSeq.Load()
+		queues, err := c.exec.QueueList(ctx)
+		if err != nil {
+			return err
 		}
-		if q.Limits.Limited() {
-			limited = append(limited, q.Name)
+		var paused, limited []string
+		for _, q := range queues {
+			if !q.PausedAt.IsZero() {
+				paused = append(paused, q.Name)
+			}
+			if q.Limits.Limited() {
+				limited = append(limited, q.Name)
+			}
+		}
+		c.mu.Lock()
+		current := c.controlSeq.Load() == seq
+		if current {
+			c.controlSeq.Add(1)
+			c.setQueueState(paused, limited)
+		}
+		c.mu.Unlock()
+		if current {
+			return nil
 		}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.controlSeq.Add(1)
-	c.setQueueState(paused, limited)
 }
 
 // setQueueState sets every local producer's pause state and claim path
 // from the lists of paused and limited queues. The caller holds c.mu.
 func (c *Client[TTx]) setQueueState(paused, limited []string) {
-	set := make(map[string]struct{}, len(paused))
+	pausedSet := make(map[string]struct{}, len(paused))
 	for _, q := range paused {
-		set[q] = struct{}{}
+		pausedSet[q] = struct{}{}
+	}
+	limitedSet := make(map[string]struct{}, len(limited))
+	for _, q := range limited {
+		limitedSet[q] = struct{}{}
 	}
 	for name, p := range c.producers {
-		_, isPaused := set[name]
+		_, isPaused := pausedSet[name]
 		p.setPaused(isPaused)
+		_, isLimited := limitedSet[name]
+		p.limited.Store(isLimited)
 	}
-	c.setLimited(limited)
 }

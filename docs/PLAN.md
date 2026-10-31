@@ -1138,12 +1138,14 @@ RETURNING j.*;
   that row, so they pay nothing for the feature.
 - **Paused queues** skip claiming. `Queues().Pause` upserts the queue row and sends
   `pg_notify('hopper_control', 'pause:<queue>')`; the pausing client applies it at once,
-  and other clients re-read which queues are paused and limited when the notification
-  arrives, rather than trust its payload, and on every lease renewal, in the same round
-  trip as the renewal. A renewal does not apply what it read if a pause, resume or
-  limit change was applied while it was in flight, since it may have read the queues
-  before that change committed; the next renewal reads them again. `Queues().Add` and `Remove` start and stop working a queue on one client at
-  runtime. Clients record the queues they work in `hopper_queues` on start.
+  and clients that work the queue re-read which queues are paused and limited when the
+  notification arrives, rather than trust its payload, and on every lease renewal, in
+  the same round trip as the renewal. Neither a renewal nor a re-read applies what it
+  read if a pause, resume or limit change was applied while it was in flight, since it
+  may have read the queues before that change committed: a re-read reads them again,
+  and a renewal leaves them to the next renewal. `Queues().Add` and `Remove` start and
+  stop working a queue on one client at runtime. Clients record the queues they work in
+  `hopper_queues` on start.
 
 ### 7.4 Execute
 - Each queue runs a bounded pool of goroutines. Workers are started only once a slot is
