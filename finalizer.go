@@ -447,6 +447,22 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 			}
 			return
 		}
+		if errors.Is(err, driver.ErrRowsHeld) {
+			// The statement gave up on a row of another job that a
+			// caller's transaction holds, such as a dependent its JobCancelTx
+			// canceled by cascade. Halves are written again, so that the
+			// transaction holds up only the result that reaches the row,
+			// which is then tried again later, as a result whose own row is
+			// held is.
+			if len(batch) > 1 {
+				half := len(batch) / 2
+				f.write(ctx, batch[:half], skipLocked)
+				f.write(ctx, batch[half:], skipLocked)
+				return
+			}
+			f.afterFlush(ctx, batch, nil)
+			return
+		}
 		if ctx.Err() != nil {
 			f.logger.ErrorContext(ctx, "hopper: results dropped; jobs will be rescued", "count", len(jobs), "error", err)
 			return

@@ -46,6 +46,12 @@ var ErrJobNotClaimable = errors.New("hopper: job is not claimable")
 // transaction holds the job's row.
 var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 
+// ErrRowsHeld is returned by JobFinalizeMany with SkipLocked when its
+// statement gave up waiting for a row another transaction holds that is not
+// one of its jobs' own, such as a dependent it cancels by cascade: it
+// finalized none of them. A smaller set of the jobs may not reach that row.
+var ErrRowsHeld = errors.New("hopper: another transaction holds a row the statement reaches")
+
 // ErrHistoryIndexRepair wraps the error Executor.HistoryIndex returns when
 // only the repair of an index failed: the pass did the rest of its work,
 // which an error without it may have ended before.
@@ -275,8 +281,11 @@ type Executor interface {
 	// after the lease was last renewed (and no later than now), at the first
 	// such start plus the larger of its TTL and params.Grace, if that is
 	// later. It expires nothing unless the lease of client params.ClientID
-	// is live. It returns the jobs as they are afterwards. It waits for
-	// rows another transaction holds as JobDiscardExpired does.
+	// is live. It returns the jobs as they are afterwards. It skips the
+	// jobs another transaction holds, and waits only briefly for any other
+	// row one holds, as JobDiscardExpired does, and then expires none. On a
+	// SingleWriter engine it too waits only briefly for another
+	// transaction's writes, and then expires none.
 	JobExpireLeases(ctx context.Context, params JobExpireLeasesParams) ([]*JobRow, error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
@@ -1072,7 +1081,8 @@ type JobFinalizeParams struct {
 	// it. A skipped job is not among the applied. A statement waits only
 	// briefly for any other row another transaction holds that it reaches,
 	// such as a dependent it cancels by cascade that a JobCancelTx held open
-	// has canceled, and then skips every job. On a SingleWriter engine
+	// has canceled, and then finalizes none of the jobs and returns
+	// ErrRowsHeld. On a SingleWriter engine
 	// every job is skipped while another transaction writes. It does not
 	// apply to the results of leased jobs.
 	SkipLocked bool

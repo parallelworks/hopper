@@ -185,6 +185,13 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			queueOf[j.ID] = j.Queue
 		}
 		applied, err := c.exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin, NoBatches: noBatches, SkipLocked: true})
+		if errors.Is(err, driver.ErrRowsHeld) {
+			// A transaction held open holds a row the batch's finalize
+			// reaches, a dependent of one of its jobs: the next pass tries
+			// again, rather than hold the leader's loop up while it bisects.
+			c.logger.WarnContext(ctx, "hopper: rescue deferred: another transaction holds a row it reaches", "candidates", len(candidates))
+			return
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				c.logger.ErrorContext(ctx, "hopper: rescue jobs", "error", err)

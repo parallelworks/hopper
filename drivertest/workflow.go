@@ -707,6 +707,7 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			var gaveUp bool
 			run := func() int {
 				t.Helper()
 				lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -728,14 +729,19 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 					var applied []driver.JobFinalized
 					applied, err = exec.JobFinalizeMany(lctx, driver.JobFinalizeParams{Jobs: failed(b), SkipLocked: true})
 					n = len(applied)
+					// It gives up with ErrRowsHeld, so that the finalizer
+					// writes the batch again in halves.
+					if errors.Is(err, driver.ErrRowsHeld) {
+						gaveUp, err = true, nil
+					}
 				}
 				if err != nil {
 					t.Fatalf("%s while a transaction that canceled the dependent is held open: %v", duty, err)
 				}
 				return n
 			}
-			if n := run(); n != 0 {
-				t.Fatalf("%s while a transaction that canceled the dependent is held open finalized %d jobs; want it to give up", duty, n)
+			if n := run(); n != 0 || duty == "rescue" && !gaveUp {
+				t.Fatalf("%s while a transaction that canceled the dependent is held open finalized %d jobs (ErrRowsHeld: %t); want it to give up", duty, n, gaveUp)
 			}
 			if err := rollback(); err != nil {
 				t.Fatal(err)

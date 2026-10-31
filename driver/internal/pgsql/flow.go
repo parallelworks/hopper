@@ -257,12 +257,6 @@ var batchSettleIDsSQL = batchSettleSQL(`
   FOR UPDATE OF b
 `)
 
-// settleLockTimeout bounds how long BatchSettle with IDs waits for a batch
-// row. It is below deadlock_timeout's default, so that a settle that would
-// deadlock with a finalize completing several batches gives up first, and
-// leaves the batch to the leader.
-const settleLockTimeout = "500ms"
-
 // BatchSettle implements driver.Executor.
 func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettleParams) (driver.BatchSettleResult, error) {
 	var (
@@ -286,27 +280,24 @@ func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 	if len(params.IDs) == 0 {
 		return res, nil
 	}
+	// The settle waits for a batch row only briefly (heldLockTimeout), and
+	// a settle that gives up leaves the batch to the leader.
 	ids := uuidArray(params.IDs)
-	if e.InTx {
-		if err := e.Conn.QueryRow(ctx, batchSettleIDsSQL, driver.ChannelInsert, ids).Scan(&res.Folded, &res.Completed, &last); err != nil {
-			return res, fmt.Errorf("hopper: settle batches: %w", err)
-		}
-		res.Last = last.ID
-		return res, nil
-	}
-	err := e.withTx(ctx, func(tx Tx) error {
-		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '"+settleLockTimeout+"'"); err != nil {
-			return err
-		}
-		return tx.QueryRow(ctx, batchSettleIDsSQL, driver.ChannelInsert, ids).Scan(&res.Folded, &res.Completed, &last)
+	res, err := briefly(ctx, e, func(c Conn) (driver.BatchSettleResult, error) {
+		var (
+			r    driver.BatchSettleResult
+			last nullUUID
+		)
+		err := c.QueryRow(ctx, batchSettleIDsSQL, driver.ChannelInsert, ids).Scan(&r.Folded, &r.Completed, &last)
+		r.Last = last.ID
+		return r, err
 	})
+	if errors.Is(err, driver.ErrRowsHeld) {
+		return driver.BatchSettleResult{}, nil
+	}
 	if err != nil {
-		if lockNotAvailable(err) {
-			return driver.BatchSettleResult{}, nil
-		}
 		return driver.BatchSettleResult{}, fmt.Errorf("hopper: settle batches: %w", err)
 	}
-	res.Last = last.ID
 	return res, nil
 }
 

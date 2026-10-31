@@ -1666,7 +1666,13 @@ Skipping that row would be wrong, since a transaction that then rolled back woul
 leave the dependent pending behind a failed dependency, and the promotion sweep would
 run it. These statements run instead in a transaction of their own under a 500 ms
 `lock_timeout`: one that cannot get a row in time finalizes none of its jobs, which the
-next pass tries again. A partition's creation or drop is deferred the same way (§7.10).
+next pass tries again, so while the transaction stays open the jobs of that pass's
+batch wait with the one that reaches its row. A partition's creation or drop is
+deferred the same way (§7.10). A client's finalizer, whose write of the results of
+batch jobs skipping held rows (`SkipLocked`) runs the same way, gets
+`driver.ErrRowsHeld` from a write that gave up, and writes the results again in
+halves, so that only the result whose statement reaches the held row waits, tried again
+later as one whose own row is held is.
 
 The index build (`HistoryIndex`) runs in its own loop of the leader's term, once the
 term's first history maintenance has created the partitions ahead and then every
