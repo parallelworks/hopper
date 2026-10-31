@@ -57,7 +57,14 @@ type Client[TTx any] struct {
 	genCancel context.CancelFunc
 
 	producers map[string]*producer
-	finalizer *finalizer
+	// controlSeq counts applications of the queues' pause and limit state
+	// to the producers; it changes only under mu. A renewal or a re-read
+	// that another application overtook does not apply its reading, which
+	// may be older. appliedFrom, under mu, is the controlSeq that the
+	// renewal or re-read last applied read before its statement.
+	controlSeq  atomic.Uint64
+	appliedFrom uint64
+	finalizer   *finalizer
 	// Loops by the phase that stops them: producers and the leader stop
 	// with claiming; the listener and the lease loop run until the end.
 	producerWG sync.WaitGroup
@@ -545,6 +552,7 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 		id := c.clientID.Load()
+		seq := c.controlSeq.Load()
 		start := time.Now()
 		rctx, cancel := context.WithTimeout(ctx, c.renewalWait())
 		res, err := c.exec.ClientRenew(rctx, driver.ClientRenewParams{ClientID: id, TTL: c.tuning.leaseTTL})
@@ -565,8 +573,7 @@ func (c *Client[TTx]) leaseLoop(ctx context.Context) {
 		for _, jobID := range res.CancelRequested {
 			c.cancelLocal(jobID)
 		}
-		c.applyPaused(res.PausedQueues)
-		c.applyLimited(res.LimitedQueues)
+		c.applyRenewed(seq, res.PausedQueues, res.LimitedQueues)
 	}
 }
 
@@ -578,41 +585,6 @@ func (c *Client[TTx]) renewalWait() time.Duration {
 		wait = max(wait, time.Until(from.Add(c.tuning.leaseTTL)))
 	}
 	return wait
-}
-
-// limitedQueues reads which queues have limits.
-func (c *Client[TTx]) limitedQueues(ctx context.Context) ([]string, error) {
-	queues, err := c.exec.QueueList(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var limited []string
-	for _, q := range queues {
-		if q.Limits.Limited() {
-			limited = append(limited, q.Name)
-		}
-	}
-	return limited, nil
-}
-
-// applyLimited sets every local producer's claim path from the list of
-// limited queues.
-func (c *Client[TTx]) applyLimited(limited []string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.setLimited(limited)
-}
-
-// setLimited is applyLimited for a caller holding c.mu.
-func (c *Client[TTx]) setLimited(limited []string) {
-	set := make(map[string]struct{}, len(limited))
-	for _, q := range limited {
-		set[q] = struct{}{}
-	}
-	for name, p := range c.producers {
-		_, isLimited := set[name]
-		p.limited.Store(isLimited)
-	}
 }
 
 // fence handles the loss of lease id: it cancels every job running under

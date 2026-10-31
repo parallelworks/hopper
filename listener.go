@@ -65,7 +65,7 @@ func (c *Client[TTx]) listenOnce(ctx context.Context) error {
 		case driver.ChannelLeader:
 			c.pokeLeader()
 		case driver.ChannelControl:
-			c.control(n.Payload)
+			c.control(ctx, n.Payload)
 		case driver.ChannelDone:
 			if id, err := ParseJobID(n.Payload); err == nil {
 				c.signalDone(id)
@@ -77,7 +77,7 @@ func (c *Client[TTx]) listenOnce(ctx context.Context) error {
 }
 
 // control applies an operator action from ChannelControl.
-func (c *Client[TTx]) control(payload string) {
+func (c *Client[TTx]) control(ctx context.Context, payload string) {
 	action, arg, ok := strings.Cut(payload, ":")
 	if !ok {
 		return
@@ -87,16 +87,13 @@ func (c *Client[TTx]) control(payload string) {
 		if id, err := ParseJobID(arg); err == nil {
 			c.cancelLocal(id)
 		}
-	case "pause":
-		c.setPaused(arg, true)
-	case "resume":
-		c.setPaused(arg, false)
-	case "limit":
-		// Re-read the set rather than trust the payload.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	case "pause", "resume", "limit":
+		// Re-read rather than trusted, as the payload may come from
+		// another schema.
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if limited, err := c.limitedQueues(ctx); err == nil {
-			c.applyLimited(limited)
+		if err := c.refreshQueue(rctx, arg); err != nil && ctx.Err() == nil {
+			c.logger.WarnContext(ctx, "hopper: read queue state", "error", err)
 		}
 	}
 }
