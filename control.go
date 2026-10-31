@@ -307,14 +307,16 @@ type QueueControl[TTx any] struct {
 }
 
 // Pause stops every client from claiming from the queue. Running jobs
-// finish. Clients learn of it through a notification and on every lease
-// renewal.
+// finish. This client, if it works the queue, applies it before Pause
+// returns; others learn of it through a notification and on every lease
+// renewal. If this client then fails to read the queues' state back, Pause
+// returns that error with the pause committed, and this client too learns
+// of it through the notification or its next renewal.
 func (q *QueueControl[TTx]) Pause(ctx context.Context, name string) error {
 	if err := q.c.exec.QueuePause(ctx, name); err != nil {
 		return err
 	}
-	q.c.setPaused(name, true)
-	return nil
+	return q.c.refreshQueue(ctx, name)
 }
 
 // Resume undoes Pause.
@@ -322,8 +324,7 @@ func (q *QueueControl[TTx]) Resume(ctx context.Context, name string) error {
 	if err := q.c.exec.QueueResume(ctx, name); err != nil {
 		return err
 	}
-	q.c.setPaused(name, false)
-	return nil
+	return q.c.refreshQueue(ctx, name)
 }
 
 // List returns every queue known to the cluster.
@@ -335,8 +336,10 @@ func (q *QueueControl[TTx]) List(ctx context.Context) ([]*QueueRow, error) {
 type QueueLimits = driver.QueueLimits
 
 // SetLimits replaces a queue's cluster-wide limits. Zero values remove a
-// limit. Clients learn of the change through a notification and on their
-// next lease renewal.
+// limit. This client, if it works the queue, applies the change before
+// SetLimits returns; others learn of it through a notification and on
+// their next lease renewal. As with Pause, an error from reading the
+// queues' state back leaves the change committed.
 func (q *QueueControl[TTx]) SetLimits(ctx context.Context, name string, limits QueueLimits) error {
 	if name == "" {
 		return errors.New("hopper: queue name is required")
@@ -348,12 +351,7 @@ func (q *QueueControl[TTx]) SetLimits(ctx context.Context, name string, limits Q
 	if err := q.c.exec.QueueSetLimits(ctx, limits); err != nil {
 		return err
 	}
-	limited, err := q.c.limitedQueues(ctx)
-	if err != nil {
-		return err
-	}
-	q.c.applyLimited(limited)
-	return nil
+	return q.c.refreshQueue(ctx, name)
 }
 
 // Add starts working a queue on this client at runtime, for example a
@@ -379,6 +377,7 @@ func (q *QueueControl[TTx]) Add(ctx context.Context, name string, cfg QueueConfi
 		return err
 	}
 	paused, limited := queueState(state, name)
+	c.controlSeq.Add(1)
 	c.startProducer(name, cfg, paused, limited)
 	return nil
 }
@@ -546,27 +545,99 @@ func (c *Client[TTx]) cancelLocal(id JobID) {
 	}
 }
 
-// setPaused applies a queue's pause state to the local producer, if any.
-func (c *Client[TTx]) setPaused(queue string, paused bool) {
+// applyRenewed applies a renewal's lists of paused and limited queues,
+// unless the queues' state was applied since seq was read before the
+// renewal: the renewal may have read the queues before a change that was
+// applied committed, and the next one reads them again. Applying them moves
+// controlSeq too, so that a re-read that read the queues before the renewal
+// did reads them again rather than set back a change only the renewal saw.
+func (c *Client[TTx]) applyRenewed(seq uint64, paused, limited []string) {
 	c.mu.Lock()
-	p := c.producers[queue]
+	defer c.mu.Unlock()
+	c.applyQueueState(seq, paused, limited)
+}
+
+// applyQueueState applies the lists of paused and limited queues that a
+// renewal or a re-read read after reading controlSeq as seq, and reports
+// whether it did: it does not if the queues' state was applied since. The
+// caller holds c.mu.
+func (c *Client[TTx]) applyQueueState(seq uint64, paused, limited []string) bool {
+	if c.controlSeq.Load() != seq {
+		return false
+	}
+	c.controlSeq.Add(1)
+	c.appliedFrom = seq
+	c.setQueueState(paused, limited)
+	return true
+}
+
+// refreshQueue is refreshQueueState after a pause, resume or limit change
+// to queue, if this client works it: a change to another queue changes
+// nothing here.
+func (c *Client[TTx]) refreshQueue(ctx context.Context, queue string) error {
+	c.mu.Lock()
+	_, works := c.producers[queue]
 	c.mu.Unlock()
-	if p != nil {
-		p.setPaused(paused)
+	if !works {
+		return nil
+	}
+	return c.refreshQueueState(ctx)
+}
+
+// refreshQueueState reads which queues are paused and limited and applies
+// it. A control notification calls it rather than trust its payload, since
+// every schema in the database shares the channel. So do Pause, Resume and
+// SetLimits after their write, rather than apply the change they made: a
+// newer change to the queue may have committed and been applied already.
+// Like a renewal's, a reading may predate a change applied while it was in
+// flight; it is then not applied. Nor need it be once the reading of a
+// renewal or another re-read that read controlSeq after it moved past the
+// value this re-read first read has been applied: that reading began after
+// this re-read did, so after the change it is for, and what is applied
+// later is newer still. Otherwise it reads again. The first application to
+// overtake its second reading is such a reading, unless it is a
+// Queues().Add, so a re-read reads at most twice, and once more for each
+// Add that overtakes it, however often the queues change.
+func (c *Client[TTx]) refreshQueueState(ctx context.Context) error {
+	first := c.controlSeq.Load()
+	for seq := first; ; seq = c.controlSeq.Load() {
+		queues, err := c.exec.QueueList(ctx)
+		if err != nil {
+			return err
+		}
+		var paused, limited []string
+		for _, q := range queues {
+			if !q.PausedAt.IsZero() {
+				paused = append(paused, q.Name)
+			}
+			if q.Limits.Limited() {
+				limited = append(limited, q.Name)
+			}
+		}
+		c.mu.Lock()
+		done := c.applyQueueState(seq, paused, limited) || c.appliedFrom > first
+		c.mu.Unlock()
+		if done {
+			return nil
+		}
 	}
 }
 
-// applyPaused sets every local producer's pause state from the list of
-// paused queues.
-func (c *Client[TTx]) applyPaused(paused []string) {
-	set := make(map[string]struct{}, len(paused))
+// setQueueState sets every local producer's pause state and claim path
+// from the lists of paused and limited queues. The caller holds c.mu.
+func (c *Client[TTx]) setQueueState(paused, limited []string) {
+	pausedSet := make(map[string]struct{}, len(paused))
 	for _, q := range paused {
-		set[q] = struct{}{}
+		pausedSet[q] = struct{}{}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	limitedSet := make(map[string]struct{}, len(limited))
+	for _, q := range limited {
+		limitedSet[q] = struct{}{}
+	}
 	for name, p := range c.producers {
-		_, isPaused := set[name]
+		_, isPaused := pausedSet[name]
 		p.setPaused(isPaused)
+		_, isLimited := limitedSet[name]
+		p.limited.Store(isLimited)
 	}
 }

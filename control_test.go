@@ -241,21 +241,25 @@ func TestPauseAndResume(t *testing.T) {
 	})
 	c := h.started(workers, 2)
 	other := h.client(&hopper.Config{})
+	// Every schema in the database shares the notification channels.
+	foreign := newHarness(t).client(&hopper.Config{})
+	waitFor(t, c.Listening)
 
-	if err := other.Queues().Pause(ctx, hopper.QueueDefault); err != nil {
+	// The worker pauses at once. Neither a renewal in flight across the
+	// pause nor another schema's resume of its own queue of the same name
+	// undoes it.
+	if err := c.Queues().Pause(ctx, hopper.QueueDefault); err != nil {
 		t.Fatal(err)
 	}
-	// Wait until the worker has learned of the pause (through the
-	// notification or a renewal), then insert.
-	waitFor(t, func() bool {
-		s, err := c.Stats(ctx)
-		return err == nil && s.Queues[hopper.QueueDefault] != nil && s.Queues[hopper.QueueDefault].Paused
-	})
+	// Renewals cross the pause, and a claim that began before it ends.
 	time.Sleep(fastTuning.LeaseRenew * 2)
 	if _, err := c.Insert(ctx, noop{}, nil); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond)
+	if err := foreign.Queues().Resume(ctx, hopper.QueueDefault); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(fastTuning.LeaseRenew * 2)
 	if ran.Load() != 0 {
 		t.Fatal("job ran on a paused queue")
 	}
@@ -264,10 +268,25 @@ func TestPauseAndResume(t *testing.T) {
 		t.Errorf("queues = %v, %v", queues, err)
 	}
 
+	// Another client's resume reaches the worker.
 	if err := other.Queues().Resume(ctx, hopper.QueueDefault); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return ran.Load() == 1 })
+
+	// So does another client's pause, through the notification or else a
+	// renewal.
+	if err := other.Queues().Pause(ctx, hopper.QueueDefault); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(fastTuning.LeaseRenew * 2)
+	if _, err := c.Insert(ctx, noop{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(fastTuning.LeaseRenew * 2)
+	if n := ran.Load(); n != 1 {
+		t.Fatalf("ran %d jobs; one ran on a queue another client paused", n)
+	}
 }
 
 // TestRemoveWhileStopping removes queues while the client stops: each call
