@@ -2650,9 +2650,16 @@ observability without new machinery.
       being flattened: as a plain join or `NOT EXISTS` the planner hashed the whole
       table on every claim. Postgres evaluates it only for a claimed job in a
       batch, so a job outside one costs the `CASE` and nothing else, and one whose
-      edges do not read costs a probe of the empty partial index. The tail's probe for
-      a dependent that reads is the same, so a workflow that never asks records
-      nothing, deletes nothing and costs what it did before. A dependency gone
+      edges do not read costs a probe of its edges by the primary key. The claim reads
+      the job's edges by that key, filtering those that read (`coalesce(reads, false)`,
+      which no partial index's predicate matches), not through the partial index on
+      them: statistics taken while no edge read, as a deployment's are until its
+      workflows start reading, make both partial indexes look empty, and the planner
+      then walked the one keyed by dependency whole, filtering it by the claimed job,
+      so that every claim read every edge that reads (hopperbench's `workflow-outputs`
+      ran fifteen times slower after `workflow`). The tail's probe for a dependent that
+      reads goes through the partial index by dependency, so a workflow that never
+      asks records nothing, deletes nothing and costs what it did before. A dependency gone
       from the live table without a result, which finished before the upgrade or on a
       client of an earlier release during a rolling deploy, is reported with no state
       rather than left out.

@@ -1318,32 +1318,6 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Release()
-	explain := func(mode, query string, args []any) string {
-		t.Helper()
-		if _, err := conn.Exec(ctx, "SET plan_cache_mode = "+mode); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := conn.Exec(ctx, "PREPARE explained AS "+query); err != nil {
-			t.Fatal(err)
-		}
-		defer conn.Exec(ctx, "DEALLOCATE explained") //nolint:errcheck // the connection's last use
-		var types []string
-		if err := conn.QueryRow(ctx, "SELECT parameter_types::text[] FROM pg_prepared_statements WHERE name = 'explained'").Scan(&types); err != nil {
-			t.Fatal(err)
-		}
-		literals := make([]string, len(args))
-		for i, arg := range args {
-			if err := conn.QueryRow(ctx, "SELECT quote_nullable($1::"+types[i]+")", arg).Scan(&literals[i]); err != nil {
-				t.Fatalf("argument %d: %v", i+1, err)
-			}
-			literals[i] += "::" + types[i]
-		}
-		var plan string
-		if err := conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) EXECUTE explained("+strings.Join(literals, ", ")+")").Scan(&plan); err != nil {
-			t.Fatal(err)
-		}
-		return plan
-	}
 	log.mu.Lock()
 	statements, args := log.sql, log.args
 	log.mu.Unlock()
@@ -1358,7 +1332,7 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 		}
 		explained++
 		for _, mode := range []string{"force_generic_plan", "force_custom_plan"} {
-			plan := explain(mode, q, args[i])
+			plan := explainPrepared(t, ctx, conn, mode, q, args[i])
 			if strings.Contains(plan, `"Index Name": "hopper_jobs_running"`) {
 				t.Errorf("%s plan scans hopper_jobs_running:\n%s\n%s", mode, q, plan)
 			}
@@ -1370,4 +1344,112 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 	if explained != 7 {
 		t.Errorf("explained %d statements, want 7", explained)
 	}
+}
+
+// The claim reads a claimed workflow job's edges that read by the job's ID,
+// whatever the statistics say of how many edges read. Analyzed while no
+// workflow read its dependencies' outputs, they say none does, and both
+// partial indexes on the edges that read look empty: a plan that walked
+// the one keyed by the dependency, filtering every edge that reads by the
+// claimed job, cost every claim a pass over all of them once workflows
+// that read came (hopperbench's workflow-outputs after workflow ran 15
+// times slower).
+func TestClaimDependenciesIgnoreStaleStatistics(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	if _, err := pool.Exec(ctx, "ALTER TABLE hopper_job_deps SET (autovacuum_enabled = false)"); err != nil {
+		t.Fatal(err)
+	}
+	workflows := func(n int, reads bool) {
+		t.Helper()
+		for range n {
+			p := driver.WorkflowInsertParams{Name: "w", Jobs: insertParams("step", 10)}
+			for s := 1; s <= 8; s++ {
+				p.Deps = append(p.Deps, driver.JobDependency{Job: s, DependsOn: 0, Reads: reads}, driver.JobDependency{Job: 9, DependsOn: s, Reads: reads})
+			}
+			if _, err := exec.WorkflowInsert(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	workflows(300, false)
+	if _, err := pool.Exec(ctx, "ANALYZE hopper_job_deps"); err != nil {
+		t.Fatal(err)
+	}
+	workflows(300, true)
+
+	log := &statementLog{}
+	traced := tracedDriver(t, pool, log).Executor()
+	clientID := register(t, ctx, exec)
+	claimed, err := traced.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 100})
+	if err != nil || len(claimed.Jobs) != 100 {
+		t.Fatalf("claim = %d jobs, %v", len(claimed.Jobs), err)
+	}
+	results := make([]driver.JobFinalize, len(claimed.Jobs))
+	for i, j := range claimed.Jobs {
+		results[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true, Output: json.RawMessage(`{}`)}
+	}
+	if applied, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results}); err != nil || len(applied) != 100 {
+		t.Fatalf("finalize = %d, %v", len(applied), err)
+	}
+	log.mu.Lock()
+	statements, args := log.sql, log.args
+	log.mu.Unlock()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	// A node's own fields come before its child plans, so the match stays
+	// inside the node.
+	scan := regexp.MustCompile(`"Node Type": "(Seq Scan|Index Scan|Index Only Scan|Bitmap Heap Scan)",[^{}]*?"Relation Name": "hopper_job_deps"[^{}]*`)
+	explained := 0
+	for i, q := range statements {
+		if !strings.Contains(q, "hopper_job_deps") {
+			continue
+		}
+		explained++
+		for _, mode := range []string{"force_generic_plan", "force_custom_plan"} {
+			plan := explainPrepared(t, ctx, conn, mode, q, args[i])
+			for _, m := range scan.FindAllString(plan, -1) {
+				if !strings.Contains(m, `"Index Cond"`) {
+					t.Errorf("%s plan reads hopper_job_deps without a key to look up:\n%s\n%s", mode, m, q)
+				}
+			}
+		}
+	}
+	if explained != 2 {
+		t.Errorf("explained %d statements, want the claim and the finalize", explained)
+	}
+}
+
+// explainPrepared returns the JSON plan of query, prepared on conn under
+// plan_cache_mode mode, for args written in as literals of its parameters'
+// types.
+func explainPrepared(t *testing.T, ctx context.Context, conn *pgxpool.Conn, mode, query string, args []any) string {
+	t.Helper()
+	if _, err := conn.Exec(ctx, "SET plan_cache_mode = "+mode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "PREPARE explained AS "+query); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(ctx, "DEALLOCATE explained") //nolint:errcheck // the connection's last use
+	var types []string
+	if err := conn.QueryRow(ctx, "SELECT parameter_types::text[] FROM pg_prepared_statements WHERE name = 'explained'").Scan(&types); err != nil {
+		t.Fatal(err)
+	}
+	literals := make([]string, len(args))
+	for i, arg := range args {
+		if err := conn.QueryRow(ctx, "SELECT quote_nullable($1::"+types[i]+")", arg).Scan(&literals[i]); err != nil {
+			t.Fatalf("argument %d: %v", i+1, err)
+		}
+		literals[i] += "::" + types[i]
+	}
+	var plan string
+	if err := conn.QueryRow(ctx, "EXPLAIN (FORMAT JSON) EXECUTE explained("+strings.Join(literals, ", ")+")").Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	return plan
 }
