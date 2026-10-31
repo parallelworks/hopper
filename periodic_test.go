@@ -34,8 +34,9 @@ func periodicNames(jobs []hopper.PeriodicJob) []string {
 
 // countN counts the jobs, live and finished, whose args' N is n.
 func (h *harness) countN(n string) int {
-	return h.count("SELECT count(*) FROM hopper_jobs WHERE args->>'n' = $1", n) +
-		h.count("SELECT count(*) FROM hopper_job_history WHERE args->>'n' = $1", n)
+	// One statement, so a job finishing between two counts is not counted in both tables.
+	return h.count(`SELECT count(*) FROM (SELECT id FROM hopper_jobs WHERE args->>'n' = $1
+		UNION ALL SELECT id FROM hopper_job_history WHERE args->>'n' = $1) j`, n)
 }
 
 func TestPeriodicJobsRegistry(t *testing.T) {
@@ -283,14 +284,18 @@ func TestPeriodicJobsConcurrentChanges(t *testing.T) {
 	wg.Wait()
 	a.PeriodicJobs().Clear()
 	b.PeriodicJobs().Clear()
-	time.Sleep(200 * time.Millisecond)
-	slots := int(time.Since(start)/interval) + 1
 
+	// The leader may insert slots until another client's Clear reaches it,
+	// so the slots are counted up to after the jobs are.
+	var got [3]int
+	for i := range got {
+		got[i] = h.countN(strconv.Itoa(10 + i))
+	}
+	slots := int(time.Since(start)/interval) + 1
 	var total int
-	for n := 10; n < 13; n++ {
-		got := h.countN(strconv.Itoa(n))
+	for i, got := range got {
 		if got > slots {
-			t.Errorf("p%d inserted %d jobs in %d slots", n-10, got, slots)
+			t.Errorf("p%d inserted %d jobs in %d slots", i, got, slots)
 		}
 		total += got
 	}
