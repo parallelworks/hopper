@@ -1676,7 +1676,9 @@ batch jobs skipping held rows (`SkipLocked`) runs the same way, gets
 `driver.ErrRowsHeld` from a write that gave up, and writes the results again in
 halves, so that only the result whose statement reaches the held row waits, tried again
 later as one whose own row is held is. Since each of its tries waits out the bound and
-holds up the client's other writes meanwhile, the tries back off, from 250 ms to 2 s.
+holds up the client's other writes meanwhile, the tries back off, from 250 ms to 2 s,
+and a result tried again is written apart from a flush's fresh results, so that a try
+that gives up again splits only the results tried again.
 
 The index build (`HistoryIndex`) runs in its own loop of the leader's term, once the
 term's first history maintenance has created the partitions ahead and then every

@@ -1,6 +1,7 @@
 package hopper
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -332,6 +333,66 @@ func TestFinalizerSplitsBatchOnRowsHeld(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the result whose statement reached the held row was not tried again")
+	}
+}
+
+// A result tried again is written in a statement of its own, so that a
+// write that gives up again on a held row of another job splits only the
+// results tried again, and the flush's fresh results are written at once.
+func TestFinalizerWritesRetriedResultsApart(t *testing.T) {
+	exec := &rowsHeldExec{held: driver.JobID{3}, get: func(id driver.JobID) (*driver.JobRow, error) {
+		return &driver.JobRow{ID: id, State: driver.JobStateRunning}, nil
+	}}
+	var applied []driver.JobID
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeBatch: 4, finalizeBuffer: 4}, 0, func(string) {},
+		func(_ *driver.JobRow, r driver.JobFinalize) { applied = append(applied, r.ID) })
+	batch := make([]pending, 4)
+	for i := range batch {
+		batch[i] = pending{
+			job:    &driver.JobRow{Queue: "default", BatchID: driver.JobID{9}},
+			result: driver.JobFinalize{ID: driver.JobID{byte(i)}, State: driver.JobStateCompleted},
+		}
+		batch[i].completedTx = &batch[i].result
+	}
+	batch[3].completedTx, batch[3].waits = nil, 1
+	f.flush(context.Background(), batch)
+	if !slices.Equal(exec.sizes, []int{3, 1}) {
+		t.Errorf("statements of sizes %v, want the fresh results in one and the result tried again in another", exec.sizes)
+	}
+	if want := []driver.JobID{{0}, {1}, {2}}; !slices.Equal(applied, want) {
+		t.Errorf("applied %v, want %v", applied, want)
+	}
+}
+
+// A result that waited for its own row before its write gave up on a held
+// row of another job starts that wait's backoff at the shortest, and warns
+// of the new cause.
+func TestRowsHeldRetryAfterOwnRowWaits(t *testing.T) {
+	exec := &rowsHeldExec{held: driver.JobID{3}, get: func(id driver.JobID) (*driver.JobRow, error) {
+		return &driver.JobRow{ID: id, State: driver.JobStateRunning}, nil
+	}}
+	var logs bytes.Buffer
+	f := newFinalizer(exec, slog.New(slog.NewTextHandler(&logs, nil)), tuning{finalizeBatch: 4, finalizeBuffer: 4}, 0, func(string) {},
+		func(*driver.JobRow, driver.JobFinalize) {})
+	start := time.Now()
+	f.write(context.Background(), []pending{{
+		job:    &driver.JobRow{Queue: "default", BatchID: driver.JobID{9}},
+		result: driver.JobFinalize{ID: exec.held, State: driver.JobStateCompleted},
+		waits:  3,
+	}}, true)
+	select {
+	case p := <-f.in:
+		if waited := time.Since(start); waited >= 2*heldRetry {
+			t.Errorf("tried again after %v, want the shortest backoff, %v", waited, heldRetry)
+		}
+		if p.waits != 4 || p.rowsHeldWaits != 1 {
+			t.Errorf("waits %d, rowsHeldWaits %d; want 4 and 1", p.waits, p.rowsHeldWaits)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the result was not tried again")
+	}
+	if !strings.Contains(logs.String(), "holds a row a finished job's result reaches") {
+		t.Errorf("logged %q, want the warning that names the held row of another job", logs.String())
 	}
 }
 
