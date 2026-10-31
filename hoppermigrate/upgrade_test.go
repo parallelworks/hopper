@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/parallelworks/hopper"
 	"github.com/parallelworks/hopper/driver"
 	"github.com/parallelworks/hopper/hoppermigrate"
@@ -182,11 +185,28 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 	const holdFor = 2 * time.Second
 
 	var (
-		stop            = make(chan struct{})
-		wg              sync.WaitGroup
-		slowest         atomic.Int64
-		slowestFinalize atomic.Int64
+		stop = make(chan struct{})
+		wg   sync.WaitGroup
 	)
+	// bounded runs a claim's or a finalize's statement, which fails if it
+	// waits longer than the bound for a lock. The bound is on lock waits
+	// rather than on the statement's time, which a loaded host stretches
+	// whatever the migration does.
+	bounded := func(what, query string) bool {
+		err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, "SELECT set_config('lock_timeout', $1, true)", fmt.Sprintf("%dms", (holdFor/2).Milliseconds())); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, query)
+			return err
+		})
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			t.Errorf("a %s waited more than %s for a lock during the migration", what, holdFor/2)
+		} else if err != nil {
+			t.Errorf("%s during the migration: %v", what, err)
+		}
+		return err == nil
+	}
 	wg.Go(func() {
 		for i := 200; ; i += 10 {
 			select {
@@ -208,15 +228,10 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 				return
 			case <-time.After(2 * time.Millisecond):
 			}
-			start := time.Now()
 			// The claim's lock on hopper_jobs, in a form every version accepts.
-			if _, err := pool.Exec(ctx, `SELECT id FROM hopper_jobs WHERE state IN ('available', 'scheduled', 'retryable')
-			                             AND scheduled_at <= now() ORDER BY priority, scheduled_at, seq LIMIT 8 FOR UPDATE SKIP LOCKED`); err != nil {
-				t.Errorf("claim during the migration: %v", err)
+			if !bounded("claim", `SELECT id FROM hopper_jobs WHERE state IN ('available', 'scheduled', 'retryable')
+			                  AND scheduled_at <= now() ORDER BY priority, scheduled_at, seq LIMIT 8 FOR UPDATE SKIP LOCKED`) {
 				return
-			}
-			if took := int64(time.Since(start)); took > slowest.Load() {
-				slowest.Store(took)
 			}
 		}
 	})
@@ -227,17 +242,12 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 				return
 			case <-time.After(5 * time.Millisecond):
 			}
-			start := time.Now()
 			// A finalize's move of a job into history. It takes the jobs
 			// inserted during the migration, which the rest of the test
 			// does not count.
-			if _, err := pool.Exec(ctx, archive(`id = (SELECT id FROM hopper_jobs WHERE state = 'available'
-			    AND (args->>'n')::int BETWEEN 200 AND 99999 ORDER BY seq LIMIT 1 FOR UPDATE SKIP LOCKED)`)); err != nil {
-				t.Errorf("finalize during the migration: %v", err)
+			if !bounded("finalize", archive(`id = (SELECT id FROM hopper_jobs WHERE state = 'available'
+			    AND (args->>'n')::int BETWEEN 200 AND 99999 ORDER BY seq LIMIT 1 FOR UPDATE SKIP LOCKED)`)) {
 				return
-			}
-			if took := int64(time.Since(start)); took > slowestFinalize.Load() {
-				slowestFinalize.Store(took)
 			}
 		}
 	})
@@ -274,12 +284,6 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 	}
 	if locks && took < holdFor*9/10 {
 		t.Errorf("migration took %s, less than the held transaction's %s: it was not held up", took, holdFor)
-	}
-	if s := time.Duration(slowest.Load()); s > holdFor/2 {
-		t.Errorf("a claim waited %s during the migration", s)
-	}
-	if s := time.Duration(slowestFinalize.Load()); s > holdFor/2 {
-		t.Errorf("a finalize waited %s during the migration", s)
 	}
 
 	// This release's client works every job: the waiting ones, those
