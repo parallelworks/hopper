@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/hopper"
 	"github.com/parallelworks/hopper/driver"
@@ -182,26 +182,30 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 	if _, err := held.Exec(ctx, archive(`(args->>'n')::int = 5`)); err != nil {
 		t.Fatal(err)
 	}
-	const holdFor = 2 * time.Second
+	const holdFor = 3 * time.Second
+
+	// Claims and finalizes run on a pool of their own, whose sessions'
+	// lock_timeout fails a statement that waits longer than waitBound for a
+	// lock. A lock request queued behind the held transaction holds them up
+	// until it commits, close to holdFor; a migration's own short hold of a
+	// lock, stretched by a loaded host, stays well below the bound.
+	const waitBound = holdFor * 3 / 4
+	trafficConfig := pool.Config()
+	trafficConfig.ConnConfig.RuntimeParams["lock_timeout"] = fmt.Sprintf("%dms", waitBound.Milliseconds())
+	traffic, err := pgxpool.NewWithConfig(ctx, trafficConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var (
 		stop = make(chan struct{})
 		wg   sync.WaitGroup
 	)
-	// bounded runs a claim's or a finalize's statement, which fails if it
-	// waits longer than the bound for a lock. The bound is on lock waits
-	// rather than on the statement's time, which a loaded host stretches
-	// whatever the migration does.
+	// bounded runs a claim's or a finalize's statement on that pool.
 	bounded := func(what, query string) bool {
-		err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, "SELECT set_config('lock_timeout', $1, true)", fmt.Sprintf("%dms", (holdFor/2).Milliseconds())); err != nil {
-				return err
-			}
-			_, err := tx.Exec(ctx, query)
-			return err
-		})
+		_, err := traffic.Exec(ctx, query)
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "55P03" {
-			t.Errorf("a %s waited more than %s for a lock during the migration", what, holdFor/2)
+			t.Errorf("a %s waited more than %s for a lock during the migration", what, waitBound)
 		} else if err != nil {
 			t.Errorf("%s during the migration: %v", what, err)
 		}
@@ -269,6 +273,7 @@ func upgradeUnderTraffic(t *testing.T, from int) {
 	took := time.Since(start)
 	close(stop)
 	wg.Wait()
+	traffic.Close()
 	if err != nil {
 		t.Fatalf("Up under traffic: %v", err)
 	}
