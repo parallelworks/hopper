@@ -71,7 +71,7 @@ func TestUpgradeUnderTraffic(t *testing.T) {
 var releasedSchemas = map[string]int{
 	"0.1.0": 6, "0.1.1": 7, "0.1.2": 7, "0.2.0": 7, "0.3.0": 8, "0.3.1": 8,
 	"0.4.0": 8, "0.5.0": 8, "0.6.0": 9, "0.7.0": 13, "0.8.0": 18, "0.9.0": 20,
-	"0.10.0": 21,
+	"0.10.0": 21, "0.10.1": 21,
 }
 
 // TestReleasedSchemas checks that releasedSchemas has the version the
