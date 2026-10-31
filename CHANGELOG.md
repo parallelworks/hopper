@@ -6,6 +6,13 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.10.2](https://github.com/parallelworks/hopper/compare/v0.10.1...v0.10.2) (2026-10-31)
+
+
+### Bug fixes
+
+* **client:** a workflow whose failed step is retried and completes runs OnSuccess, not OnFailure ([#97](https://github.com/parallelworks/hopper/issues/97)) ([fd35692](https://github.com/parallelworks/hopper/commit/fd356920aa65b738c6a12d0afbfd150554429f8f))
+
 ## [0.10.1](https://github.com/parallelworks/hopper/compare/v0.10.0...v0.10.1) (2026-10-29)
 
 
