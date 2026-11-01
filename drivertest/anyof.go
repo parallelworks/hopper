@@ -221,6 +221,15 @@ func testWorkflowAnyOf[TTx any](t *testing.T, f Fixture[TTx]) {
 	})
 
 	if _, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Jobs: params("bad", 3),
+		Deps: []driver.JobDependency{
+			{Job: 2, DependsOn: 0, AnyOf: 1, OnFailure: driver.DependencyCancel},
+			{Job: 2, DependsOn: 1, AnyOf: 1, OnFailure: driver.DependencyIgnore},
+		},
+	}); err == nil {
+		t.Error("an any-of group whose edges have different policies was inserted")
+	}
+	if _, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
 		Jobs: params("bad", 2),
 		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0, AnyOf: 1 << 15}},
 	}); err == nil {

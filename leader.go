@@ -199,9 +199,16 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			return
 		}
 
-		// The dependents it canceled by cascade are left, as its own jobs
-		// are, to the promotion sweep of this leader's pass.
-		applied, _ = splitCascaded(applied)
+		// The dependents it canceled by cascade are followed up as a
+		// client follows up those of its finalize: one of theirs can wait
+		// on an any-of group the cascade exhausted, which the sweep, from
+		// where its last pass stopped, may not reach in this pass.
+		applied, cascaded := splitCascaded(applied)
+		if len(cascaded) > 0 {
+			if _, err := c.exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: cascaded}); err != nil && ctx.Err() == nil {
+				c.logger.WarnContext(ctx, "hopper: promote dependents of jobs canceled by cascade; the sweep will", "count", len(cascaded), "error", err)
+			}
+		}
 		var retried, discarded int
 		queues := map[string]struct{}{}
 		byID := make(map[JobID]driver.JobFinalize, len(fin))

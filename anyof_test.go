@@ -116,19 +116,19 @@ func TestWorkflowAfterAnyIsChecked(t *testing.T) {
 // a cascade exhausted when the finalizing client follows up, not at the
 // leader's next sweep: s1 waits for s0, and s2 for any of s1, so s0's
 // failure cancels s1 by cascade, which the finalize returns to the client
-// for its follow-up. The leader passes once an hour, after its first.
+// for its follow-up. No client leads: the leader lease is held, for an
+// hour, by a client that does not exist, so no sweep runs.
 func TestWorkflowAfterAnyExhaustedByCascade(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	ctx := context.Background()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_leader (client_id, elected_at, expires_at) VALUES (-1, now(), now() + interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
 	var rec depRecorder
 	workers := hopper.NewWorkers()
 	hopper.AddWorkFunc(workers, depWorker(&rec))
-	tun := fastTuning
-	tun.LeaderInterval, tun.LeaderTTL = time.Hour, time.Hour
-	c := h.startedWith(workers, 4, tun)
-	waitFor(t, c.IsLeader)
-	time.Sleep(300 * time.Millisecond) // the leader's first pass, on an empty schema
+	c := h.started(workers, 4)
 
 	wf := hopper.NewWorkflow("cascade", nil)
 	s0 := wf.Add(depStep{Name: "s0", Fail: true}, nil)
@@ -155,5 +155,8 @@ func TestWorkflowAfterAnyExhaustedByCascade(t *testing.T) {
 	}
 	if rec.get("0/s1") != nil || rec.get("0/s2") != nil {
 		t.Error("a step after the failed step ran")
+	}
+	if c.IsLeader() {
+		t.Error("the client leads, and its sweep may have canceled s2")
 	}
 }

@@ -961,7 +961,8 @@ type JobDependency struct {
 	// number (1 to 32767): Job waits for one job of the group to complete
 	// rather than for all of them to finish. Job's ordinary edges have
 	// zero. All of Job's edges have one OnFailure, which applies to a group
-	// once every job of it has finished without completing.
+	// once every job of it has finished without completing; a workflow
+	// whose group's edges have different ones is rejected.
 	AnyOf int
 }
 

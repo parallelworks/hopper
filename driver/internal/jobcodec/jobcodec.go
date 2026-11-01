@@ -214,12 +214,21 @@ func CheckDependencies(deps []driver.JobDependency, n int) ([]bool, error) {
 	}
 	if anyOf {
 		groups := make(map[[2]int]int, len(deps))
+		policies := map[[2]int]string{}
 		for _, d := range deps {
 			pair := [2]int{d.Job, d.DependsOn}
 			if g, seen := groups[pair]; seen && g != d.AnyOf {
 				return nil, fmt.Errorf("dependency %d -> %d is given in two any-of groups, or in one and as an ordinary edge", d.Job, d.DependsOn)
 			}
 			groups[pair] = d.AnyOf
+			if d.AnyOf == 0 {
+				continue
+			}
+			group, policy := [2]int{d.Job, d.AnyOf}, EdgePolicy(d)
+			if p, seen := policies[group]; seen && p != policy {
+				return nil, fmt.Errorf("any-of group %d of job %d has edges with different OnFailure", d.AnyOf, d.Job)
+			}
+			policies[group] = policy
 		}
 	}
 	return pending, nil

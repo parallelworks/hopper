@@ -2739,8 +2739,10 @@ observability without new machinery.
       recursive step cannot read its own rows in a subquery: the finalize returns the
       jobs it canceled by cascade (`JobFinalized.Cascaded`), and the finalizing client
       follows them up as it does the jobs it finalized, with `WorkflowPromoteReady`,
-      which cancels the dependent; the leader's sweep does for a client that stopped
-      before its follow-up. SQLite's tail, run by a single writer, checks the groups of
+      which cancels the dependent, as the leader's rescue does those of its finalize.
+      The leader's sweep does for a client that stopped before its follow-up, and for
+      the statements that return no such jobs: `JobCancel` and `JobDelete` of a waiting
+      job, `FinishTx`, and the expiry of job leases and of TTLs. SQLite's tail, run by a single writer, checks the groups of
       the jobs its cascade cancels as it goes.
     - **Concurrent steps of a group.** The race is the one of concurrent dependencies:
       the last two steps of a group that fail in concurrent statements each see the

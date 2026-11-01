@@ -235,14 +235,17 @@ edges AS (
 
 // anyOfGroupsSQL returns two CTEs: one, named name+"_edges", of the
 // edges in a group of the jobs in the array dependents, and one, named
-// name, of each of those groups, with its dependent (job_id), its policy
-// (on_failure), whether one of its jobs completed (satisfied) and whether
-// one is live (live). batches is an array that holds the dependents'
-// batches, done the IDs of the jobs that finished in the statement and
-// completed those of them that completed. A job of a group in the live
-// table completed if it is among completed and is live unless it is
-// among done; one gone from it completed unless its result says it
-// failed.
+// name, of each of those groups, with its dependent (job_id), whether its
+// policy is any_cancel (cancels), whether one of its jobs completed
+// (satisfied) and whether one is live (live). A group is its dependent's
+// edges of one number, whatever policy each stores, as SQLite reads it:
+// grouped by policy too, a group whose edges disagree would be split in
+// two, each decided without the other's jobs. batches is an array that
+// holds the dependents' batches, done the IDs of the jobs that finished in
+// the statement and completed those of them that completed. A job of a
+// group in the live table completed if it is among completed and is live
+// unless it is among done; one gone from it completed unless its result
+// says it failed.
 //
 // Each job of the groups is looked up once, in one probe of the live
 // table and one of the results for all of them, which the CTE of
@@ -258,7 +261,7 @@ func anyOfGroupsSQL(name, dependents, batches, done, completed string) string {
   WHERE g.job_id = ANY (` + dependents + `) AND g.any_of IS NOT NULL
 ),
 ` + name + ` AS (
-  SELECT e.job_id, e.on_failure,
+  SELECT e.job_id, bool_or(e.on_failure = 'any_cancel') AS cancels,
     bool_or(CASE WHEN e.depends_on = ANY (m.present) THEN e.depends_on = ANY (` + completed + `)
                  ELSE e.depends_on <> ALL (m.failed) END) AS satisfied,
     bool_or(e.depends_on = ANY (m.present) AND e.depends_on <> ALL (` + done + `)) AS live
@@ -269,20 +272,30 @@ func anyOfGroupsSQL(name, dependents, batches, done, completed string) string {
             WHERE r.batch_id = ANY (` + batches + `) AND r.job_id = ANY (ARRAY(SELECT depends_on FROM ` + name + `_edges))
               AND r.state <> 'completed') AS failed
     OFFSET 0) m
-  GROUP BY e.job_id, e.any_of, e.on_failure
+  GROUP BY e.job_id, e.any_of
 )`
+}
+
+// candidateGroupsSQL is anyOfGroupsSQL of the jobs a CTE named candidates
+// selects, outside a finalize. The dependents' batches are read only for
+// those with a group, so that candidates without one cost no read of
+// their rows.
+func candidateGroupsSQL(name string) string {
+	return anyOfGroupsSQL(name, "ARRAY(SELECT id FROM candidates)",
+		"ARRAY(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = ANY (ARRAY(SELECT job_id FROM "+name+"_edges)))",
+		"'{}'::uuid[]", "'{}'::uuid[]")
 }
 
 // anyOfHolds is true of a row of anyOfGroupsSQL's groups that holds its
 // dependent: none of its jobs completed, and one is live or its policy
 // is any_cancel, which holds the dependent of an exhausted group until it
 // is canceled.
-const anyOfHolds = `NOT satisfied AND (live OR on_failure = 'any_cancel')`
+const anyOfHolds = `NOT satisfied AND (live OR cancels)`
 
 // anyOfExhaustedCancel is true of a row of anyOfGroupsSQL's groups that
 // cancels its dependent: none of its jobs is live or completed, and its
 // policy is any_cancel.
-const anyOfExhaustedCancel = `NOT satisfied AND NOT live AND on_failure = 'any_cancel'`
+const anyOfExhaustedCancel = `NOT satisfied AND NOT live AND cancels`
 
 // resultsSQL records the final state and output of each job of done with
 // a dependent that reads it (StepOpts.Dependencies), for that dependent's
@@ -341,9 +354,7 @@ const resultsClearedSQL = `results_cleared AS (
 func workflowPromoteSQL(candidates string) string {
 	return `
 WITH candidates AS (` + candidates + `),
-` + anyOfGroupsSQL("held", "ARRAY(SELECT id FROM candidates)",
-		"ARRAY(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = ANY (ARRAY(SELECT id FROM candidates)))",
-		"'{}'::uuid[]", "'{}'::uuid[]") + `,
+` + candidateGroupsSQL("held") + `,
 ready AS (
   SELECT j.id FROM {{schema}}.hopper_jobs j
   WHERE j.id = ANY (ARRAY(SELECT id FROM candidates))
@@ -375,9 +386,7 @@ SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
 func workflowCancelExhaustedSQL(candidates string) string {
 	return `
 WITH RECURSIVE candidates AS (` + candidates + `),
-` + anyOfGroupsSQL("candidate", "ARRAY(SELECT id FROM candidates)",
-		"ARRAY(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = ANY (ARRAY(SELECT id FROM candidates)))",
-		"'{}'::uuid[]", "'{}'::uuid[]") + `,
+` + candidateGroupsSQL("candidate") + `,
 finished AS (
   DELETE FROM {{schema}}.hopper_jobs j
   WHERE j.id IN (
