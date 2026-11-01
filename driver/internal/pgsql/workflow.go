@@ -170,6 +170,9 @@ progress_cleared AS (
 ),
 ` + resultsSQL + `,
 ` + batchCallbacksSQL(insertChannelParam) + `,
+held AS (` + anyOfHeldSQL(
+		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY (ARRAY(SELECT id FROM done)))",
+		"ARRAY(SELECT id FROM done)", "ARRAY(SELECT id FROM done WHERE final_state = 'completed')") + `),
 promoted AS (
   UPDATE {{schema}}.hopper_jobs j
   SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
@@ -179,7 +182,7 @@ promoted AS (
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
       WHERE d.job_id = j.id AND d.any_of IS NULL AND x.id NOT IN (SELECT id FROM done))
-    AND ` + anyOfReadySQL("ARRAY(SELECT id FROM done)", "ARRAY(SELECT id FROM done WHERE final_state = 'completed')") + `
+    AND j.id <> ALL (ARRAY(SELECT job_id FROM held))
   RETURNING pg_notify(` + insertChannelParam + `, j.queue)
 ),
 edges AS (
@@ -242,25 +245,28 @@ func anyOfExhaustedSQL(d, batch, failed string) string {
       LIMIT 1) IS NULL`
 }
 
-// anyOfReadySQL is true of a pending job j none of whose any-of groups
-// holds it: each has a job that completed, in the statement (among
-// completed) or before, or has none live, outside done, and lets j run
-// regardless. An exhausted group whose policy is any_cancel holds j until
-// it is canceled.
-func anyOfReadySQL(done, completed string) string {
-	return `(
-      SELECT 1 FROM {{schema}}.hopper_job_deps g
-      WHERE g.job_id = j.id AND coalesce(g.any_of, 0) <> 0
-        AND (g.on_failure = 'any_cancel'
-             OR (EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = g.depends_on) AND g.depends_on <> ALL (` + done + `)))
-        AND (
-          SELECT 1 FROM {{schema}}.hopper_job_deps s
-          WHERE s.job_id = j.id AND coalesce(s.any_of, 0) <> 0 AND coalesce(s.any_of, 0) = g.any_of
-            AND CASE WHEN EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = s.depends_on)
-                     THEN s.depends_on = ANY (` + completed + `)
-                     ELSE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_job_results r
-                                      WHERE r.batch_id = j.batch_id AND r.job_id = s.depends_on AND r.state <> 'completed') END
-          LIMIT 1) IS NULL
+// anyOfHeldSQL selects, of the jobs in the array dependents, those an
+// any-of group holds: none of its jobs completed, in the statement (among
+// completed) or before, and one of them is live, outside done, or its
+// policy is any_cancel, which holds the dependent of an exhausted group
+// until it is canceled. It walks the partial index on the edges in a
+// group, by dependent, which holds nothing of a workflow without groups:
+// as a condition evaluated per candidate instead, its estimate, multiplied
+// by the candidates', put the finalize past jit_above_cost.
+func anyOfHeldSQL(dependents, done, completed string) string {
+	return `
+  SELECT g.job_id FROM {{schema}}.hopper_job_deps g
+  WHERE g.job_id = ANY (` + dependents + `) AND coalesce(g.any_of, 0) <> 0
+    AND (g.on_failure = 'any_cancel'
+         OR (EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = g.depends_on) AND g.depends_on <> ALL (` + done + `)))
+    AND (
+      SELECT 1 FROM {{schema}}.hopper_job_deps s
+      WHERE s.job_id = g.job_id AND coalesce(s.any_of, 0) <> 0 AND coalesce(s.any_of, 0) = g.any_of
+        AND CASE WHEN EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = s.depends_on)
+                 THEN s.depends_on = ANY (` + completed + `)
+                 ELSE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_job_results r
+                                  WHERE r.batch_id = (SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = g.job_id)
+                                    AND r.job_id = s.depends_on AND r.state <> 'completed') END
       LIMIT 1) IS NULL`
 }
 
@@ -321,6 +327,7 @@ const resultsClearedSQL = `results_cleared AS (
 func workflowPromoteSQL(candidates string) string {
 	return `
 WITH candidates AS (` + candidates + `),
+held AS (` + anyOfHeldSQL("ARRAY(SELECT id FROM candidates)", "'{}'::uuid[]", "'{}'::uuid[]") + `),
 ready AS (
   SELECT j.id FROM {{schema}}.hopper_jobs j
   WHERE j.id = ANY (ARRAY(SELECT id FROM candidates))
@@ -328,7 +335,7 @@ ready AS (
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
       WHERE d.job_id = j.id AND d.any_of IS NULL)
-    AND ` + anyOfReadySQL("'{}'::uuid[]", "'{}'::uuid[]") + `
+    AND j.id <> ALL (ARRAY(SELECT job_id FROM held))
   FOR UPDATE OF j SKIP LOCKED
 ),
 promoted AS (
@@ -339,8 +346,9 @@ promoted AS (
 )
 SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
   (SELECT id FROM candidates ORDER BY id DESC LIMIT 1),
-  (SELECT count(*) FROM {{schema}}.hopper_jobs j
-   WHERE j.id = ANY (ARRAY(SELECT id FROM candidates)) AND j.state = 'pending' AND ` + anyOfCancelSQL + `)`
+  (SELECT count(*) FROM {{schema}}.hopper_job_deps g
+   WHERE g.job_id = ANY (ARRAY(SELECT job_id FROM held)) AND coalesce(g.any_of, 0) <> 0 AND g.on_failure = 'any_cancel'
+     AND ` + anyOfExhaustedSQL("g", "(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = g.job_id)", "'{}'::uuid[]") + `)`
 }
 
 // anyOfCancelSQL is true of a job j with an any-of group whose policy is

@@ -2721,12 +2721,12 @@ observability without new machinery.
       check for live dependencies, and require that no group holds the dependent: a
       group holds it while none of its steps completed (in the statement, or before) and
       either one is live (outside the statement's own jobs) or the policy is
-      `any_cancel`. That costs a dependent without groups one probe of an empty partial
-      index (`hopper_job_deps_any_of_job`), and only once every other condition has
-      passed. Each check is a scalar subquery on that index rather than `NOT EXISTS`
-      over the primary key: the planner turned the latter into a hash of every edge,
-      and the estimate of a dependent's edges times a statement's candidates put the
-      finalize past `jit_above_cost`, so a server built with JIT compiled every finalize
+      `any_cancel`. That costs a statement without groups one probe of an empty partial index
+      (`hopper_job_deps_any_of_job`) per candidate. The statement selects the candidates a group holds in a CTE of its own
+      (`held`), walking that index from the candidates, and the promotion leaves them
+      out: as a condition evaluated per candidate, the planner turned it into a hash of
+      every edge, or its estimate times the candidates' put the finalize past
+      `jit_above_cost`, so that a server built with JIT compiled every finalize
       (hopperbench's `workflow` at half speed in CI). The tail
       cancels the dependent of a canceled or discarded job whose `any_cancel` group is
       exhausted, in the cascade's first step; a group exhausted by a job the cascade
