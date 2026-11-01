@@ -130,7 +130,14 @@ const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
 //
 // The cascade cancels a dependent of a job that failed in the statement
 // through an any_cancel group when one of its any_cancel groups is
-// exhausted (exhausted), and promoted skips one a group holds (held). Its
+// exhausted (exhausted). promoted leaves a dependent with a group to the
+// follow-up (WorkflowPromoteReady), whatever its groups say (grouped): a
+// group is satisfied by any one of its jobs, so two of them completing in
+// concurrent statements would each promote the dependent, and the second
+// would wait for the first's row lock, the whole of its statement held up
+// by a caller's transaction held open (CompleteTx, FinishTx). The
+// follow-up skips a row another transaction holds, which that
+// transaction's own follow-up, or the leader's sweep, decides. Its
 // recursive step, which cannot read its own rows in a subquery, follows
 // cancel edges only: a group exhausted by a job it canceled holds that
 // group's dependent, which the follow-up of the jobs the cascade canceled
@@ -183,10 +190,8 @@ progress_cleared AS (
 ),
 ` + resultsSQL + `,
 ` + batchCallbacksSQL(insertChannelParam) + `,
-` + anyOfGroupsSQL("held",
-		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY (ARRAY(SELECT id FROM done)))",
-		"ARRAY(SELECT batch_id FROM done)",
-		"ARRAY(SELECT id FROM done)", "ARRAY(SELECT id FROM done WHERE final_state = 'completed')") + `,
+` + anyOfEdgesSQL("grouped",
+		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY (ARRAY(SELECT id FROM done)))") + `,
 promoted AS (
   UPDATE {{schema}}.hopper_jobs j
   SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
@@ -195,8 +200,8 @@ promoted AS (
     AND j.id NOT IN (SELECT id FROM cascaded)
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
-      WHERE d.job_id = j.id AND d.any_of IS NULL AND x.id NOT IN (SELECT id FROM done))
-    AND j.id <> ALL (ARRAY(SELECT job_id FROM held WHERE ` + anyOfHolds + `))
+      WHERE d.job_id = j.id AND x.id NOT IN (SELECT id FROM done))
+    AND j.id <> ALL (ARRAY(SELECT job_id FROM grouped_edges))
   RETURNING pg_notify(` + insertChannelParam + `, j.queue)
 ),
 edges AS (
@@ -256,10 +261,7 @@ edges AS (
 // planned at millions, past jit_above_cost, where JIT compiled the
 // leader's statements for seconds.
 func anyOfGroupsSQL(name, dependents, batches, done, completed string) string {
-	return name + `_edges AS MATERIALIZED (
-  SELECT g.job_id, g.any_of, g.on_failure, g.depends_on FROM {{schema}}.hopper_job_deps g
-  WHERE g.job_id = ANY (` + dependents + `) AND g.any_of IS NOT NULL
-),
+	return anyOfEdgesSQL(name, dependents) + `,
 ` + name + ` AS (
   SELECT e.job_id, bool_or(e.on_failure = 'any_cancel') AS cancels,
     bool_or(CASE WHEN e.depends_on = ANY (m.present) THEN e.depends_on = ANY (` + completed + `)
@@ -284,6 +286,16 @@ func candidateGroupsSQL(name string) string {
 	return anyOfGroupsSQL(name, "ARRAY(SELECT id FROM candidates)",
 		"ARRAY(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = ANY (ARRAY(SELECT job_id FROM "+name+"_edges)))",
 		"'{}'::uuid[]", "'{}'::uuid[]")
+}
+
+// anyOfEdgesSQL returns a CTE, named name+"_edges", of the edges in a
+// group of the jobs in the array dependents, materialized: a lookup of
+// hopper_job_deps_any_of_job, which is empty without groups.
+func anyOfEdgesSQL(name, dependents string) string {
+	return name + `_edges AS MATERIALIZED (
+  SELECT g.job_id, g.any_of, g.on_failure, g.depends_on FROM {{schema}}.hopper_job_deps g
+  WHERE g.job_id = ANY (` + dependents + `) AND g.any_of IS NOT NULL
+)`
 }
 
 // anyOfHolds is true of a row of anyOfGroupsSQL's groups that holds its

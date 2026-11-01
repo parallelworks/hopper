@@ -2720,11 +2720,22 @@ observability without new machinery.
       that reads or has it in a group is one probe of the partial index on such edges by
       dependency; whether one reads it, for the output, is a second only for the jobs the
       first finds, so a workflow with neither records nothing, as before.
-    - The tail's promotion and `WorkflowPromoteReady` leave a group's edges out of the
-      check for live dependencies, and require that no group holds the dependent: a
-      group holds it while none of its steps completed (in the statement, or before) and
-      either one is live (outside the statement's own jobs) or the policy is
-      `any_cancel`. A statement reads the group edges of its dependents once, from
+    - The tail's promotion leaves a dependent with a group alone, whatever its groups
+      say, to the finalizing client's follow-up. A group is satisfied by any one of its
+      steps, so two of them completing in concurrent statements would each promote the
+      dependent, and the second would wait for the first's row lock: held open in a
+      caller's transaction (`CompleteTx`, `FinishTx`), it would hold up the other's
+      whole flush, which a fan-in of ordinary edges never does, since each statement
+      sees the other dependency live. `WorkflowPromoteReady` leaves a group's edges out
+      of the check for live dependencies, and requires that no group holds the
+      dependent: a group holds it while none of its steps completed and either one is
+      live or the policy is `any_cancel`. It skips a dependent's row another
+      transaction holds, which that transaction's follow-up decides once it commits,
+      or the leader's sweep. A dependent with a group is so promoted one follow-up
+      after its last dependency finishes, and by the sweep, within a leader interval,
+      when the statement that finished it has no follow-up (the paths listed below for
+      the cascade). The tail's promotion of a dependent without groups is unchanged.
+      A statement reads the group edges of its dependents once, from
       `hopper_job_deps_any_of_job`, the partial index on the edges in a group by
       dependent, which is empty without groups, so a statement without groups costs one
       probe of it; it then looks the groups' steps up in one probe of the live table and
@@ -2746,7 +2757,15 @@ observability without new machinery.
       sweep bounds the delay: it cancels such a dependent within a leader interval (5 s
       by default) of the cascade, or a few with more pending workflow steps than one
       pass walks. SQLite's tail, run by a single writer, checks the groups of
-      the jobs its cascade cancels as it goes.
+      the jobs its cascade cancels as it goes, and promotes a dependent whose group is
+      satisfied itself, since no other write can hold its row.
+    - **Group size.** The group check compares each edge of a group with arrays of the
+      group's steps, which Postgres scans linearly, so a statement that decides a group
+      costs its size squared, and each step that finishes after it does too. Measured
+      on Postgres 18, one step's discard cost 7 ms with a group of 1,000 steps, 51 ms
+      with 4,000 and 183 ms with 8,000, and its follow-up 19 to 93 ms. Groups are best
+      kept to a few hundred steps; a form that looks each step up in a hash, by a join,
+      is a planned follow-up.
     - **Concurrent steps of a group.** The race is the one of concurrent dependencies:
       the last two steps of a group that fail in concurrent statements each see the
       other live, so neither cancels the dependent, and a step of a group that completes

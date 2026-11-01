@@ -2,6 +2,7 @@ package hopper_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -158,5 +159,40 @@ func TestWorkflowAfterAnyExhaustedByCascade(t *testing.T) {
 	}
 	if c.IsLeader() {
 		t.Error("the client leads, and its sweep may have canceled s2")
+	}
+}
+
+// TestLeaseFinishCancelsAnyOfExhaustedByCascade is
+// TestWorkflowAfterAnyExhaustedByCascade for a leased step: Finish follows
+// up the jobs its finalize canceled by cascade, so s2 is canceled by the
+// time it returns, with no leader to sweep.
+func TestLeaseFinishCancelsAnyOfExhaustedByCascade(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_leader (client_id, elected_at, expires_at) VALUES (-1, now(), now() + interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	c := leaseClient(h, &hopper.Config{})
+	remote := &hopper.StepOpts{Insert: &hopper.InsertOpts{Queue: remoteQueue}}
+	wf := hopper.NewWorkflow("leased", nil)
+	s0 := wf.Add(remoteJob{N: 0}, remote)
+	s1 := wf.Add(remoteJob{N: 1}, &hopper.StepOpts{After: []hopper.Step{s0}, Insert: remote.Insert})
+	wf.Add(remoteJob{N: 2}, &hopper.StepOpts{AfterAny: [][]hopper.Step{{s1}}, Insert: remote.Insert})
+	res, err := c.InsertWorkflow(ctx, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l, err := c.Leases().Claim(ctx, res.Jobs[0].Job.ID, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Leases().Finish(ctx, l.Token, hopper.LeaseResult{Err: hopper.Cancel(errors.New("gone"))}); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []hopper.JobState{hopper.JobStateDiscarded, hopper.JobStateCanceled, hopper.JobStateCanceled} {
+		if j, err := c.JobGet(ctx, res.Jobs[i].Job.ID); err != nil || j.State != want {
+			t.Errorf("s%d after Finish is %v (%v); want %s", i, j.State, err, want)
+		}
 	}
 }

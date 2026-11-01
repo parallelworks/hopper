@@ -48,10 +48,21 @@ func (a anyOfFixture) claimAll() map[driver.JobID]*driver.JobRow {
 	return out
 }
 
+// finish finalizes a job and follows it up as a client does: an engine
+// that locks rows leaves the promotion of a dependent with a group to the
+// follow-up.
 func (a anyOfFixture) finish(id driver.JobID, state driver.JobState) {
 	a.t.Helper()
-	if applied := finalizeCurrent(a.ctx, a.t, a.exec, driver.JobFinalize{ID: id, AttemptedBy: a.clientID, State: state, Archive: true}); len(applied) != 1 {
+	result := driver.JobFinalize{ID: id, AttemptedBy: a.clientID, State: state, Archive: true}
+	out, err := a.exec.JobFinalizeMany(a.ctx, driver.JobFinalizeParams{Jobs: withFences(a.ctx, a.t, a.exec, []driver.JobFinalize{result})})
+	if err != nil {
+		a.t.Fatal(err)
+	}
+	if applied := appliedIDs(out); len(applied) != 1 {
 		a.t.Fatalf("finalize %s as %s applied %v", id, state, applied)
+	}
+	if _, err := a.exec.WorkflowPromoteReady(a.ctx, driver.WorkflowPromoteParams{DependsOn: append(appliedIDs(out), cascadedIDs(out)...)}); err != nil {
+		a.t.Fatal(err)
 	}
 }
 
@@ -618,5 +629,90 @@ func testWorkflowsAnyOfConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	if n := f.CountEdges(ctx, t, d); n != 0 {
 		t.Errorf("edges left = %d, want 0", n)
+	}
+}
+
+// testWorkflowAnyOfHeld finalizes two jobs of one any-of group, each of
+// which satisfies it: one in a caller's transaction held open, as
+// CompleteTx does, the other in a client's flush. A finalize does not
+// promote a dependent with a group, so the flush, and its follow-up, which
+// skips rows another transaction holds, do not wait for the held one; the
+// follow-up promotes the dependent, once, whether the transaction then
+// commits or rolls back, and the held finalize's own follow-up after its
+// commit finds nothing more to do. On an engine that runs one writer at a
+// time, the flush waits for the transaction instead, as any write does.
+func testWorkflowAnyOfHeld[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	if singleWriter(d) {
+		t.Skip("one writer at a time: a write waits for a transaction held open")
+	}
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	for _, end := range []string{"commit", "rollback"} {
+		t.Run(end, func(t *testing.T) {
+			wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+				Name: "held", Jobs: params("held", 3),
+				Deps: []driver.JobDependency{{Job: 2, DependsOn: 0, AnyOf: 1}, {Job: 2, DependsOn: 1, AnyOf: 1}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			x, y, dep := wf.Jobs[0].Job.ID, wf.Jobs[1].Job.ID, wf.Jobs[2].Job.ID
+			// The claim takes the previous subtest's dependent too.
+			claimed := map[driver.JobID]bool{}
+			for _, j := range claim(ctx, t, exec, clientID, 10) {
+				claimed[j.ID] = true
+			}
+			if !claimed[x] || !claimed[y] {
+				t.Fatalf("claimed %v, want both jobs of the group", claimed)
+			}
+			completed := func(id driver.JobID) driver.JobFinalize {
+				return driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateCompleted, Archive: true}
+			}
+			var promoted int64
+			promote := func(c context.Context, dependsOn ...driver.JobID) error {
+				res, err := exec.WorkflowPromoteReady(c, driver.WorkflowPromoteParams{DependsOn: dependsOn})
+				promoted += res.Promoted
+				return err
+			}
+
+			tx, commit, rollback := f.Begin(ctx, t, d)
+			defer rollback() //nolint:errcheck // already ended on the happy path
+			if applied := finalizeCurrent(ctx, t, d.UnwrapTx(tx), completed(x)); len(applied) != 1 {
+				t.Fatalf("finalize in the transaction applied %v", applied)
+			}
+			fctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			out, err := exec.JobFinalizeMany(fctx, driver.JobFinalizeParams{Jobs: withFences(ctx, t, exec, []driver.JobFinalize{completed(y)})})
+			if err != nil || len(appliedIDs(out)) != 1 {
+				t.Fatalf("finalize of the other job of the group while the transaction is held open = %v, %v; want it not to wait", out, err)
+			}
+			if err := promote(fctx, y); err != nil {
+				t.Fatalf("follow-up while the transaction is held open: %v; want it not to wait", err)
+			}
+			if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateAvailable {
+				t.Fatalf("dependent after the follow-up = %+v, %v; want it promoted", j, err)
+			}
+			if end == "commit" {
+				if err := commit(); err != nil {
+					t.Fatal(err)
+				}
+				if err := promote(ctx, x); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{Limit: 1000}); err != nil {
+				t.Fatal(err)
+			}
+			if promoted != 1 {
+				t.Errorf("follow-ups promoted %d, want 1", promoted)
+			}
+			if j, err := exec.JobGet(ctx, dep); err != nil || j.State != driver.JobStateAvailable {
+				t.Errorf("dependent = %+v, %v; want it available", j, err)
+			}
+		})
 	}
 }
