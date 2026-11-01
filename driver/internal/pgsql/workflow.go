@@ -147,7 +147,7 @@ func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.on_failure = 'any_cancel'"+
 			" AND d.depends_on = ANY (ARRAY(SELECT id FROM finished WHERE final_state IN ('canceled', 'discarded'))))",
 		"ARRAY(SELECT batch_id FROM finished)",
-		"ARRAY(SELECT id FROM finished WHERE final_state IN ('canceled', 'discarded'))", "'{}'::uuid[]") + `,
+		"ARRAY(SELECT id FROM finished WHERE final_state IN ('canceled', 'discarded'))") + `,
 cascade AS (
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN finished f ON d.depends_on = f.id
   WHERE f.final_state IN ('canceled', 'discarded')
@@ -223,9 +223,9 @@ edges AS (
 // dependent once the group's jobs have all finished, counts it.
 //
 // A statement sees the rows it finalizes in the live table still, so
-// anyOfGroupsSQL takes the IDs of those that finished or completed in it,
-// as arrays: a job of a group in the live table is live unless it is
-// among them. A group's edges are found through hopper_job_deps_any_of_job,
+// anyOfGroupsSQL takes the IDs of those that finished in it, as an array:
+// a job of a group in the live table is live unless it is among them. A
+// group's edges are found through hopper_job_deps_any_of_job,
 // the partial index on the edges in a group (any_of IS NOT NULL) by
 // dependent, which is empty for workflows without groups, so they cost a
 // probe of it per statement. With coalesce(any_of, 0) <> 0 as its
@@ -246,10 +246,11 @@ edges AS (
 // edges of one number, whatever policy each stores, as SQLite reads it:
 // grouped by policy too, a group whose edges disagree would be split in
 // two, each decided without the other's jobs. batches is an array that
-// holds the dependents' batches, done the IDs of the jobs that finished in
-// the statement and completed those of them that completed. A job of a
-// group in the live table completed if it is among completed and is live
-// unless it is among done; one gone from it completed unless its result
+// holds the dependents' batches, and done the IDs of the jobs that finished
+// in the statement. A job of a group in the live table has not completed,
+// and is live unless it is among done: no statement decides a group from
+// the jobs it completes itself, since the finalize leaves a dependent with
+// a group to the follow-up. One gone from it completed unless its result
 // says it failed.
 //
 // Each job of the groups is looked up once, in one probe of the live
@@ -260,12 +261,11 @@ edges AS (
 // dependents times four hundred edges each without statistics, and
 // planned at millions, past jit_above_cost, where JIT compiled the
 // leader's statements for seconds.
-func anyOfGroupsSQL(name, dependents, batches, done, completed string) string {
+func anyOfGroupsSQL(name, dependents, batches, done string) string {
 	return anyOfEdgesSQL(name, dependents) + `,
 ` + name + ` AS (
   SELECT e.job_id, bool_or(e.on_failure = 'any_cancel') AS cancels,
-    bool_or(CASE WHEN e.depends_on = ANY (m.present) THEN e.depends_on = ANY (` + completed + `)
-                 ELSE e.depends_on <> ALL (m.failed) END) AS satisfied,
+    bool_or(e.depends_on <> ALL (m.present) AND e.depends_on <> ALL (m.failed)) AS satisfied,
     bool_or(e.depends_on = ANY (m.present) AND e.depends_on <> ALL (` + done + `)) AS live
   FROM ` + name + `_edges e, (
     SELECT ARRAY(SELECT x.id FROM {{schema}}.hopper_jobs x
@@ -285,7 +285,7 @@ func anyOfGroupsSQL(name, dependents, batches, done, completed string) string {
 func candidateGroupsSQL(name string) string {
 	return anyOfGroupsSQL(name, "ARRAY(SELECT id FROM candidates)",
 		"ARRAY(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = ANY (ARRAY(SELECT job_id FROM "+name+"_edges)))",
-		"'{}'::uuid[]", "'{}'::uuid[]")
+		"'{}'::uuid[]")
 }
 
 // anyOfEdgesSQL returns a CTE, named name+"_edges", of the edges in a

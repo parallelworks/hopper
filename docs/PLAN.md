@@ -2599,7 +2599,8 @@ observability without new machinery.
   unsatisfied edges, deleted as dependents finalize, and the statement that finalizes
   a job is the one that acts on its dependents: it promotes those whose dependencies
   have all left the live table (including the ones finalized in the same statement)
-  to `available` and notifies their queues, and it cancels, transitively, the
+  to `available` and notifies their queues (on Postgres, all but those with an any-of
+  group, which it leaves to the follow-up below), and it cancels, transitively, the
   dependents of a canceled or discarded job whose edge says `cancel` (the default;
   `ignore` lets the dependent run once its dependencies have finished, whatever their
   outcome). Canceled dependents go to history with a "dependency failed" error and
@@ -2750,7 +2751,8 @@ observability without new machinery.
       recursive step cannot read its own rows in a subquery: the finalize returns the
       jobs it canceled by cascade (`JobFinalized.Cascaded`), and the finalizing client
       follows them up as it does the jobs it finalized, with `WorkflowPromoteReady`,
-      which cancels the dependent, as the leader's rescue does those of its finalize.
+      which cancels the dependent, as the leader's rescue does the jobs of a workflow
+      it discarded and those its finalize canceled by cascade.
       The leader's sweep does for a client that stopped before its follow-up, and for
       the statements that return no such jobs: `JobCancel` and `JobDelete` of a waiting
       job, `FinishTx`, and the expiry of job leases and of TTLs. Those are rare, and the
@@ -2768,11 +2770,13 @@ observability without new machinery.
       is a planned follow-up.
     - **Concurrent steps of a group.** The race is the one of concurrent dependencies:
       the last two steps of a group that fail in concurrent statements each see the
-      other live, so neither cancels the dependent, and a step of a group that completes
-      while the dependent's ordinary dependency finishes each sees the other live, so
-      neither promotes it. `WorkflowPromoteReady`, which each client runs after its
-      flush commits and the leader sweeps with, promotes the latter, and counts the
-      exhausted `any_cancel` groups that hold candidates; only when there are any, a
+      other live, so neither cancels the dependent; a step of a group that completes
+      while the dependent's ordinary dependency finishes leaves the dependent to the
+      follow-ups, as every finalize on Postgres does, and the first of them may find
+      the other statement uncommitted. `WorkflowPromoteReady`, which each client runs
+      after its flush commits and the leader sweeps with, promotes the latter in the
+      follow-up that runs second, and counts the exhausted `any_cancel` groups that
+      hold candidates; only when there are any, a
       second statement cancels them (`FOR UPDATE SKIP LOCKED`, the condition rechecked,
       with the finalize tail, waiting only briefly for rows another transaction holds)
       and the dependents of what it canceled are considered the same way, until it

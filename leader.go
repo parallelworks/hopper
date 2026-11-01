@@ -162,6 +162,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 
 		fin := make([]driver.JobFinalize, len(candidates))
 		queueOf := make(map[JobID]string, len(candidates))
+		// inBatch holds the jobs of a batch the rescue discards, whose
+		// dependents it follows up.
+		inBatch := map[JobID]struct{}{}
 		noBatches := true
 		for i, cand := range candidates {
 			j := cand.Job
@@ -180,6 +183,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			}
 			if j.Attempt >= j.MaxAttempts {
 				f.State = driver.JobStateDiscarded
+				if !j.BatchID.IsZero() {
+					inBatch[j.ID] = struct{}{}
+				}
 			}
 			fin[i] = f
 			queueOf[j.ID] = j.Queue
@@ -199,14 +205,22 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			return
 		}
 
-		// The dependents it canceled by cascade are followed up as a
-		// client follows up those of its finalize: one of theirs can wait
-		// on an any-of group the cascade exhausted, which the sweep, from
-		// where its last pass stopped, may not reach in this pass.
+		// The jobs it discarded of a batch, and the dependents it canceled
+		// by cascade, are followed up as a client follows up those of its
+		// finalize: the finalize leaves a dependent with an any-of group to
+		// the follow-up, and one of the cascade's own dependents can wait on
+		// a group the cascade exhausted, which the sweep, from where its last
+		// pass stopped, may not reach in this pass.
 		applied, cascaded := splitCascaded(applied)
-		if len(cascaded) > 0 {
-			if _, err := c.exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: cascaded}); err != nil && ctx.Err() == nil {
-				c.logger.WarnContext(ctx, "hopper: promote dependents of jobs canceled by cascade; the sweep will", "count", len(cascaded), "error", err)
+		var followUp []JobID
+		for _, a := range applied {
+			if _, ok := inBatch[a.ID]; ok {
+				followUp = append(followUp, a.ID)
+			}
+		}
+		if followUp = append(followUp, cascaded...); len(followUp) > 0 {
+			if _, err := c.exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: followUp}); err != nil && ctx.Err() == nil {
+				c.logger.WarnContext(ctx, "hopper: promote dependents of rescued jobs; the sweep will", "count", len(followUp), "error", err)
 			}
 		}
 		var retried, discarded int

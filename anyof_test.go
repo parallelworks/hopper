@@ -191,8 +191,14 @@ func TestLeaseFinishCancelsAnyOfExhaustedByCascade(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, want := range []hopper.JobState{hopper.JobStateDiscarded, hopper.JobStateCanceled, hopper.JobStateCanceled} {
-		if j, err := c.JobGet(ctx, res.Jobs[i].Job.ID); err != nil || j.State != want {
-			t.Errorf("s%d after Finish is %v (%v); want %s", i, j.State, err, want)
+		j, err := c.JobGet(ctx, res.Jobs[i].Job.ID)
+		if err != nil {
+			t.Errorf("get s%d: %v", i, err)
+		} else if j.State != want {
+			t.Errorf("s%d after Finish is %s; want %s", i, j.State, want)
 		}
+	}
+	if c.IsLeader() {
+		t.Error("the client leads, and its sweep may have canceled s2")
 	}
 }

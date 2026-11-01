@@ -359,11 +359,14 @@ type Executor interface {
 	// WorkflowPromoteReady makes pending jobs whose dependencies have all
 	// finalized claimable. The statement that finalizes a job promotes its
 	// dependents itself, but two dependencies finalized by concurrent
-	// transactions each see the other still live, and neither promotes. A
-	// client therefore promotes the dependents of the jobs it has just
-	// finalized, and the leader sweeps up the rest. It likewise cancels,
-	// with their dependents, the pending jobs that an exhausted any-of group
-	// whose policy is cancel holds (JobDependency.AnyOf), which concurrent
+	// transactions each see the other still live, and neither promotes;
+	// and an engine that locks rows may leave every dependent with an
+	// any-of group (JobDependency.AnyOf) to this call, since two jobs of a
+	// group completing at once would each promote it, the second waiting
+	// for the first's row lock. A client therefore promotes the dependents
+	// of the jobs it has just finalized, and the leader sweeps up the rest.
+	// It likewise cancels, with their dependents, the pending jobs that an
+	// exhausted any-of group whose policy is cancel holds, which concurrent
 	// finalizes of the group's last jobs each left to the other.
 	WorkflowPromoteReady(ctx context.Context, params WorkflowPromoteParams) (WorkflowPromoteResult, error)
 

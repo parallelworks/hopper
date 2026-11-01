@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -187,8 +188,9 @@ func TestRescueEndsAPassThatRescuedNothing(t *testing.T) {
 	}
 }
 
-// cascadeRescueExec has one rescue candidate on its last attempt, whose
-// discard cancels a dependent by cascade, and records the follow-ups.
+// cascadeRescueExec has one rescue candidate of a workflow on its last
+// attempt, whose discard cancels a dependent by cascade, and records the
+// follow-ups.
 type cascadeRescueExec struct {
 	driver.Executor
 	reads    int
@@ -211,14 +213,19 @@ func (e *cascadeRescueExec) WorkflowPromoteReady(_ context.Context, p driver.Wor
 	return driver.WorkflowPromoteResult{}, nil
 }
 
-// The rescue follows up the jobs its finalize canceled by cascade, as a
-// client's finalizer does, and counts only its own jobs as rescued.
+// The rescue follows up the job of a workflow it discarded and the jobs its
+// finalize canceled by cascade, as a client's finalizer does, and counts
+// only its own jobs as rescued.
 func TestRescueFollowsUpItsCascade(t *testing.T) {
 	exec := &cascadeRescueExec{}
-	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.DiscardHandler), tuning: defaultTuning, events: &eventBus{}}
+	var logs strings.Builder
+	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.NewTextHandler(&logs, nil)), tuning: defaultTuning, events: &eventBus{}}
 	c.clientID.Store(2)
 	c.rescue(context.Background())
-	if len(exec.promoted) != 1 || !slices.Equal(exec.promoted[0], []driver.JobID{{2}}) {
-		t.Errorf("follow-ups = %v, want one of the job canceled by cascade", exec.promoted)
+	if len(exec.promoted) != 1 || !slices.Equal(exec.promoted[0], []driver.JobID{{1}, {2}}) {
+		t.Errorf("follow-ups = %v, want one of the discarded job and the job canceled by cascade", exec.promoted)
+	}
+	if !strings.Contains(logs.String(), "retried=0 discarded=1 dropped=0") {
+		t.Errorf("rescue logged %q, want the discarded job alone counted", logs.String())
 	}
 }

@@ -19,6 +19,9 @@ type anyOfFixture struct {
 	t        *testing.T
 	exec     driver.Executor
 	clientID int64
+	// singleWriter is set for an engine that runs one writer at a time,
+	// whose finalize decides a dependent's groups itself.
+	singleWriter bool
 }
 
 func (a anyOfFixture) insert(name string, n int, deps ...driver.JobDependency) (driver.JobID, []driver.JobID) {
@@ -50,7 +53,9 @@ func (a anyOfFixture) claimAll() map[driver.JobID]*driver.JobRow {
 
 // finish finalizes a job and follows it up as a client does: an engine
 // that locks rows leaves the promotion of a dependent with a group to the
-// follow-up.
+// follow-up. On an engine that runs one writer at a time, whose finalize
+// promotes such a dependent itself, it does not follow up, so that the
+// tests check the finalize alone.
 func (a anyOfFixture) finish(id driver.JobID, state driver.JobState) {
 	a.t.Helper()
 	result := driver.JobFinalize{ID: id, AttemptedBy: a.clientID, State: state, Archive: true}
@@ -60,6 +65,9 @@ func (a anyOfFixture) finish(id driver.JobID, state driver.JobState) {
 	}
 	if applied := appliedIDs(out); len(applied) != 1 {
 		a.t.Fatalf("finalize %s as %s applied %v", id, state, applied)
+	}
+	if a.singleWriter {
+		return
 	}
 	if _, err := a.exec.WorkflowPromoteReady(a.ctx, driver.WorkflowPromoteParams{DependsOn: append(appliedIDs(out), cascadedIDs(out)...)}); err != nil {
 		a.t.Fatal(err)
@@ -93,7 +101,7 @@ func testWorkflowAnyOf[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
-	a := anyOfFixture{ctx: ctx, t: t, exec: exec, clientID: register(ctx, t, exec)}
+	a := anyOfFixture{ctx: ctx, t: t, exec: exec, clientID: register(ctx, t, exec), singleWriter: singleWriter(d)}
 
 	t.Run("first completion", func(t *testing.T) {
 		a := a
@@ -260,7 +268,7 @@ func testWorkflowAnyOfConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
-	a := anyOfFixture{ctx: ctx, t: t, exec: exec, clientID: register(ctx, t, exec)}
+	a := anyOfFixture{ctx: ctx, t: t, exec: exec, clientID: register(ctx, t, exec), singleWriter: singleWriter(d)}
 	promote := func(dependsOn ...driver.JobID) driver.WorkflowPromoteResult {
 		t.Helper()
 		res, err := exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: dependsOn, Limit: 10})
