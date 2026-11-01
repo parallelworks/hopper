@@ -1438,7 +1438,7 @@ func TestClaimDependenciesIgnoreStaleStatistics(t *testing.T) {
 	first := map[string]string{
 		"hopper_job_deps_pkey": "job_id", "hopper_job_deps_reads_job": "job_id",
 		"hopper_job_deps_depends_on": "depends_on", "hopper_job_deps_reads_depends_on": "depends_on",
-		"hopper_job_deps_results_depends_on": "depends_on",
+		"hopper_job_deps_results_depends_on": "depends_on", "hopper_job_deps_any_of_job": "job_id",
 	}
 	explained := 0
 	for i, q := range statements {

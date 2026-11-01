@@ -17,6 +17,13 @@
 -- so it stays one probe; the previous release's probe of the edges that
 -- read still matches it.
 --
+-- hopper_job_deps_any_of_job indexes the edges in a group by dependent,
+-- for the promotion's and the cancel's lookups of a dependent's groups: it
+-- is empty for workflows without groups, so those lookups cost them
+-- nothing. Its predicate is coalesce(any_of, 0) <> 0, which the lookups
+-- name, and which a lookup of the edges that read by dependency does not
+-- match.
+--
 -- Adding the column changes only the catalog, and building the index
 -- reads hopper_job_deps, which holds only the edges of the workflows in
 -- flight. Both need an ACCESS EXCLUSIVE lock on hopper_job_deps, which
@@ -38,6 +45,7 @@ BEGIN
       ALTER TABLE hopper_job_deps ADD COLUMN any_of smallint;
       CREATE INDEX hopper_job_deps_results_depends_on ON hopper_job_deps (depends_on) WHERE reads OR any_of IS NOT NULL;
       DROP INDEX hopper_job_deps_reads_depends_on;
+      CREATE INDEX hopper_job_deps_any_of_job ON hopper_job_deps (job_id) WHERE coalesce(any_of, 0) <> 0;
       EXIT;
     EXCEPTION WHEN lock_not_available THEN
       tries := tries + 1;

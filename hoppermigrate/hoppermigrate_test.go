@@ -1539,7 +1539,7 @@ func TestAnyOfEdgesUpgrade(t *testing.T) {
 	if err := <-upgraded; err != nil {
 		t.Fatal(err)
 	}
-	if !column() || !exists("hopper_job_deps_results_depends_on") || exists("hopper_job_deps_reads_depends_on") {
+	if !column() || !exists("hopper_job_deps_results_depends_on") || !exists("hopper_job_deps_any_of_job") || exists("hopper_job_deps_reads_depends_on") {
 		t.Error("v23 did not add any_of and rebuild the index on the edges that record results")
 	}
 	var edges int
@@ -1552,7 +1552,7 @@ func TestAnyOfEdgesUpgrade(t *testing.T) {
 	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 22}); err != nil {
 		t.Fatal(err)
 	}
-	if column() || !exists("hopper_job_deps_reads_depends_on") || exists("hopper_job_deps_results_depends_on") {
+	if column() || !exists("hopper_job_deps_reads_depends_on") || exists("hopper_job_deps_results_depends_on") || exists("hopper_job_deps_any_of_job") {
 		t.Error("v23's down script did not drop any_of and build hopper_job_deps_reads_depends_on back")
 	}
 	var policies []string

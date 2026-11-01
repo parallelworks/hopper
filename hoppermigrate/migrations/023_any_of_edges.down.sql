@@ -16,6 +16,7 @@ BEGIN
       UPDATE hopper_job_deps SET on_failure = 'ignore' WHERE any_of IS NOT NULL;
       CREATE INDEX hopper_job_deps_reads_depends_on ON hopper_job_deps (depends_on) WHERE reads;
       DROP INDEX hopper_job_deps_results_depends_on;
+      DROP INDEX hopper_job_deps_any_of_job;
       ALTER TABLE hopper_job_deps DROP COLUMN any_of;
       EXIT;
     EXCEPTION WHEN lock_not_available THEN

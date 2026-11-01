@@ -206,12 +206,17 @@ edges AS (
 // among them. A group's jobs are read by the dependent's edges, by primary
 // key, and each job by primary key, in the live table and in the results,
 // so a dependent without groups costs one more read of its own edges, and
-// only once every other condition has passed. The edges are filtered by
-// coalesce(any_of, 0), which the partial index on the edges that read or
-// are in a group does not match, as the claim filters by
-// coalesce(reads, false): by any_of itself, statistics taken while no edge
-// was in a group made that index look empty, and the planner walked it
-// whole, filtering it by the dependent. Each check is a scalar subquery,
+// only once every other condition has passed. A group's edges are found
+// through hopper_job_deps_any_of_job, the partial index on the edges in a
+// group by dependent, which is empty for workflows without groups, so a
+// lookup there costs, and is estimated to cost, next to nothing: through
+// the primary key, the estimate of a dependent's edges times the
+// candidates of a statement put it past jit_above_cost, and a server built
+// with JIT compiled every finalize. The condition is coalesce(any_of, 0)
+// <> 0, the index's predicate, which the partial index on the edges that
+// read or are in a group, by dependency, does not match: by any_of itself,
+// statistics taken while no edge was in a group made that one look empty,
+// and the planner walked it whole, filtering it by the dependent. Each check is a scalar subquery,
 // (SELECT 1 ... LIMIT 1) IS NULL, rather than NOT EXISTS, which the
 // planner may turn into an anti-join: it hashed the edges whole for one,
 // at an estimated cost that put every finalize past jit_above_cost, so that
@@ -233,7 +238,7 @@ func anyOfLiveOrSatisfiedSQL(m, batch, failed string) string {
 func anyOfExhaustedSQL(d, batch, failed string) string {
 	return `(
       SELECT 1 FROM {{schema}}.hopper_job_deps s
-      WHERE s.job_id = ` + d + `.job_id AND coalesce(s.any_of, 0) = ` + d + `.any_of AND ` + anyOfLiveOrSatisfiedSQL("s.depends_on", batch, failed) + `
+      WHERE s.job_id = ` + d + `.job_id AND coalesce(s.any_of, 0) <> 0 AND coalesce(s.any_of, 0) = ` + d + `.any_of AND ` + anyOfLiveOrSatisfiedSQL("s.depends_on", batch, failed) + `
       LIMIT 1) IS NULL`
 }
 
@@ -250,7 +255,7 @@ func anyOfReadySQL(done, completed string) string {
              OR (EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = g.depends_on) AND g.depends_on <> ALL (` + done + `)))
         AND (
           SELECT 1 FROM {{schema}}.hopper_job_deps s
-          WHERE s.job_id = j.id AND coalesce(s.any_of, 0) = g.any_of
+          WHERE s.job_id = j.id AND coalesce(s.any_of, 0) <> 0 AND coalesce(s.any_of, 0) = g.any_of
             AND CASE WHEN EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = s.depends_on)
                      THEN s.depends_on = ANY (` + completed + `)
                      ELSE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_job_results r
@@ -345,7 +350,7 @@ SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
 // hopper_job_deps whole for one.
 var anyOfCancelSQL = `(
     SELECT 1 FROM {{schema}}.hopper_job_deps g
-    WHERE g.job_id = j.id AND g.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL("g", "j.batch_id", "'{}'::uuid[]") + `
+    WHERE g.job_id = j.id AND coalesce(g.any_of, 0) <> 0 AND g.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL("g", "j.batch_id", "'{}'::uuid[]") + `
     LIMIT 1) IS NOT NULL`
 
 // workflowCancelExhaustedSQL cancels the pending jobs among those a CTE

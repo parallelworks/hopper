@@ -717,7 +717,9 @@ nothing there. Schema v23 adds `any_of` to `hopper_job_deps`, the number of
 the dependent's any-of group an edge is in (§11), NULL for an ordinary edge, and on
 Postgres rebuilds the partial index on the edges that read, by dependency, as
 `hopper_job_deps_results_depends_on`, whose predicate (`reads OR any_of IS NOT NULL`)
-covers the edges of groups too, in the same loop on `hopper_job_deps` alone. The previous
+covers the edges of groups too, and adds `hopper_job_deps_any_of_job (job_id) WHERE
+coalesce(any_of, 0) <> 0`, by which the promotion and the cancel look a dependent's groups
+up (§11), in the same loop on `hopper_job_deps` alone. The previous
 release's probe of the edges that read still matches it. Its down script turns the edges
 of groups into `ignore` edges, which is how the previous release treats them.
 
@@ -2719,8 +2721,13 @@ observability without new machinery.
       check for live dependencies, and require that no group holds the dependent: a
       group holds it while none of its steps completed (in the statement, or before) and
       either one is live (outside the statement's own jobs) or the policy is
-      `any_cancel`. That costs a dependent without groups one more read of its own
-      edges by primary key, and only once every other condition has passed. The tail
+      `any_cancel`. That costs a dependent without groups one probe of an empty partial
+      index (`hopper_job_deps_any_of_job`), and only once every other condition has
+      passed. Each check is a scalar subquery on that index rather than `NOT EXISTS`
+      over the primary key: the planner turned the latter into a hash of every edge,
+      and the estimate of a dependent's edges times a statement's candidates put the
+      finalize past `jit_above_cost`, so a server built with JIT compiled every finalize
+      (hopperbench's `workflow` at half speed in CI). The tail
       cancels the dependent of a canceled or discarded job whose `any_cancel` group is
       exhausted, in the cascade's first step; a group exhausted by a job the cascade
       itself canceled is left to the leader's sweep of `WorkflowPromoteReady`, since the
