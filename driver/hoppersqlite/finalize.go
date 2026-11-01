@@ -246,7 +246,8 @@ func encodeResults(jobs []driver.JobFinalize) ([]result, error) {
 // JobFinalizeMany implements driver.Executor. A result applies only to a
 // job running in the claim that produced it, by the same client at the same
 // fence, so a stale result never overwrites a newer attempt; each applied
-// result is reported with its fence. With
+// result is reported with its fence, and each dependent the tail canceled
+// by cascade after them, with Cascaded set. With
 // SkipLocked, a write lock another transaction holds is waited for only
 // briefly, after which no result is applied.
 func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
@@ -346,8 +347,14 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		if params.NoBatches {
 			return nil
 		}
-		_, err := x.tail(ctx, done)
-		return err
+		all, err := x.tail(ctx, done)
+		if err != nil {
+			return err
+		}
+		for _, f := range all[len(done):] {
+			applied = append(applied, driver.JobFinalized{ID: f.row.job.ID, Cascaded: true})
+		}
+		return nil
 	})
 	if errors.Is(err, errLockBusy) {
 		return nil, nil

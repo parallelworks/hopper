@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -401,6 +402,23 @@ func (f *finalizer) flush(ctx context.Context, batch []pending) {
 	f.followUp(ctx, committed)
 }
 
+// splitCascaded separates the results a JobFinalizeMany applied from the
+// dependents it canceled by cascade. Without a cascade, it returns applied
+// as it is.
+func splitCascaded(applied []driver.JobFinalized) (results []driver.JobFinalized, cascaded []driver.JobID) {
+	if !slices.ContainsFunc(applied, func(a driver.JobFinalized) bool { return a.Cascaded }) {
+		return applied, nil
+	}
+	for _, a := range applied {
+		if a.Cascaded {
+			cascaded = append(cascaded, a.ID)
+		} else {
+			results = append(results, a)
+		}
+	}
+	return results, cascaded
+}
+
 // write writes results in one statement. While ctx is live it retries with
 // backoff until the write succeeds; a statement that timed out is retried
 // as two halves. Once ctx is done (the client is stopping) it makes one more
@@ -441,9 +459,10 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 			continue
 		}
 		if err == nil {
+			applied, cascaded := splitCascaded(applied)
 			finished := f.afterFlush(ctx, batch, applied)
 			if !noBatches {
-				f.followUp(ctx, finished)
+				f.followUp(ctx, finished, cascaded...)
 			}
 			return
 		}
@@ -470,8 +489,11 @@ func (f *finalizer) write(ctx context.Context, batch []pending, skipLocked bool)
 // their dependents, once the statements that finished them have committed:
 // of two clients that finalized a batch's or a dependent's last jobs at the
 // same time, each missing the other's, the one that follows up second
-// completes the batch and promotes the dependent.
-func (f *finalizer) followUp(ctx context.Context, finished []pending) {
+// completes the batch and promotes the dependent. The dependents those
+// statements canceled by cascade are followed up as they are: one of
+// theirs can wait on an any-of group the cascade exhausted, which the
+// statement leaves to its follow-up, and which promotion cancels.
+func (f *finalizer) followUp(ctx context.Context, finished []pending, cascaded ...driver.JobID) {
 	seen := map[driver.JobID]struct{}{}
 	var batches, jobs []driver.JobID
 	for _, p := range finished {
@@ -484,6 +506,7 @@ func (f *finalizer) followUp(ctx context.Context, finished []pending) {
 			batches = append(batches, p.job.BatchID)
 		}
 	}
+	jobs = append(jobs, cascaded...)
 	if len(jobs) == 0 {
 		return
 	}

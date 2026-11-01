@@ -130,7 +130,11 @@ const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
 //
 // The cascade cancels a dependent of a job that failed in the statement
 // through an any_cancel group when one of its any_cancel groups is
-// exhausted (exhausted), and promoted skips one a group holds (held).
+// exhausted (exhausted), and promoted skips one a group holds (held). Its
+// recursive step, which cannot read its own rows in a subquery, follows
+// cancel edges only: a group exhausted by a job it canceled holds that
+// group's dependent, which the follow-up of the jobs the cascade canceled
+// cancels (the finalize statements return them, JobFinalized.Cascaded).
 func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
 	return anyOfGroupsSQL("exhausted",
 		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.on_failure = 'any_cancel'"+

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -343,27 +344,55 @@ func testWorkflowAnyOfConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		a.wantStates("the late member failed", map[driver.JobID]driver.JobState{ids[3]: driver.JobStateAvailable})
 	})
 
-	t.Run("sweep", func(t *testing.T) {
-		a := a
-		a.t = t
-		// A group exhausted by jobs that a cascade canceled: 1 waits for 0,
-		// and 2 for any of 1, so 0's failure cancels 1 and then 2, which
-		// a finalize on Postgres leaves to the leader's sweep: a follow-up
-		// of 0 finds no dependent, 1's edge to it gone with 1.
+	// A group exhausted by a job that a cascade canceled: 1 waits for 0,
+	// and 2 for any of 1, so 0's failure cancels 1 and then 2. The
+	// finalize returns 1 among the jobs it canceled by cascade, and the
+	// finalizing client's follow-up, which takes those as it takes the
+	// jobs it finalized, cancels 2 if the statement did not, with no
+	// leader's sweep: a follow-up of 0 alone finds no dependent, 1's edge
+	// to it gone with 1.
+	cascaded := func(a anyOfFixture) (dependent driver.JobID, followUp []driver.JobID) {
+		a.t.Helper()
 		_, ids := a.insert("cascaded", 3,
 			driver.JobDependency{Job: 1, DependsOn: 0},
 			driver.JobDependency{Job: 2, DependsOn: 1, AnyOf: 1})
 		a.claimAll()
-		a.finish(ids[0], driver.JobStateDiscarded)
+		result := driver.JobFinalize{ID: ids[0], AttemptedBy: a.clientID, State: driver.JobStateDiscarded, Archive: true}
+		out, err := a.exec.JobFinalizeMany(a.ctx, driver.JobFinalizeParams{Jobs: withFences(a.ctx, a.t, a.exec, []driver.JobFinalize{result})})
+		if err != nil {
+			a.t.Fatal(err)
+		}
+		if got := appliedIDs(out); len(got) != 1 || got[0] != ids[0] {
+			a.t.Fatalf("finalize of 0 applied %v", got)
+		}
+		if got := cascadedIDs(out); !slices.Contains(got, ids[1]) {
+			a.t.Fatalf("finalize of 0 canceled %v by cascade, want 1 among them", got)
+		}
+		return ids[2], append(appliedIDs(out), cascadedIDs(out)...)
+	}
+	t.Run("cascaded follow-up", func(t *testing.T) {
+		a := a
+		a.t = t
+		dependent, followUp := cascaded(a)
+		if _, err := exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: followUp}); err != nil {
+			t.Fatal(err)
+		}
+		a.wantStates("after the follow-up", map[driver.JobID]driver.JobState{dependent: driver.JobStateCanceled})
+	})
+	t.Run("sweep", func(t *testing.T) {
+		a := a
+		a.t = t
+		// Without the follow-up, the leader's sweep cancels it.
+		dependent, _ := cascaded(a)
 		for range 3 {
-			if a.state(ids[2]) != driver.JobStatePending {
+			if a.state(dependent) != driver.JobStatePending {
 				break
 			}
 			if _, err := exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{Limit: 1000}); err != nil {
 				t.Fatal(err)
 			}
 		}
-		a.wantStates("after the sweep", map[driver.JobID]driver.JobState{ids[1]: driver.JobStateCanceled, ids[2]: driver.JobStateCanceled})
+		a.wantStates("after the sweep", map[driver.JobID]driver.JobState{dependent: driver.JobStateCanceled})
 	})
 }
 
@@ -492,13 +521,13 @@ func testWorkflowsAnyOfConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 						return
 					}
 				}
-				var ids []driver.JobID
+				var ids, cascaded []driver.JobID
 				for wctx.Err() == nil {
 					sctx, scancel := context.WithTimeout(ctx, 10*time.Second)
 					out, err := exec.JobFinalizeMany(sctx, driver.JobFinalizeParams{Jobs: fin})
 					scancel()
 					if err == nil {
-						ids = appliedIDs(out)
+						ids, cascaded = appliedIDs(out), cascadedIDs(out)
 						break
 					}
 					time.Sleep(time.Millisecond)
@@ -512,7 +541,7 @@ func testWorkflowsAnyOfConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 					continue
 				}
 				_, _ = exec.BatchSettle(wctx, driver.BatchSettleParams{IDs: batches})
-				_, _ = exec.WorkflowPromoteReady(wctx, driver.WorkflowPromoteParams{DependsOn: ids})
+				_, _ = exec.WorkflowPromoteReady(wctx, driver.WorkflowPromoteParams{DependsOn: append(ids, cascaded...)})
 			}
 		})
 	}

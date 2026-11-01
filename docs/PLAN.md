@@ -2611,8 +2611,9 @@ observability without new machinery.
     finalizes) each see the other still live, so neither statement promotes the
     dependent. `WorkflowPromoteReady` promotes pending jobs none of whose dependencies
     is still live, skipping rows a finalize holds. After each flush commits, the
-    finalizer runs it on the dependents of the jobs the flush finished (and the client
-    does for a job it saw `CompleteTx` commit), so of the two, the one that follows up
+    finalizer runs it on the dependents of the jobs the flush finished and of those it
+    canceled by cascade (and the client does for a job it saw `CompleteTx` commit, or
+    that a lease's `Finish` finished), so of the two, the one that follows up
     second promotes the dependent at once. The leader sweeps up what clients left (a
     client that stopped between commit and follow-up): it walks `hopper_job_deps` a
     chunk at a time in ID order, for at most one leader interval per pass, resuming
@@ -2723,19 +2724,24 @@ observability without new machinery.
       check for live dependencies, and require that no group holds the dependent: a
       group holds it while none of its steps completed (in the statement, or before) and
       either one is live (outside the statement's own jobs) or the policy is
-      `any_cancel`. That costs a statement without groups one probe of an empty partial index
-      (`hopper_job_deps_any_of_job`) per candidate. The statement selects the candidates a group holds in a CTE of its own
-      (`held`), walking that index from the candidates, and the promotion leaves them
-      out: as a condition evaluated per candidate, the planner turned it into a hash of
-      every edge, or its estimate times the candidates' put the finalize past
-      `jit_above_cost`, so that a server built with JIT compiled every finalize
-      (hopperbench's `workflow` at half speed in CI). The tail
-      cancels the dependent of a canceled or discarded job whose `any_cancel` group is
-      exhausted, in the cascade's first step; a group exhausted by a job the cascade
-      itself canceled is left to the leader's sweep of `WorkflowPromoteReady`, since the
-      recursive step cannot read its own rows in a subquery, and a client's follow-up
-      considers only the dependents of the jobs it finalized, whose edges to the jobs
-      the cascade canceled are gone with them.
+      `any_cancel`. A statement reads the group edges of its dependents once, from
+      `hopper_job_deps_any_of_job`, the partial index on the edges in a group by
+      dependent, which is empty without groups, so a statement without groups costs one
+      probe of it; it then looks the groups' steps up in one probe of the live table and
+      one of the results for all of them, and aggregates per group. As a check per edge or
+      per candidate, a subquery the planner multiplies by the edges it guesses, the
+      statements were planned at millions without statistics on `hopper_job_deps`, past
+      `jit_above_cost`, so that a server built with JIT compiled the leader's
+      statements for seconds and every finalize for a tenth of a second (hopperbench's
+      `workflow` at half speed in CI). The tail cancels the dependent of a canceled or
+      discarded job whose `any_cancel` group is exhausted, in the cascade's first step.
+      A group exhausted by a job the cascade itself canceled is not, since the
+      recursive step cannot read its own rows in a subquery: the finalize returns the
+      jobs it canceled by cascade (`JobFinalized.Cascaded`), and the finalizing client
+      follows them up as it does the jobs it finalized, with `WorkflowPromoteReady`,
+      which cancels the dependent; the leader's sweep does for a client that stopped
+      before its follow-up. SQLite's tail, run by a single writer, checks the groups of
+      the jobs its cascade cancels as it goes.
     - **Concurrent steps of a group.** The race is the one of concurrent dependencies:
       the last two steps of a group that fail in concurrent statements each see the
       other live, so neither cancels the dependent, and a step of a group that completes

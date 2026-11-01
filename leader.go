@@ -199,6 +199,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			return
 		}
 
+		// The dependents it canceled by cascade are left, as its own jobs
+		// are, to the promotion sweep of this leader's pass.
+		applied, _ = splitCascaded(applied)
 		var retried, discarded int
 		queues := map[string]struct{}{}
 		byID := make(map[JobID]driver.JobFinalize, len(fin))

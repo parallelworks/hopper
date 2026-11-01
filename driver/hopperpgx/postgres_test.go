@@ -1412,8 +1412,8 @@ func TestWorkflowPlansWithoutStatistics(t *testing.T) {
 		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: state, Archive: true}
 	}
 	finished, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin})
-	if err != nil || len(finished) != 100 {
-		t.Fatalf("finalize = %d, %v", len(finished), err)
+	if err != nil || len(finished) <= 100 {
+		t.Fatalf("finalize = %d, %v; want 100 results and the jobs it canceled by cascade", len(finished), err)
 	}
 	dependsOn := make([]driver.JobID, len(finished))
 	for i, f := range finished {

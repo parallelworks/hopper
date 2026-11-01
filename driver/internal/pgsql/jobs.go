@@ -111,7 +111,7 @@ var scanIDs = collect(func(r Row) (driver.JobID, error) {
 
 var scanFinalized = collect(func(r Row) (driver.JobFinalized, error) {
 	var f driver.JobFinalized
-	err := r.Scan(&f.ID, &f.Fence)
+	err := r.Scan(&f.ID, &f.Fence, &f.Cascaded)
 	return f, err
 })
 
@@ -676,7 +676,8 @@ finished AS (
 func isRunning(column string) string { return column + "::text = 'running'" }
 
 var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
-SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
+SELECT id, fence, false FROM retry UNION ALL SELECT id, fence, false FROM finished
+UNION ALL SELECT id, 0::bigint, true FROM cascaded`
 
 // appendLogSQL appends an attempt's log, if it has one, to its job's logs,
 // keeping the latest $13. A snooze gives its attempt back, so a job that
@@ -701,7 +702,7 @@ const appendLogSQL = `CASE
 // no batch or workflow (driver.JobFinalizeParams.NoBatches): without the
 // insert channel, so the parameters after it move down one.
 var jobFinalizePlainSQL = strings.NewReplacer("$11", "$10", "$12", "$11", "$13", "$12", "$14", "$13").Replace(jobFinalizeHeadSQL) + plainFinalizeTailSQL + `
-SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
+SELECT id, fence, false FROM retry UNION ALL SELECT id, fence, false FROM finished`
 
 // skipLockedSQL makes a finalize statement skip the jobs whose rows another
 // transaction holds (driver.JobFinalizeParams.SkipLocked).
@@ -753,10 +754,11 @@ var leaseFinalizeHeadSQL = func() string {
 
 var (
 	jobFinalizeLeaseSQL = leaseFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
-SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
+SELECT id, fence, false FROM retry UNION ALL SELECT id, fence, false FROM finished
+UNION ALL SELECT id, 0::bigint, true FROM cascaded`
 	jobFinalizeLeasePlainSQL = strings.NewReplacer("$11", "$10", "$12", "$11", "$13", "$12", "$14", "$13", "$15", "$14").Replace(leaseFinalizeHeadSQL) +
 		plainFinalizeTailSQL + `
-SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM finished`
+SELECT id, fence, false FROM retry UNION ALL SELECT id, fence, false FROM finished`
 )
 
 // JobFinalizeMany implements driver.Executor.

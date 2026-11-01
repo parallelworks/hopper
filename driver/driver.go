@@ -196,7 +196,8 @@ type Executor interface {
 	// it, by the same client at the same fence; the job and fence of each
 	// applied result are returned, and the caller treats the rest as fenced.
 	// Of two results of one job, at most one applies, and its fence says
-	// which.
+	// which. The dependents it canceled by cascade follow the applied
+	// results, with Cascaded set.
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobFinalized, error)
 	// JobRecordProgress stores a running job's progress, fenced like a
 	// finalize: only while the job is running in the given claim, by the
@@ -1139,10 +1140,17 @@ type WorkflowPromoteResult struct {
 }
 
 // JobFinalized names a result JobFinalizeMany applied: its job, and the
-// fence of the claim it belonged to.
+// fence of the claim it belonged to; or, with Cascaded set and no fence, a
+// job the statement canceled by cascade.
 type JobFinalized struct {
 	ID    JobID
 	Fence int64
+	// Cascaded marks a dependent the statement canceled because a job it
+	// finalized failed. The caller follows it up as it does the jobs it
+	// finalized (WorkflowPromoteReady with it among DependsOn): its own
+	// dependents can wait on an any-of group it exhausted, which the
+	// statement leaves to that follow-up.
+	Cascaded bool
 }
 
 // JobFinalize is the result of one attempt.

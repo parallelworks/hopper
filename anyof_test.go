@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/parallelworks/hopper"
 )
@@ -108,5 +109,51 @@ func TestWorkflowAfterAnyIsChecked(t *testing.T) {
 	}
 	if n := h.count("SELECT count(*) FROM hopper_jobs"); n != 0 {
 		t.Errorf("%d jobs inserted by rejected workflows", n)
+	}
+}
+
+// TestWorkflowAfterAnyExhaustedByCascade cancels a step whose any-of group
+// a cascade exhausted when the finalizing client follows up, not at the
+// leader's next sweep: s1 waits for s0, and s2 for any of s1, so s0's
+// failure cancels s1 by cascade, which the finalize returns to the client
+// for its follow-up. The leader passes once an hour, after its first.
+func TestWorkflowAfterAnyExhaustedByCascade(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	var rec depRecorder
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, depWorker(&rec))
+	tun := fastTuning
+	tun.LeaderInterval, tun.LeaderTTL = time.Hour, time.Hour
+	c := h.startedWith(workers, 4, tun)
+	waitFor(t, c.IsLeader)
+	time.Sleep(300 * time.Millisecond) // the leader's first pass, on an empty schema
+
+	wf := hopper.NewWorkflow("cascade", nil)
+	s0 := wf.Add(depStep{Name: "s0", Fail: true}, nil)
+	s1 := wf.Add(depStep{Name: "s1"}, hopper.After(s0))
+	wf.Add(depStep{Name: "s2"}, hopper.AfterAny(s1))
+	res, err := c.InsertWorkflow(ctx, wf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, c, res.Jobs[0].Job.ID, hopper.JobStateDiscarded, hopper.JobStateCanceled)
+	deadline := time.Now().Add(time.Second)
+	for {
+		j, err := c.JobGet(ctx, res.Jobs[2].Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if j.State == hopper.JobStateCanceled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("s2 is %s a second after s0 failed; want it canceled by the finalizing client's follow-up", j.State)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rec.get("0/s1") != nil || rec.get("0/s2") != nil {
+		t.Error("a step after the failed step ran")
 	}
 }
