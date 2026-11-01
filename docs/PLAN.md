@@ -716,11 +716,13 @@ one try at a time. SQLite's claim still uses its index of that name, and v22 cha
 nothing there. Schema v23 adds `any_of` to `hopper_job_deps`, the number of
 the dependent's any-of group an edge is in (§11), NULL for an ordinary edge, and on
 Postgres rebuilds the partial index on the edges that read, by dependency, as
-`hopper_job_deps_results_depends_on`, whose predicate (`reads OR any_of IS NOT NULL`)
-covers the edges of groups too, and adds `hopper_job_deps_any_of_job (job_id) WHERE
-coalesce(any_of, 0) <> 0`, by which the promotion and the cancel look a dependent's groups
-up (§11), in the same loop on `hopper_job_deps` alone. The previous
-release's probe of the edges that read still matches it. Its down script turns the edges
+`hopper_job_deps_results_depends_on`, whose predicate (`coalesce(reads, any_of IS NOT
+NULL)`) covers the edges of groups too and is not implied by a lookup of a dependent's
+groups, and adds `hopper_job_deps_any_of_job (job_id) WHERE any_of IS NOT NULL`, by which
+the promotion and the cancel look a dependent's groups up (§11), in the same loop on
+`hopper_job_deps` alone. The previous
+release's probe of the edges that read matches neither, and reads a finished job's edges by
+`hopper_job_deps_depends_on` during a rolling upgrade. Its down script turns the edges
 of groups into `ignore` edges, which is how the previous release treats them.
 
 ### 6.1 Job IDs

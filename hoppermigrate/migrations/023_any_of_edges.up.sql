@@ -14,15 +14,19 @@
 -- that every snapshot sees whether a member that left the live table
 -- completed. The partial index on the edges that read, by dependency,
 -- which that finalize probes, is rebuilt to cover the edges of groups too,
--- so it stays one probe; the previous release's probe of the edges that
--- read still matches it.
+-- so it stays one probe. Its predicate is coalesce(reads, any_of IS NOT
+-- NULL), which the lookups of a dependent's groups (any_of IS NOT NULL) do
+-- not imply: with reads OR any_of IS NOT NULL, statistics taken while no
+-- edge read could have the planner walk it whole for one, as v22 found. The
+-- previous release's probe of the edges that read does not match it
+-- either, and reads the dependency's edges by hopper_job_deps_depends_on
+-- during a rolling upgrade.
 --
--- hopper_job_deps_any_of_job indexes the edges in a group by dependent,
--- for the promotion's and the cancel's lookups of a dependent's groups: it
--- is empty for workflows without groups, so those lookups cost them
--- nothing. Its predicate is coalesce(any_of, 0) <> 0, which the lookups
--- name, and which a lookup of the edges that read by dependency does not
--- match.
+-- hopper_job_deps_any_of_job indexes the edges in a group by dependent
+-- (any_of IS NOT NULL), for the promotion's and the cancel's lookups of a
+-- dependent's groups: it is empty for workflows without groups, and the
+-- null fraction of any_of in the statistics says so, so those lookups cost
+-- them nothing.
 --
 -- Adding the column changes only the catalog, and building the index
 -- reads hopper_job_deps, which holds only the edges of the workflows in
@@ -43,9 +47,9 @@ BEGIN
     BEGIN
       LOCK TABLE hopper_job_deps IN ACCESS EXCLUSIVE MODE;
       ALTER TABLE hopper_job_deps ADD COLUMN any_of smallint;
-      CREATE INDEX hopper_job_deps_results_depends_on ON hopper_job_deps (depends_on) WHERE reads OR any_of IS NOT NULL;
+      CREATE INDEX hopper_job_deps_results_depends_on ON hopper_job_deps (depends_on) WHERE coalesce(reads, any_of IS NOT NULL);
       DROP INDEX hopper_job_deps_reads_depends_on;
-      CREATE INDEX hopper_job_deps_any_of_job ON hopper_job_deps (job_id) WHERE coalesce(any_of, 0) <> 0;
+      CREATE INDEX hopper_job_deps_any_of_job ON hopper_job_deps (job_id) WHERE any_of IS NOT NULL;
       EXIT;
     EXCEPTION WHEN lock_not_available THEN
       tries := tries + 1;

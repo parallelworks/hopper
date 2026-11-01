@@ -211,19 +211,16 @@ edges AS (
 // so a dependent without groups costs one more read of its own edges, and
 // only once every other condition has passed. A group's edges are found
 // through hopper_job_deps_any_of_job, the partial index on the edges in a
-// group by dependent, which is empty for workflows without groups, so a
-// lookup there costs, and is estimated to cost, next to nothing: through
-// the primary key, the estimate of a dependent's edges times the
-// candidates of a statement put it past jit_above_cost, and a server built
-// with JIT compiled every finalize. The condition is coalesce(any_of, 0)
-// <> 0, the index's predicate, which the partial index on the edges that
-// read or are in a group, by dependency, does not match: by any_of itself,
-// statistics taken while no edge was in a group made that one look empty,
-// and the planner walked it whole, filtering it by the dependent. Each check is a scalar subquery,
-// (SELECT 1 ... LIMIT 1) IS NULL, rather than NOT EXISTS, which the
-// planner may turn into an anti-join: it hashed the edges whole for one,
-// at an estimated cost that put every finalize past jit_above_cost, so that
-// each one spent a tenth of a second compiling itself.
+// group (any_of IS NOT NULL) by dependent, which is empty for workflows
+// without groups, and which the statistics, whose null fraction of any_of
+// is exact, say is. With coalesce(any_of, 0) <> 0 as its predicate, which
+// the planner estimates true of all but one edge in two hundred, it chose
+// to walk the edges whole for a statement's dependents now and then. The
+// partial index on the edges that read or are in a group, by dependency,
+// has coalesce(reads, any_of IS NOT NULL) for its predicate, which
+// any_of IS NOT NULL does not imply: with reads OR any_of IS NOT NULL, a
+// lookup of a dependent's groups could walk that one whole, filtering it
+// by the dependent, as v22 found of the edges that read.
 
 // anyOfLiveOrSatisfiedSQL is true of a job m of a group of a dependent in
 // batch that still keeps the group from being exhausted: live and not
@@ -241,7 +238,7 @@ func anyOfLiveOrSatisfiedSQL(m, batch, failed string) string {
 func anyOfExhaustedSQL(d, batch, failed string) string {
 	return `(
       SELECT 1 FROM {{schema}}.hopper_job_deps s
-      WHERE s.job_id = ` + d + `.job_id AND coalesce(s.any_of, 0) <> 0 AND coalesce(s.any_of, 0) = ` + d + `.any_of AND ` + anyOfLiveOrSatisfiedSQL("s.depends_on", batch, failed) + `
+      WHERE s.job_id = ` + d + `.job_id AND s.any_of = ` + d + `.any_of AND ` + anyOfLiveOrSatisfiedSQL("s.depends_on", batch, failed) + `
       LIMIT 1) IS NULL`
 }
 
@@ -256,12 +253,12 @@ func anyOfExhaustedSQL(d, batch, failed string) string {
 func anyOfHeldSQL(dependents, done, completed string) string {
 	return `
   SELECT g.job_id FROM {{schema}}.hopper_job_deps g
-  WHERE g.job_id = ANY (` + dependents + `) AND coalesce(g.any_of, 0) <> 0
+  WHERE g.job_id = ANY (` + dependents + `) AND g.any_of IS NOT NULL
     AND (g.on_failure = 'any_cancel'
          OR (EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = g.depends_on) AND g.depends_on <> ALL (` + done + `)))
     AND (
       SELECT 1 FROM {{schema}}.hopper_job_deps s
-      WHERE s.job_id = g.job_id AND coalesce(s.any_of, 0) <> 0 AND coalesce(s.any_of, 0) = g.any_of
+      WHERE s.job_id = g.job_id AND s.any_of = g.any_of
         AND CASE WHEN EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = s.depends_on)
                  THEN s.depends_on = ANY (` + completed + `)
                  ELSE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_job_results r
@@ -290,7 +287,7 @@ const resultsSQL = `results AS (
          THEN d.output END
   FROM done d
   WHERE d.batch_id IS NOT NULL
-    AND (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id AND (e.reads OR e.any_of IS NOT NULL) LIMIT 1) IS NOT NULL
+    AND (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id AND coalesce(e.reads, e.any_of IS NOT NULL) LIMIT 1) IS NOT NULL
     AND d.batch_id <> ALL (ARRAY(SELECT id FROM batches))
   ON CONFLICT (batch_id, job_id) DO UPDATE SET state = EXCLUDED.state, output = EXCLUDED.output,
     finalized_at = EXCLUDED.finalized_at
@@ -347,7 +344,7 @@ promoted AS (
 SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
   (SELECT id FROM candidates ORDER BY id DESC LIMIT 1),
   (SELECT count(*) FROM {{schema}}.hopper_job_deps g
-   WHERE g.job_id = ANY (ARRAY(SELECT job_id FROM held)) AND coalesce(g.any_of, 0) <> 0 AND g.on_failure = 'any_cancel'
+   WHERE g.job_id = ANY (ARRAY(SELECT job_id FROM held)) AND g.any_of IS NOT NULL AND g.on_failure = 'any_cancel'
      AND ` + anyOfExhaustedSQL("g", "(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = g.job_id)", "'{}'::uuid[]") + `)`
 }
 
@@ -358,7 +355,7 @@ SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
 // hopper_job_deps whole for one.
 var anyOfCancelSQL = `(
     SELECT 1 FROM {{schema}}.hopper_job_deps g
-    WHERE g.job_id = j.id AND coalesce(g.any_of, 0) <> 0 AND g.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL("g", "j.batch_id", "'{}'::uuid[]") + `
+    WHERE g.job_id = j.id AND g.any_of IS NOT NULL AND g.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL("g", "j.batch_id", "'{}'::uuid[]") + `
     LIMIT 1) IS NOT NULL`
 
 // workflowCancelExhaustedSQL cancels the pending jobs among those a CTE
