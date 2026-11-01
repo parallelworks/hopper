@@ -345,9 +345,10 @@ const resultsClearedSQL = `results_cleared AS (
 // candidates selects none of whose dependencies is still live and none of
 // whose any-of groups holds them, skipping rows a finalize holds: that
 // finalize decides them. It returns how many it promoted, how many
-// candidates there were, the greatest candidate ID, and how many of them
-// an exhausted any-of group whose policy is any_cancel holds, for
-// workflowCancelExhaustedSQL to cancel.
+// candidates there were, the greatest candidate ID, and how many exhausted
+// any-of groups whose policy is any_cancel hold one of them (a group, not
+// a candidate, each; its candidate pending or not), for
+// workflowCancelExhaustedSQL to cancel what is still pending.
 // The candidates are looked up as finalizeTailSQL looks up its own rows:
 // joined instead, a sweep's LIMIT, which a generic plan takes for a
 // tenth of the edges, had it scan hopper_jobs whole for every chunk.

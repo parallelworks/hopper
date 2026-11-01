@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -25,7 +26,7 @@ const (
 
 // maxAnyOfGroups is the most any-of groups a step can have; the engines
 // number them in a smallint.
-const maxAnyOfGroups = 32767
+const maxAnyOfGroups = math.MaxInt16
 
 // WorkflowOpts sets a workflow's completion callbacks and metadata. A
 // workflow is a batch, so the callbacks are those of BatchOpts: OnSuccess

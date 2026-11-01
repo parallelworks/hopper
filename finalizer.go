@@ -519,8 +519,12 @@ func (f *finalizer) followUp(ctx context.Context, finished []pending, cascaded .
 func settleAndPromote(ctx context.Context, exec finalizeExecutor, logger *slog.Logger, batches, jobs []driver.JobID) {
 	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
 	defer cancel()
-	if _, err := exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: batches}); err != nil {
-		logger.WarnContext(ctx, "hopper: settle batches; the leader will", "count", len(batches), "error", err)
+	// A nil IDs would make BatchSettle a sweep: a follow-up of jobs canceled
+	// by cascade alone has no batch of its own to settle.
+	if len(batches) > 0 {
+		if _, err := exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: batches}); err != nil {
+			logger.WarnContext(ctx, "hopper: settle batches; the leader will", "count", len(batches), "error", err)
+		}
 	}
 	if _, err := exec.WorkflowPromoteReady(opCtx, driver.WorkflowPromoteParams{DependsOn: jobs}); err != nil {
 		logger.WarnContext(ctx, "hopper: promote dependents; the leader will", "count", len(jobs), "error", err)

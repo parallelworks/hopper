@@ -2742,7 +2742,10 @@ observability without new machinery.
       which cancels the dependent, as the leader's rescue does those of its finalize.
       The leader's sweep does for a client that stopped before its follow-up, and for
       the statements that return no such jobs: `JobCancel` and `JobDelete` of a waiting
-      job, `FinishTx`, and the expiry of job leases and of TTLs. SQLite's tail, run by a single writer, checks the groups of
+      job, `FinishTx`, and the expiry of job leases and of TTLs. Those are rare, and the
+      sweep bounds the delay: it cancels such a dependent within a leader interval (5 s
+      by default) of the cascade, or a few with more pending workflow steps than one
+      pass walks. SQLite's tail, run by a single writer, checks the groups of
       the jobs its cascade cancels as it goes.
     - **Concurrent steps of a group.** The race is the one of concurrent dependencies:
       the last two steps of a group that fail in concurrent statements each see the
@@ -2750,7 +2753,7 @@ observability without new machinery.
       while the dependent's ordinary dependency finishes each sees the other live, so
       neither promotes it. `WorkflowPromoteReady`, which each client runs after its
       flush commits and the leader sweeps with, promotes the latter, and counts the
-      candidates an exhausted `any_cancel` group holds; only when there are any, a
+      exhausted `any_cancel` groups that hold candidates; only when there are any, a
       second statement cancels them (`FOR UPDATE SKIP LOCKED`, the condition rechecked,
       with the finalize tail, waiting only briefly for rows another transaction holds)
       and the dependents of what it canceled are considered the same way, until it
