@@ -2371,7 +2371,8 @@ the partition's extension lock, so the data volume has no size limit.
   then eight after it, then one after those, each step recording a small output, which
   measures the finalize tail, dependency promotion and output, and `workflow-outputs`,
   the same with every step after the first claimed with its dependencies' outputs, for
-  the cost of `StepOpts.Dependencies`), the two insert paths,
+  the cost of `StepOpts.Dependencies`, and `workflow-any`, the same with the last step
+  waiting for any one of the eight (`StepOpts.AfterAny`)), the two insert paths,
   pickup latency on an idle queue and under a paced load (`loaded`, at `-rate` jobs/s),
   and `-history N` to preload history rows. It warms up before measuring, because the
   first leader election creates history partitions, which briefly blocks finalizes.
@@ -2722,8 +2723,10 @@ observability without new machinery.
       edges by primary key, and only once every other condition has passed. The tail
       cancels the dependent of a canceled or discarded job whose `any_cancel` group is
       exhausted, in the cascade's first step; a group exhausted by a job the cascade
-      itself canceled is left to `WorkflowPromoteReady`, since the recursive step
-      cannot read its own rows in a subquery.
+      itself canceled is left to the leader's sweep of `WorkflowPromoteReady`, since the
+      recursive step cannot read its own rows in a subquery, and a client's follow-up
+      considers only the dependents of the jobs it finalized, whose edges to the jobs
+      the cascade canceled are gone with them.
     - **Concurrent steps of a group.** The race is the one of concurrent dependencies:
       the last two steps of a group that fail in concurrent statements each see the
       other live, so neither cancels the dependent, and a step of a group that completes

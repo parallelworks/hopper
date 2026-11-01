@@ -196,9 +196,12 @@ func DecodeDependencies(stored string) []driver.Dependency {
 }
 
 // CheckDependencies checks a workflow's edges against its n jobs, and
-// returns which jobs have dependencies, to insert pending.
+// returns which jobs have dependencies, to insert pending. An edge given
+// twice must be in the same group both times: the engines keep one row per
+// pair, the first, while EdgesJSON records every edge given.
 func CheckDependencies(deps []driver.JobDependency, n int) ([]bool, error) {
 	pending := make([]bool, n)
+	anyOf := false
 	for _, d := range deps {
 		if d.Job < 0 || d.Job >= n || d.DependsOn < 0 || d.DependsOn >= n || d.Job == d.DependsOn {
 			return nil, fmt.Errorf("dependency %d -> %d is out of range", d.Job, d.DependsOn)
@@ -207,6 +210,17 @@ func CheckDependencies(deps []driver.JobDependency, n int) ([]bool, error) {
 			return nil, fmt.Errorf("dependency %d -> %d has any-of group %d, out of range", d.Job, d.DependsOn, d.AnyOf)
 		}
 		pending[d.Job] = true
+		anyOf = anyOf || d.AnyOf != 0
+	}
+	if anyOf {
+		groups := make(map[[2]int]int, len(deps))
+		for _, d := range deps {
+			pair := [2]int{d.Job, d.DependsOn}
+			if g, seen := groups[pair]; seen && g != d.AnyOf {
+				return nil, fmt.Errorf("dependency %d -> %d is given in two any-of groups, or in one and as an ordinary edge", d.Job, d.DependsOn)
+			}
+			groups[pair] = d.AnyOf
+		}
 	}
 	return pending, nil
 }

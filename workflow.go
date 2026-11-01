@@ -65,9 +65,10 @@ type StepOpts struct {
 	// Dependencies has the step claimed with the steps in After and in
 	// AfterAny that have finished by its claim, in JobRow.Dependencies:
 	// each one's name, final state and output. A step of a group still
-	// running when this one is claimed is not among them. The engine records a step's state and output only for a
-	// step with a dependent that sets it, so a workflow that does not costs
-	// what one without dependencies' results did.
+	// running when this one is claimed is not among them. The engine
+	// records a step's state and output only for a step with a dependent
+	// that sets it, so a workflow that does not costs what one without
+	// dependencies' results did.
 	Dependencies bool
 	// Insert holds the job's own options.
 	Insert *InsertOpts

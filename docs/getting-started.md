@@ -391,7 +391,7 @@ step's `OnDependencyFailure` applies: canceled by default, or run with
 
 ```go
 var attempts []hopper.Step
-for region := range regions {
+for _, region := range regions {
 	attempts = append(attempts, wf.Add(Provision{Region: region}, hopper.After(plan)))
 }
 // Configure whichever instance is provisioned first.

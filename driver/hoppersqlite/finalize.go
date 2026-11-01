@@ -420,12 +420,8 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 				queue = append(queue, step{id: dep})
 				continue
 			}
-			errs, err := hopperError(row, "hopper: dependency failed", x.now)
+			f, err := x.cancelDependent(ctx, row)
 			if err != nil {
-				return nil, err
-			}
-			f := finished{row: row, state: driver.JobStateCanceled, errors: errs, logs: row.logs, archive: true}
-			if err := x.finish(ctx, f); err != nil {
 				return nil, err
 			}
 			deps, err := x.recordResult(ctx, f)
@@ -541,6 +537,17 @@ func (x *w) recordResult(ctx context.Context, f finished) ([]driver.JobID, error
 	return ids, nil
 }
 
+// cancelDependent finishes a pending job as canceled because a job it
+// depends on failed, or every job of one of its any-of groups did.
+func (x *w) cancelDependent(ctx context.Context, row *liveRow) (finished, error) {
+	errs, err := hopperError(row, "hopper: dependency failed", x.now)
+	if err != nil {
+		return finished{}, err
+	}
+	f := finished{row: row, state: driver.JobStateCanceled, errors: errs, logs: row.logs, archive: true}
+	return f, x.finish(ctx, f)
+}
+
 // The edges of a dependent's any-of group (hopper_job_deps.any_of) hold it
 // until one of their jobs has completed. A group none of whose jobs
 // completed holds it while one is live, and once none is, its policy
@@ -555,11 +562,16 @@ func (x *w) recordResult(ctx context.Context, f finished) ([]driver.JobID, error
 const anyOfSatisfiedSQL = `NOT EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = s.depends_on)
 	AND NOT EXISTS (SELECT 1 FROM hopper_job_results r WHERE r.batch_id = %[1]s AND r.job_id = s.depends_on AND r.state <> 'completed')`
 
-// anyOfExhaustedSQL is true of the group of the edge d, of a dependent in
-// the batch of the second parameter, when none of its jobs is live or has
-// completed.
-var anyOfExhaustedSQL = `NOT EXISTS (SELECT 1 FROM hopper_job_deps s WHERE s.job_id = d.job_id AND s.any_of = d.any_of
-	AND (EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = s.depends_on) OR (` + fmt.Sprintf(anyOfSatisfiedSQL, "?2") + `)))`
+// anyOfExhausted is true of the group of the edge named edge, of a
+// dependent in batch, when none of its jobs is live or has completed.
+func anyOfExhausted(edge, batch string) string {
+	return `NOT EXISTS (SELECT 1 FROM hopper_job_deps s WHERE s.job_id = ` + edge + `.job_id AND s.any_of = ` + edge + `.any_of
+	AND (EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = s.depends_on) OR (` + fmt.Sprintf(anyOfSatisfiedSQL, batch) + `)))`
+}
+
+// anyOfExhaustedSQL is anyOfExhausted of the edge d, of a dependent in the
+// batch of the second parameter.
+var anyOfExhaustedSQL = anyOfExhausted("d", "?2")
 
 // anyOfReadySQL is true of a job j none of whose any-of groups holds it.
 var anyOfReadySQL = `NOT EXISTS (SELECT 1 FROM hopper_job_deps g WHERE g.job_id = j.id AND g.any_of IS NOT NULL
@@ -570,8 +582,7 @@ var anyOfReadySQL = `NOT EXISTS (SELECT 1 FROM hopper_job_deps g WHERE g.job_id 
 // anyOfCancelSQL is true of a job j with an any-of group whose policy is
 // any_cancel and none of whose jobs is live or has completed.
 var anyOfCancelSQL = `EXISTS (SELECT 1 FROM hopper_job_deps g WHERE g.job_id = j.id AND g.on_failure = 'any_cancel'
-	AND NOT EXISTS (SELECT 1 FROM hopper_job_deps s WHERE s.job_id = j.id AND s.any_of = g.any_of
-	  AND (EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = s.depends_on) OR (` + fmt.Sprintf(anyOfSatisfiedSQL, "j.batch_id") + `))))`
+	AND ` + anyOfExhausted("g", "j.batch_id") + `)`
 
 // ids returns the IDs a query selects.
 func (x *w) ids(ctx context.Context, query string, args ...any) ([]driver.JobID, error) {

@@ -360,7 +360,10 @@ type Executor interface {
 	// dependents itself, but two dependencies finalized by concurrent
 	// transactions each see the other still live, and neither promotes. A
 	// client therefore promotes the dependents of the jobs it has just
-	// finalized, and the leader sweeps up the rest.
+	// finalized, and the leader sweeps up the rest. It likewise cancels,
+	// with their dependents, the pending jobs that an exhausted any-of group
+	// whose policy is cancel holds (JobDependency.AnyOf), which concurrent
+	// finalizes of the group's last jobs each left to the other.
 	WorkflowPromoteReady(ctx context.Context, params WorkflowPromoteParams) (WorkflowPromoteResult, error)
 
 	// PeriodicInsert inserts the job for a periodic slot if that slot has

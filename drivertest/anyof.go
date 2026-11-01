@@ -348,7 +348,8 @@ func testWorkflowAnyOfConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		a.t = t
 		// A group exhausted by jobs that a cascade canceled: 1 waits for 0,
 		// and 2 for any of 1, so 0's failure cancels 1 and then 2, which
-		// a finalize on Postgres leaves to the follow-up or the sweep.
+		// a finalize on Postgres leaves to the leader's sweep: a follow-up
+		// of 0 finds no dependent, 1's edge to it gone with 1.
 		_, ids := a.insert("cascaded", 3,
 			driver.JobDependency{Job: 1, DependsOn: 0},
 			driver.JobDependency{Job: 2, DependsOn: 1, AnyOf: 1})

@@ -156,12 +156,15 @@ func (e *executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 	return &w, nil
 }
 
-// readySQL selects, of the IDs it is given, the pending jobs none of whose
-// dependencies is still live and none of whose any-of groups holds them.
-var readySQL = `SELECT j.id FROM hopper_jobs j
-WHERE j.id IN (%s) AND j.state = 'pending'
-  AND NOT EXISTS (SELECT 1 FROM hopper_job_deps d JOIN hopper_jobs x ON x.id = d.depends_on WHERE d.job_id = j.id AND d.any_of IS NULL)
-  AND ` + anyOfReadySQL
+// pendingSQL reads, of the IDs it is given, the pending jobs, each with
+// whether it is ready, none of its dependencies still live and none of its
+// any-of groups holding it, and whether an exhausted any-of group whose
+// policy is any_cancel holds it, in one read for both.
+var pendingSQL = `SELECT j.id,
+  NOT EXISTS (SELECT 1 FROM hopper_job_deps d JOIN hopper_jobs x ON x.id = d.depends_on WHERE d.job_id = j.id AND d.any_of IS NULL)
+    AND ` + anyOfReadySQL + `,
+  ` + anyOfCancelSQL + `
+FROM hopper_jobs j WHERE j.id IN (%s) AND j.state = 'pending'`
 
 // exhaustedSQL selects the pending jobs among those in %s that an exhausted
 // any-of group whose policy is any_cancel holds.
@@ -203,13 +206,33 @@ func (e *executor) WorkflowPromoteReady(ctx context.Context, params driver.Workf
 	for i, id := range candidates {
 		ids[i] = idParam(id)
 	}
-	ready, err := queryIDs(ctx, e.read(), fmt.Sprintf(readySQL, placeholders(len(ids))), ids...)
+	type pending struct {
+		id               driver.JobID
+		ready, exhausted bool
+	}
+	rows, err := queryAll(ctx, e.read(), func(r scanner) (pending, error) {
+		var (
+			p  pending
+			id []byte
+		)
+		if err := r.Scan(&id, &p.ready, &p.exhausted); err != nil {
+			return p, err
+		}
+		return p, p.id.Scan(id)
+	}, fmt.Sprintf(pendingSQL, placeholders(len(ids))), ids...)
 	if err != nil {
 		return res, err
 	}
-	exhausted, err := queryIDs(ctx, e.read(), fmt.Sprintf(exhaustedSQL, placeholders(len(ids))), ids...)
-	if err != nil || len(ready)+len(exhausted) == 0 {
-		return res, err
+	var ready, exhausted []driver.JobID
+	for _, p := range rows {
+		if p.ready {
+			ready = append(ready, p.id)
+		} else if p.exhausted {
+			exhausted = append(exhausted, p.id)
+		}
+	}
+	if len(ready)+len(exhausted) == 0 {
+		return res, nil
 	}
 	err = e.write(ctx, func(x *w) error {
 		res.Promoted, res.Canceled = 0, 0
@@ -250,12 +273,8 @@ func (x *w) cancelExhausted(ctx context.Context, id driver.JobID) (int, error) {
 	if err != nil || row == nil {
 		return 0, err
 	}
-	errs, err := hopperError(row, "hopper: dependency failed", x.now)
+	f, err := x.cancelDependent(ctx, row)
 	if err != nil {
-		return 0, err
-	}
-	f := finished{row: row, state: driver.JobStateCanceled, errors: errs, logs: row.logs, archive: true}
-	if err := x.finish(ctx, f); err != nil {
 		return 0, err
 	}
 	done, err := x.tail(ctx, []finished{f})
