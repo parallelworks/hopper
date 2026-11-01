@@ -127,12 +127,21 @@ const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
 // The cascade still joins too, its first step to finished and its
 // recursive step to its own rows, which cannot take that form, and relies
 // on the leader keeping hopper_job_deps analyzed (JobsMaintain).
+//
+// The cascade cancels a dependent of a job that failed in the statement
+// through an any_cancel group when one of its any_cancel groups is
+// exhausted (exhausted), and promoted skips one a group holds (held).
 func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
-	return `cascade AS (
+	return anyOfGroupsSQL("exhausted",
+		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.on_failure = 'any_cancel'"+
+			" AND d.depends_on = ANY (ARRAY(SELECT id FROM finished WHERE final_state IN ('canceled', 'discarded'))))",
+		"ARRAY(SELECT batch_id FROM finished)",
+		"ARRAY(SELECT id FROM finished WHERE final_state IN ('canceled', 'discarded'))", "'{}'::uuid[]") + `,
+cascade AS (
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN finished f ON d.depends_on = f.id
   WHERE f.final_state IN ('canceled', 'discarded')
-    AND (d.on_failure = 'cancel' OR (d.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL("d", "f.batch_id",
-		"ARRAY(SELECT id FROM finished WHERE final_state IN ('canceled', 'discarded'))") + `))
+    AND (d.on_failure = 'cancel' OR (d.on_failure = 'any_cancel'
+      AND d.job_id = ANY (ARRAY(SELECT job_id FROM exhausted WHERE ` + anyOfExhaustedCancel + `))))
   UNION
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN cascade c ON d.depends_on = c.job_id
   WHERE d.on_failure = 'cancel'
@@ -170,9 +179,10 @@ progress_cleared AS (
 ),
 ` + resultsSQL + `,
 ` + batchCallbacksSQL(insertChannelParam) + `,
-held AS (` + anyOfHeldSQL(
+` + anyOfGroupsSQL("held",
 		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY (ARRAY(SELECT id FROM done)))",
-		"ARRAY(SELECT id FROM done)", "ARRAY(SELECT id FROM done WHERE final_state = 'completed')") + `),
+		"ARRAY(SELECT batch_id FROM done)",
+		"ARRAY(SELECT id FROM done)", "ARRAY(SELECT id FROM done WHERE final_state = 'completed')") + `,
 promoted AS (
   UPDATE {{schema}}.hopper_jobs j
   SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
@@ -182,7 +192,7 @@ promoted AS (
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
       WHERE d.job_id = j.id AND d.any_of IS NULL AND x.id NOT IN (SELECT id FROM done))
-    AND j.id <> ALL (ARRAY(SELECT job_id FROM held))
+    AND j.id <> ALL (ARRAY(SELECT job_id FROM held WHERE ` + anyOfHolds + `))
   RETURNING pg_notify(` + insertChannelParam + `, j.queue)
 ),
 edges AS (
@@ -203,69 +213,72 @@ edges AS (
 // none; it counts as completed, as that release, which runs the
 // dependent once the group's jobs have all finished, counts it.
 //
-// A statement sees the rows it finalizes in the live table still, so the
-// expressions below take the IDs of those that failed or completed in it,
+// A statement sees the rows it finalizes in the live table still, so
+// anyOfGroupsSQL takes the IDs of those that finished or completed in it,
 // as arrays: a job of a group in the live table is live unless it is
-// among them. A group's jobs are read by the dependent's edges, by primary
-// key, and each job by primary key, in the live table and in the results,
-// so a dependent without groups costs one more read of its own edges, and
-// only once every other condition has passed. A group's edges are found
-// through hopper_job_deps_any_of_job, the partial index on the edges in a
-// group (any_of IS NOT NULL) by dependent, which is empty for workflows
-// without groups, and which the statistics, whose null fraction of any_of
-// is exact, say is. With coalesce(any_of, 0) <> 0 as its predicate, which
-// the planner estimates true of all but one edge in two hundred, it chose
-// to walk the edges whole for a statement's dependents now and then. The
-// partial index on the edges that read or are in a group, by dependency,
-// has coalesce(reads, any_of IS NOT NULL) for its predicate, which
-// any_of IS NOT NULL does not imply: with reads OR any_of IS NOT NULL, a
-// lookup of a dependent's groups could walk that one whole, filtering it
-// by the dependent, as v22 found of the edges that read.
+// among them. A group's edges are found through hopper_job_deps_any_of_job,
+// the partial index on the edges in a group (any_of IS NOT NULL) by
+// dependent, which is empty for workflows without groups, so they cost a
+// probe of it per statement. With coalesce(any_of, 0) <> 0 as its
+// predicate, which the planner estimates true of all but one edge in two
+// hundred, it chose to walk the edges whole for a statement's dependents
+// now and then. The partial index on the edges that read or are in a
+// group, by dependency, has coalesce(reads, any_of IS NOT NULL) for its
+// predicate, which any_of IS NOT NULL does not imply: with reads OR
+// any_of IS NOT NULL, a lookup of a dependent's groups could walk that
+// one whole, filtering it by the dependent, as v22 found of the edges
+// that read.
 
-// anyOfLiveOrSatisfiedSQL is true of a job m of a group of a dependent in
-// batch that still keeps the group from being exhausted: live and not
-// among failed, or gone without a failed result.
-func anyOfLiveOrSatisfiedSQL(m, batch, failed string) string {
-	return `CASE WHEN EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = ` + m + `)
-        THEN ` + m + ` <> ALL (` + failed + `)
-        ELSE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_job_results r
-                         WHERE r.batch_id = ` + batch + ` AND r.job_id = ` + m + ` AND r.state <> 'completed') END`
-}
-
-// anyOfExhaustedSQL is true of the group of the edge d when no job of it
-// is live or has completed: d's job has failed in the statement, or
-// before, and so has every other, failed lists those that failed in it.
-func anyOfExhaustedSQL(d, batch, failed string) string {
-	return `(
-      SELECT 1 FROM {{schema}}.hopper_job_deps s
-      WHERE s.job_id = ` + d + `.job_id AND s.any_of = ` + d + `.any_of AND ` + anyOfLiveOrSatisfiedSQL("s.depends_on", batch, failed) + `
-      LIMIT 1) IS NULL`
-}
-
-// anyOfHeldSQL selects, of the jobs in the array dependents, those an
-// any-of group holds: none of its jobs completed, in the statement (among
-// completed) or before, and one of them is live, outside done, or its
-// policy is any_cancel, which holds the dependent of an exhausted group
-// until it is canceled. It walks the partial index on the edges in a
-// group, by dependent, which holds nothing of a workflow without groups:
-// as a condition evaluated per candidate instead, its estimate, multiplied
-// by the candidates', put the finalize past jit_above_cost.
-func anyOfHeldSQL(dependents, done, completed string) string {
-	return `
-  SELECT g.job_id FROM {{schema}}.hopper_job_deps g
+// anyOfGroupsSQL returns two CTEs: one, named name+"_edges", of the
+// edges in a group of the jobs in the array dependents, and one, named
+// name, of each of those groups, with its dependent (job_id), its policy
+// (on_failure), whether one of its jobs completed (satisfied) and whether
+// one is live (live). batches is an array that holds the dependents'
+// batches, done the IDs of the jobs that finished in the statement and
+// completed those of them that completed. A job of a group in the live
+// table completed if it is among completed and is live unless it is
+// among done; one gone from it completed unless its result says it
+// failed.
+//
+// Each job of the groups is looked up once, in one probe of the live
+// table and one of the results for all of them, which the CTE of
+// edges, materialized, feeds, so the groups cost what their edges do:
+// a check of a group's jobs per edge or per dependent, a subquery the
+// planner multiplies by the edges it guesses, guessed at a statement's
+// dependents times four hundred edges each without statistics, and
+// planned at millions, past jit_above_cost, where JIT compiled the
+// leader's statements for seconds.
+func anyOfGroupsSQL(name, dependents, batches, done, completed string) string {
+	return name + `_edges AS MATERIALIZED (
+  SELECT g.job_id, g.any_of, g.on_failure, g.depends_on FROM {{schema}}.hopper_job_deps g
   WHERE g.job_id = ANY (` + dependents + `) AND g.any_of IS NOT NULL
-    AND (g.on_failure = 'any_cancel'
-         OR (EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = g.depends_on) AND g.depends_on <> ALL (` + done + `)))
-    AND (
-      SELECT 1 FROM {{schema}}.hopper_job_deps s
-      WHERE s.job_id = g.job_id AND s.any_of = g.any_of
-        AND CASE WHEN EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = s.depends_on)
-                 THEN s.depends_on = ANY (` + completed + `)
-                 ELSE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_job_results r
-                                  WHERE r.batch_id = (SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = g.job_id)
-                                    AND r.job_id = s.depends_on AND r.state <> 'completed') END
-      LIMIT 1) IS NULL`
+),
+` + name + ` AS (
+  SELECT e.job_id, e.on_failure,
+    bool_or(CASE WHEN e.depends_on = ANY (m.present) THEN e.depends_on = ANY (` + completed + `)
+                 ELSE e.depends_on <> ALL (m.failed) END) AS satisfied,
+    bool_or(e.depends_on = ANY (m.present) AND e.depends_on <> ALL (` + done + `)) AS live
+  FROM ` + name + `_edges e, (
+    SELECT ARRAY(SELECT x.id FROM {{schema}}.hopper_jobs x
+                 WHERE x.id = ANY (ARRAY(SELECT depends_on FROM ` + name + `_edges))) AS present,
+      ARRAY(SELECT r.job_id FROM {{schema}}.hopper_job_results r
+            WHERE r.batch_id = ANY (` + batches + `) AND r.job_id = ANY (ARRAY(SELECT depends_on FROM ` + name + `_edges))
+              AND r.state <> 'completed') AS failed
+    OFFSET 0) m
+  GROUP BY e.job_id, e.any_of, e.on_failure
+)`
 }
+
+// anyOfHolds is true of a row of anyOfGroupsSQL's groups that holds its
+// dependent: none of its jobs completed, and one is live or its policy
+// is any_cancel, which holds the dependent of an exhausted group until it
+// is canceled.
+const anyOfHolds = `NOT satisfied AND (live OR on_failure = 'any_cancel')`
+
+// anyOfExhaustedCancel is true of a row of anyOfGroupsSQL's groups that
+// cancels its dependent: none of its jobs is live or completed, and its
+// policy is any_cancel.
+const anyOfExhaustedCancel = `NOT satisfied AND NOT live AND on_failure = 'any_cancel'`
 
 // resultsSQL records the final state and output of each job of done with
 // a dependent that reads it (StepOpts.Dependencies), for that dependent's
@@ -324,7 +337,9 @@ const resultsClearedSQL = `results_cleared AS (
 func workflowPromoteSQL(candidates string) string {
 	return `
 WITH candidates AS (` + candidates + `),
-held AS (` + anyOfHeldSQL("ARRAY(SELECT id FROM candidates)", "'{}'::uuid[]", "'{}'::uuid[]") + `),
+` + anyOfGroupsSQL("held", "ARRAY(SELECT id FROM candidates)",
+		"ARRAY(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = ANY (ARRAY(SELECT id FROM candidates)))",
+		"'{}'::uuid[]", "'{}'::uuid[]") + `,
 ready AS (
   SELECT j.id FROM {{schema}}.hopper_jobs j
   WHERE j.id = ANY (ARRAY(SELECT id FROM candidates))
@@ -332,7 +347,7 @@ ready AS (
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
       WHERE d.job_id = j.id AND d.any_of IS NULL)
-    AND j.id <> ALL (ARRAY(SELECT job_id FROM held))
+    AND j.id <> ALL (ARRAY(SELECT job_id FROM held WHERE ` + anyOfHolds + `))
   FOR UPDATE OF j SKIP LOCKED
 ),
 promoted AS (
@@ -343,20 +358,8 @@ promoted AS (
 )
 SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
   (SELECT id FROM candidates ORDER BY id DESC LIMIT 1),
-  (SELECT count(*) FROM {{schema}}.hopper_job_deps g
-   WHERE g.job_id = ANY (ARRAY(SELECT job_id FROM held)) AND g.any_of IS NOT NULL AND g.on_failure = 'any_cancel'
-     AND ` + anyOfExhaustedSQL("g", "(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = g.job_id)", "'{}'::uuid[]") + `)`
+  (SELECT count(*) FROM held WHERE ` + anyOfExhaustedCancel + `)`
 }
-
-// anyOfCancelSQL is true of a job j with an any-of group whose policy is
-// any_cancel and none of whose jobs is live or has completed. It is a
-// scalar subquery, which the planner cannot turn into a join: as EXISTS, a
-// semi-join, statistics that said no edge was in a group had it scan
-// hopper_job_deps whole for one.
-var anyOfCancelSQL = `(
-    SELECT 1 FROM {{schema}}.hopper_job_deps g
-    WHERE g.job_id = j.id AND g.any_of IS NOT NULL AND g.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL("g", "j.batch_id", "'{}'::uuid[]") + `
-    LIMIT 1) IS NOT NULL`
 
 // workflowCancelExhaustedSQL cancels the pending jobs among those a CTE
 // named candidates selects that an exhausted any-of group whose policy is
@@ -368,11 +371,15 @@ var anyOfCancelSQL = `(
 func workflowCancelExhaustedSQL(candidates string) string {
 	return `
 WITH RECURSIVE candidates AS (` + candidates + `),
+` + anyOfGroupsSQL("candidate", "ARRAY(SELECT id FROM candidates)",
+		"ARRAY(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = ANY (ARRAY(SELECT id FROM candidates)))",
+		"'{}'::uuid[]", "'{}'::uuid[]") + `,
 finished AS (
   DELETE FROM {{schema}}.hopper_jobs j
   WHERE j.id IN (
     SELECT j.id FROM {{schema}}.hopper_jobs j
-    WHERE j.id = ANY (ARRAY(SELECT id FROM candidates)) AND j.state = 'pending' AND ` + anyOfCancelSQL + `
+    WHERE j.id = ANY (ARRAY(SELECT id FROM candidates)) AND j.state = 'pending'
+      AND j.id = ANY (ARRAY(SELECT job_id FROM candidate WHERE ` + anyOfExhaustedCancel + `))
     FOR UPDATE OF j SKIP LOCKED
   )
   RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "j.logs", "NULL::jsonb", "true", "'canceled'::text", "$1") + `

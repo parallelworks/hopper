@@ -1356,6 +1356,116 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 	}
 }
 
+// The statements that finalize workflow jobs, promote them, and cancel
+// those an exhausted any-of group holds stay under jit_above_cost when
+// hopper_job_deps has no statistics, as before the leader first analyzes
+// it. The planner then takes each dependency to have four hundred edges
+// and each dependent as many: an any-of check per edge, a subquery
+// multiplied by the edges guessed, planned the leader's lease expiry at
+// millions, which JIT compiled for seconds on every pass.
+func TestWorkflowPlansWithoutStatistics(t *testing.T) {
+	t.Parallel()
+	ctx, d, exec := setup(t)
+	pool := d.Pool()
+	exec1 := func(q string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	for _, table := range []string{"hopper_jobs", "hopper_job_deps", "hopper_job_results", "hopper_batches", "hopper_batch_progress"} {
+		exec1("ALTER TABLE " + table + " SET (autovacuum_enabled = false)")
+	}
+	// Five thousand workflows of ten steps: one, eight after it, one after
+	// those, the last of the first fifty also in an any-of group, which
+	// cancels it, of a job that was discarded.
+	exec1(`CREATE UNLOGGED TABLE steps AS
+		SELECT w, s, hopper_uuidv7() AS id, b.id AS batch_id
+		FROM (SELECT w, hopper_uuidv7() AS id FROM generate_series(1, 5000) w) b, generate_series(0, 9) s ORDER BY w, s`)
+	exec1(`INSERT INTO hopper_batches (id, pending, total, name) SELECT DISTINCT batch_id, 10, 10, 'w' FROM steps`)
+	exec1(`INSERT INTO hopper_jobs (id, kind, state, args, batch_id)
+		SELECT id, 'step', (CASE WHEN s = 0 THEN 'available' ELSE 'pending' END)::hopper_job_state, '{}', batch_id FROM steps ORDER BY w, s`)
+	exec1(`INSERT INTO hopper_job_deps (job_id, depends_on)
+		SELECT m.id, r.id FROM steps m JOIN steps r ON r.w = m.w AND r.s = 0 WHERE m.s BETWEEN 1 AND 8
+		UNION ALL SELECT l.id, m.id FROM steps l JOIN steps m ON m.w = l.w AND m.s BETWEEN 1 AND 8 WHERE l.s = 9`)
+	exec1(`CREATE UNLOGGED TABLE gone AS SELECT hopper_uuidv7() AS id, batch_id, l.id AS job_id FROM steps l WHERE l.s = 9 AND l.w <= 50`)
+	exec1(`INSERT INTO hopper_job_deps (job_id, depends_on, on_failure, any_of) SELECT job_id, id, 'any_cancel', 1 FROM gone`)
+	exec1(`INSERT INTO hopper_job_results (batch_id, job_id, state) SELECT batch_id, id, 'discarded' FROM gone`)
+	var analyzed int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stats WHERE schemaname = current_schema() AND tablename = 'hopper_job_deps'`).Scan(&analyzed); err != nil || analyzed != 0 {
+		t.Fatalf("hopper_job_deps has statistics of %d columns, %v", analyzed, err)
+	}
+
+	clientID := register(t, ctx, exec)
+	res, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "default", ClientID: clientID, Limit: 200})
+	if err != nil || len(res.Jobs) != 200 {
+		t.Fatalf("claim = %d jobs, %v", len(res.Jobs), err)
+	}
+	log := &statementLog{}
+	traced := tracedDriver(t, pool, log).Executor()
+	fin := make([]driver.JobFinalize, 100)
+	for i, j := range res.Jobs[:100] {
+		state := driver.JobStateCompleted
+		if i%2 == 1 {
+			state = driver.JobStateDiscarded
+		}
+		fin[i] = driver.JobFinalize{ID: j.ID, AttemptedBy: clientID, Fence: j.Fence, State: state, Archive: true}
+	}
+	finished, err := traced.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: fin})
+	if err != nil || len(finished) != 100 {
+		t.Fatalf("finalize = %d, %v", len(finished), err)
+	}
+	dependsOn := make([]driver.JobID, len(finished))
+	for i, f := range finished {
+		dependsOn[i] = f.ID
+	}
+	if _, err := traced.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: dependsOn}); err != nil {
+		t.Fatal(err)
+	}
+	swept, err := traced.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{Limit: 1000})
+	if err != nil || swept.Canceled == 0 {
+		t.Fatalf("sweep = %+v, %v; want the jobs of exhausted groups canceled", swept, err)
+	}
+	if _, err := traced.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 100, ClientID: clientID}); err != nil {
+		t.Fatal(err)
+	}
+	var pending driver.JobID
+	if err := pool.QueryRow(ctx, `SELECT id FROM steps WHERE w = 4000 AND s = 1`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := traced.JobCancel(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	log.mu.Lock()
+	statements, args := log.sql, log.args
+	log.mu.Unlock()
+	cost := regexp.MustCompile(`"Total Cost": ([0-9.]+)`)
+	explained := 0
+	for i, q := range statements {
+		if !strings.Contains(q, "hopper_job_deps") {
+			continue
+		}
+		explained++
+		for _, mode := range []string{"force_generic_plan", "force_custom_plan"} {
+			plan := explainPrepared(t, ctx, conn, mode, q, args[i])
+			if c := cost.FindStringSubmatch(plan); c == nil {
+				t.Errorf("%s plan has no total cost:\n%s", mode, plan)
+			} else if cost, _ := strconv.ParseFloat(c[1], 64); cost >= 100000 {
+				t.Errorf("%s plan costs %.0f, past jit_above_cost:\n%s\n%s", mode, cost, q, plan)
+			}
+		}
+	}
+	if explained < 7 {
+		t.Errorf("explained %d statements, want at least 7", explained)
+	}
+}
+
 // The claim reads a claimed workflow job's edges that read by the job's ID,
 // whatever the statistics say of how many edges read. Analyzed while no
 // workflow read its dependencies' outputs, they say none does, and both
