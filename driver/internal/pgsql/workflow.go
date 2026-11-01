@@ -332,10 +332,14 @@ SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
 }
 
 // anyOfCancelSQL is true of a job j with an any-of group whose policy is
-// any_cancel and none of whose jobs is live or has completed.
-var anyOfCancelSQL = `EXISTS (
+// any_cancel and none of whose jobs is live or has completed. It is a
+// scalar subquery, which the planner cannot turn into a join: as EXISTS, a
+// semi-join, statistics that said no edge was in a group had it scan
+// hopper_job_deps whole for one.
+var anyOfCancelSQL = `(
     SELECT 1 FROM {{schema}}.hopper_job_deps g
-    WHERE g.job_id = j.id AND g.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL("g", "j.batch_id", "'{}'::uuid[]") + `)`
+    WHERE g.job_id = j.id AND g.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL("g", "j.batch_id", "'{}'::uuid[]") + `
+    LIMIT 1) IS NOT NULL`
 
 // workflowCancelExhaustedSQL cancels the pending jobs among those a CTE
 // named candidates selects that an exhausted any-of group whose policy is
