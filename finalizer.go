@@ -574,7 +574,13 @@ func (f *finalizer) afterFlush(ctx context.Context, batch []pending, applied []d
 // still running in this attempt, a transaction holds its row: the result is
 // tried again later. A job completed with CompleteTx that finished in this
 // attempt had its transaction commit after all, and the completion is
-// reported. Otherwise the job has moved on, and the result is dropped.
+// reported. Otherwise the job has moved on, and the result is dropped; a
+// terminal one is still returned as finished, for the follow-up: the
+// statement that moved the job on may be this result's own, retried after
+// an error the commit came before, and the follow-up, which does nothing
+// for a job that has not finished, then promotes or cancels its
+// dependents, those with an any-of group among them, which the finalize
+// leaves to it.
 func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
 	switch state := readTx(ctx, f.exec, p.job); {
 	case state == txCommitted && p.completedTx != nil:
@@ -582,7 +588,7 @@ func (f *finalizer) notWritten(ctx context.Context, p pending) (pending, bool) {
 		return p, true
 	case state == txCommitted, state == txLost:
 		f.logger.WarnContext(ctx, "hopper: result dropped: job no longer owned by this attempt", "job_id", p.result.ID)
-		return p, false
+		return p, p.result.State.Terminal()
 	}
 	if p.waits++; p.waits == 1 {
 		switch {

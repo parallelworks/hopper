@@ -205,12 +205,13 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			return
 		}
 
-		// The jobs it discarded of a batch, and the dependents it canceled
-		// by cascade, are followed up as a client follows up those of its
-		// finalize: the finalize leaves a dependent with an any-of group to
-		// the follow-up, and one of the cascade's own dependents can wait on
-		// a group the cascade exhausted, which the sweep, from where its last
-		// pass stopped, may not reach in this pass.
+		// The dependents of the jobs it discarded of a batch, and of those it
+		// canceled by cascade, are promoted or canceled as a client's
+		// follow-up does (their batches are left to settleBatches): the
+		// finalize leaves a dependent with an any-of group to the follow-up,
+		// and one of the cascade's own dependents can wait on a group the
+		// cascade exhausted, which the sweep, from where its last pass
+		// stopped, may not reach in this pass.
 		applied, cascaded := splitCascaded(applied)
 		var followUp []JobID
 		for _, a := range applied {

@@ -2753,14 +2753,19 @@ observability without new machinery.
       follows them up as it does the jobs it finalized, with `WorkflowPromoteReady`,
       which cancels the dependent, as the leader's rescue does the jobs of a workflow
       it discarded and those its finalize canceled by cascade.
-      The leader's sweep does for a client that stopped before its follow-up, and for
-      the statements that return no such jobs: `JobCancel` and `JobDelete` of a waiting
-      job, `FinishTx`, and the expiry of job leases and of TTLs. Those are rare, and the
-      sweep bounds the delay: it cancels such a dependent within a leader interval (5 s
-      by default) of the cascade, or a few with more pending workflow steps than one
-      pass walks. SQLite's tail, run by a single writer, checks the groups of
-      the jobs its cascade cancels as it goes, and promotes a dependent whose group is
-      satisfied itself, since no other write can hold its row.
+      The leader's sweep does for a client that stopped before its follow-up, whose
+      follow-up failed, or whose follow-up skipped a dependent's row held by a
+      transaction that then rolled back; for a `Leases.Finish` whose statement committed
+      though it returned an error, which the caller's retry finds fenced; and for the
+      statements that return no such jobs: `JobCancel`, `JobDelete` and their `Tx` forms
+      on a waiting job, `FinishTx`, and the expiry of job leases and of TTLs. (A flush retried after an error its commit came before finds its jobs
+      gone, and follows up those whose results were terminal all the same.) Those are
+      rare, and the sweep bounds the delay: it promotes or cancels such a dependent
+      within a leader interval (5 s by default) of the statement, or a few with more
+      pending workflow steps than one pass walks. SQLite's tail, run by a single
+      writer, checks the groups of the jobs its cascade cancels as it goes, and
+      promotes a dependent whose group is satisfied itself, since no other write can
+      hold its row.
     - **Group size.** The group check compares each edge of a group with arrays of the
       group's steps, which Postgres scans linearly, so a statement that decides a group
       costs its size squared, and each step that finishes after it does too. Measured

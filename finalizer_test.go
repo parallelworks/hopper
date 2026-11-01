@@ -594,6 +594,52 @@ func TestFinalizerCreditsTheResultThatApplied(t *testing.T) {
 	}
 }
 
+// lostCommitExec fails a workflow job's first finalize after it committed,
+// as a connection reset after the commit does: the retry finds the job in
+// history, finalized by this attempt, and applies nothing.
+type lostCommitExec struct {
+	stubExec
+	job      driver.JobRow
+	calls    int
+	promoted [][]driver.JobID
+}
+
+func (e *lostCommitExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error) {
+	j := e.job
+	return &j, nil
+}
+
+func (e *lostCommitExec) JobFinalizeMany(context.Context, driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
+	if e.calls++; e.calls == 1 {
+		return nil, errors.New("connection reset")
+	}
+	return nil, nil
+}
+
+func (e *lostCommitExec) WorkflowPromoteReady(_ context.Context, p driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
+	e.promoted = append(e.promoted, p.DependsOn)
+	return driver.WorkflowPromoteResult{}, nil
+}
+
+// A workflow job whose finalize committed though the client saw it fail is
+// followed up all the same when the retry finds it finalized: a finalize
+// leaves its dependents with an any-of group to the follow-up.
+func TestFinalizerFollowsUpACommitItDidNotSee(t *testing.T) {
+	claimed := driver.JobRow{ID: driver.JobID{1}, Queue: "default", State: driver.JobStateRunning, AttemptedBy: 7, Attempt: 1, Fence: 1, BatchID: driver.JobID{9}}
+	for _, state := range []driver.JobState{driver.JobStateCompleted, driver.JobStateDiscarded} {
+		finalized := claimed
+		finalized.State = state
+		exec := &lostCommitExec{job: finalized}
+		f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeBatch: 10, finalizeBuffer: 10}, 0, func(string) {},
+			func(*driver.JobRow, driver.JobFinalize) {})
+		row := claimed
+		f.write(context.Background(), []pending{{job: &row, result: driver.JobFinalize{ID: row.ID, AttemptedBy: 7, Fence: 1, State: state, Archive: true}}}, false)
+		if exec.calls != 2 || len(exec.promoted) != 1 || !slices.Equal(exec.promoted[0], []driver.JobID{row.ID}) {
+			t.Errorf("%s: %d statements, follow-ups %v; want the retry and a follow-up of the job", state, exec.calls, exec.promoted)
+		}
+	}
+}
+
 // fixedJob is a JobGet that reads one job, as it is.
 type fixedJob driver.JobRow
 

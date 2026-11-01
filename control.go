@@ -30,7 +30,9 @@ var (
 // running job, on any client, has its context canceled (with cause
 // ErrJobCanceled) and finalizes as canceled unless it completes anyway. A
 // finalized job is returned unchanged. The job as it is afterwards is
-// returned.
+// returned. On Postgres, a waiting job's workflow dependent with an any-of
+// group (StepOpts.AfterAny) is promoted or canceled by the leader's sweep,
+// within about a leader interval, rather than by the cancel itself.
 func (c *Client[TTx]) JobCancel(ctx context.Context, id JobID) (*JobRow, error) {
 	job, err := c.exec.JobCancel(ctx, id)
 	if err != nil {
@@ -118,7 +120,8 @@ func retryParams(id JobID, opts []RetryOption) driver.JobRetryParams {
 // JobDelete removes a job that is not running, from the live table or from
 // history, and returns it as it was last stored. A waiting job is canceled
 // as JobCancel does, but keeps no history row: its batch counts it as
-// failed, its dependents react as they do to a cancel, and Await on it
+// failed, its dependents react as they do to a cancel (one with an any-of
+// group at the leader's sweep, as for JobCancel), and Await on it
 // returns ErrNotFound rather than waiting forever. It returns ErrJobRunning for a
 // running job (cancel it, then delete it once it has finished) and
 // ErrNotFound for an unknown one.

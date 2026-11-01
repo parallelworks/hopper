@@ -367,7 +367,8 @@ type Executor interface {
 	// of the jobs it has just finalized, and the leader sweeps up the rest.
 	// It likewise cancels, with their dependents, the pending jobs that an
 	// exhausted any-of group whose policy is cancel holds, which concurrent
-	// finalizes of the group's last jobs each left to the other.
+	// finalizes of the group's last jobs each left to the other, or which a
+	// job canceled by cascade exhausted (JobFinalized.Cascaded).
 	WorkflowPromoteReady(ctx context.Context, params WorkflowPromoteParams) (WorkflowPromoteResult, error)
 
 	// PeriodicInsert inserts the job for a periodic slot if that slot has
