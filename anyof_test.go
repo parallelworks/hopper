@@ -31,7 +31,7 @@ func TestWorkflowAfterAny(t *testing.T) {
 	}
 	opts := hopper.AfterAny(matrix...)
 	opts.After, opts.Name, opts.Dependencies = []hopper.Step{setup}, "report", true
-	wf.Add(depStep{Name: "report"}, opts) // step 7
+	wf.Add(depStep{Name: "report"}, opts)                       // step 7
 	wf.Add(depStep{Name: "never"}, hopper.AfterAny(failing...)) // step 8
 	res, err := c.InsertWorkflow(ctx, wf)
 	if err != nil {

@@ -27,7 +27,6 @@ const (
 // number them in a smallint.
 const maxAnyOfGroups = 32767
 
-
 // WorkflowOpts sets a workflow's completion callbacks and metadata. A
 // workflow is a batch, so the callbacks are those of BatchOpts: OnSuccess
 // when every step completed, OnFailure when any was canceled or
