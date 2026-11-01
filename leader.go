@@ -162,6 +162,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 
 		fin := make([]driver.JobFinalize, len(candidates))
 		queueOf := make(map[JobID]string, len(candidates))
+		// inBatch holds the jobs of a batch the rescue discards, whose
+		// dependents it follows up.
+		inBatch := map[JobID]struct{}{}
 		noBatches := true
 		for i, cand := range candidates {
 			j := cand.Job
@@ -180,6 +183,9 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			}
 			if j.Attempt >= j.MaxAttempts {
 				f.State = driver.JobStateDiscarded
+				if !j.BatchID.IsZero() {
+					inBatch[j.ID] = struct{}{}
+				}
 			}
 			fin[i] = f
 			queueOf[j.ID] = j.Queue
@@ -199,6 +205,25 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 			return
 		}
 
+		// The dependents of the jobs it discarded of a batch, and of those it
+		// canceled by cascade, are promoted or canceled as a client's
+		// follow-up does (their batches are left to settleBatches): the
+		// finalize leaves a dependent with an any-of group to the follow-up,
+		// and one of the cascade's own dependents can wait on a group the
+		// cascade exhausted, which the sweep, from where its last pass
+		// stopped, may not reach in this pass.
+		applied, cascaded := splitCascaded(applied)
+		var followUp []JobID
+		for _, a := range applied {
+			if _, ok := inBatch[a.ID]; ok {
+				followUp = append(followUp, a.ID)
+			}
+		}
+		if followUp = append(followUp, cascaded...); len(followUp) > 0 {
+			if _, err := c.exec.WorkflowPromoteReady(ctx, driver.WorkflowPromoteParams{DependsOn: followUp}); err != nil && ctx.Err() == nil {
+				c.logger.WarnContext(ctx, "hopper: promote dependents of rescued jobs; the sweep will", "count", len(followUp), "error", err)
+			}
+		}
 		var retried, discarded int
 		queues := map[string]struct{}{}
 		byID := make(map[JobID]driver.JobFinalize, len(fin))
@@ -391,6 +416,9 @@ func (c *Client[TTx]) promoteReady(ctx context.Context) {
 		}
 		if res.Promoted > 0 {
 			c.logger.InfoContext(ctx, "hopper: promoted workflow jobs whose dependencies finished concurrently", "count", res.Promoted)
+		}
+		if res.Canceled > 0 {
+			c.logger.InfoContext(ctx, "hopper: canceled workflow jobs whose any-of groups failed", "count", res.Canceled)
 		}
 		if res.Scanned < int64(c.tuning.rescueBatch) {
 			c.promoteAfter = driver.JobID{}

@@ -196,7 +196,8 @@ type Executor interface {
 	// it, by the same client at the same fence; the job and fence of each
 	// applied result are returned, and the caller treats the rest as fenced.
 	// Of two results of one job, at most one applies, and its fence says
-	// which.
+	// which. The dependents it canceled by cascade follow the applied
+	// results, with Cascaded set.
 	JobFinalizeMany(ctx context.Context, params JobFinalizeParams) ([]JobFinalized, error)
 	// JobRecordProgress stores a running job's progress, fenced like a
 	// finalize: only while the job is running in the given claim, by the
@@ -358,9 +359,16 @@ type Executor interface {
 	// WorkflowPromoteReady makes pending jobs whose dependencies have all
 	// finalized claimable. The statement that finalizes a job promotes its
 	// dependents itself, but two dependencies finalized by concurrent
-	// transactions each see the other still live, and neither promotes. A
-	// client therefore promotes the dependents of the jobs it has just
-	// finalized, and the leader sweeps up the rest.
+	// transactions each see the other still live, and neither promotes;
+	// and an engine that locks rows may leave every dependent with an
+	// any-of group (JobDependency.AnyOf) to this call, since two jobs of a
+	// group completing at once would each promote it, the second waiting
+	// for the first's row lock. A client therefore promotes the dependents
+	// of the jobs it has just finalized, and the leader sweeps up the rest.
+	// It likewise cancels, with their dependents, the pending jobs that an
+	// exhausted any-of group whose policy is cancel holds, which concurrent
+	// finalizes of the group's last jobs each left to the other, or which a
+	// job canceled by cascade exhausted (JobFinalized.Cascaded).
 	WorkflowPromoteReady(ctx context.Context, params WorkflowPromoteParams) (WorkflowPromoteResult, error)
 
 	// PeriodicInsert inserts the job for a periodic slot if that slot has
@@ -953,6 +961,13 @@ type JobDependency struct {
 	// DependsOn has finished: the engine records DependsOn's final state and
 	// output only for a job with a dependent that reads it.
 	Reads bool
+	// AnyOf, when not zero, puts the edge in Job's any-of group of that
+	// number (1 to 32767): Job waits for one job of the group to complete
+	// rather than for all of them to finish. Job's ordinary edges have
+	// zero. All of Job's edges have one OnFailure, which applies to a group
+	// once every job of it has finished without completing; a workflow
+	// whose group's edges have different ones is rejected.
+	AnyOf int
 }
 
 // WorkflowInsertParams describes a workflow: a named batch whose jobs
@@ -983,6 +998,9 @@ type WorkflowInsertResult struct {
 // JobEdge is an edge of an inserted workflow.
 type JobEdge struct {
 	Job, DependsOn JobID
+	// AnyOf is the number of Job's any-of group the edge is in, or zero for
+	// an ordinary edge (JobDependency.AnyOf).
+	AnyOf int
 }
 
 // WorkflowRow is a workflow's progress, jobs and graph.
@@ -1116,6 +1134,10 @@ type WorkflowPromoteParams struct {
 type WorkflowPromoteResult struct {
 	// Promoted counts the jobs made claimable.
 	Promoted int64
+	// Canceled counts the jobs canceled because every job of one of their
+	// any-of groups finished without completing, and those canceled with
+	// them, down the graph.
+	Canceled int64
 	// Scanned counts the jobs considered by a sweep, and Last is the
 	// greatest of their IDs, the After of the next chunk.
 	Scanned int64
@@ -1123,10 +1145,17 @@ type WorkflowPromoteResult struct {
 }
 
 // JobFinalized names a result JobFinalizeMany applied: its job, and the
-// fence of the claim it belonged to.
+// fence of the claim it belonged to; or, with Cascaded set and no fence, a
+// job the statement canceled by cascade.
 type JobFinalized struct {
 	ID    JobID
 	Fence int64
+	// Cascaded marks a dependent the statement canceled because a job it
+	// finalized failed. The caller follows it up as it does the jobs it
+	// finalized (WorkflowPromoteReady with it among DependsOn): its own
+	// dependents can wait on an any-of group it exhausted, which the
+	// statement leaves to that follow-up.
+	Cascaded bool
 }
 
 // JobFinalize is the result of one attempt.

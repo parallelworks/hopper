@@ -246,7 +246,8 @@ func encodeResults(jobs []driver.JobFinalize) ([]result, error) {
 // JobFinalizeMany implements driver.Executor. A result applies only to a
 // job running in the claim that produced it, by the same client at the same
 // fence, so a stale result never overwrites a newer attempt; each applied
-// result is reported with its fence. With
+// result is reported with its fence, and each dependent the tail canceled
+// by cascade after them, with Cascaded set. With
 // SkipLocked, a write lock another transaction holds is waited for only
 // briefly, after which no result is applied.
 func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
@@ -346,8 +347,14 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		if params.NoBatches {
 			return nil
 		}
-		_, err := x.tail(ctx, done)
-		return err
+		all, err := x.tail(ctx, done)
+		if err != nil {
+			return err
+		}
+		for _, f := range all[len(done):] {
+			applied = append(applied, driver.JobFinalized{ID: f.row.job.ID, Cascaded: true})
+		}
+		return nil
 	})
 	if errors.Is(err, errLockBusy) {
 		return nil, nil
@@ -364,19 +371,46 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 	if len(done) == 0 {
 		return done, nil
 	}
-	// Cancel the dependents of failed jobs, down the graph by cancel edges.
+	// Record the results the jobs' dependents need, and read each job's
+	// dependents once, for the promotion below too: the edges do not
+	// change until the end of the tail.
+	dependents := make([][]driver.JobID, 0, len(done))
+	for _, f := range done {
+		deps, err := x.recordResult(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+		dependents = append(dependents, deps)
+	}
+
+	// Cancel the dependents of failed jobs, down the graph by cancel edges,
+	// and those of an any-of group that cancels them once every job of the
+	// group has failed. A job's result is recorded as it is canceled,
+	// before the groups it is in are checked.
+	// As on Postgres, the walk goes on through a dependent that is not
+	// pending, by its cancel edges only, since it did not fail.
+	type step struct {
+		id, batch driver.JobID
+		failed    bool
+	}
 	cascaded := map[driver.JobID]bool{}
-	var queue []driver.JobID
+	var queue []step
 	for _, f := range done {
 		if f.failed() {
-			queue = append(queue, f.row.job.ID)
+			queue = append(queue, step{f.row.job.ID, f.row.job.BatchID, true})
 		}
 	}
 	seen := map[driver.JobID]bool{}
 	for len(queue) > 0 {
-		id := queue[0]
+		from := queue[0]
 		queue = queue[1:]
-		deps, err := x.ids(ctx, "SELECT job_id FROM hopper_job_deps WHERE depends_on = ? AND on_failure = 'cancel'", idParam(id))
+		query, args := "SELECT job_id FROM hopper_job_deps WHERE depends_on = ? AND on_failure = 'cancel'", []any{idParam(from.id)}
+		if from.failed {
+			query = `SELECT d.job_id FROM hopper_job_deps d WHERE d.depends_on = ?
+				AND (d.on_failure = 'cancel' OR (d.on_failure = 'any_cancel' AND ` + anyOfExhaustedSQL + `))`
+			args = append(args, idParam(from.batch))
+		}
+		deps, err := x.ids(ctx, query, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -385,69 +419,26 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 				continue
 			}
 			seen[dep] = true
-			queue = append(queue, dep)
 			row, err := x.liveRow(ctx, dep)
 			if err != nil {
 				return nil, err
 			}
 			if row == nil || row.job.State != driver.JobStatePending {
+				queue = append(queue, step{id: dep})
 				continue
 			}
-			errs, err := hopperError(row, "hopper: dependency failed", x.now)
+			f, err := x.cancelDependent(ctx, row)
 			if err != nil {
 				return nil, err
 			}
-			f := finished{row: row, state: driver.JobStateCanceled, errors: errs, logs: row.logs, archive: true}
-			if err := x.finish(ctx, f); err != nil {
+			deps, err := x.recordResult(ctx, f)
+			if err != nil {
 				return nil, err
 			}
 			done = append(done, f)
+			dependents = append(dependents, deps)
 			cascaded[dep] = true
-		}
-	}
-
-	// Record the result of each job with a dependent that reads it
-	// (StepOpts.Dependencies), for that dependent's claims. countBatch
-	// deletes a workflow's results when it completes. The edges do not
-	// change until the end of the tail, so each job's dependents are read
-	// once, here, with whether any reads it, for the promotion below too: a
-	// workflow that never asks runs no statement more than it did.
-	dependents := make([][]driver.JobID, len(done))
-	for i, f := range done {
-		type dependent struct {
-			id    driver.JobID
-			reads bool
-		}
-		deps, err := queryAll(ctx, x, func(r scanner) (dependent, error) {
-			var (
-				d     dependent
-				id    []byte
-				reads sql.NullBool
-			)
-			if err := r.Scan(&id, &reads); err != nil {
-				return d, err
-			}
-			d.reads = reads.Bool
-			err := d.id.Scan(id)
-			return d, err
-		}, "SELECT job_id, reads FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
-		if err != nil {
-			return nil, err
-		}
-		read := false
-		for _, d := range deps {
-			dependents[i] = append(dependents[i], d.id)
-			read = read || d.reads
-		}
-		if !read || f.row.job.BatchID.IsZero() {
-			continue
-		}
-		if _, err := x.ExecContext(ctx, `
-			INSERT INTO hopper_job_results (job_id, batch_id, state, output, finalized_at) VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT (batch_id, job_id) DO UPDATE SET state = excluded.state, output = excluded.output,
-			  finalized_at = excluded.finalized_at`,
-			idParam(f.row.job.ID), idParam(f.row.job.BatchID), string(f.state), f.output, x.us()); err != nil {
-			return nil, fmt.Errorf("record result of job %s: %w", f.row.job.ID, err)
+			queue = append(queue, step{dep, row.job.BatchID, true})
 		}
 	}
 
@@ -499,6 +490,107 @@ func (x *w) tail(ctx context.Context, done []finished) ([]finished, error) {
 	return done, nil
 }
 
+// recordResult records the final state of a job of done with a dependent
+// that reads it (StepOpts.Dependencies), for that dependent's claims, or
+// that has it in an any-of group, for that dependent's promotion, with its
+// output for one that reads it, and returns its dependents. countBatch
+// deletes a workflow's results when it completes. A workflow with neither
+// runs no statement more than it did.
+func (x *w) recordResult(ctx context.Context, f finished) ([]driver.JobID, error) {
+	type dependent struct {
+		id           driver.JobID
+		reads, group bool
+	}
+	deps, err := queryAll(ctx, x, func(r scanner) (dependent, error) {
+		var (
+			d     dependent
+			id    []byte
+			reads sql.NullBool
+			group sql.NullInt64
+		)
+		if err := r.Scan(&id, &reads, &group); err != nil {
+			return d, err
+		}
+		d.reads, d.group = reads.Bool, group.Valid
+		err := d.id.Scan(id)
+		return d, err
+	}, "SELECT job_id, reads, any_of FROM hopper_job_deps WHERE depends_on = ?", idParam(f.row.job.ID))
+	if err != nil {
+		return nil, err
+	}
+	var (
+		ids          = make([]driver.JobID, len(deps))
+		read, record bool
+	)
+	for i, d := range deps {
+		ids[i] = d.id
+		read = read || d.reads
+		record = record || d.reads || d.group
+	}
+	if !record || f.row.job.BatchID.IsZero() {
+		return ids, nil
+	}
+	var output any
+	if read {
+		output = f.output
+	}
+	if _, err := x.ExecContext(ctx, `
+		INSERT INTO hopper_job_results (job_id, batch_id, state, output, finalized_at) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (batch_id, job_id) DO UPDATE SET state = excluded.state, output = excluded.output,
+		  finalized_at = excluded.finalized_at`,
+		idParam(f.row.job.ID), idParam(f.row.job.BatchID), string(f.state), output, x.us()); err != nil {
+		return nil, fmt.Errorf("record result of job %s: %w", f.row.job.ID, err)
+	}
+	return ids, nil
+}
+
+// cancelDependent finishes a pending job as canceled because a job it
+// depends on failed, or every job of one of its any-of groups did.
+func (x *w) cancelDependent(ctx context.Context, row *liveRow) (finished, error) {
+	errs, err := hopperError(row, "hopper: dependency failed", x.now)
+	if err != nil {
+		return finished{}, err
+	}
+	f := finished{row: row, state: driver.JobStateCanceled, errors: errs, logs: row.logs, archive: true}
+	return f, x.finish(ctx, f)
+}
+
+// The edges of a dependent's any-of group (hopper_job_deps.any_of) hold it
+// until one of their jobs has completed. A group none of whose jobs
+// completed holds it while one is live, and once none is, its policy
+// applies: any_ignore lets the dependent run, and any_cancel cancels it. A
+// job of a group leaves the live table with its final state recorded
+// (recordResult); one gone without a result was finalized by a release
+// before any-of groups, which records none, and counts as completed, as
+// that release counts it.
+
+// anyOfSatisfiedSQL is true of a job s.depends_on of a group of a
+// dependent in batch %[1]s that has completed.
+const anyOfSatisfiedSQL = `NOT EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = s.depends_on)
+	AND NOT EXISTS (SELECT 1 FROM hopper_job_results r WHERE r.batch_id = %[1]s AND r.job_id = s.depends_on AND r.state <> 'completed')`
+
+// anyOfExhausted is true of the group of the edge named edge, of a
+// dependent in batch, when none of its jobs is live or has completed.
+func anyOfExhausted(edge, batch string) string {
+	return `NOT EXISTS (SELECT 1 FROM hopper_job_deps s WHERE s.job_id = ` + edge + `.job_id AND s.any_of = ` + edge + `.any_of
+	AND (EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = s.depends_on) OR (` + fmt.Sprintf(anyOfSatisfiedSQL, batch) + `)))`
+}
+
+// anyOfExhaustedSQL is anyOfExhausted of the edge d, of a dependent in the
+// batch of the second parameter.
+var anyOfExhaustedSQL = anyOfExhausted("d", "?2")
+
+// anyOfReadySQL is true of a job j none of whose any-of groups holds it.
+var anyOfReadySQL = `NOT EXISTS (SELECT 1 FROM hopper_job_deps g WHERE g.job_id = j.id AND g.any_of IS NOT NULL
+	AND (g.on_failure = 'any_cancel' OR EXISTS (SELECT 1 FROM hopper_jobs x WHERE x.id = g.depends_on))
+	AND NOT EXISTS (SELECT 1 FROM hopper_job_deps s WHERE s.job_id = j.id AND s.any_of = g.any_of
+	  AND ` + fmt.Sprintf(anyOfSatisfiedSQL, "j.batch_id") + `))`
+
+// anyOfCancelSQL is true of a job j with an any-of group whose policy is
+// any_cancel and none of whose jobs is live or has completed.
+var anyOfCancelSQL = `EXISTS (SELECT 1 FROM hopper_job_deps g WHERE g.job_id = j.id AND g.on_failure = 'any_cancel'
+	AND ` + anyOfExhausted("g", "j.batch_id") + `)`
+
 // ids returns the IDs a query selects.
 func (x *w) ids(ctx context.Context, query string, args ...any) ([]driver.JobID, error) {
 	return queryIDs(ctx, x, query, args...)
@@ -517,14 +609,16 @@ func queryIDs(ctx context.Context, q querier, query string, args ...any) ([]driv
 }
 
 // promoteIfReady makes a pending job claimable if none of its dependencies
-// is still live, and reports whether it did.
+// is still live and none of its any-of groups holds it, and reports
+// whether it did.
 func (x *w) promoteIfReady(ctx context.Context, id driver.JobID) (bool, error) {
 	var queue string
 	err := x.QueryRowContext(ctx, `
-		UPDATE hopper_jobs SET state = CASE WHEN scheduled_at > ? THEN 'scheduled' ELSE 'available' END
+		UPDATE hopper_jobs AS j SET state = CASE WHEN scheduled_at > ? THEN 'scheduled' ELSE 'available' END
 		WHERE id = ? AND state = 'pending'
-		  AND NOT EXISTS (SELECT 1 FROM hopper_job_deps d JOIN hopper_jobs x ON x.id = d.depends_on WHERE d.job_id = ?)
-		RETURNING queue`, x.us(), idParam(id), idParam(id)).Scan(&queue)
+		  AND NOT EXISTS (SELECT 1 FROM hopper_job_deps d JOIN hopper_jobs x ON x.id = d.depends_on WHERE d.job_id = j.id AND d.any_of IS NULL)
+		  AND `+anyOfReadySQL+`
+		RETURNING queue`, x.us(), idParam(id)).Scan(&queue)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}

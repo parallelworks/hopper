@@ -382,6 +382,22 @@ anyway), and the workflow is a batch, so it has the same callbacks.
 `client.WorkflowGet(ctx, res.ID)` and `hopper workflows get <id>` show its
 progress and graph.
 
+A step can also wait for any one of several steps: `hopper.AfterAny(a, b, c)`,
+or `StepOpts.AfterAny` for several groups beside `After`. It runs once its
+`After` steps have finished and one step of each group has completed; the
+others run on without affecting it. If every step of a group fails, the
+step's `OnDependencyFailure` applies: canceled by default, or run with
+`DependencyIgnore`.
+
+```go
+var attempts []hopper.Step
+for _, region := range regions {
+	attempts = append(attempts, wf.Add(Provision{Region: region}, hopper.After(plan)))
+}
+// Configure whichever instance is provisioned first.
+wf.Add(Configure{}, hopper.AfterAny(attempts...))
+```
+
 A step with `StepOpts.Dependencies` set is claimed with its dependencies
 that have finished: name a step with `StepOpts.Name`, and a step after it
 finds it with `job.Dependency(name)`, with its final state (`completed`,

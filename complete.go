@@ -22,7 +22,9 @@ var ErrJobFenced = driver.ErrJobFenced
 // the context the worker was given. The job moves to history (unless its
 // queue has DeleteCompleted) with the output SetOutput recorded before the
 // call; awaited jobs, batches and workflow dependents are handled as on any
-// completion, once tx commits.
+// completion, once tx commits; on Postgres, a dependent with an any-of
+// group (StepOpts.AfterAny) is promoted by the client once the worker has
+// returned and the client has seen tx commit, or by the leader's sweep.
 //
 // The completion is fenced like every finalize: if the attempt no longer
 // owns the job, nothing is written and ErrJobFenced is returned, and the

@@ -3,7 +3,6 @@ package pgsql
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -128,10 +127,32 @@ const plainFinalizeTailSQL = `done AS (SELECT * FROM finished),
 // The cascade still joins too, its first step to finished and its
 // recursive step to its own rows, which cannot take that form, and relies
 // on the leader keeping hopper_job_deps analyzed (JobsMaintain).
+//
+// The cascade cancels a dependent of a job that failed in the statement
+// through an any_cancel group when one of its any_cancel groups is
+// exhausted (exhausted). promoted leaves a dependent with a group to the
+// follow-up (WorkflowPromoteReady), whatever its groups say (grouped): a
+// group is satisfied by any one of its jobs, so two of them completing in
+// concurrent statements would each promote the dependent, and the second
+// would wait for the first's row lock, the whole of its statement held up
+// by a caller's transaction held open (CompleteTx, FinishTx). The
+// follow-up skips a row another transaction holds, which that
+// transaction's own follow-up, or the leader's sweep, decides. Its
+// recursive step, which cannot read its own rows in a subquery, follows
+// cancel edges only: a group exhausted by a job it canceled holds that
+// group's dependent, which the follow-up of the jobs the cascade canceled
+// cancels (the finalize statements return them, JobFinalized.Cascaded).
 func finalizeTailSQL(doneChannelParam, insertChannelParam string) string {
-	return `cascade AS (
+	return anyOfGroupsSQL("exhausted",
+		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.on_failure = 'any_cancel'"+
+			" AND d.depends_on = ANY (ARRAY(SELECT id FROM finished WHERE final_state IN ('canceled', 'discarded'))))",
+		"ARRAY(SELECT batch_id FROM finished)",
+		"ARRAY(SELECT id FROM finished WHERE final_state IN ('canceled', 'discarded'))") + `,
+cascade AS (
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN finished f ON d.depends_on = f.id
-  WHERE f.final_state IN ('canceled', 'discarded') AND d.on_failure = 'cancel'
+  WHERE f.final_state IN ('canceled', 'discarded')
+    AND (d.on_failure = 'cancel' OR (d.on_failure = 'any_cancel'
+      AND d.job_id = ANY (ARRAY(SELECT job_id FROM exhausted WHERE ` + anyOfExhaustedCancel + `))))
   UNION
   SELECT d.job_id FROM {{schema}}.hopper_job_deps d JOIN cascade c ON d.depends_on = c.job_id
   WHERE d.on_failure = 'cancel'
@@ -169,6 +190,8 @@ progress_cleared AS (
 ),
 ` + resultsSQL + `,
 ` + batchCallbacksSQL(insertChannelParam) + `,
+` + anyOfEdgesSQL("grouped",
+		"ARRAY(SELECT d.job_id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY (ARRAY(SELECT id FROM done)))") + `,
 promoted AS (
   UPDATE {{schema}}.hopper_jobs j
   SET state = CASE WHEN j.scheduled_at > now() THEN 'scheduled' ELSE 'available' END::{{schema}}.hopper_job_state
@@ -178,6 +201,7 @@ promoted AS (
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
       WHERE d.job_id = j.id AND x.id NOT IN (SELECT id FROM done))
+    AND j.id <> ALL (ARRAY(SELECT job_id FROM grouped_edges))
   RETURNING pg_notify(` + insertChannelParam + `, j.queue)
 ),
 edges AS (
@@ -185,21 +209,127 @@ edges AS (
 )`
 }
 
+// The edges of a dependent's any-of group (hopper_job_deps.any_of, the
+// group's number) hold it until one of their jobs has completed, which
+// satisfies the group. A group none of whose jobs completed holds the
+// dependent while one of them is live, and once none is, its policy
+// applies: any_ignore lets the dependent run, and any_cancel cancels it,
+// as a 'cancel' edge does when its job fails. A job of a group leaves the
+// live table with its final state recorded in hopper_job_results, in the
+// statement that finalizes it (resultsSQL), so every snapshot sees each
+// job of a group either live or with its outcome. One gone without a
+// result was finalized by a client of the previous release, which records
+// none; it counts as completed, as that release, which runs the
+// dependent once the group's jobs have all finished, counts it.
+//
+// A statement sees the rows it finalizes in the live table still, so
+// anyOfGroupsSQL takes the IDs of those that finished in it, as an array:
+// a job of a group in the live table is live unless it is among them. A
+// group's edges are found through hopper_job_deps_any_of_job,
+// the partial index on the edges in a group (any_of IS NOT NULL) by
+// dependent, which is empty for workflows without groups, so they cost a
+// probe of it per statement. With coalesce(any_of, 0) <> 0 as its
+// predicate, which the planner estimates true of all but one edge in two
+// hundred, it chose to walk the edges whole for a statement's dependents
+// now and then. The partial index on the edges that read or are in a
+// group, by dependency, has coalesce(reads, any_of IS NOT NULL) for its
+// predicate, which any_of IS NOT NULL does not imply: with reads OR
+// any_of IS NOT NULL, a lookup of a dependent's groups could walk that
+// one whole, filtering it by the dependent, as v22 found of the edges
+// that read.
+
+// anyOfGroupsSQL returns two CTEs: one, named name+"_edges", of the
+// edges in a group of the jobs in the array dependents, and one, named
+// name, of each of those groups, with its dependent (job_id), whether its
+// policy is any_cancel (cancels), whether one of its jobs completed
+// (satisfied) and whether one is live (live). A group is its dependent's
+// edges of one number, whatever policy each stores, as SQLite reads it:
+// grouped by policy too, a group whose edges disagree would be split in
+// two, each decided without the other's jobs. batches is an array that
+// holds the dependents' batches, and done the IDs of the jobs that finished
+// in the statement. A job of a group in the live table has not completed,
+// and is live unless it is among done: no statement decides a group from
+// the jobs it completes itself, since the finalize leaves a dependent with
+// a group to the follow-up. One gone from it completed unless its result
+// says it failed.
+//
+// Each job of the groups is looked up once, in one probe of the live
+// table and one of the results for all of them, which the CTE of
+// edges, materialized, feeds, so the groups cost what their edges do:
+// a check of a group's jobs per edge or per dependent, a subquery the
+// planner multiplies by the edges it guesses, guessed at a statement's
+// dependents times four hundred edges each without statistics, and
+// planned at millions, past jit_above_cost, where JIT compiled the
+// leader's statements for seconds.
+func anyOfGroupsSQL(name, dependents, batches, done string) string {
+	return anyOfEdgesSQL(name, dependents) + `,
+` + name + ` AS (
+  SELECT e.job_id, bool_or(e.on_failure = 'any_cancel') AS cancels,
+    bool_or(e.depends_on <> ALL (m.present) AND e.depends_on <> ALL (m.failed)) AS satisfied,
+    bool_or(e.depends_on = ANY (m.present) AND e.depends_on <> ALL (` + done + `)) AS live
+  FROM ` + name + `_edges e, (
+    SELECT ARRAY(SELECT x.id FROM {{schema}}.hopper_jobs x
+                 WHERE x.id = ANY (ARRAY(SELECT depends_on FROM ` + name + `_edges))) AS present,
+      ARRAY(SELECT r.job_id FROM {{schema}}.hopper_job_results r
+            WHERE r.batch_id = ANY (` + batches + `) AND r.job_id = ANY (ARRAY(SELECT depends_on FROM ` + name + `_edges))
+              AND r.state <> 'completed') AS failed
+    OFFSET 0) m
+  GROUP BY e.job_id, e.any_of
+)`
+}
+
+// candidateGroupsSQL is anyOfGroupsSQL of the jobs a CTE named candidates
+// selects, outside a finalize. The dependents' batches are read only for
+// those with a group, so that candidates without one cost no read of
+// their rows.
+func candidateGroupsSQL(name string) string {
+	return anyOfGroupsSQL(name, "ARRAY(SELECT id FROM candidates)",
+		"ARRAY(SELECT x.batch_id FROM {{schema}}.hopper_jobs x WHERE x.id = ANY (ARRAY(SELECT job_id FROM "+name+"_edges)))",
+		"'{}'::uuid[]")
+}
+
+// anyOfEdgesSQL returns a CTE, named name+"_edges", of the edges in a
+// group of the jobs in the array dependents, materialized: a lookup of
+// hopper_job_deps_any_of_job, which is empty without groups.
+func anyOfEdgesSQL(name, dependents string) string {
+	return name + `_edges AS MATERIALIZED (
+  SELECT g.job_id, g.any_of, g.on_failure, g.depends_on FROM {{schema}}.hopper_job_deps g
+  WHERE g.job_id = ANY (` + dependents + `) AND g.any_of IS NOT NULL
+)`
+}
+
+// anyOfHolds is true of a row of anyOfGroupsSQL's groups that holds its
+// dependent: none of its jobs completed, and one is live or its policy
+// is any_cancel, which holds the dependent of an exhausted group until it
+// is canceled.
+const anyOfHolds = `NOT satisfied AND (live OR cancels)`
+
+// anyOfExhaustedCancel is true of a row of anyOfGroupsSQL's groups that
+// cancels its dependent: none of its jobs is live or completed, and its
+// policy is any_cancel.
+const anyOfExhaustedCancel = `NOT satisfied AND NOT live AND cancels`
+
 // resultsSQL records the final state and output of each job of done with
 // a dependent that reads it (StepOpts.Dependencies), for that dependent's
-// claims, and deletes the results of the workflows the statement completes
-// that have any such dependent, whose jobs have all finished. A job of a
-// workflow completing in the statement has no dependent left, so it
-// records none. Whether a job has such a dependent is a probe per job of
-// the partial index on the edges that read, a scalar subquery, which
-// finds nothing in a workflow that never asks: a filter on an array of
-// the statement's jobs compared every pair. A job retried from history
-// and finished again replaces its result.
+// claims, and the final state of each with a dependent that has it in an
+// any-of group, for that dependent's promotion; and deletes the results of
+// the workflows the statement completes that have any such dependent,
+// whose jobs have all finished. A job of a workflow completing in the
+// statement has no dependent left, so it records none. Whether a job has
+// such a dependent is a probe per job of the partial index on the edges
+// that read or are in a group, a scalar subquery, which finds nothing in a
+// workflow with neither: a filter on an array of the statement's jobs
+// compared every pair. Whether one reads it, and its output is kept, is
+// a second probe, for the jobs the first finds. A job retried from
+// history and finished again replaces its result.
 const resultsSQL = `results AS (
   INSERT INTO {{schema}}.hopper_job_results (job_id, batch_id, state, output)
-  SELECT d.id, d.batch_id, d.final_state::{{schema}}.hopper_job_state, d.output FROM done d
+  SELECT d.id, d.batch_id, d.final_state::{{schema}}.hopper_job_state,
+    CASE WHEN (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id AND e.reads LIMIT 1) IS NOT NULL
+         THEN d.output END
+  FROM done d
   WHERE d.batch_id IS NOT NULL
-    AND (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id AND e.reads LIMIT 1) IS NOT NULL
+    AND (SELECT 1 FROM {{schema}}.hopper_job_deps e WHERE e.depends_on = d.id AND coalesce(e.reads, e.any_of IS NOT NULL) LIMIT 1) IS NOT NULL
     AND d.batch_id <> ALL (ARRAY(SELECT id FROM batches))
   ON CONFLICT (batch_id, job_id) DO UPDATE SET state = EXCLUDED.state, output = EXCLUDED.output,
     finalized_at = EXCLUDED.finalized_at
@@ -224,22 +354,28 @@ const resultsClearedSQL = `results_cleared AS (
 )`
 
 // workflowPromoteSQL promotes the pending jobs among those a CTE named
-// candidates selects none of whose dependencies is still live, skipping rows
-// a finalize holds: that finalize decides them. It returns how many it
-// promoted, how many candidates there were, and the greatest candidate ID.
+// candidates selects none of whose dependencies is still live and none of
+// whose any-of groups holds them, skipping rows a finalize holds: that
+// finalize decides them. It returns how many it promoted, how many
+// candidates there were, the greatest candidate ID, and how many exhausted
+// any-of groups whose policy is any_cancel hold one of them (a group, not
+// a candidate, each; its candidate pending or not), for
+// workflowCancelExhaustedSQL to cancel what is still pending.
 // The candidates are looked up as finalizeTailSQL looks up its own rows:
-// joined instead, a sweep's LIMIT $2, which a generic plan takes for a
+// joined instead, a sweep's LIMIT, which a generic plan takes for a
 // tenth of the edges, had it scan hopper_jobs whole for every chunk.
 func workflowPromoteSQL(candidates string) string {
 	return `
 WITH candidates AS (` + candidates + `),
+` + candidateGroupsSQL("held") + `,
 ready AS (
   SELECT j.id FROM {{schema}}.hopper_jobs j
   WHERE j.id = ANY (ARRAY(SELECT id FROM candidates))
     AND j.state = 'pending'
     AND NOT EXISTS (
       SELECT 1 FROM {{schema}}.hopper_job_deps d JOIN {{schema}}.hopper_jobs x ON x.id = d.depends_on
-      WHERE d.job_id = j.id)
+      WHERE d.job_id = j.id AND d.any_of IS NULL)
+    AND j.id <> ALL (ARRAY(SELECT job_id FROM held WHERE ` + anyOfHolds + `))
   FOR UPDATE OF j SKIP LOCKED
 ),
 promoted AS (
@@ -249,44 +385,108 @@ promoted AS (
   RETURNING pg_notify($1, j.queue)
 )
 SELECT (SELECT count(*) FROM promoted), (SELECT count(*) FROM candidates),
-  (SELECT id FROM candidates ORDER BY id DESC LIMIT 1)`
+  (SELECT id FROM candidates ORDER BY id DESC LIMIT 1),
+  (SELECT count(*) FROM held WHERE ` + anyOfExhaustedCancel + `)`
 }
 
-// workflowPromoteSweepSQL considers, in ID order, up to $2 jobs with
-// dependencies and an ID after $3. It walks the edges, the working set of
-// unfinished workflows, so it costs nothing without them, and a chunk at a
-// time however many pending steps they have.
-var workflowPromoteSweepSQL = workflowPromoteSQL(`
+// workflowCancelExhaustedSQL cancels the pending jobs among those a CTE
+// named candidates selects that an exhausted any-of group whose policy is
+// any_cancel holds, as the finalize that failed the group's last job
+// cancels its dependent when no other job of the group finished in a
+// concurrent statement, and returns the IDs of every job it finished, its
+// dependents canceled in turn among them. It skips a row another
+// statement holds, which decides it.
+func workflowCancelExhaustedSQL(candidates string) string {
+	return `
+WITH RECURSIVE candidates AS (` + candidates + `),
+` + candidateGroupsSQL("candidate") + `,
+finished AS (
+  DELETE FROM {{schema}}.hopper_jobs j
+  WHERE j.id IN (
+    SELECT j.id FROM {{schema}}.hopper_jobs j
+    WHERE j.id = ANY (ARRAY(SELECT id FROM candidates)) AND j.state = 'pending'
+      AND j.id = ANY (ARRAY(SELECT job_id FROM candidate WHERE ` + anyOfExhaustedCancel + `))
+    FOR UPDATE OF j SKIP LOCKED
+  )
+  RETURNING ` + finishedColumns(appendErrorSQL("hopper: dependency failed"), "j.logs", "NULL::jsonb", "true", "'canceled'::text", "$1") + `
+),
+` + finalizeTailSQL("$1", "$2") + `
+SELECT id FROM done`
+}
+
+// workflowSweepCandidates selects, in ID order, up to %[1]s jobs with
+// dependencies and an ID after %[2]s. It walks the edges, the working set
+// of unfinished workflows, so it costs nothing without them, and a chunk
+// at a time however many pending steps they have.
+const workflowSweepCandidates = `
   SELECT DISTINCT d.job_id AS id FROM {{schema}}.hopper_job_deps d
-  WHERE d.job_id > $3 ORDER BY d.job_id LIMIT $2
-`)
+  WHERE d.job_id > %[2]s ORDER BY d.job_id LIMIT %[1]s
+`
 
-// workflowPromoteDependentsSQL considers the dependents of the jobs in $2.
-var workflowPromoteDependentsSQL = workflowPromoteSQL(`
-  SELECT DISTINCT d.job_id AS id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY($2::uuid[])
-`)
+// workflowDependentsCandidates selects the dependents of the jobs in %s.
+const workflowDependentsCandidates = `
+  SELECT DISTINCT d.job_id AS id FROM {{schema}}.hopper_job_deps d WHERE d.depends_on = ANY(%s::uuid[])
+`
 
-// WorkflowPromoteReady implements driver.Executor.
+var (
+	workflowPromoteSweepSQL      = workflowPromoteSQL(fmt.Sprintf(workflowSweepCandidates, "$2", "$3"))
+	workflowPromoteDependentsSQL = workflowPromoteSQL(fmt.Sprintf(workflowDependentsCandidates, "$2"))
+	workflowCancelSweepSQL       = workflowCancelExhaustedSQL(fmt.Sprintf(workflowSweepCandidates, "$3", "$4"))
+	workflowCancelDependentsSQL  = workflowCancelExhaustedSQL(fmt.Sprintf(workflowDependentsCandidates, "$3"))
+)
+
+// WorkflowPromoteReady implements driver.Executor. When a candidate is
+// held by an exhausted any-of group that cancels it, it cancels the
+// candidates so held, waiting only briefly for rows another transaction
+// holds, and then considers the dependents of what it canceled the same
+// way, until it cancels none. A wait that runs out leaves the rest to the
+// leader's next pass.
 func (e *Executor) WorkflowPromoteReady(ctx context.Context, params driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
 	var (
-		res  driver.WorkflowPromoteResult
-		last nullUUID
-		err  error
+		res       driver.WorkflowPromoteResult
+		last      nullUUID
+		exhausted int64
+		err       error
 	)
+	cancelSQL, cancelArgs := workflowCancelDependentsSQL, []any{uuidArray(params.DependsOn)}
 	switch {
 	case params.DependsOn == nil:
 		err = e.Conn.QueryRow(ctx, workflowPromoteSweepSQL, driver.ChannelInsert, max(params.Limit, 1), uuidParam(params.After)).
-			Scan(&res.Promoted, &res.Scanned, &last)
+			Scan(&res.Promoted, &res.Scanned, &last, &exhausted)
+		cancelSQL, cancelArgs = workflowCancelSweepSQL, []any{max(params.Limit, 1), uuidParam(params.After)}
 	case len(params.DependsOn) == 0:
 		return res, nil
 	default:
 		err = e.Conn.QueryRow(ctx, workflowPromoteDependentsSQL, driver.ChannelInsert, uuidArray(params.DependsOn)).
-			Scan(&res.Promoted, &res.Scanned, &last)
+			Scan(&res.Promoted, &res.Scanned, &last, &exhausted)
 	}
 	if err != nil {
 		return driver.WorkflowPromoteResult{}, fmt.Errorf("hopper: promote ready workflow jobs: %w", err)
 	}
 	res.Last = last.ID
+	for exhausted > 0 {
+		args := append([]any{driver.ChannelDone, driver.ChannelInsert}, cancelArgs...)
+		finished, err := briefly(ctx, e, func(c Conn) ([]driver.JobID, error) {
+			return scanIDs(c.Query(ctx, cancelSQL, args...))
+		})
+		if errors.Is(err, driver.ErrRowsHeld) {
+			break
+		}
+		if err != nil {
+			return res, fmt.Errorf("hopper: cancel workflow jobs of exhausted any-of groups: %w", err)
+		}
+		res.Canceled += int64(len(finished))
+		if len(finished) == 0 {
+			break
+		}
+		var promoted int64
+		if err := e.Conn.QueryRow(ctx, workflowPromoteDependentsSQL, driver.ChannelInsert, uuidArray(finished)).
+			Scan(&promoted, new(int64), new(nullUUID), &exhausted); err != nil {
+			return res, fmt.Errorf("hopper: promote ready workflow jobs: %w", err)
+		}
+		res.Promoted += promoted
+		cancelSQL, cancelArgs = workflowCancelDependentsSQL, []any{uuidArray(finished)}
+	}
 	return res, nil
 }
 
@@ -313,12 +513,9 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 	if n == 0 {
 		return nil, errors.New("hopper: insert workflow: no jobs")
 	}
-	pending := make([]bool, n)
-	for _, d := range params.Deps {
-		if d.Job < 0 || d.Job >= n || d.DependsOn < 0 || d.DependsOn >= n || d.Job == d.DependsOn {
-			return nil, fmt.Errorf("hopper: insert workflow: dependency %d -> %d is out of range", d.Job, d.DependsOn)
-		}
-		pending[d.Job] = true
+	pending, err := jobcodec.CheckDependencies(params.Deps, n)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: insert workflow: %w", err)
 	}
 	var (
 		kinds, queues, ordering, partitions = make([]string, n), make([]string, n), make([]string, n), make([]string, n)
@@ -361,41 +558,41 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return fmt.Errorf("generate ids: %w", err)
 		}
 		// The graph, for inspection, and the working set of edges.
-		edges := make([][2]string, len(params.Deps))
+		edgesJSON, err := jobcodec.EdgesJSON(params.Deps, ids)
+		if err != nil {
+			return err
+		}
 		steps, err := jobcodec.StepsJSON(params.Steps, ids)
 		if err != nil {
 			return err
 		}
 		jobIDs, depIDs, policies := make([]driver.JobID, len(params.Deps)), make([]driver.JobID, len(params.Deps)), make([]string, len(params.Deps))
-		depSteps := make([]string, len(params.Deps))
+		depSteps, groups := make([]string, len(params.Deps)), make([]int, len(params.Deps))
 		// An edge that does not read, and a workflow with none that do, store
 		// NULL, as the partial indexes on the edges expect. Only a claim
-		// reads an edge's step name, and only of an edge that reads.
+		// reads an edge's step name, and only of an edge that reads. A
+		// workflow with an any-of group records results too, for its
+		// members, and is marked to have them cleared as one that reads is.
 		reads, yes := make([]*bool, len(params.Deps)), true
-		var anyReads *bool
+		var anyResults *bool
 		for i, d := range params.Deps {
 			jobIDs[i], depIDs[i] = ids[d.Job], ids[d.DependsOn]
 			if d.Reads {
-				reads[i], anyReads = &yes, &yes
+				reads[i], anyResults = &yes, &yes
 				if len(params.Steps) > 0 {
 					depSteps[i] = params.Steps[d.DependsOn]
 				}
 			}
-			edges[i] = [2]string{ids[d.Job].String(), ids[d.DependsOn].String()}
-			policies[i] = string(d.OnFailure)
-			if d.OnFailure == "" {
-				policies[i] = string(driver.DependencyCancel)
+			policies[i] = jobcodec.EdgePolicy(d)
+			if d.AnyOf != 0 {
+				groups[i], anyResults = d.AnyOf, &yes
 			}
-		}
-		edgesJSON, err := json.Marshal(edges)
-		if err != nil {
-			return err
 		}
 		err = tx.QueryRow(ctx, `
 			INSERT INTO {{schema}}.hopper_batches (name, pending, total, on_success, on_failure, on_complete, metadata, edges, steps, reads)
 			VALUES ($1, $2, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9) RETURNING id`,
 			nullable(params.Name), n, onSuccess, onFailure, onComplete, jsonOrEmptyObject(params.Metadata), string(edgesJSON),
-			nullable(string(steps)), anyReads).Scan(&res.ID)
+			nullable(string(steps)), anyResults).Scan(&res.ID)
 		if err != nil {
 			return fmt.Errorf("insert batch: %w", err)
 		}
@@ -407,9 +604,9 @@ func (e *Executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			return fmt.Errorf("insert jobs: %w", err)
 		}
 		if len(params.Deps) > 0 {
-			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_job_deps (job_id, depends_on, on_failure, step, reads)
-				SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::boolean[]) ON CONFLICT DO NOTHING`,
-				uuidArray(jobIDs), uuidArray(depIDs), textArray(policies), nullableTextArray(depSteps), reads); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO {{schema}}.hopper_job_deps (job_id, depends_on, on_failure, step, reads, any_of)
+				SELECT * FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::boolean[], $6::smallint[]) ON CONFLICT DO NOTHING`,
+				uuidArray(jobIDs), uuidArray(depIDs), textArray(policies), nullableTextArray(depSteps), reads, nullableIntArray(groups)); err != nil {
 				return fmt.Errorf("insert dependencies: %w", err)
 			}
 		}
@@ -465,13 +662,8 @@ func (e *Executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 	w.Batch.Name, w.Batch.CompletedAt, w.Batch.Metadata = name.String, completed.Time, metadata.raw()
 	w.Steps = jobcodec.DecodeSteps(string(steps))
 	if edges != "" {
-		var pairs [][2]driver.JobID
-		if err := json.Unmarshal([]byte(edges), &pairs); err != nil {
+		if w.Edges, err = jobcodec.DecodeEdges(string(edges)); err != nil {
 			return nil, fmt.Errorf("hopper: get workflow: edges: %w", err)
-		}
-		w.Edges = make([]driver.JobEdge, len(pairs))
-		for i, p := range pairs {
-			w.Edges[i] = driver.JobEdge{Job: p[0], DependsOn: p[1]}
 		}
 	}
 	if w.Jobs, err = historyJobs(e.Conn.Query(ctx, workflowJobsSQL, uuidParam(id))); err != nil {

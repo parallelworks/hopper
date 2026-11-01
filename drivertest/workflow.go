@@ -730,7 +730,7 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 				case "rescue":
 					var applied []driver.JobFinalized
 					applied, err = exec.JobFinalizeMany(lctx, driver.JobFinalizeParams{Jobs: failed(b), SkipLocked: true, BriefWait: true})
-					n = len(applied)
+					n = len(appliedIDs(applied))
 				}
 				if errors.Is(err, driver.ErrRowsHeld) {
 					gaveUp, err = true, nil
@@ -761,7 +761,7 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 				results := failed(b)
 				go func() {
 					applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: results, SkipLocked: true})
-					waited <- finalized{len(applied), err}
+					waited <- finalized{len(appliedIDs(applied)), err}
 				}()
 				f.WaitForLockWait(ctx, t, d)
 				select {

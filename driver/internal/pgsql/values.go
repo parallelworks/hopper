@@ -39,6 +39,18 @@ func intArray(values []int) []int64 {
 	return out
 }
 
+// nullableIntArray sends zeros as NULL.
+func nullableIntArray(values []int) []*int64 {
+	elems := make([]*int64, len(values))
+	for i, v := range values {
+		if v != 0 {
+			n := int64(v)
+			elems[i] = &n
+		}
+	}
+	return elems
+}
+
 func int64Array(values []int64) []int64 { return orEmpty(values) }
 
 func floatArray(values []float64) []float64 { return orEmpty(values) }

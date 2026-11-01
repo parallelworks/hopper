@@ -338,7 +338,8 @@ func (l *Leases[TTx]) Finish(ctx context.Context, token LeaseToken, res LeaseRes
 	if err != nil {
 		return err
 	}
-	if err := l.write(ctx, l.c.exec, row, f); err != nil {
+	cascaded, err := l.write(ctx, l.c.exec, row, f)
+	if err != nil {
 		return err
 	}
 	c := l.c
@@ -352,7 +353,7 @@ func (l *Leases[TTx]) Finish(ctx context.Context, token LeaseToken, res LeaseRes
 		// As the finalizer follows up a flush: of two last jobs of a batch
 		// or a dependent finished at once, the one that follows up second
 		// completes it.
-		settleAndPromote(ctx, c.exec, c.logger, []JobID{row.BatchID}, []JobID{row.ID})
+		settleAndPromote(ctx, c.exec, c.logger, []JobID{row.BatchID}, append([]JobID{row.ID}, cascaded...))
 	}
 	return nil
 }
@@ -369,7 +370,7 @@ func (l *Leases[TTx]) FinishTx(ctx context.Context, tx TTx, token LeaseToken, re
 	if err != nil {
 		return err
 	}
-	if err := l.write(ctx, exec, row, f); err != nil {
+	if _, err := l.write(ctx, exec, row, f); err != nil {
 		return err
 	}
 	if f.Delay == 0 && !f.State.Terminal() {
@@ -432,15 +433,18 @@ func (l *Leases[TTx]) result(ctx context.Context, exec driver.Executor, token Le
 	return row, f, nil
 }
 
-func (l *Leases[TTx]) write(ctx context.Context, exec driver.Executor, row *driver.JobRow, f driver.JobFinalize) error {
+// write writes the result f of the leased job row and returns the
+// dependents the statement canceled by cascade.
+func (l *Leases[TTx]) write(ctx context.Context, exec driver.Executor, row *driver.JobRow, f driver.JobFinalize) ([]JobID, error) {
 	applied, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{
 		Jobs: []driver.JobFinalize{f}, NoBatches: row.BatchID.IsZero(), KeepLogs: l.c.cfg.JobLogs.MaxAttempts,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
+	applied, cascaded := splitCascaded(applied)
 	if len(applied) == 0 {
-		return ErrJobFenced
+		return nil, ErrJobFenced
 	}
-	return nil
+	return cascaded, nil
 }
