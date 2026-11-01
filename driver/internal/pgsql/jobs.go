@@ -446,9 +446,8 @@ const claimEligibleSQL = `
                           AND o.state IN ('available', 'scheduled', 'retryable'))))`
 
 // claimDependenciesSQL reads, for a job a CTE named claimed claims, the
-// dependencies it reads (hopper_job_deps.reads, through the partial index
-// on those edges, empty for workflows that never ask) that have finished,
-// as a JSON array: those with a result,
+// dependencies it reads (hopper_job_deps.reads) that have finished, as a
+// JSON array: those with a result,
 // and those gone from the live table without one, which finished before
 // the engine recorded results and read with no state. Only a job in a
 // batch can have any, so a claimed job outside one costs a CASE and
@@ -458,8 +457,15 @@ const claimEligibleSQL = `
 // results table or a hopper_job_deps without statistics had the planner
 // hash the whole results table, and the check that the dependency left the
 // live table, as NOT EXISTS, became a hash of all of hopper_jobs, built for
-// every claim of a workflow job. It builds json rather than jsonb, which
-// the client parses either way.
+// every claim of a workflow job. The job's edges are read by the primary
+// key, which leads with job_id, and filtered by coalesce(d.reads, false),
+// which the partial index on the edges that read does not match: with
+// d.reads, statistics taken while no edge read made that index look empty,
+// and the planner walked it whole, filtering every edge that reads by the
+// claimed job, on every claim. (Schema v22 dropped the partial index by
+// job_id that the lookup was meant to use; with it, the same statistics
+// had the finalize walk that one whole instead.) It builds json rather
+// than jsonb, which the client parses either way.
 const claimDependenciesSQL = `CASE WHEN claimed.batch_id IS NOT NULL THEN (
     SELECT json_agg(json_build_object('id', d.depends_on, 'step', d.step, 'state', r.state, 'output', r.output) ORDER BY d.depends_on)
     FROM {{schema}}.hopper_job_deps d
@@ -468,7 +474,7 @@ const claimDependenciesSQL = `CASE WHEN claimed.batch_id IS NOT NULL THEN (
       WHERE r.batch_id = claimed.batch_id AND r.job_id = d.depends_on
       OFFSET 0
     ) r ON true
-    WHERE d.job_id = claimed.id AND d.reads
+    WHERE d.job_id = claimed.id AND coalesce(d.reads, false)
       AND (r.state IS NOT NULL OR (SELECT x.id FROM {{schema}}.hopper_jobs x WHERE x.id = d.depends_on) IS NULL)
   ) END`
 

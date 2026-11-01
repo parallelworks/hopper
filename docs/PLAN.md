@@ -705,7 +705,15 @@ edge whose dependent reads its dependencies, and a workflow with any such edge; 
 otherwise), with partial indexes on the edges that read, by dependent and by dependency.
 The columns and indexes take v17's loop on `hopper_job_deps` and `hopper_batches`, in
 the order a finalize names them; the indexes cover none of the existing edges, and
-neither `hopper_jobs` nor history is locked, so claims never wait for it.
+neither `hopper_jobs` nor history is locked, so claims never wait for it. Schema v22
+drops the partial index by dependent on Postgres: the claim reads a
+job's edges by the primary key instead (§11), and, left in place, the index made the
+finalize's probe for a dependent that reads ambiguous, since statistics taken while no
+edge read make both partial indexes look empty, and the planner then walked it whole,
+filtered by the dependency. The drop takes a loop like v21's, on `hopper_job_deps`
+alone; every claim since v21 reads that table, so claims, like finalizes, wait at most
+one try at a time. SQLite's claim still uses its index of that name, and v22 changes
+nothing there.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -2650,9 +2658,17 @@ observability without new machinery.
       being flattened: as a plain join or `NOT EXISTS` the planner hashed the whole
       table on every claim. Postgres evaluates it only for a claimed job in a
       batch, so a job outside one costs the `CASE` and nothing else, and one whose
-      edges do not read costs a probe of the empty partial index. The tail's probe for
-      a dependent that reads is the same, so a workflow that never asks records
-      nothing, deletes nothing and costs what it did before. A dependency gone
+      edges do not read costs a probe of its edges by the primary key. The claim reads
+      the job's edges by that key, filtering those that read (`coalesce(reads, false)`,
+      which no partial index's predicate matches), not through the partial index on
+      them: statistics taken while no edge read, as a deployment's are until its
+      workflows start reading, make both partial indexes look empty, and the planner
+      then walked the one keyed by dependency whole, filtering it by the claimed job,
+      so that every claim read every edge that reads (hopperbench's `workflow-outputs`
+      ran fifteen times slower after `workflow`). The tail's probe for a dependent that
+      reads goes through the partial index by dependency, the only partial index on
+      the edges since v22, so a workflow that never asks records nothing and deletes
+      nothing, and its finalizes cost what they did before. A dependency gone
       from the live table without a result, which finished before the upgrade or on a
       client of an earlier release during a rolling deploy, is reported with no state
       rather than left out.
@@ -2726,8 +2742,8 @@ observability without new machinery.
   reports the partition, which it backs off and warns about, and goes on to the next.
   The migration's transaction is read committed, and keeps no snapshot between its statements, so the build never waits
   for it while it waits for the lock. A change that needs `ACCESS EXCLUSIVE`, such as adding a
-  column, tries under a 50 ms `lock_timeout` in a loop (schema v9, v10, v15 to v18, and v13 and v14
-  for the `SHARE` lock that declaring a history index takes, which finalizes wait for), because a lock
+  column, tries under a 50 ms `lock_timeout` in a loop (schema v9, v10, v15 to v18, v21 and v22, and v13
+  and v14 for the `SHARE` lock that declaring a history index takes, which finalizes wait for), because a lock
   request queued behind an open transaction on the table would hold up every claim
   behind it; claims wait at most one try at a time. A try that changes both `hopper_jobs`
   and history (v17, v18) locks them first, `hopper_jobs` before history, the order a finalize
