@@ -9,7 +9,7 @@ toolchain go1.27.3
 godebug fips140=only
 
 require (
-	github.com/parallelworks/hopper v0.10.2 // x-release-please-version
+	github.com/parallelworks/hopper v0.10.3 // x-release-please-version
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.61.0
 )
