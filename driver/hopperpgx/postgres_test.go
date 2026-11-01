@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1325,6 +1326,7 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 	// stays inside the node: a scan of another table whose subplan probes
 	// one of these is not a scan of it.
 	scan := regexp.MustCompile(`"Node Type": "Seq Scan",[^{}]*?"Relation Name": "(hopper_jobs|hopper_job_deps|hopper_batches)"`)
+	jitCost := regexp.MustCompile(`"Total Cost": ([0-9.]+)`)
 	explained := 0
 	for i, q := range statements {
 		if !strings.Contains(q, "hopper_jobs") || strings.HasPrefix(strings.TrimSpace(q), "SELECT state FROM") {
@@ -1338,6 +1340,14 @@ func TestFinalizePlansIgnoreStaleStatistics(t *testing.T) {
 			}
 			if m := scan.FindStringSubmatch(plan); m != nil {
 				t.Errorf("%s plan scans %s whole:\n%s\n%s", mode, m[1], q, plan)
+			}
+			// Past jit_above_cost (100,000 by default), a server built
+			// with JIT compiles the statement on every execution, which
+			// costs a finalize about a tenth of a second.
+			if c := jitCost.FindStringSubmatch(plan); c == nil {
+				t.Errorf("%s plan has no total cost:\n%s", mode, plan)
+			} else if cost, _ := strconv.ParseFloat(c[1], 64); cost >= 100000 {
+				t.Errorf("%s plan costs %.0f, past jit_above_cost:\n%s\n%s", mode, cost, q, plan)
 			}
 		}
 	}

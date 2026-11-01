@@ -211,7 +211,11 @@ edges AS (
 // are in a group does not match, as the claim filters by
 // coalesce(reads, false): by any_of itself, statistics taken while no edge
 // was in a group made that index look empty, and the planner walked it
-// whole, filtering it by the dependent.
+// whole, filtering it by the dependent. Each check is a scalar subquery,
+// (SELECT 1 ... LIMIT 1) IS NULL, rather than NOT EXISTS, which the
+// planner may turn into an anti-join: it hashed the edges whole for one,
+// at an estimated cost that put every finalize past jit_above_cost, so that
+// each one spent a tenth of a second compiling itself.
 
 // anyOfLiveOrSatisfiedSQL is true of a job m of a group of a dependent in
 // batch that still keeps the group from being exhausted: live and not
@@ -227,9 +231,10 @@ func anyOfLiveOrSatisfiedSQL(m, batch, failed string) string {
 // is live or has completed: d's job has failed in the statement, or
 // before, and so has every other, failed lists those that failed in it.
 func anyOfExhaustedSQL(d, batch, failed string) string {
-	return `NOT EXISTS (
+	return `(
       SELECT 1 FROM {{schema}}.hopper_job_deps s
-      WHERE s.job_id = ` + d + `.job_id AND coalesce(s.any_of, 0) = ` + d + `.any_of AND ` + anyOfLiveOrSatisfiedSQL("s.depends_on", batch, failed) + `)`
+      WHERE s.job_id = ` + d + `.job_id AND coalesce(s.any_of, 0) = ` + d + `.any_of AND ` + anyOfLiveOrSatisfiedSQL("s.depends_on", batch, failed) + `
+      LIMIT 1) IS NULL`
 }
 
 // anyOfReadySQL is true of a pending job j none of whose any-of groups
@@ -238,18 +243,20 @@ func anyOfExhaustedSQL(d, batch, failed string) string {
 // regardless. An exhausted group whose policy is any_cancel holds j until
 // it is canceled.
 func anyOfReadySQL(done, completed string) string {
-	return `NOT EXISTS (
+	return `(
       SELECT 1 FROM {{schema}}.hopper_job_deps g
       WHERE g.job_id = j.id AND coalesce(g.any_of, 0) <> 0
         AND (g.on_failure = 'any_cancel'
              OR (EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = g.depends_on) AND g.depends_on <> ALL (` + done + `)))
-        AND NOT EXISTS (
+        AND (
           SELECT 1 FROM {{schema}}.hopper_job_deps s
           WHERE s.job_id = j.id AND coalesce(s.any_of, 0) = g.any_of
             AND CASE WHEN EXISTS (SELECT 1 FROM {{schema}}.hopper_jobs x WHERE x.id = s.depends_on)
                      THEN s.depends_on = ANY (` + completed + `)
                      ELSE NOT EXISTS (SELECT 1 FROM {{schema}}.hopper_job_results r
-                                      WHERE r.batch_id = j.batch_id AND r.job_id = s.depends_on AND r.state <> 'completed') END))`
+                                      WHERE r.batch_id = j.batch_id AND r.job_id = s.depends_on AND r.state <> 'completed') END
+          LIMIT 1) IS NULL
+      LIMIT 1) IS NULL`
 }
 
 // resultsSQL records the final state and output of each job of done with
