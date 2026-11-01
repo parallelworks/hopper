@@ -219,8 +219,10 @@ func testWorkflowAnyOf[TTx any](t *testing.T, f Fixture[TTx]) {
 		a.finish(ids[1], driver.JobStateCompleted)
 	})
 
-	if _, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{Jobs: params("bad", 2),
-		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0, AnyOf: 1 << 15}}}); err == nil {
+	if _, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+		Jobs: params("bad", 2),
+		Deps: []driver.JobDependency{{Job: 1, DependsOn: 0, AnyOf: 1 << 15}},
+	}); err == nil {
 		t.Error("a group number out of range was inserted")
 	}
 }

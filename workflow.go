@@ -292,8 +292,10 @@ func anyOfDeps(wf *Workflow, i int, opts StepOpts) ([]driver.JobDependency, erro
 				return nil, fmt.Errorf("hopper: step %d waits for step %d in two places among After and AfterAny", i, dep.i)
 			}
 			where[dep.i] = g + 1
-			deps = append(deps, driver.JobDependency{Job: i, DependsOn: dep.i, OnFailure: opts.OnDependencyFailure,
-				Reads: opts.Dependencies, AnyOf: g + 1})
+			deps = append(deps, driver.JobDependency{
+				Job: i, DependsOn: dep.i, OnFailure: opts.OnDependencyFailure,
+				Reads: opts.Dependencies, AnyOf: g + 1,
+			})
 		}
 	}
 	return deps, nil
