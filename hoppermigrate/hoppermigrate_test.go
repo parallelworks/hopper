@@ -1296,6 +1296,11 @@ func TestDependencyResultsUpgrade(t *testing.T) {
 	if err := <-upgraded; err != nil {
 		t.Fatal(err)
 	}
+	// This release's statements need the latest schema; down passes
+	// through v21 below.
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger}); err != nil {
+		t.Fatal(err)
+	}
 
 	clientID, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: time.Hour})
 	if err != nil {
