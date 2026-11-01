@@ -23,6 +23,11 @@ const (
 	DependencyIgnore = driver.DependencyIgnore
 )
 
+// maxAnyOfGroups is the most any-of groups a step can have; the engines
+// number them in a smallint.
+const maxAnyOfGroups = 32767
+
+
 // WorkflowOpts sets a workflow's completion callbacks and metadata. A
 // workflow is a batch, so the callbacks are those of BatchOpts: OnSuccess
 // when every step completed, OnFailure when any was canceled or
@@ -42,15 +47,26 @@ type StepOpts struct {
 	// After lists the steps this one waits for. It is inserted pending and
 	// becomes available once they have all finished.
 	After []Step
-	// OnDependencyFailure defaults to DependencyCancel.
+	// AfterAny lists groups of steps this one waits for one of: it becomes
+	// available once the steps in After have finished and, in each group,
+	// at least one step has completed. The other steps of a group run on,
+	// and how they finish does not change this one. A step can wait for
+	// several groups and for steps in After at once; no step may be in two
+	// groups, or in a group and in After.
+	AfterAny [][]Step
+	// OnDependencyFailure says what happens when a step in After is
+	// canceled or discarded, and when every step of a group in AfterAny
+	// has finished without one completing: DependencyCancel, the default,
+	// cancels this step, and DependencyIgnore runs it all the same.
 	OnDependencyFailure DependencyFailure
 	// Name names the step for its dependents, which find it among their
 	// JobRow.Dependencies by it, and for WorkflowGet. Names are unique
 	// within a workflow; a step may have none.
 	Name string
-	// Dependencies has the step claimed with the steps in After, once they
-	// have finished, in JobRow.Dependencies: each one's name, final state
-	// and output. The engine records a step's state and output only for a
+	// Dependencies has the step claimed with the steps in After and in
+	// AfterAny that have finished by its claim, in JobRow.Dependencies:
+	// each one's name, final state and output. A step of a group still
+	// running when this one is claimed is not among them. The engine records a step's state and output only for a
 	// step with a dependent that sets it, so a workflow that does not costs
 	// what one without dependencies' results did.
 	Dependencies bool
@@ -71,6 +87,13 @@ type Dependency = driver.Dependency
 // After returns options for a step that waits for the given steps.
 func After(steps ...Step) *StepOpts {
 	return &StepOpts{After: steps}
+}
+
+// AfterAny returns options for a step that waits for any one of the given
+// steps to complete: a group of AfterAny, such as a step that goes on with
+// whichever of several equivalent attempts at a task completes first.
+func AfterAny(steps ...Step) *StepOpts {
+	return &StepOpts{AfterAny: [][]Step{steps}}
 }
 
 // Workflow collects steps with dependencies between them, to insert
@@ -178,6 +201,13 @@ func (c *Client[TTx]) insertWorkflow(ctx context.Context, exec driver.Executor, 
 			}
 			wp.Deps = append(wp.Deps, driver.JobDependency{Job: i, DependsOn: dep.i, OnFailure: s.opts.OnDependencyFailure, Reads: s.opts.Dependencies})
 		}
+		if len(s.opts.AfterAny) > 0 {
+			deps, err := anyOfDeps(wf, i, s.opts)
+			if err != nil {
+				return nil, err
+			}
+			wp.Deps = append(wp.Deps, deps...)
+		}
 	}
 
 	// The steps go through the insert middleware like any other insert,
@@ -234,6 +264,40 @@ func (c *Client[TTx]) insertWorkflow(ctx context.Context, exec driver.Executor, 
 		}
 	}
 	return res, nil
+}
+
+// anyOfDeps returns the edges of step i's AfterAny groups, numbered from
+// one. A step in two groups, or in a group and in After, would be one edge
+// with two meanings, and an empty group could never be satisfied.
+func anyOfDeps(wf *Workflow, i int, opts StepOpts) ([]driver.JobDependency, error) {
+	if len(opts.AfterAny) > maxAnyOfGroups {
+		return nil, fmt.Errorf("hopper: step %d has %d any-of groups, more than %d", i, len(opts.AfterAny), maxAnyOfGroups)
+	}
+	where := make(map[int]int, len(opts.After)) // step -> group, 0 for After
+	for _, dep := range opts.After {
+		where[dep.i] = 0
+	}
+	var deps []driver.JobDependency
+	for g, group := range opts.AfterAny {
+		if len(group) == 0 {
+			return nil, fmt.Errorf("hopper: step %d has an empty any-of group", i)
+		}
+		for _, dep := range group {
+			if dep.wf != wf || dep.i >= i {
+				return nil, fmt.Errorf("hopper: step %d depends on a step of another workflow", i)
+			}
+			if prev, seen := where[dep.i]; seen {
+				if prev == g+1 {
+					continue
+				}
+				return nil, fmt.Errorf("hopper: step %d waits for step %d in two places among After and AfterAny", i, dep.i)
+			}
+			where[dep.i] = g + 1
+			deps = append(deps, driver.JobDependency{Job: i, DependsOn: dep.i, OnFailure: opts.OnDependencyFailure,
+				Reads: opts.Dependencies, AnyOf: g + 1})
+		}
+	}
+	return deps, nil
 }
 
 // WorkflowGet returns a workflow's progress, its jobs (live and finished)

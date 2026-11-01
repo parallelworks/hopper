@@ -392,6 +392,9 @@ func (c *Client[TTx]) promoteReady(ctx context.Context) {
 		if res.Promoted > 0 {
 			c.logger.InfoContext(ctx, "hopper: promoted workflow jobs whose dependencies finished concurrently", "count", res.Promoted)
 		}
+		if res.Canceled > 0 {
+			c.logger.InfoContext(ctx, "hopper: canceled workflow jobs whose any-of groups failed", "count", res.Canceled)
+		}
 		if res.Scanned < int64(c.tuning.rescueBatch) {
 			c.promoteAfter = driver.JobID{}
 			return

@@ -34,7 +34,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 22
+	const latest = 23
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -1452,5 +1452,117 @@ func TestClaimEdgesUpgrade(t *testing.T) {
 	}
 	if !indexed() {
 		t.Error("v22's down script did not build hopper_job_deps_reads_job back")
+	}
+}
+
+// v23 adds hopper_job_deps.any_of and rebuilds the partial index on the
+// edges that read, by dependency, to cover the edges of any-of groups,
+// keeping the edges as they are; its down script turns the edges of groups
+// into edges that ignore failures and builds the index back. While a
+// transaction holds hopper_job_deps it waits in its retry loop, and a
+// claim's read of hopper_job_deps and a finalize's write to it go on
+// meanwhile.
+func TestAnyOfEdgesUpgrade(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 22}); err != nil {
+		t.Fatal(err)
+	}
+	exists := func(name string) bool {
+		t.Helper()
+		var ok bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	column := func() bool {
+		t.Helper()
+		var ok bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'hopper_job_deps' AND column_name = 'any_of')`).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if !exists("hopper_job_deps_reads_depends_on") || column() {
+		t.Fatal("v22 has no hopper_job_deps_reads_depends_on, or has any_of")
+	}
+	var job driver.JobID
+	if err := pool.QueryRow(ctx, `INSERT INTO hopper_jobs (kind, state) VALUES ('step', 'available') RETURNING id`).Scan(&job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_job_deps (job_id, depends_on, reads) VALUES (hopper_uuidv7(), $1, true)`, job); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // ended below
+	if _, err := tx.Exec(ctx, `DELETE FROM hopper_job_deps WHERE false`); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := make(chan error, 1)
+	go func() {
+		_, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 23})
+		upgraded <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-upgraded:
+		t.Fatalf("v23 completed while a transaction held hopper_job_deps: %v", err)
+	default:
+	}
+	// Every claim reads hopper_job_deps and a finalize deletes from it. An
+	// ALTER TABLE queued for its lock without the loop would hold both up
+	// until the transaction ends.
+	for _, q := range []string{`SELECT count(*) FROM hopper_job_deps`, `DELETE FROM hopper_job_deps WHERE false`} {
+		sctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		if _, err := pool.Exec(sctx, q); err != nil {
+			t.Errorf("%s during the migration: %v", q, err)
+		}
+		cancel()
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-upgraded; err != nil {
+		t.Fatal(err)
+	}
+	if !column() || !exists("hopper_job_deps_results_depends_on") || exists("hopper_job_deps_reads_depends_on") {
+		t.Error("v23 did not add any_of and rebuild the index on the edges that record results")
+	}
+	var edges int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM hopper_job_deps WHERE reads`).Scan(&edges); err != nil || edges != 1 {
+		t.Errorf("edges that read after v23 = %d, %v; want the one", edges, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_job_deps (job_id, depends_on, on_failure, any_of) VALUES (hopper_uuidv7(), $1, 'any_cancel', 1)`, job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 22}); err != nil {
+		t.Fatal(err)
+	}
+	if column() || !exists("hopper_job_deps_reads_depends_on") || exists("hopper_job_deps_results_depends_on") {
+		t.Error("v23's down script did not drop any_of and build hopper_job_deps_reads_depends_on back")
+	}
+	var policies []string
+	rows, err := pool.Query(ctx, `SELECT on_failure FROM hopper_job_deps ORDER BY on_failure`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			t.Fatal(err)
+		}
+		policies = append(policies, p)
+	}
+	if err := rows.Err(); err != nil || len(policies) != 2 || policies[0] != "cancel" || policies[1] != "ignore" {
+		t.Errorf("edges after down = %v, %v; want the edge that reads to cancel and the group's to ignore", policies, err)
 	}
 }

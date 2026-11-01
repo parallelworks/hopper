@@ -10,6 +10,8 @@ package jobcodec
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -191,4 +193,81 @@ func DecodeDependencies(stored string) []driver.Dependency {
 		}
 	}
 	return out
+}
+
+// CheckDependencies checks a workflow's edges against its n jobs, and
+// returns which jobs have dependencies, to insert pending.
+func CheckDependencies(deps []driver.JobDependency, n int) ([]bool, error) {
+	pending := make([]bool, n)
+	for _, d := range deps {
+		if d.Job < 0 || d.Job >= n || d.DependsOn < 0 || d.DependsOn >= n || d.Job == d.DependsOn {
+			return nil, fmt.Errorf("dependency %d -> %d is out of range", d.Job, d.DependsOn)
+		}
+		if d.AnyOf < 0 || d.AnyOf > math.MaxInt16 {
+			return nil, fmt.Errorf("dependency %d -> %d has any-of group %d, out of range", d.Job, d.DependsOn, d.AnyOf)
+		}
+		pending[d.Job] = true
+	}
+	return pending, nil
+}
+
+// EdgePolicy is what an edge stores as its on_failure: the dependent's
+// policy, cancel by default, and for an edge of an any-of group, that
+// policy prefixed with "any_". A group's edges never store "cancel", which
+// cancels the dependent as soon as the one job fails, so an engine of a
+// release before any-of groups, which knows only "cancel" and "ignore",
+// leaves them alone, as edges of a dependent that runs once they have all
+// finished.
+func EdgePolicy(d driver.JobDependency) string {
+	policy := d.OnFailure
+	if policy == "" {
+		policy = driver.DependencyCancel
+	}
+	if d.AnyOf != 0 {
+		return "any_" + string(policy)
+	}
+	return string(policy)
+}
+
+// EdgesJSON returns a workflow's edges as the JSON array a workflow row
+// stores for WorkflowGet: a pair of job IDs per edge, the dependent's
+// first, and for an edge of an any-of group its group number after them,
+// as a string. A reader of a release before any-of groups decodes the pair
+// and drops the number.
+func EdgesJSON(deps []driver.JobDependency, ids []driver.JobID) ([]byte, error) {
+	edges := make([][]string, len(deps))
+	for i, d := range deps {
+		edges[i] = []string{ids[d.Job].String(), ids[d.DependsOn].String()}
+		if d.AnyOf != 0 {
+			edges[i] = append(edges[i], strconv.Itoa(d.AnyOf))
+		}
+	}
+	return json.Marshal(edges)
+}
+
+// DecodeEdges reads the edges EdgesJSON writes.
+func DecodeEdges(stored string) ([]driver.JobEdge, error) {
+	var edges [][]string
+	if err := json.Unmarshal([]byte(stored), &edges); err != nil {
+		return nil, err
+	}
+	out := make([]driver.JobEdge, len(edges))
+	for i, e := range edges {
+		if len(e) < 2 {
+			return nil, fmt.Errorf("edge %d has %d elements", i, len(e))
+		}
+		var err error
+		if out[i].Job, err = driver.ParseJobID(e[0]); err != nil {
+			return nil, err
+		}
+		if out[i].DependsOn, err = driver.ParseJobID(e[1]); err != nil {
+			return nil, err
+		}
+		if len(e) > 2 {
+			if out[i].AnyOf, err = strconv.Atoi(e[2]); err != nil {
+				return nil, fmt.Errorf("edge %d: any-of group: %w", i, err)
+			}
+		}
+	}
+	return out, nil
 }

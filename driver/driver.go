@@ -953,6 +953,12 @@ type JobDependency struct {
 	// DependsOn has finished: the engine records DependsOn's final state and
 	// output only for a job with a dependent that reads it.
 	Reads bool
+	// AnyOf, when not zero, puts the edge in Job's any-of group of that
+	// number (1 to 32767): Job waits for one job of the group to complete
+	// rather than for all of them to finish. Job's ordinary edges have
+	// zero. All of Job's edges have one OnFailure, which applies to a group
+	// once every job of it has finished without completing.
+	AnyOf int
 }
 
 // WorkflowInsertParams describes a workflow: a named batch whose jobs
@@ -983,6 +989,9 @@ type WorkflowInsertResult struct {
 // JobEdge is an edge of an inserted workflow.
 type JobEdge struct {
 	Job, DependsOn JobID
+	// AnyOf is the number of Job's any-of group the edge is in, or zero for
+	// an ordinary edge (JobDependency.AnyOf).
+	AnyOf int
 }
 
 // WorkflowRow is a workflow's progress, jobs and graph.
@@ -1116,6 +1125,10 @@ type WorkflowPromoteParams struct {
 type WorkflowPromoteResult struct {
 	// Promoted counts the jobs made claimable.
 	Promoted int64
+	// Canceled counts the jobs canceled because every job of one of their
+	// any-of groups finished without completing, and those canceled with
+	// them, down the graph.
+	Canceled int64
 	// Scanned counts the jobs considered by a sweep, and Last is the
 	// greatest of their IDs, the After of the next chunk.
 	Scanned int64

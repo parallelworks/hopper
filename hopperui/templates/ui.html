@@ -170,7 +170,7 @@
 {{if .Data.Edges}}
 <svg class="dag" width="{{.Data.Width}}" height="{{.Data.Height}}" viewBox="0 0 {{.Data.Width}} {{.Data.Height}}">
   <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z"/></marker></defs>
-  {{range .Data.Edges}}<line x1="{{.X1}}" y1="{{.Y1}}" x2="{{.X2}}" y2="{{.Y2}}" marker-end="url(#arrow)"/>{{end}}
+  {{range .Data.Edges}}<line x1="{{.X1}}" y1="{{.Y1}}" x2="{{.X2}}" y2="{{.Y2}}"{{if .AnyOf}} stroke-dasharray="4 3"{{end}} marker-end="url(#arrow)"/>{{end}}
   {{range .Data.Nodes}}
   <a href="{{$.Prefix}}/jobs/{{.Job.ID}}"><g class="node {{.Job.State}}" transform="translate({{.X}},{{.Y}})">
     <title>{{.Job.Kind}} {{printf "%s" .Job.Args}}</title>

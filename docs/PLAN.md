@@ -713,7 +713,13 @@ edge read make both partial indexes look empty, and the planner then walked it w
 filtered by the dependency. The drop takes a loop like v21's, on `hopper_job_deps`
 alone; every claim since v21 reads that table, so claims, like finalizes, wait at most
 one try at a time. SQLite's claim still uses its index of that name, and v22 changes
-nothing there.
+nothing there. Schema v23 adds `any_of` to `hopper_job_deps`, the number of
+the dependent's any-of group an edge is in (§11), NULL for an ordinary edge, and on
+Postgres rebuilds the partial index on the edges that read, by dependency, as
+`hopper_job_deps_results_depends_on`, whose predicate (`reads OR any_of IS NOT NULL`)
+covers the edges of groups too, in the same loop on `hopper_job_deps` alone. The previous
+release's probe of the edges that read still matches it. Its down script turns the edges
+of groups into `ignore` edges, which is how the previous release treats them.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -2678,8 +2684,71 @@ observability without new machinery.
       so the size of a claim of workflow steps is bounded by what those steps'
       dependencies recorded; an application that keeps outputs large caps them before
       `SetOutput`.
+  - **Any-of groups.** A step can wait for any one of a group of steps
+    (`StepOpts.AfterAny`, a list of groups, or `hopper.AfterAny(steps...)` for one),
+    beside its ordinary dependencies, for instance a step that goes on with whichever
+    instance of a matrix of equivalent jobs completes first. It becomes available once
+    its ordinary dependencies have finished and, in each of its groups, one step has
+    completed. The others in a group run on; how they finish changes nothing for the
+    dependent, and the workflow completes once they have finished too. A group whose
+    steps all finish without completing (canceled or discarded) is exhausted, and the
+    step's `OnDependencyFailure` applies to it as to its ordinary edges: `cancel`
+    cancels the step, transitively, as a failed `cancel` edge does, and `ignore` lets it
+    run. A group has no policy of its own: one knob per step, as for `After`, covers
+    the uses we know of (a step that needs one result and a cleanup step that runs
+    regardless), and a group that wants another policy can be given its own step.
+    - Each edge of a group is a `hopper_job_deps` row with the group's number in
+      `any_of`, and its policy stored as `any_cancel` or `any_ignore`, never `cancel`: a
+      client of the previous release, which cancels a dependent the moment a job it
+      depends on by a `cancel` edge fails, leaves the edges alone, and promotes the
+      dependent once every step of the group has finished, as for `ignore` edges.
+      `hopper_batches.edges` gives an edge of a group a third element, its number, which
+      that release's `WorkflowGet` drops.
+    - A step of a group records its final state in `hopper_job_results` in the statement
+      that finalizes it, as a dependency that is read does (its output only if a
+      dependent reads it), so every snapshot sees each step of a group live or with its
+      outcome, and a workflow with groups is marked in `hopper_batches.reads` for the
+      results to be deleted when it completes. A step of a group gone without a result
+      was finalized by the previous release, which records none, and counts as
+      completed, as that release counts it. The tail's probe for a job with a dependent
+      that reads or has it in a group is one probe of the partial index on such edges by
+      dependency; whether one reads it, for the output, is a second only for the jobs the
+      first finds, so a workflow with neither records nothing, as before.
+    - The tail's promotion and `WorkflowPromoteReady` leave a group's edges out of the
+      check for live dependencies, and require that no group holds the dependent: a
+      group holds it while none of its steps completed (in the statement, or before) and
+      either one is live (outside the statement's own jobs) or the policy is
+      `any_cancel`. That costs a dependent without groups one more read of its own
+      edges by primary key, and only once every other condition has passed. The tail
+      cancels the dependent of a canceled or discarded job whose `any_cancel` group is
+      exhausted, in the cascade's first step; a group exhausted by a job the cascade
+      itself canceled is left to `WorkflowPromoteReady`, since the recursive step
+      cannot read its own rows in a subquery.
+    - **Concurrent steps of a group.** The race is the one of concurrent dependencies:
+      the last two steps of a group that fail in concurrent statements each see the
+      other live, so neither cancels the dependent, and a step of a group that completes
+      while the dependent's ordinary dependency finishes each sees the other live, so
+      neither promotes it. `WorkflowPromoteReady`, which each client runs after its
+      flush commits and the leader sweeps with, promotes the latter, and counts the
+      candidates an exhausted `any_cancel` group holds; only when there are any, a
+      second statement cancels them (`FOR UPDATE SKIP LOCKED`, the condition rechecked,
+      with the finalize tail, waiting only briefly for rows another transaction holds)
+      and the dependents of what it canceled are considered the same way, until it
+      cancels none. A promotion and a cancel of the same step cannot both happen: a
+      cancel needs every step of the group gone without a completion in its snapshot,
+      and a completing step is either still live in it or has its result there; the
+      promotion's update rechecks `pending` under the row lock, so two promotions
+      cannot both apply. A step of a group that finishes after its dependent has
+      been promoted or canceled finds it not pending and leaves it, and once the
+      dependent has finished its edges are gone and the step records no result. On
+      SQLite, whose writes run one at a time, the finalize's own walk cancels a
+      dependent once every step of its group has failed, however they finished.
+    - A claim carries the dependencies that read and have finished by then: a step of
+      a group still running is left out, as it has neither a result nor left the live
+      table.
   Workflows are inspectable with
-  `WorkflowGet`, `hopper workflows get` and, as a DAG, in `hopperui`.
+  `WorkflowGet` (an edge's `AnyOf`), `hopper workflows get` (`anyN:` before an edge of
+  group N) and, as a DAG, in `hopperui` (the edges of groups dashed).
 
 ## 12. Migrations
 

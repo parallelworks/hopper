@@ -420,6 +420,8 @@ type node struct {
 
 type edge struct {
 	X1, Y1, X2, Y2 int
+	// AnyOf marks an edge of an any-of group, drawn dashed.
+	AnyOf bool
 }
 
 const (
@@ -484,7 +486,7 @@ func layout(wf *hopper.WorkflowRow) workflowData {
 			continue
 		}
 		f, t := data.Nodes[from], data.Nodes[to]
-		data.Edges = append(data.Edges, edge{X1: f.X + nodeW, Y1: f.Y + nodeH/2, X2: t.X, Y2: t.Y + nodeH/2})
+		data.Edges = append(data.Edges, edge{X1: f.X + nodeW, Y1: f.Y + nodeH/2, X2: t.X, Y2: t.Y + nodeH/2, AnyOf: e.AnyOf != 0})
 	}
 	return data
 }
