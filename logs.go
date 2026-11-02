@@ -267,8 +267,13 @@ func (a *attempt) closeLog(timeout time.Duration) {
 // in the LogStore to close. A hard stop, which cancels ctx, waits for the
 // canceled jobs only for the stop's grace, so their attempts wait for at
 // most half of it and their results still reach the finalizer; so does a
-// fenced attempt's, which is ctx's other cancellation.
-func (c *Client[TTx]) logCloseTimeout(ctx context.Context) time.Duration {
+// fenced attempt's, which is ctx's other cancellation. An attempt the stop
+// canceled waits only until stopBy, if set, the half of the grace its
+// Config.OnError shares.
+func (c *Client[TTx]) logCloseTimeout(ctx context.Context, stopBy time.Time) time.Duration {
+	if !stopBy.IsZero() {
+		return min(c.tuning.logCloseTimeout, max(time.Until(stopBy), 0))
+	}
 	if ctx.Err() != nil {
 		return min(c.tuning.logCloseTimeout, c.tuning.stopGrace/2)
 	}

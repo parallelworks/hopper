@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -493,6 +494,70 @@ func TestStopAndCancelClaimInFlight(t *testing.T) {
 		}
 		if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateScheduled || f.Delay != 0 || f.Error != nil {
 			t.Errorf("job from the claim in flight: %+v, %v; want its attempt given back, with no error", f, ok)
+		}
+	})
+}
+
+// blockingStore is a LogStore whose writers' Close waits for their context.
+type blockingStore struct{}
+
+type blockingWriter struct{ ctx context.Context }
+
+func (blockingWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func (w blockingWriter) Close() error {
+	<-w.ctx.Done()
+	return w.ctx.Err()
+}
+
+func (blockingStore) Writer(ctx context.Context, _ *JobRow) (io.WriteCloser, error) {
+	return blockingWriter{ctx: ctx}, nil
+}
+
+func (blockingStore) Logs(context.Context, JobID) ([]AttemptLog, error) { return nil, nil }
+
+// TestStopDeadlineHookAndLogShareGrace: a Stop's deadline cancels a job
+// whose worker takes a moment to return, whose OnError waits for its
+// context and whose store's Close blocks. The hook and the log's close
+// share half the stop's grace, so the result is still written, its
+// attempt given back.
+func TestStopDeadlineHookAndLogShareGrace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		job := stopJob(1, 3, `{}`)
+		exec := &stopExec{jobs: []*driver.JobRow{job}, results: map[driver.JobID]driver.JobFinalize{}}
+		workers := NewWorkers()
+		AddWorkFunc(workers, func(ctx context.Context, _ *Job[stopSlowArgs]) error {
+			Logger(ctx).Info("running")
+			<-ctx.Done()
+			time.Sleep(100 * time.Millisecond)
+			return ctx.Err()
+		})
+		c, err := NewClient(stopDriver{exec: exec}, &Config{
+			Queues:    map[string]QueueConfig{QueueDefault: {MaxWorkers: 1}},
+			Workers:   workers,
+			Logger:    slog.New(slog.DiscardHandler),
+			NeverLead: true,
+			JobLogs:   JobLogsConfig{Store: blockingStore{}},
+			OnError: func(ctx context.Context, _ *JobRow, _ error) ErrorOutcome {
+				<-ctx.Done()
+				return ErrorOutcome{}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait() // the job is running
+		stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Stop = %v, want its deadline", err)
+		}
+		if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateRetryable {
+			t.Errorf("job whose hook and log close outlasted half the grace: %+v, %v; want its result written, its attempt given back", f, ok)
 		}
 	})
 }

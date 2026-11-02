@@ -450,9 +450,9 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // error. The same holds for the jobs a Stop cancels when its ctx expires.
 //
 // MaxAttempts does not bound a job that every stop interrupts: its timeout
-// does, and each interruption adds an entry to its Errors. OnError runs
-// with a context bounded by half the stop's short grace, so that the result
-// is still written. A worker must not call Stop or StopAndCancel itself:
+// does, and each interruption adds an entry to its Errors. OnError, and
+// then the close of the attempt's log in Config.JobLogs.Store, share half
+// the stop's short grace, so that the result is still written. A worker must not call Stop or StopAndCancel itself:
 // the stop waits for the worker, which then loses its result.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	return c.stop(ctx, true)

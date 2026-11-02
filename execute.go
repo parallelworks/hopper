@@ -46,7 +46,12 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 		claimed := *row
 		a.row = &claimed
 	}
-	defer func() { a.closeLog(c.logCloseTimeout(ctx)) }()
+	// stopBy is set as the worker returns, for an attempt the client's stop
+	// canceled: what follows the worker, Config.OnError and the log's
+	// close, shares half the stop's grace up to it, so that the result
+	// still reaches the finalizer within the grace.
+	var stopBy time.Time
+	defer func() { a.closeLog(c.logCloseTimeout(ctx, stopBy)) }()
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	jobCtx = driver.WithOwner(jobCtx, a)
@@ -58,7 +63,9 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	// returns, before anything below can wait. An attempt its own timeout
 	// ended first timed out (runWorker wraps ErrJobTimeout only then), which
 	// counts as any timeout does.
-	stopped := errors.Is(context.Cause(jobCtx), ErrClientStopped) && !errors.Is(err, ErrJobTimeout)
+	if errors.Is(context.Cause(jobCtx), ErrClientStopped) && !errors.Is(err, ErrJobTimeout) {
+		stopBy = time.Now().Add(c.tuning.stopGrace / 2)
+	}
 	completed := a.completedTx()
 	state := txUnknown
 	if completed != nil {
@@ -77,7 +84,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	// A job completed with CompleteTx whose read failed may have committed:
 	// its failure is neither logged nor shown to Config.OnError.
 	known := completed == nil || state != txUnknown
-	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err, known, stopped)
+	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err, known, stopBy)
 	if f.State.Terminal() {
 		f.Output = a.get()
 	}
@@ -206,10 +213,11 @@ func safeWork(ctx context.Context, work func(ctx context.Context) error) (err er
 // outcome maps a worker's return value to a state transition. unit is nil
 // when the job never reached a worker. ctx is the lease generation and
 // jobCtx the job's own context. known is false when the attempt may have
-// succeeded after all, and then Config.OnError is not called. stopped
-// reports that the client's stop canceled the attempt before the worker
-// returned.
-func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, qcfg QueueConfig, unit workUnit, err error, known, stopped bool) driver.JobFinalize {
+// succeeded after all, and then Config.OnError is not called. stopBy is
+// set when the client's stop canceled the attempt before the worker
+// returned, and bounds Config.OnError's context then.
+func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, qcfg QueueConfig, unit workUnit, err error, known bool, stopBy time.Time) driver.JobFinalize {
+	stopped := !stopBy.IsZero()
 	if err == nil {
 		return completedResult(row, qcfg)
 	}
@@ -254,7 +262,8 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 		// The client was fenced and canceled the job, which a rescue may
 		// already have run again: retry it immediately, as the rescue
 		// would. On its last attempt it is dead-lettered instead, as a
-		// rescued job would be.
+		// rescued job would be. An attempt its timeout ended before the
+		// client's stop canceled it (not stopped) is retried the same way.
 		f.State = driver.JobStateRetryable
 		return f
 	}
@@ -266,11 +275,11 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 		// ctx, which a fence or a stop's deadline cancels while it runs.
 		hookCtx := ctx
 		if stopped {
-			// Bounded, as a canceled attempt's log close is, so that its
+			// Bounded by stopBy, which the log's close shares, so that the
 			// result still reaches the finalizer within a stop's grace.
-			var cancel context.CancelFunc
-			hookCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), c.tuning.stopGrace/2)
-			defer cancel()
+			var cancelHook context.CancelFunc
+			hookCtx, cancelHook = context.WithDeadline(context.WithoutCancel(ctx), stopBy)
+			defer cancelHook()
 		}
 		o := c.onError(hookCtx, row, err)
 		// So does a JobCancel that arrived while the hook ran.

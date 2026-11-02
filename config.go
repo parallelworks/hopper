@@ -59,17 +59,19 @@ type Config struct {
 	// kind, with the worker's error: a returned error, a recovered panic
 	// (*PanicError), a timeout (ErrJobTimeout), a Cancel, or a kind with no
 	// worker (*UnknownKindError). It is not called for a Snooze, nor when the
-	// job was canceled with JobCancel or the client lost its lease, nor for a
-	// job the leader rescues from a lost client or RescueStuckAfter. It is
-	// called for an attempt the client's stop canceled (StopAndCancel), with
-	// a context that the stop does not cancel, bounded by half its grace. What it returns overrides the outcome;
+	// job was canceled with JobCancel or the client lost its lease, nor for
+	// an attempt whose timeout ended it before the client's stop canceled
+	// it, nor for a job the leader rescues from a lost client or
+	// RescueStuckAfter. It is called for an attempt the client's stop
+	// canceled (StopAndCancel), with a context that the stop does not
+	// cancel, bounded by half its grace, which the close of the attempt's
+	// log in JobLogs.Store shares. What it returns overrides the outcome;
 	// the zero ErrorOutcome keeps it. It runs on the worker's goroutine,
 	// concurrently with other jobs, before the result is written, so it
 	// should return quickly; a panic in it is logged and keeps the outcome.
 	// Its context carries the client (ClientFromContext) and outlives the
-	// job's. It runs after Middleware,
-	// which sees the worker's error, not the outcome OnError chooses; the
-	// job's events report the outcome.
+	// job's. It runs after Middleware, which sees the worker's error, not
+	// the outcome OnError chooses; the job's events report the outcome.
 	OnError func(ctx context.Context, job *JobRow, err error) ErrorOutcome
 	// RetryPolicy chooses when a failed job runs again, for workers whose
 	// NextRetry returns the zero time, unless the queue's RetryPolicy does.
