@@ -1197,16 +1197,19 @@ RETURNING j.*;
   keeps the output set before it, so the worker can react: set a smaller one, such as
   a reference to where it stored the large one, or return an error. The refusal is
   remembered until a later `SetOutput` sets an output within the limit: `CompleteTx`
-  returns it rather than complete the job, and an attempt whose worker returns nil is
-  discarded with it, as if the worker had returned `Cancel`. Completing it would hand
-  `Await` and the steps that read it no output, or an older one, as if the job had
-  produced it; and retrying it would redo the work to produce the same output again,
-  so it is not retried, though `OnError` can choose a retry for a job whose output
-  varies. A worker that returns an error of its own fails as that error says. A
-  lease's `Finish` and `FinishTx` refuse a larger `LeaseResult.Output` the same way,
-  before `OnError` runs, and write nothing: the holder keeps the lease, to finish
-  again with a smaller output or an error, and one that never does has the lease
-  expire.
+  returns it rather than complete the job, and an attempt whose worker returns nil, or
+  returns the refusal itself (`return hopper.SetOutput(ctx, v)`, or `CompleteTx`'s
+  error), is discarded with it, as if the worker had returned `Cancel`. Completing it
+  would hand `Await` and the steps that read it no output, or an older one, as if the
+  job had produced it; and retrying it would redo the work to produce the same output
+  again, so it is not retried, though `OnError` can choose a retry for a job whose
+  output varies. Such a discard is logged at error level, as a discarded job is. A
+  worker that returns an error of its own fails as that error says. A
+  lease's `Finish` and `FinishTx` refuse a completion's larger `LeaseResult.Output`
+  the same way and write nothing: the holder keeps the lease, to finish again with a
+  smaller output or an error, and one that never does has the lease expire. A
+  failure's output is encoded only if the failure ends the job, as before, and one
+  past the limit is dropped, so a holder can always report a failure.
 
 ### 7.5 Finalize
 Results are buffered and written by a per-client finalizer. It flushes every 25ms or
@@ -2706,7 +2709,8 @@ observability without new machinery.
       step retried from history (`JobRetry`) after it finished has no edges left and is
       claimed without them. A claim carries the outputs of all a job's dependencies,
       so the size of a claim of workflow steps is bounded by what those steps'
-      dependencies recorded, which `Config.MaxOutputBytes` caps (§7.4).
+      dependencies recorded, each of which `Config.MaxOutputBytes` caps when the
+      clients that run those steps set it (§7.4).
   - **Any-of groups.** A step can wait for any one of a group of steps
     (`StepOpts.AfterAny`, a list of groups, or `hopper.AfterAny(steps...)` for one),
     beside its ordinary dependencies, for instance a step that goes on with whichever

@@ -40,13 +40,14 @@ type Config struct {
 	Codec Codec
 	// MaxOutputBytes caps a job's output, as Codec encodes it: SetOutput
 	// refuses a larger one with an *OutputTooLargeError, and an attempt
-	// whose worker returns nil after such a refusal, with no smaller output
-	// set since, is discarded with that error, as if the worker had
+	// whose worker returns nil or that error after such a refusal, with no
+	// smaller output set since, is discarded with it, as if the worker had
 	// returned Cancel; CompleteTx refuses to complete it, and a lease's
-	// Finish and FinishTx refuse such a LeaseResult.Output, writing
-	// nothing. Each workflow step that reads its dependencies' outputs
-	// (StepOpts.Dependencies) is claimed with them, so the cap also bounds
-	// what a claim carries. Zero, the default, sets no limit.
+	// Finish and FinishTx refuse such a LeaseResult.Output of a
+	// completion, writing nothing, and drop it from a failure. Each workflow step that reads its dependencies' outputs
+	// (StepOpts.Dependencies) is claimed with them, so the cap, set on
+	// every client that runs them, also bounds each output a claim carries.
+	// Zero, the default, sets no limit.
 	MaxOutputBytes int
 	// JobTimeout is how long a job may run before its context is canceled,
 	// unless its worker's Timeout says otherwise. Defaults to one minute.

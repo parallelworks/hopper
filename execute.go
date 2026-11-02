@@ -48,11 +48,20 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 
 	unit, err := c.runWorker(jobCtx, row)
 	completed := a.completedTx()
-	if refused := a.refusedOutput(); err == nil && completed == nil && refused != nil {
-		// The worker returned nil although SetOutput refused its output:
-		// completed, the job would hand its dependents and Await no output,
-		// or an older one. The output's size will not change on a retry.
-		err = Cancel(refused)
+	if refused := a.refusedOutput(); refused != nil && completed == nil {
+		// An attempt whose worker returned nil although SetOutput refused
+		// its output is not completed: the job would hand its dependents
+		// and Await no output, or an older one. Nor is one whose worker
+		// returned the refusal itself, as `return hopper.SetOutput(ctx, v)`
+		// and CompleteTx's error do, retried: the output's size will not
+		// change on a retry.
+		var cancel *CancelError
+		switch {
+		case err == nil:
+			err = Cancel(refused)
+		case errors.Is(err, refused) && !errors.As(err, &cancel):
+			err = Cancel(err)
+		}
 	}
 	state := txUnknown
 	if completed != nil {
@@ -297,7 +306,9 @@ func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driv
 	}
 	var cancel *CancelError
 	switch {
-	case errors.As(err, &cancel) && f.State == driver.JobStateDiscarded:
+	case errors.As(err, &cancel) && f.State == driver.JobStateDiscarded && !errors.Is(err, ErrOutputTooLarge):
+		// A Cancel for an output past Config.MaxOutputBytes, the client's
+		// or the worker's, is logged as a discard, below, at error level.
 		c.logger.InfoContext(ctx, "hopper: job canceled by worker", "job_id", row.ID, "kind", row.Kind, "error", err)
 	case f.State == driver.JobStateCanceled:
 		c.logger.InfoContext(ctx, "hopper: job canceled", "job_id", row.ID, "kind", row.Kind)
