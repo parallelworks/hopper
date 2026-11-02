@@ -188,7 +188,8 @@ type LeaseStatus struct {
 // (Cancel) discards it, as does an error matching ErrOutputTooLarge; any
 // other error retries it, with Config.OnError, the kind's worker's
 // NextRetry (when this client has the worker) and the retry policies
-// applied as for a worker's error, or discards it on its last attempt. After JobCancel, an error cancels the job.
+// applied as for a worker's error, or discards it on its last attempt.
+// After JobCancel, an error cancels the job.
 type LeaseResult struct {
 	Err error
 	// Output is the completed job's output, encoded with Config.Codec and
@@ -196,7 +197,7 @@ type LeaseResult struct {
 	// job. One larger than Config.MaxOutputBytes, encoded, has Finish and
 	// FinishTx return an *OutputTooLargeError and change nothing, leaving
 	// the lease to finish again, unless Err is set: then the output is
-	// dropped and the failure recorded.
+	// dropped, as is one that does not encode, and the failure recorded.
 	Output any
 }
 
@@ -434,12 +435,10 @@ func (l *Leases[TTx]) result(ctx context.Context, exec driver.Executor, token Le
 	f := c.outcome(context.WithoutCancel(ctx), jobCtx, row, qcfg, unit, res.Err, true)
 	f.AttemptedBy, f.Lease = 0, token.fenceOf()
 	if f.State.Terminal() && res.Output != nil && res.Err != nil {
-		// A failure's output past the limit is dropped, not the failure.
-		output, err = encodeOutput(c.cfg.Codec, res.Output, c.cfg.MaxOutputBytes)
-		if errors.Is(err, ErrOutputTooLarge) {
+		// A failure is recorded whatever its output: one past the limit, or
+		// that does not encode, is dropped, not the failure.
+		if output, err = encodeOutput(c.cfg.Codec, res.Output, c.cfg.MaxOutputBytes); err != nil {
 			c.logger.WarnContext(ctx, "hopper: leased job's output dropped", "job_id", row.ID, "kind", row.Kind, "error", err)
-		} else if err != nil {
-			return nil, driver.JobFinalize{}, err
 		}
 	}
 	if f.State.Terminal() {

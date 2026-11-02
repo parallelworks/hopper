@@ -244,6 +244,21 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 			t.Errorf("failed job: %s with %d bytes of output; want discarded without it", j.State, len(j.Output))
 		}
 
+		// So is one whose output does not encode.
+		ins, err = c.Insert(ctx, remote{}, &hopper.InsertOpts{Queue: remoteQueue})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l, err = c.Leases().Claim(ctx, ins.Job.ID, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Leases().Finish(ctx, l.Token, hopper.LeaseResult{Err: hopper.Cancel(errors.New("gone")), Output: func() {}}); err != nil {
+			t.Fatalf("Finish of a failure with an output that does not encode = %v, want it recorded", err)
+		}
+		if j := finished(t, c, ins.Job.ID); j.State != hopper.JobStateDiscarded || len(j.Output) != 0 {
+			t.Errorf("failed job with an output that does not encode: %s with %d bytes of output; want discarded without it", j.State, len(j.Output))
+		}
+
 		// A holder that finishes with the refusal has the job discarded, as
 		// a worker that returns it does.
 		ins, err = c.Insert(ctx, remote{}, &hopper.InsertOpts{Queue: remoteQueue, MaxAttempts: 3})

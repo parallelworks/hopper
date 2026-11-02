@@ -1201,10 +1201,10 @@ RETURNING j.*;
   returns nil completes the job with the earlier output, or none. A lease's `Finish`
   and `FinishTx` refuse a completion's larger `LeaseResult.Output` and write nothing,
   so the holder can finish again; a `LeaseResult.Err` matching `ErrOutputTooLarge`
-  discards the job, and a failure's output past the limit is dropped, with a warning,
-  so a failure is always recorded. PostgreSQL keeps outputs as jsonb, whose text can
-  be longer than the encoded output (a space after each comma and colon, numbers
-  written out in full).
+  discards the job, and a failure's output past the limit, or one that does not
+  encode, is dropped, with a warning, so a failure is always recorded. PostgreSQL
+  keeps outputs as jsonb, whose text can be longer than the encoded output (a space
+  after each comma and colon, numbers written out in full).
 
 ### 7.5 Finalize
 Results are buffered and written by a per-client finalizer. It flushes every 25ms or

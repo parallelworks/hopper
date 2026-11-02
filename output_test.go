@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/parallelworks/hopper"
-
 	"github.com/parallelworks/hopper/driver"
 	"github.com/parallelworks/hopper/internal/outputtest"
 )
@@ -141,7 +140,7 @@ func TestJobCancelWinsOverARefusal(t *testing.T) {
 
 func TestMaxOutputBytesIsChecked(t *testing.T) {
 	t.Parallel()
-	if _, err := hopper.NewClient(newHarness(t).d, &hopper.Config{MaxOutputBytes: -1}); err == nil {
-		t.Error("a negative MaxOutputBytes was accepted")
+	if _, err := hopper.NewClient(newHarness(t).d, &hopper.Config{MaxOutputBytes: -1}); err == nil || !strings.Contains(err.Error(), "MaxOutputBytes") {
+		t.Errorf("NewClient with a negative MaxOutputBytes = %v, want its refusal", err)
 	}
 }
