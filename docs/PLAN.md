@@ -1190,6 +1190,21 @@ RETURNING j.*;
   jobs. A workflow step's output is also kept, with its final state, for the steps
   after it that read it (`StepOpts.Dependencies`), until the workflow completes,
   whatever history's retention and `DeleteCompleted` (§11).
+- `Config.MaxOutputBytes` caps an output as the codec encodes it; zero, the default,
+  sets no limit. The client checks it, so every engine applies it alike and no driver
+  or schema changes. `SetOutput` refuses a larger output with an
+  `*OutputTooLargeError` (`errors.Is` `ErrOutputTooLarge`) and keeps the output set
+  before it. Nothing is remembered: the attempt's outcome follows the error the worker
+  returns. One that matches `ErrOutputTooLarge` discards the job, as a `Cancel` does,
+  since a retry would produce as large an output, unless `JobCancel` canceled it
+  first; `OnError` gets the error as returned and can choose otherwise. A worker that
+  returns nil completes the job with the earlier output, or none. A lease's `Finish`
+  and `FinishTx` refuse a completion's larger `LeaseResult.Output` and write nothing,
+  so the holder can finish again; a `LeaseResult.Err` matching `ErrOutputTooLarge`
+  discards the job, and a failure's output past the limit, or one that does not
+  encode, is dropped, with a warning, so a failure is always recorded. PostgreSQL
+  keeps outputs as jsonb, whose text can be longer than the encoded output (a space
+  after each comma and colon, numbers written out in full).
 
 ### 7.5 Finalize
 Results are buffered and written by a per-client finalizer. It flushes every 25ms or
@@ -2689,8 +2704,8 @@ observability without new machinery.
       step retried from history (`JobRetry`) after it finished has no edges left and is
       claimed without them. A claim carries the outputs of all a job's dependencies,
       so the size of a claim of workflow steps is bounded by what those steps'
-      dependencies recorded; an application that keeps outputs large caps them before
-      `SetOutput`.
+      dependencies recorded, each of which `Config.MaxOutputBytes` caps when the
+      clients that run those steps set it (§7.4).
   - **Any-of groups.** A step can wait for any one of a group of steps
     (`StepOpts.AfterAny`, a list of groups, or `hopper.AfterAny(steps...)` for one),
     beside its ordinary dependencies, for instance a step that goes on with whichever

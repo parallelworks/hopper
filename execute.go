@@ -31,7 +31,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	defer cancel(nil)
 	a := &attempt{
 		codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt,
-		row: row, baseLogger: c.logger, logs: c.cfg.JobLogs,
+		row: row, baseLogger: c.logger, logs: c.cfg.JobLogs, maxOutput: c.cfg.MaxOutputBytes,
 	}
 	if c.cfg.JobLogs.Store != nil {
 		// The store's Writer gets the row as claimed: the worker changes its
@@ -224,12 +224,15 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 
 	var cancel *CancelError
 	byWorker := errors.As(err, &cancel)
+	// An output past Config.MaxOutputBytes would be as large on a retry, so
+	// its refusal discards the job, unless JobCancel canceled it first.
+	tooLarge := errors.Is(err, ErrOutputTooLarge)
 	canceled := errors.Is(context.Cause(jobCtx), ErrJobCanceled)
 	switch {
 	case !byWorker && canceled:
 		f.State = driver.JobStateCanceled
 		return f
-	case !byWorker && ctx.Err() != nil && row.Attempt < row.MaxAttempts:
+	case !byWorker && !tooLarge && ctx.Err() != nil && row.Attempt < row.MaxAttempts:
 		// The client is stopping (or was fenced) and canceled the job. That
 		// is not the job's fault: retry immediately elsewhere. On its last
 		// attempt it is dead-lettered instead, as a rescued job would be.
@@ -260,7 +263,7 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 			return f
 		}
 	}
-	if byWorker || row.Attempt >= row.MaxAttempts {
+	if byWorker || tooLarge || row.Attempt >= row.MaxAttempts {
 		f.State = driver.JobStateDiscarded
 	} else {
 		f.State = driver.JobStateRetryable

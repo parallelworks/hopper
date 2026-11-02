@@ -14,7 +14,8 @@ type Worker[T JobArgs] interface {
 	// Work runs the job. Returning nil completes it. Returning an error
 	// schedules a retry with backoff, or discards the job when it is out of
 	// attempts. Return Snooze(d) to run again later without using an attempt
-	// and Cancel(err) to discard now.
+	// and Cancel(err) to discard now. An error matching ErrOutputTooLarge,
+	// SetOutput's refusal (Config.MaxOutputBytes), also discards it now.
 	Work(ctx context.Context, job *Job[T]) error
 	// Timeout returns how long the job may run before its context is
 	// canceled: 0 for the client's default, or a negative duration for no

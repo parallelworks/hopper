@@ -35,6 +35,9 @@ type attempt struct {
 	loggerOnce sync.Once
 	logger     *slog.Logger
 
+	// maxOutput is Config.MaxOutputBytes.
+	maxOutput int
+
 	mu        sync.Mutex
 	output    json.RawMessage
 	completed *driver.JobFinalize
@@ -74,6 +77,38 @@ func (a *attempt) get() json.RawMessage {
 	return a.output
 }
 
+// ErrOutputTooLarge is what an *OutputTooLargeError matches with
+// errors.Is.
+var ErrOutputTooLarge = errors.New("hopper: output larger than Config.MaxOutputBytes")
+
+// OutputTooLargeError reports a job's output larger than
+// Config.MaxOutputBytes: Size bytes as the client's Codec encoded it,
+// against Limit.
+type OutputTooLargeError struct {
+	Size, Limit int
+}
+
+func (e *OutputTooLargeError) Error() string {
+	return fmt.Sprintf("hopper: output of %d bytes is larger than Config.MaxOutputBytes (%d)", e.Size, e.Limit)
+}
+
+// Is reports whether target is ErrOutputTooLarge.
+func (e *OutputTooLargeError) Is(target error) bool { return target == ErrOutputTooLarge }
+
+// encodeOutput encodes a job's output with codec, for SetOutput and a
+// lease's result, and refuses one larger than limit, a limit of zero being
+// none, with an *OutputTooLargeError.
+func encodeOutput(codec Codec, v any, limit int) ([]byte, error) {
+	data, err := codec.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: encode output: %w", err)
+	}
+	if limit > 0 && len(data) > limit {
+		return nil, &OutputTooLargeError{Size: len(data), Limit: limit}
+	}
+	return data, nil
+}
+
 func (a *attempt) completedTx() *driver.JobFinalize {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -89,14 +124,21 @@ var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 // is kept only for archived jobs, so it is lost on queues with
 // DeleteCompleted. A job finalized with CompleteTx stores the output set
 // before that call.
+//
+// An output larger than Config.MaxOutputBytes, encoded, is refused with an
+// *OutputTooLargeError, which matches ErrOutputTooLarge, and the output set
+// before it, if any, is kept. Return the error: an attempt that fails with
+// it is discarded, not retried, as its output would be as large again. A
+// worker that returns nil instead completes the job with the earlier
+// output, or none.
 func SetOutput(ctx context.Context, v any) error {
 	a, _ := ctx.Value(attemptKey{}).(*attempt)
 	if a == nil {
 		return ErrNotInJob
 	}
-	data, err := a.codec.Marshal(v)
+	data, err := encodeOutput(a.codec, v, a.maxOutput)
 	if err != nil {
-		return fmt.Errorf("hopper: encode output: %w", err)
+		return err
 	}
 	a.mu.Lock()
 	a.output = data

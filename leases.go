@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -186,15 +185,19 @@ type LeaseStatus struct {
 // LeaseResult ends a leased attempt as if the job's worker had returned
 // Err: nil completes the job, with Output; a *SnoozeError (Snooze) snoozes
 // it, which gives the attempt back and keeps the fence; a *CancelError
-// (Cancel) discards it; any other error retries it, with Config.OnError,
-// the kind's worker's NextRetry (when this client has the worker) and the
-// retry policies applied as for a worker's error, or discards it on its
-// last attempt. After JobCancel, an error cancels the job.
+// (Cancel) discards it, as does an error matching ErrOutputTooLarge; any
+// other error retries it, with Config.OnError, the kind's worker's
+// NextRetry (when this client has the worker) and the retry policies
+// applied as for a worker's error, or discards it on its last attempt.
+// After JobCancel, an error cancels the job.
 type LeaseResult struct {
 	Err error
 	// Output is the completed job's output, encoded with Config.Codec and
 	// kept as SetOutput's is. It is ignored unless the attempt ends the
-	// job.
+	// job. One larger than Config.MaxOutputBytes, encoded, has Finish and
+	// FinishTx return an *OutputTooLargeError and change nothing, leaving
+	// the lease to finish again, unless Err is set: then the output is
+	// dropped, as is one that does not encode, and the failure recorded.
 	Output any
 }
 
@@ -411,6 +414,14 @@ func (l *Leases[TTx]) result(ctx context.Context, exec driver.Executor, token Le
 		jobCtx, cancel = context.WithCancelCause(jobCtx)
 		cancel(ErrJobCanceled)
 	}
+	// A completion's output past Config.MaxOutputBytes is refused before
+	// anything is written, so the holder keeps the lease to finish again.
+	var output []byte
+	if res.Output != nil && res.Err == nil {
+		if output, err = encodeOutput(c.cfg.Codec, res.Output, c.cfg.MaxOutputBytes); err != nil {
+			return nil, driver.JobFinalize{}, err
+		}
+	}
 	// The kind's worker, if this client has one, chooses the retry delay as
 	// it would for its own attempt (NextRetry, and an ordered delivery's
 	// cap); one whose args do not decode leaves it to the retry policies.
@@ -423,12 +434,15 @@ func (l *Leases[TTx]) result(ctx context.Context, exec driver.Executor, token Le
 	}
 	f := c.outcome(context.WithoutCancel(ctx), jobCtx, row, qcfg, unit, res.Err, true)
 	f.AttemptedBy, f.Lease = 0, token.fenceOf()
-	if f.State.Terminal() && res.Output != nil {
-		data, err := c.cfg.Codec.Marshal(res.Output)
-		if err != nil {
-			return nil, driver.JobFinalize{}, fmt.Errorf("hopper: encode output: %w", err)
+	if f.State.Terminal() && res.Output != nil && res.Err != nil {
+		// A failure is recorded whatever its output: one past the limit, or
+		// that does not encode, is dropped, not the failure.
+		if output, err = encodeOutput(c.cfg.Codec, res.Output, c.cfg.MaxOutputBytes); err != nil {
+			c.logger.WarnContext(ctx, "hopper: leased job's output dropped", "job_id", row.ID, "kind", row.Kind, "error", err)
 		}
-		f.Output = data
+	}
+	if f.State.Terminal() {
+		f.Output = output
 	}
 	return row, f, nil
 }

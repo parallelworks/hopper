@@ -38,6 +38,17 @@ type Config struct {
 	JobLogs JobLogsConfig
 	// Codec encodes args and outputs. Defaults to JSONCodec.
 	Codec Codec
+	// MaxOutputBytes caps a job's output, as Codec encodes it: SetOutput
+	// refuses a larger one with an *OutputTooLargeError, as do a lease's
+	// Finish and FinishTx for a completion's LeaseResult.Output, and an
+	// attempt that fails with an error matching ErrOutputTooLarge is
+	// discarded, not retried. Set on every client that runs a workflow's
+	// steps, it also bounds the outputs a step that reads its dependencies'
+	// (StepOpts.Dependencies) is claimed with, though PostgreSQL keeps them
+	// as jsonb, whose text can be longer than the encoded output (a space
+	// after each comma and colon, numbers written out in full). Zero, the
+	// default, sets no limit.
+	MaxOutputBytes int
 	// JobTimeout is how long a job may run before its context is canceled,
 	// unless its worker's Timeout says otherwise. Defaults to one minute.
 	JobTimeout time.Duration
@@ -228,6 +239,9 @@ func (cfg *Config) withDefaults() (Config, error) {
 
 	if out.MaxAttempts < 0 {
 		return out, errors.New("hopper: Config.MaxAttempts must be positive")
+	}
+	if out.MaxOutputBytes < 0 {
+		return out, errors.New("hopper: Config.MaxOutputBytes must not be negative")
 	}
 	var err error
 	if out.JobLogs, err = withJobLogDefaults(out.JobLogs); err != nil {

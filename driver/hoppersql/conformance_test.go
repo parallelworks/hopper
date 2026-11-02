@@ -18,6 +18,7 @@ import (
 	"github.com/parallelworks/hopper/driver/hoppersql"
 	"github.com/parallelworks/hopper/drivertest"
 	"github.com/parallelworks/hopper/hoppermigrate"
+	"github.com/parallelworks/hopper/internal/outputtest"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
 
@@ -362,4 +363,9 @@ func TestTagListingReadsAPageOfHistory(t *testing.T) {
 	if len(read.rows) == 0 || slices.Max(read.rows) > 10 {
 		t.Errorf("the reads of history's jobs returned %v rows, want at most 10 each", read.rows)
 	}
+}
+
+func TestMaxOutputBytes(t *testing.T) {
+	t.Parallel()
+	outputtest.Run(t, newFixture().NewDriver)
 }
