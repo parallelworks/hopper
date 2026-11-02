@@ -211,6 +211,12 @@ func (s minutesUntil) Next(t time.Time) time.Time {
 	return next
 }
 
+// neverDue is a cron expression with no slot, as February has no 30th.
+// Unlike noSlots, a client records it for the leader, so a test of stored
+// definitions that counts RunOnStart's job does not depend on a slot coming
+// due while it runs.
+const neverDue = "0 0 30 2 *"
+
 // A job added mid-term whose last slot is old back-fills CatchUp slots, as
 // at the start of a term, and RunOnStart adds its job to them.
 func TestPeriodicJobsAddCatchesUp(t *testing.T) {
@@ -493,7 +499,7 @@ func TestPeriodicStrictKindsRecordsOnlyWorkedKinds(t *testing.T) {
 		Workers:     workers,
 		StrictKinds: true,
 		NeverLead:   true,
-		Periodic:    []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: 8}, &hopper.PeriodicOpts{RunOnStart: true})},
+		Periodic:    []hopper.PeriodicJob{hopper.Cron(neverDue, noop{N: 8}, &hopper.PeriodicOpts{RunOnStart: true})},
 	})
 	if err := strict.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -523,7 +529,7 @@ func TestPeriodicRunOnStartOnceAcrossReplicas(t *testing.T) {
 		c := h.client(&hopper.Config{
 			Queues:   map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
 			Workers:  noopWorkers(),
-			Periodic: []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: 7}, &hopper.PeriodicOpts{RunOnStart: true})},
+			Periodic: []hopper.PeriodicJob{hopper.Cron(neverDue, noop{N: 7}, &hopper.PeriodicOpts{RunOnStart: true})},
 		})
 		c.SetTuning(tun)
 		if err := c.Start(ctx); err != nil {
@@ -532,17 +538,9 @@ func TestPeriodicRunOnStartOnceAcrossReplicas(t *testing.T) {
 		return c
 	}
 	jobs := h.countN
-	dbNow := func() time.Time {
-		var now time.Time
-		if err := h.pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
-			t.Fatal(err)
-		}
-		return now
-	}
-	from := dbNow()
 	leader := start()
 	waitFor(t, leader.IsLeader)
-	waitFor(t, func() bool { return jobs("7") >= 1 })
+	waitFor(t, func() bool { return jobs("7") == 1 })
 	follower := start()
 	time.Sleep(time.Second)
 	if err := follower.Stop(ctx); err != nil {
@@ -552,12 +550,8 @@ func TestPeriodicRunOnStartOnceAcrossReplicas(t *testing.T) {
 	if !leader.IsLeader() {
 		t.Fatal("leadership moved, which runs RunOnStart again")
 	}
-	// The job's hourly slots that came due during the test are inserted
-	// besides RunOnStart's, counted up to after the jobs are.
-	n := jobs("7")
-	slots := int(dbNow().Truncate(time.Hour).Sub(from.Truncate(time.Hour)) / time.Hour)
-	if n < 1 || n > 1+slots {
-		t.Errorf("RunOnStart inserted %d jobs as a replica started and stopped, with %d hourly slots due, want 1", n-slots, slots)
+	if n := jobs("7"); n != 1 {
+		t.Errorf("RunOnStart inserted %d jobs as a replica started and stopped, want 1", n)
 	}
 }
 
@@ -572,7 +566,7 @@ func TestPeriodicLeaderStartsWithItsOwnDefinition(t *testing.T) {
 			Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
 			Workers:   noopWorkers(),
 			NeverLead: neverLead,
-			Periodic:  []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: n}, &hopper.PeriodicOpts{Name: "x", RunOnStart: true})},
+			Periodic:  []hopper.PeriodicJob{hopper.Cron(neverDue, noop{N: n}, &hopper.PeriodicOpts{Name: "x", RunOnStart: true})},
 		})
 		if err := c.Start(ctx); err != nil {
 			t.Fatal(err)
