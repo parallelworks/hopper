@@ -5,6 +5,7 @@ package outputtest
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -89,6 +90,7 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 				hopper.QueueDefault: {MaxWorkers: 4},
 			},
 			Workers:        workers,
+			Logger:         slog.New(slog.DiscardHandler),
 			MaxOutputBytes: max,
 			PollInterval:   20 * time.Millisecond,
 		})
