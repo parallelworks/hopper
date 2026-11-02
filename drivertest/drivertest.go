@@ -196,6 +196,10 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"WorkflowFanInConcurrent", testWorkflowFanInConcurrent[TTx]},
 		{"WorkflowCascadeHeld", testWorkflowCascadeHeld[TTx]},
 		{"WorkflowsConcurrent", testWorkflowsConcurrent[TTx]},
+		{"WorkflowAnyOf", testWorkflowAnyOf[TTx]},
+		{"WorkflowAnyOfConcurrent", testWorkflowAnyOfConcurrent[TTx]},
+		{"WorkflowAnyOfHeld", testWorkflowAnyOfHeld[TTx]},
+		{"WorkflowsAnyOfConcurrent", testWorkflowsAnyOfConcurrent[TTx]},
 		{"WorkflowRetriedFailure", testWorkflowRetriedFailure[TTx]},
 		{"WorkflowRetriedFailureHeld", testWorkflowRetriedFailureHeld[TTx]},
 		{"WorkflowRetriedAfterCompletion", testWorkflowRetriedAfterCompletion[TTx]},
@@ -561,11 +565,25 @@ func finalize(ctx context.Context, t *testing.T, exec driver.Executor, jobs ...d
 	return appliedIDs(applied)
 }
 
-// appliedIDs returns the jobs of the results a finalize applied.
+// appliedIDs returns the jobs of the results a finalize applied, without
+// the dependents it canceled by cascade.
 func appliedIDs(applied []driver.JobFinalized) []driver.JobID {
-	ids := make([]driver.JobID, len(applied))
-	for i, a := range applied {
-		ids[i] = a.ID
+	ids := make([]driver.JobID, 0, len(applied))
+	for _, a := range applied {
+		if !a.Cascaded {
+			ids = append(ids, a.ID)
+		}
+	}
+	return ids
+}
+
+// cascadedIDs returns the dependents a finalize canceled by cascade.
+func cascadedIDs(applied []driver.JobFinalized) []driver.JobID {
+	var ids []driver.JobID
+	for _, a := range applied {
+		if a.Cascaded {
+			ids = append(ids, a.ID)
+		}
 	}
 	return ids
 }

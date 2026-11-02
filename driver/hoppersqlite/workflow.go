@@ -3,7 +3,6 @@ package hoppersqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -18,12 +17,9 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 	if n == 0 {
 		return nil, errors.New("hopper: insert workflow: no jobs")
 	}
-	pending := make([]bool, n)
-	for _, d := range params.Deps {
-		if d.Job < 0 || d.Job >= n || d.DependsOn < 0 || d.DependsOn >= n || d.Job == d.DependsOn {
-			return nil, fmt.Errorf("hopper: insert workflow: dependency %d -> %d is out of range", d.Job, d.DependsOn)
-		}
-		pending[d.Job] = true
+	pending, err := jobcodec.CheckDependencies(params.Deps, n)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: insert workflow: %w", err)
 	}
 	jobs := make([]jobInsert, n)
 	var notifyQueues []string
@@ -49,15 +45,6 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		for i := range jobs {
 			jobs[i].id = newID(x.now)
 		}
-		// The graph, for inspection, and the working set of edges.
-		edges := make([][2]string, len(params.Deps))
-		for i, d := range params.Deps {
-			edges[i] = [2]string{jobs[d.Job].id.String(), jobs[d.DependsOn].id.String()}
-		}
-		edgesJSON, err := json.Marshal(edges)
-		if err != nil {
-			return err
-		}
 		ids := make([]driver.JobID, n)
 		for i := range jobs {
 			ids[i] = jobs[i].id
@@ -66,15 +53,22 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 		if err != nil {
 			return err
 		}
+		// The graph, for inspection, and the working set of edges.
+		edgesJSON, err := jobcodec.EdgesJSON(params.Deps, ids)
+		if err != nil {
+			return err
+		}
 		res.ID = newID(x.now)
 		for i := range jobs {
 			jobs[i].batchID = res.ID
 		}
 		// An edge that does not read, and a workflow with none that do, store
-		// NULL, as the partial indexes on the edges expect.
+		// NULL, as the partial indexes on the edges expect. A workflow with
+		// an any-of group records results too, for its members, and is
+		// marked to have them deleted as one that reads is.
 		var reads any
 		for _, d := range params.Deps {
-			if d.Reads {
+			if d.Reads || d.AnyOf != 0 {
 				reads = 1
 			}
 		}
@@ -90,21 +84,20 @@ func (e *executor) WorkflowInsert(ctx context.Context, params driver.WorkflowIns
 			res.Jobs[i] = driver.JobInsertResult{Job: job}
 		}
 		for _, d := range params.Deps {
-			policy := d.OnFailure
-			if policy == "" {
-				policy = driver.DependencyCancel
-			}
 			// Only a claim reads an edge's step name, and only of an edge
 			// that reads.
-			var step, read any
+			var step, read, group any
 			if d.Reads {
 				read = 1
 				if len(params.Steps) > 0 {
 					step = nullable(params.Steps[d.DependsOn])
 				}
 			}
-			if _, err := x.ExecContext(ctx, `INSERT OR IGNORE INTO hopper_job_deps (job_id, depends_on, on_failure, step, reads) VALUES (?, ?, ?, ?, ?)`,
-				idParam(jobs[d.Job].id), idParam(jobs[d.DependsOn].id), string(policy), step, read); err != nil {
+			if d.AnyOf != 0 {
+				group = d.AnyOf
+			}
+			if _, err := x.ExecContext(ctx, `INSERT OR IGNORE INTO hopper_job_deps (job_id, depends_on, on_failure, step, reads, any_of) VALUES (?, ?, ?, ?, ?, ?)`,
+				idParam(jobs[d.Job].id), idParam(jobs[d.DependsOn].id), jobcodec.EdgePolicy(d), step, read, group); err != nil {
 				return fmt.Errorf("insert dependencies: %w", err)
 			}
 		}
@@ -139,13 +132,8 @@ func (e *executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 		w.Batch.Name = name.String
 		w.Steps = jobcodec.DecodeSteps(steps.String)
 		if edges.Valid {
-			var pairs [][2]driver.JobID
-			if err := json.Unmarshal([]byte(edges.String), &pairs); err != nil {
+			if w.Edges, err = jobcodec.DecodeEdges(edges.String); err != nil {
 				return fmt.Errorf("edges: %w", err)
-			}
-			w.Edges = make([]driver.JobEdge, len(pairs))
-			for i, p := range pairs {
-				w.Edges[i] = driver.JobEdge{Job: p[0], DependsOn: p[1]}
 			}
 		}
 		// Jobs in insertion order, live and finished alike.
@@ -168,16 +156,24 @@ func (e *executor) WorkflowGet(ctx context.Context, id driver.JobID) (*driver.Wo
 	return &w, nil
 }
 
-// readySQL selects, of the IDs it is given, the pending jobs none of whose
-// dependencies is still live.
-const readySQL = `SELECT j.id FROM hopper_jobs j
-WHERE j.id IN (%s) AND j.state = 'pending'
-  AND NOT EXISTS (SELECT 1 FROM hopper_job_deps d JOIN hopper_jobs x ON x.id = d.depends_on WHERE d.job_id = j.id)`
+// pendingSQL reads, of the IDs it is given, the pending jobs, each with
+// whether it is ready, none of its dependencies still live and none of its
+// any-of groups holding it, and whether an exhausted any-of group whose
+// policy is any_cancel holds it, in one read for both.
+var pendingSQL = `SELECT j.id,
+  NOT EXISTS (SELECT 1 FROM hopper_job_deps d JOIN hopper_jobs x ON x.id = d.depends_on WHERE d.job_id = j.id AND d.any_of IS NULL)
+    AND ` + anyOfReadySQL + `,
+  ` + anyOfCancelSQL + `
+FROM hopper_jobs j WHERE j.id IN (%s) AND j.state = 'pending'`
+
+// exhaustedSQL selects the pending jobs among those in %s that an exhausted
+// any-of group whose policy is any_cancel holds.
+var exhaustedSQL = `SELECT j.id FROM hopper_jobs j WHERE j.id IN (%s) AND j.state = 'pending' AND ` + anyOfCancelSQL
 
 // WorkflowPromoteReady implements driver.Executor. The transaction that
-// finalizes a job promotes its dependents itself, so a pass finds only
-// what a direct write left pending: it looks without the write lock, and
-// takes the lock only to promote what it found.
+// finalizes a job promotes or cancels its dependents itself, so a pass
+// finds only what a direct write left pending: it looks without the write
+// lock, and takes the lock only to promote or cancel what it found.
 func (e *executor) WorkflowPromoteReady(ctx context.Context, params driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
 	if params.DependsOn != nil && len(params.DependsOn) == 0 {
 		return driver.WorkflowPromoteResult{}, nil
@@ -210,12 +206,36 @@ func (e *executor) WorkflowPromoteReady(ctx context.Context, params driver.Workf
 	for i, id := range candidates {
 		ids[i] = idParam(id)
 	}
-	ready, err := queryIDs(ctx, e.read(), fmt.Sprintf(readySQL, placeholders(len(ids))), ids...)
-	if err != nil || len(ready) == 0 {
+	type pending struct {
+		id               driver.JobID
+		ready, exhausted bool
+	}
+	rows, err := queryAll(ctx, e.read(), func(r scanner) (pending, error) {
+		var (
+			p  pending
+			id []byte
+		)
+		if err := r.Scan(&id, &p.ready, &p.exhausted); err != nil {
+			return p, err
+		}
+		return p, p.id.Scan(id)
+	}, fmt.Sprintf(pendingSQL, placeholders(len(ids))), ids...)
+	if err != nil {
 		return res, err
 	}
+	var ready, exhausted []driver.JobID
+	for _, p := range rows {
+		if p.ready {
+			ready = append(ready, p.id)
+		} else if p.exhausted {
+			exhausted = append(exhausted, p.id)
+		}
+	}
+	if len(ready)+len(exhausted) == 0 {
+		return res, nil
+	}
 	err = e.write(ctx, func(x *w) error {
-		res.Promoted = 0
+		res.Promoted, res.Canceled = 0, 0
 		for _, id := range ready {
 			promoted, err := x.promoteIfReady(ctx, id)
 			if err != nil {
@@ -225,10 +245,38 @@ func (e *executor) WorkflowPromoteReady(ctx context.Context, params driver.Workf
 				res.Promoted++
 			}
 		}
+		for _, id := range exhausted {
+			canceled, err := x.cancelExhausted(ctx, id)
+			if err != nil {
+				return err
+			}
+			res.Canceled += int64(canceled)
+		}
 		return nil
 	})
 	if err != nil {
 		return driver.WorkflowPromoteResult{}, fmt.Errorf("hopper: promote ready workflow jobs: %w", err)
 	}
 	return res, nil
+}
+
+// cancelExhausted cancels a pending job that an exhausted any-of group whose
+// policy is any_cancel holds, as the finalize of the group's last job does,
+// and returns how many jobs it finished, its dependents canceled in turn
+// among them: none if the job is no longer so held.
+func (x *w) cancelExhausted(ctx context.Context, id driver.JobID) (int, error) {
+	held, err := x.ids(ctx, fmt.Sprintf(exhaustedSQL, "?"), idParam(id))
+	if err != nil || len(held) == 0 {
+		return 0, err
+	}
+	row, err := x.liveRow(ctx, id)
+	if err != nil || row == nil {
+		return 0, err
+	}
+	f, err := x.cancelDependent(ctx, row)
+	if err != nil {
+		return 0, err
+	}
+	done, err := x.tail(ctx, []finished{f})
+	return len(done), err
 }

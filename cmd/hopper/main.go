@@ -489,7 +489,12 @@ func (c *cli) workflows(ctx context.Context, args []string) error {
 		}
 		deps := map[hopper.JobID][]string{}
 		for _, e := range wf.Edges {
-			deps[e.Job] = append(deps[e.Job], e.DependsOn.String())
+			dep := e.DependsOn.String()
+			if e.AnyOf != 0 {
+				// A step of an any-of group: the job waits for one of them.
+				dep = fmt.Sprintf("any%d:%s", e.AnyOf, dep)
+			}
+			deps[e.Job] = append(deps[e.Job], dep)
 		}
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "ID\tKIND\tQUEUE\tSTATE\tATTEMPT\tAFTER")

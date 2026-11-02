@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -184,5 +185,47 @@ func TestRescueEndsAPassThatRescuedNothing(t *testing.T) {
 	c.rescue(context.Background())
 	if exec.reads != 1 {
 		t.Errorf("the rescue read its candidates %d times in one pass, want 1", exec.reads)
+	}
+}
+
+// cascadeRescueExec has one rescue candidate of a workflow on its last
+// attempt, whose discard cancels a dependent by cascade, and records the
+// follow-ups.
+type cascadeRescueExec struct {
+	driver.Executor
+	reads    int
+	promoted [][]driver.JobID
+}
+
+func (e *cascadeRescueExec) JobRescueCandidates(context.Context, driver.JobRescueParams) ([]driver.RescueCandidate, error) {
+	if e.reads++; e.reads > 1 {
+		return nil, nil
+	}
+	return []driver.RescueCandidate{{Job: &driver.JobRow{ID: driver.JobID{1}, Queue: "q", AttemptedBy: 1, Fence: 1, Attempt: 1, MaxAttempts: 1, BatchID: driver.JobID{9}}}}, nil
+}
+
+func (e *cascadeRescueExec) JobFinalizeMany(context.Context, driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
+	return []driver.JobFinalized{{ID: driver.JobID{1}, Fence: 1}, {ID: driver.JobID{2}, Cascaded: true}}, nil
+}
+
+func (e *cascadeRescueExec) WorkflowPromoteReady(_ context.Context, p driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
+	e.promoted = append(e.promoted, p.DependsOn)
+	return driver.WorkflowPromoteResult{}, nil
+}
+
+// The rescue follows up the job of a workflow it discarded and the jobs its
+// finalize canceled by cascade, as a client's finalizer does, and counts
+// only its own jobs as rescued.
+func TestRescueFollowsUpItsCascade(t *testing.T) {
+	exec := &cascadeRescueExec{}
+	var logs strings.Builder
+	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.NewTextHandler(&logs, nil)), tuning: defaultTuning, events: &eventBus{}}
+	c.clientID.Store(2)
+	c.rescue(context.Background())
+	if len(exec.promoted) != 1 || !slices.Equal(exec.promoted[0], []driver.JobID{{1}, {2}}) {
+		t.Errorf("follow-ups = %v, want one of the discarded job and the job canceled by cascade", exec.promoted)
+	}
+	if !strings.Contains(logs.String(), "retried=0 discarded=1 dropped=0") {
+		t.Errorf("rescue logged %q, want the discarded job alone counted", logs.String())
 	}
 }

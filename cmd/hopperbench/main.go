@@ -27,6 +27,8 @@
 //	workflow-outputs
 //	            as workflow, with every step after the first claimed with its dependencies' outputs
 //	            (StepOpts.Dependencies), which each worker checks
+//	workflow-any
+//	            as workflow, with the last step waiting for any one of the eight in the middle (AfterAny)
 //	insert      InsertMany in batches of 100 (the unnest statement)
 //	copy        InsertMany in batches of 5000 (the COPY path)
 //	latency     commit-to-Work on an idle queue, local wake-up
@@ -173,9 +175,11 @@ func run(ctx context.Context, url, schema string, scenarios []string, opts optio
 		case "retry":
 			r, err = b.drain(ctx, "retry", b.params(opts.jobs, nil), failOnceWorker)
 		case "workflow":
-			r, err = b.workflows(ctx, "workflow", opts.jobs, false)
+			r, err = b.workflows(ctx, "workflow", opts.jobs, false, false)
 		case "workflow-outputs":
-			r, err = b.workflows(ctx, "workflow-outputs", opts.jobs, true)
+			r, err = b.workflows(ctx, "workflow-outputs", opts.jobs, true, false)
+		case "workflow-any":
+			r, err = b.workflows(ctx, "workflow-any", opts.jobs, false, true)
 		case "insert":
 			r, err = b.insert(ctx, opts.jobs, 100)
 		case "copy":
@@ -372,7 +376,7 @@ func (b *bench) waitDrained(ctx context.Context) error {
 	}
 }
 
-func (b *bench) workflows(ctx context.Context, name string, jobs int, reads bool) (result, error) {
+func (b *bench) workflows(ctx context.Context, name string, jobs int, reads, anyOf bool) (result, error) {
 	n := jobs / workflowSteps
 	if n < 1 {
 		return result{}, fmt.Errorf("-jobs must be at least %d", workflowSteps)
@@ -381,7 +385,7 @@ func (b *bench) workflows(ctx context.Context, name string, jobs int, reads bool
 		return fanOut(ctx, n, 100, func(ctx context.Context, lo, hi int) error {
 			return pgx.BeginFunc(ctx, b.pool, func(tx pgx.Tx) error {
 				for i := lo; i < hi; i++ {
-					if _, err := inserter.InsertWorkflowTx(ctx, tx, benchWorkflow(i, reads)); err != nil {
+					if _, err := inserter.InsertWorkflowTx(ctx, tx, benchWorkflow(i, reads, anyOf)); err != nil {
 						return err
 					}
 				}
@@ -421,7 +425,7 @@ func (b *bench) workflows(ctx context.Context, name string, jobs int, reads bool
 	return r, nil
 }
 
-func benchWorkflow(i int, reads bool) *hopper.Workflow {
+func benchWorkflow(i int, reads, anyOf bool) *hopper.Workflow {
 	wf := hopper.NewWorkflow("bench-"+strconv.Itoa(i), nil)
 	n := i * workflowSteps
 	root := wf.Add(benchArgs{N: n}, nil)
@@ -429,7 +433,11 @@ func benchWorkflow(i int, reads bool) *hopper.Workflow {
 	for j := range middle {
 		middle[j] = wf.Add(benchArgs{N: n + 1 + j}, &hopper.StepOpts{After: []hopper.Step{root}, Dependencies: reads})
 	}
-	wf.Add(benchArgs{N: n + workflowSteps - 1}, &hopper.StepOpts{After: middle, Dependencies: reads})
+	last := &hopper.StepOpts{After: middle, Dependencies: reads}
+	if anyOf {
+		last = &hopper.StepOpts{AfterAny: [][]hopper.Step{middle}, Dependencies: reads}
+	}
+	wf.Add(benchArgs{N: n + workflowSteps - 1}, last)
 	return wf
 }
 

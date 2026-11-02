@@ -713,7 +713,17 @@ edge read make both partial indexes look empty, and the planner then walked it w
 filtered by the dependency. The drop takes a loop like v21's, on `hopper_job_deps`
 alone; every claim since v21 reads that table, so claims, like finalizes, wait at most
 one try at a time. SQLite's claim still uses its index of that name, and v22 changes
-nothing there.
+nothing there. Schema v23 adds `any_of` to `hopper_job_deps`, the number of
+the dependent's any-of group an edge is in (§11), NULL for an ordinary edge, and on
+Postgres rebuilds the partial index on the edges that read, by dependency, as
+`hopper_job_deps_results_depends_on`, whose predicate (`coalesce(reads, any_of IS NOT
+NULL)`) covers the edges of groups too and is not implied by a lookup of a dependent's
+groups, and adds `hopper_job_deps_any_of_job (job_id) WHERE any_of IS NOT NULL`, by which
+the promotion and the cancel look a dependent's groups up (§11), in the same loop on
+`hopper_job_deps` alone. The previous
+release's probe of the edges that read matches neither, and reads a finished job's edges by
+`hopper_job_deps_depends_on` during a rolling upgrade. Its down script turns the edges
+of groups into `ignore` edges, which is how the previous release treats them.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -2365,7 +2375,8 @@ the partition's extension lock, so the data volume has no size limit.
   then eight after it, then one after those, each step recording a small output, which
   measures the finalize tail, dependency promotion and output, and `workflow-outputs`,
   the same with every step after the first claimed with its dependencies' outputs, for
-  the cost of `StepOpts.Dependencies`), the two insert paths,
+  the cost of `StepOpts.Dependencies`, and `workflow-any`, the same with the last step
+  waiting for any one of the eight (`StepOpts.AfterAny`)), the two insert paths,
   pickup latency on an idle queue and under a paced load (`loaded`, at `-rate` jobs/s),
   and `-history N` to preload history rows. It warms up before measuring, because the
   first leader election creates history partitions, which briefly blocks finalizes.
@@ -2588,7 +2599,8 @@ observability without new machinery.
   unsatisfied edges, deleted as dependents finalize, and the statement that finalizes
   a job is the one that acts on its dependents: it promotes those whose dependencies
   have all left the live table (including the ones finalized in the same statement)
-  to `available` and notifies their queues, and it cancels, transitively, the
+  to `available` and notifies their queues (on Postgres, all but those with an any-of
+  group, which it leaves to the follow-up below), and it cancels, transitively, the
   dependents of a canceled or discarded job whose edge says `cancel` (the default;
   `ignore` lets the dependent run once its dependencies have finished, whatever their
   outcome). Canceled dependents go to history with a "dependency failed" error and
@@ -2600,8 +2612,9 @@ observability without new machinery.
     finalizes) each see the other still live, so neither statement promotes the
     dependent. `WorkflowPromoteReady` promotes pending jobs none of whose dependencies
     is still live, skipping rows a finalize holds. After each flush commits, the
-    finalizer runs it on the dependents of the jobs the flush finished (and the client
-    does for a job it saw `CompleteTx` commit), so of the two, the one that follows up
+    finalizer runs it on the dependents of the jobs the flush finished and of those it
+    canceled by cascade (and the client does for a job it saw `CompleteTx` commit, or
+    that a lease's `Finish` finished), so of the two, the one that follows up
     second promotes the dependent at once. The leader sweeps up what clients left (a
     client that stopped between commit and follow-up): it walks `hopper_job_deps` a
     chunk at a time in ID order, for at most one leader interval per pass, resuming
@@ -2678,8 +2691,115 @@ observability without new machinery.
       so the size of a claim of workflow steps is bounded by what those steps'
       dependencies recorded; an application that keeps outputs large caps them before
       `SetOutput`.
+  - **Any-of groups.** A step can wait for any one of a group of steps
+    (`StepOpts.AfterAny`, a list of groups, or `hopper.AfterAny(steps...)` for one),
+    beside its ordinary dependencies, for instance a step that goes on with whichever
+    instance of a matrix of equivalent jobs completes first. It becomes available once
+    its ordinary dependencies have finished and, in each of its groups, one step has
+    completed. The others in a group run on; how they finish changes nothing for the
+    dependent, and the workflow completes once they have finished too. A group whose
+    steps all finish without completing (canceled or discarded) is exhausted, and the
+    step's `OnDependencyFailure` applies to it as to its ordinary edges: `cancel`
+    cancels the step, transitively, as a failed `cancel` edge does, and `ignore` lets it
+    run. A group has no policy of its own: one knob per step, as for `After`, covers
+    the uses we know of (a step that needs one result and a cleanup step that runs
+    regardless), and a group that wants another policy can be given its own step.
+    - Each edge of a group is a `hopper_job_deps` row with the group's number in
+      `any_of`, and its policy stored as `any_cancel` or `any_ignore`, never `cancel`: a
+      client of the previous release, which cancels a dependent the moment a job it
+      depends on by a `cancel` edge fails, leaves the edges alone, and promotes the
+      dependent once every step of the group has finished, as for `ignore` edges.
+      `hopper_batches.edges` gives an edge of a group a third element, its number, which
+      that release's `WorkflowGet` drops.
+    - A step of a group records its final state in `hopper_job_results` in the statement
+      that finalizes it, as a dependency that is read does (its output only if a
+      dependent reads it), so every snapshot sees each step of a group live or with its
+      outcome, and a workflow with groups is marked in `hopper_batches.reads` for the
+      results to be deleted when it completes. A step of a group gone without a result
+      was finalized by the previous release, which records none, and counts as
+      completed, as that release counts it. The tail's probe for a job with a dependent
+      that reads or has it in a group is one probe of the partial index on such edges by
+      dependency; whether one reads it, for the output, is a second only for the jobs the
+      first finds, so a workflow with neither records nothing, as before.
+    - The tail's promotion leaves a dependent with a group alone, whatever its groups
+      say, to the finalizing client's follow-up. A group is satisfied by any one of its
+      steps, so two of them completing in concurrent statements would each promote the
+      dependent, and the second would wait for the first's row lock: held open in a
+      caller's transaction (`CompleteTx`, `FinishTx`), it would hold up the other's
+      whole flush, which a fan-in of ordinary edges never does, since each statement
+      sees the other dependency live. `WorkflowPromoteReady` leaves a group's edges out
+      of the check for live dependencies, and requires that no group holds the
+      dependent: a group holds it while none of its steps completed and either one is
+      live or the policy is `any_cancel`. It skips a dependent's row another
+      transaction holds, which that transaction's follow-up decides once it commits,
+      or the leader's sweep. A dependent with a group is so promoted one follow-up
+      after its last dependency finishes, and by the sweep, within a leader interval,
+      when the statement that finished it has no follow-up (the paths listed below for
+      the cascade). The tail's promotion of a dependent without groups is unchanged.
+      A statement reads the group edges of its dependents once, from
+      `hopper_job_deps_any_of_job`, the partial index on the edges in a group by
+      dependent, which is empty without groups, so a statement without groups costs one
+      probe of it; it then looks the groups' steps up in one probe of the live table and
+      one of the results for all of them, and aggregates per group. As a check per edge or
+      per candidate, a subquery the planner multiplies by the edges it guesses, the
+      statements were planned at millions without statistics on `hopper_job_deps`, past
+      `jit_above_cost`, so that a server built with JIT compiled the leader's
+      statements for seconds and every finalize for a tenth of a second (hopperbench's
+      `workflow` at half speed in CI). The tail cancels the dependent of a canceled or
+      discarded job whose `any_cancel` group is exhausted, in the cascade's first step.
+      A group exhausted by a job the cascade itself canceled is not, since the
+      recursive step cannot read its own rows in a subquery: the finalize returns the
+      jobs it canceled by cascade (`JobFinalized.Cascaded`), and the finalizing client
+      follows them up as it does the jobs it finalized, with `WorkflowPromoteReady`,
+      which cancels the dependent, as the leader's rescue does the jobs of a workflow
+      it discarded and those its finalize canceled by cascade.
+      The leader's sweep does for a client that stopped before its follow-up, whose
+      follow-up failed, or whose follow-up skipped a dependent's row held by a
+      transaction that then rolled back; for a `Leases.Finish` whose statement committed
+      though it returned an error, which the caller's retry finds fenced; and for the
+      statements that return no such jobs: `JobCancel`, `JobDelete` and their `Tx` forms
+      on a waiting job, `FinishTx`, and the expiry of job leases and of TTLs. (A flush retried after an error its commit came before finds its jobs
+      gone, and follows up those whose results were terminal all the same.) Those are
+      rare, and the sweep bounds the delay: it promotes or cancels such a dependent
+      within a leader interval (5 s by default) of the statement, or a few with more
+      pending workflow steps than one pass walks. SQLite's tail, run by a single
+      writer, checks the groups of the jobs its cascade cancels as it goes, and
+      promotes a dependent whose group is satisfied itself, since no other write can
+      hold its row.
+    - **Group size.** The group check compares each edge of a group with arrays of the
+      group's steps, which Postgres scans linearly, so a statement that decides a group
+      costs its size squared, and each step that finishes after it does too. Measured
+      on Postgres 18, one step's discard cost 7 ms with a group of 1,000 steps, 51 ms
+      with 4,000 and 183 ms with 8,000, and its follow-up 19 to 93 ms. Groups are best
+      kept to a few hundred steps; a form that looks each step up in a hash, by a join,
+      is a planned follow-up.
+    - **Concurrent steps of a group.** The race is the one of concurrent dependencies:
+      the last two steps of a group that fail in concurrent statements each see the
+      other live, so neither cancels the dependent; a step of a group that completes
+      while the dependent's ordinary dependency finishes leaves the dependent to the
+      follow-ups, as every finalize on Postgres does, and the first of them may find
+      the other statement uncommitted. `WorkflowPromoteReady`, which each client runs
+      after its flush commits and the leader sweeps with, promotes the latter in the
+      follow-up that runs second, and counts the exhausted `any_cancel` groups that
+      hold candidates; only when there are any, a
+      second statement cancels them (`FOR UPDATE SKIP LOCKED`, the condition rechecked,
+      with the finalize tail, waiting only briefly for rows another transaction holds)
+      and the dependents of what it canceled are considered the same way, until it
+      cancels none. A promotion and a cancel of the same step cannot both happen: a
+      cancel needs every step of the group gone without a completion in its snapshot,
+      and a completing step is either still live in it or has its result there; the
+      promotion's update rechecks `pending` under the row lock, so two promotions
+      cannot both apply. A step of a group that finishes after its dependent has
+      been promoted or canceled finds it not pending and leaves it, and once the
+      dependent has finished its edges are gone and the step records no result. On
+      SQLite, whose writes run one at a time, the finalize's own walk cancels a
+      dependent once every step of its group has failed, however they finished.
+    - A claim carries the dependencies that read and have finished by then: a step of
+      a group still running is left out, as it has neither a result nor left the live
+      table.
   Workflows are inspectable with
-  `WorkflowGet`, `hopper workflows get` and, as a DAG, in `hopperui`.
+  `WorkflowGet` (an edge's `AnyOf`), `hopper workflows get` (`anyN:` before an edge of
+  group N) and, as a DAG, in `hopperui` (the edges of groups dashed).
 
 ## 12. Migrations
 
