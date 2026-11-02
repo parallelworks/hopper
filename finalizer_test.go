@@ -81,9 +81,14 @@ func newTestFinalizer(exec finalizeExecutor, t tuning, applied func()) (*finaliz
 	return f, func() { cancel(); <-f.done }
 }
 
+// plainResult is the result of job i, completed with no logs.
+func plainResult(i int) pending {
+	return pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{ID: driver.JobID{byte(i), byte(i >> 8)}, State: driver.JobStateCompleted}}
+}
+
 func submitN(f *finalizer, n int) {
 	for i := range n {
-		f.submit(pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{ID: driver.JobID{byte(i), byte(i >> 8)}, State: driver.JobStateCompleted}})
+		f.submit(plainResult(i))
 	}
 }
 
@@ -91,15 +96,24 @@ func submitN(f *finalizer, n int) {
 // and submit blocks only once the buffer is full.
 func TestFinalizerBufferAbsorbsSlowFlush(t *testing.T) {
 	exec := &stubExec{release: make(chan struct{}), started: make(chan int, 64)}
-	// The interval is short so the last, lone result flushes on its own.
-	tun := tuning{finalizeInterval: 20 * time.Millisecond, finalizeBatch: 10, finalizeBuffer: 100}
+	// The interval is long so only full batches flush: a short one can fire
+	// while a batch is still being submitted and flush part of it.
+	tun := tuning{finalizeInterval: time.Hour, finalizeBatch: 10, finalizeBuffer: 100}
 	f, stop := newTestFinalizer(exec, tun, nil)
 	defer stop()
+	// A failure lets the held flushes go, so that stop does not wait on them.
+	release := sync.OnceFunc(func() { close(exec.release) })
+	defer release()
 
 	// The first batch flushes at finalizeBatch and then blocks in the executor.
 	submitN(f, 10)
-	if n := <-exec.started; n != 10 {
-		t.Fatalf("first flush took %d results, want 10", n)
+	select {
+	case n := <-exec.started:
+		if n != 10 {
+			t.Fatalf("first flush took %d results, want 10", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a full batch did not flush")
 	}
 	// 100 more results fill the buffer without blocking, although no flush
 	// can complete.
@@ -110,27 +124,27 @@ func TestFinalizerBufferAbsorbsSlowFlush(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("submit blocked with a buffer of 100 free slots")
 	}
-	// The next one blocks: the buffer is full and the flush has not returned.
+	// The next ones block: the buffer is full and the flush has not returned.
 	blocked := make(chan struct{})
-	go func() { submitN(f, 1); close(blocked) }()
+	go func() { submitN(f, 10); close(blocked) }()
 	select {
 	case <-blocked:
 		t.Fatal("submit did not block on a full buffer")
 	case <-time.After(100 * time.Millisecond):
 	}
 	// Once flushes complete, everything drains in batches of finalizeBatch.
-	close(exec.release)
+	release()
 	<-blocked
 	deadline := time.After(5 * time.Second)
-	for total := 10; total < 111; {
+	for total := 10; total < 120; {
 		select {
 		case n := <-exec.started:
 			total += n
-			if n > tun.finalizeBatch {
-				t.Fatalf("a flush took %d results, more than finalizeBatch %d", n, tun.finalizeBatch)
+			if n != tun.finalizeBatch {
+				t.Fatalf("a flush took %d results, want finalizeBatch %d", n, tun.finalizeBatch)
 			}
 		case <-deadline:
-			t.Fatalf("backlog not drained: flushed %d of 111", total)
+			t.Fatalf("backlog not drained: flushed %d of 120", total)
 		}
 	}
 }
@@ -187,58 +201,37 @@ func TestFinalizerSplitsTimedOutFlush(t *testing.T) {
 
 // Errors other than a timeout are retried as they are.
 func TestFinalizerRetriesFailedFlushWhole(t *testing.T) {
-	var calls int
-	exec := &failNExec{fail: 2, err: errors.New("connection reset"), calls: &calls}
-	// Only a full batch flushes, so the batch the executor checks is
-	// whole however slowly the results are submitted.
-	tun := tuning{finalizeInterval: time.Hour, finalizeBatch: 8, finalizeBuffer: 16}
-	done := make(chan struct{}, 8)
-	f, stop := newTestFinalizer(exec, tun, func() { done <- struct{}{} })
-	submitN(f, 8)
-	for range 8 {
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("results not applied after retries")
-		}
+	exec := &failNExec{fail: 2, err: errors.New("connection reset")}
+	applied := 0
+	f := newFinalizer(exec, slog.New(slog.DiscardHandler), tuning{finalizeBatch: 8, finalizeBuffer: 16}, 0, func(string) {},
+		func(*driver.JobRow, driver.JobFinalize) { applied++ })
+	batch := make([]pending, 8)
+	for i := range batch {
+		batch[i] = plainResult(i)
 	}
-	stop()
-	if calls != 3 {
-		t.Fatalf("flush attempts = %d, want 3 (two failures, then success)", calls)
+	// The batch is written directly, so no interval can split it. write
+	// retries until ctx is done, which bounds a write that never succeeds.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	f.write(ctx, batch, false)
+	if sizes := exec.batches(); !slices.Equal(sizes, []int{8, 8, 8}) || applied != 8 {
+		t.Fatalf("statements of sizes %v applied %d results; want three of 8 (two failures, then success) applying all 8", sizes, applied)
 	}
 }
 
+// failNExec fails its first fail statements with err.
 type failNExec struct {
-	fail  int
-	err   error
-	calls *int
+	stubExec
+	fail int
+	err  error
 }
 
-func (e *failNExec) BatchSettle(context.Context, driver.BatchSettleParams) (driver.BatchSettleResult, error) {
-	return driver.BatchSettleResult{}, nil
-}
-
-func (e *failNExec) WorkflowPromoteReady(context.Context, driver.WorkflowPromoteParams) (driver.WorkflowPromoteResult, error) {
-	return driver.WorkflowPromoteResult{}, nil
-}
-
-func (e *failNExec) JobGet(context.Context, driver.JobID) (*driver.JobRow, error) {
-	return nil, driver.ErrNotFound
-}
-
-func (e *failNExec) JobFinalizeMany(_ context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
-	*e.calls++
-	if *e.calls <= e.fail {
+func (e *failNExec) JobFinalizeMany(ctx context.Context, params driver.JobFinalizeParams) ([]driver.JobFinalized, error) {
+	applied, err := e.stubExec.JobFinalizeMany(ctx, params)
+	if len(e.batches()) <= e.fail {
 		return nil, e.err
 	}
-	if len(params.Jobs) != 8 {
-		return nil, errors.New("batch was split")
-	}
-	ids := make([]driver.JobFinalized, len(params.Jobs))
-	for i, j := range params.Jobs {
-		ids[i] = driver.JobFinalized{ID: j.ID, Fence: j.Fence}
-	}
-	return ids, nil
+	return applied, err
 }
 
 // A result whose row a worker's transaction wrote (RecordStepTx) goes to the
