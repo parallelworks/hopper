@@ -189,7 +189,9 @@ func TestFinalizerSplitsTimedOutFlush(t *testing.T) {
 func TestFinalizerRetriesFailedFlushWhole(t *testing.T) {
 	var calls int
 	exec := &failNExec{fail: 2, err: errors.New("connection reset"), calls: &calls}
-	tun := tuning{finalizeInterval: time.Millisecond, finalizeBatch: 8, finalizeBuffer: 16}
+	// Only a full batch flushes, so the batch the executor checks is
+	// whole however slowly the results are submitted.
+	tun := tuning{finalizeInterval: time.Hour, finalizeBatch: 8, finalizeBuffer: 16}
 	done := make(chan struct{}, 8)
 	f, stop := newTestFinalizer(exec, tun, func() { done <- struct{}{} })
 	submitN(f, 8)
