@@ -444,8 +444,16 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // has the same attempt number, so Errors holds an entry for each run of
 // it. A worker that returns nil, Snooze, Cancel or an output refusal
 // (ErrOutputTooLarge) completes, snoozes or discards the job as usual. The
-// job's timeout still bounds each run. The same holds for the jobs a Stop
-// cancels when its ctx expires.
+// job's timeout still bounds each run, and an attempt its timeout ended
+// before the stop came counts, as any timeout does. A job from a claim in
+// flight as the stop begins never runs, and gets its attempt back with no
+// error. The same holds for the jobs a Stop cancels when its ctx expires.
+//
+// MaxAttempts does not bound a job that every stop interrupts: its timeout
+// does, and each interruption adds an entry to its Errors. OnError runs
+// with a context bounded by half the stop's short grace, so that the result
+// is still written. A worker must not call Stop or StopAndCancel itself:
+// the stop waits for the worker, which then loses its result.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	return c.stop(ctx, true)
 }

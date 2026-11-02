@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,10 +30,13 @@ func (stopDriver) Capabilities() driver.Capabilities { return driver.Capabilitie
 
 type stopExec struct {
 	driver.Executor
-	mu      sync.Mutex
-	jobs    []*driver.JobRow
-	results map[driver.JobID]driver.JobFinalize
-	deleted bool
+	// claimGate, if set, holds the first claim until it is closed, as a
+	// claim in flight when the client stops.
+	claimGate chan struct{}
+	mu        sync.Mutex
+	jobs      []*driver.JobRow
+	results   map[driver.JobID]driver.JobFinalize
+	deleted   bool
 }
 
 func (e *stopExec) SchemaVersion(context.Context) (int, error) { return hoppermigrate.Latest(), nil }
@@ -68,6 +72,9 @@ func (e *stopExec) PeriodicRegister(context.Context, driver.PeriodicRegisterPara
 func (e *stopExec) Notify(context.Context, string, []string) error { return nil }
 
 func (e *stopExec) JobClaim(_ context.Context, p driver.JobClaimParams) (driver.JobClaimResult, error) {
+	if e.claimGate != nil {
+		<-e.claimGate
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	n := min(p.Limit, len(e.jobs))
@@ -360,8 +367,11 @@ func TestStopAndCancelOnError(t *testing.T) {
 		if err := c.StopAndCancel(ctx); err != nil {
 			t.Fatal(err)
 		}
-		<-causes
-		<-causes
+		for range 2 {
+			if cause := <-causes; !errors.Is(cause, ErrClientStopped) {
+				t.Errorf("a job's context was canceled with %v, want ErrClientStopped", cause)
+			}
+		}
 		if hookCtxErr != nil {
 			t.Errorf("OnError's context was canceled: %v", hookCtxErr)
 		}
@@ -370,6 +380,119 @@ func TestStopAndCancelOnError(t *testing.T) {
 		}
 		if f, ok := exec.result(later.ID); !ok || f.State != driver.JobStateRetryable || !f.Snooze || f.Delay != time.Minute {
 			t.Errorf("job on its last attempt OnError retried in a minute: %+v, %v; want that retry, its attempt given back", f, ok)
+		}
+	})
+}
+
+type stopSlowArgs struct{}
+
+func (stopSlowArgs) Kind() string { return "stop_args" }
+
+// slowStopClient returns an unstarted client over jobs whose worker runs
+// work, with a JobTimeout of a second and onError as Config.OnError.
+func slowStopClient(t *testing.T, work func(context.Context) error, onError func(context.Context, *JobRow, error) ErrorOutcome, jobs ...*driver.JobRow) (*Client[struct{}], *stopExec) {
+	t.Helper()
+	exec := &stopExec{jobs: jobs, results: map[driver.JobID]driver.JobFinalize{}}
+	workers := NewWorkers()
+	AddWorkFunc(workers, func(ctx context.Context, _ *Job[stopSlowArgs]) error { return work(ctx) })
+	c, err := NewClient(stopDriver{exec: exec}, &Config{
+		Queues:     map[string]QueueConfig{QueueDefault: {MaxWorkers: 10}},
+		Workers:    workers,
+		Logger:     slog.New(slog.DiscardHandler),
+		NeverLead:  true,
+		JobTimeout: time.Second,
+		OnError:    onError,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, exec
+}
+
+// TestStopAfterTimeoutCounts: an attempt whose own timeout ended it before
+// StopAndCancel came, though its worker returns only after the stop, timed
+// out: its attempt counts, and on its last attempt it is discarded.
+func TestStopAfterTimeoutCounts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		retried, last := stopJob(1, 3, `{}`), stopJob(3, 3, `{}`)
+		c, exec := slowStopClient(t, func(context.Context) error {
+			time.Sleep(5 * time.Second) // past its timeout, ignoring its context
+			return errors.New("slow")
+		}, nil, retried, last)
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Second) // the timeouts fired
+		if err := c.StopAndCancel(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if f, ok := exec.result(retried.ID); !ok || f.Snooze || f.State != driver.JobStateRetryable || f.Error == nil || !strings.Contains(f.Error.Error, ErrJobTimeout.Error()) {
+			t.Errorf("timed-out job with attempts left: %+v, %v; want a counted retry", f, ok)
+		}
+		if f, ok := exec.result(last.ID); !ok || f.State != driver.JobStateDiscarded {
+			t.Errorf("timed-out job on its last attempt: %+v, %v; want discarded", f, ok)
+		}
+	})
+}
+
+// TestStopDeadlineCancelsOnError: the hook of an attempt that failed on
+// its own keeps a context that the stop's deadline cancels, so a hook that
+// honors it returns within the stop's grace and the result is written.
+func TestStopDeadlineCancelsOnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		job := stopJob(1, 3, `{}`)
+		c, exec := slowStopClient(t, func(context.Context) error { return errors.New("failed") }, func(ctx context.Context, _ *JobRow, _ error) ErrorOutcome {
+			select { // a call that honors its context
+			case <-ctx.Done():
+			case <-time.After(time.Hour):
+			}
+			return ErrorOutcome{}
+		}, job)
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait() // the hook is waiting
+		stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Stop = %v, want its deadline", err)
+		}
+		if f, ok := exec.result(job.ID); !ok || f.State != driver.JobStateRetryable || f.Snooze {
+			t.Errorf("job whose hook the deadline canceled: %+v, %v; want its counted retry written", f, ok)
+		}
+	})
+}
+
+// TestStopAndCancelClaimInFlight: a job from a claim in flight when
+// StopAndCancel cancels the jobs never runs, and gets its attempt back with
+// no error recorded.
+func TestStopAndCancelClaimInFlight(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		causes := make(chan error, 1)
+		job := stopJob(3, 3, `{}`)
+		c, exec := stopClient(t, causes, job)
+		exec.claimGate = make(chan struct{})
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait() // the claim is in flight
+		stopped := make(chan error, 1)
+		go func() { stopped <- c.StopAndCancel(ctx) }()
+		synctest.Wait() // the stop waits for the claim
+		close(exec.claimGate)
+		if err := <-stopped; err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case cause := <-causes:
+			t.Errorf("the job from the claim in flight ran, canceled with %v", cause)
+		default:
+		}
+		if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateScheduled || f.Delay != 0 || f.Error != nil {
+			t.Errorf("job from the claim in flight: %+v, %v; want its attempt given back, with no error", f, ok)
 		}
 	})
 }

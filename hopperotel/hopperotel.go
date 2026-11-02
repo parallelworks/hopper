@@ -178,7 +178,8 @@ func outcomeOf(ctx context.Context, err error) string {
 		return "snoozed"
 	case errors.As(err, &cancel):
 		return "canceled"
-	case errors.Is(context.Cause(ctx), hopper.ErrClientStopped):
+	case errors.Is(context.Cause(ctx), hopper.ErrClientStopped) && !errors.Is(err, hopper.ErrOutputTooLarge):
+		// An output refusal discards the job whatever canceled the attempt.
 		return "interrupted"
 	default:
 		return "failed"

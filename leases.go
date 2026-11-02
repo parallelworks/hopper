@@ -432,7 +432,7 @@ func (l *Leases[TTx]) result(ctx context.Context, exec driver.Executor, token Le
 			unit = u
 		}
 	}
-	f := c.outcome(context.WithoutCancel(ctx), jobCtx, row, qcfg, unit, res.Err, true)
+	f := c.outcome(context.WithoutCancel(ctx), jobCtx, row, qcfg, unit, res.Err, true, false)
 	f.AttemptedBy, f.Lease = 0, token.fenceOf()
 	if f.State.Terminal() && res.Output != nil && res.Err != nil {
 		// A failure is recorded whatever its output: one past the limit, or

@@ -3,6 +3,7 @@ package hopperotel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/parallelworks/hopper"
@@ -26,6 +27,7 @@ func TestOutcomeOf(t *testing.T) {
 		{fenced, failed, "failed"},
 		{stopped, failed, "interrupted"},
 		{stopped, hopper.Cancel(failed), "canceled"},
+		{stopped, fmt.Errorf("set output: %w", hopper.ErrOutputTooLarge), "failed"},
 		{stopped, nil, "completed"},
 	} {
 		if got := outcomeOf(tc.ctx, tc.err); got != tc.want {
