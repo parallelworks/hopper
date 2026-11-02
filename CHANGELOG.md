@@ -6,6 +6,18 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.11.0](https://github.com/parallelworks/hopper/compare/v0.10.2...v0.11.0) (2026-11-02)
+
+
+### Features
+
+* **workflow:** any-of groups of dependencies (StepOpts.AfterAny) ([#114](https://github.com/parallelworks/hopper/issues/114)) ([72b7e23](https://github.com/parallelworks/hopper/commit/72b7e23175a04de5df59bf1145e0907edf821562))
+
+
+### Bug fixes
+
+* **driver:** claims and finalizes look a job's dependency edges up by key whatever the statistics say; schema v22 drops an unused index ([#112](https://github.com/parallelworks/hopper/issues/112)) ([3141d8e](https://github.com/parallelworks/hopper/commit/3141d8ebf5bec4db250c1681fb65bdb78296a68e))
+
 ## [0.10.2](https://github.com/parallelworks/hopper/compare/v0.10.1...v0.10.2) (2026-10-31)
 
 
