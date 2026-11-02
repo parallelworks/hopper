@@ -408,9 +408,9 @@ again; a step retried from history with `JobRetry` after it finished is
 claimed without them. hopper records a step's state and output only for a
 dependent that asks, so a workflow that never does costs nothing extra.
 `Config.MaxOutputBytes` caps an output, so a claim stays small: `SetOutput`
-refuses a larger one with `hopper.ErrOutputTooLarge`, and a worker that then
-returns nil, or that error, has its job discarded with it, unless it set a
-smaller output since, such as a reference to where it stored the large one.
+refuses a larger one with `hopper.ErrOutputTooLarge`, and a worker that returns
+that error has its job discarded rather than retried. To pass on something
+large, store it elsewhere and set a reference to it as the output.
 
 ```go
 parse := wf.Add(Parse{}, &hopper.StepOpts{Name: "parse", After: []hopper.Step{fetch}})

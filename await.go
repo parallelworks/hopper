@@ -38,11 +38,8 @@ type attempt struct {
 	// maxOutput is Config.MaxOutputBytes.
 	maxOutput int
 
-	mu     sync.Mutex
-	output json.RawMessage
-	// outputErr is SetOutput's refusal of an output past maxOutput, until
-	// a later SetOutput sets one.
-	outputErr error
+	mu        sync.Mutex
+	output    json.RawMessage
 	completed *driver.JobFinalize
 	// heldByTx reports that a transaction of the worker's wrote the job's
 	// row (CompleteTx, RecordStepTx, RecordCursorTx), which it may still
@@ -80,14 +77,6 @@ func (a *attempt) get() json.RawMessage {
 	return a.output
 }
 
-// refusedOutput returns SetOutput's refusal of the last output it was
-// given, if it refused it.
-func (a *attempt) refusedOutput() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.outputErr
-}
-
 // ErrOutputTooLarge is what an *OutputTooLargeError matches with
 // errors.Is.
 var ErrOutputTooLarge = errors.New("hopper: output larger than Config.MaxOutputBytes")
@@ -106,21 +95,16 @@ func (e *OutputTooLargeError) Error() string {
 // Is reports whether target is ErrOutputTooLarge.
 func (e *OutputTooLargeError) Is(target error) bool { return target == ErrOutputTooLarge }
 
-// checkOutput returns an *OutputTooLargeError if data is larger than
-// limit, a limit of zero being none.
-func checkOutput(data []byte, limit int) error {
-	if limit > 0 && len(data) > limit {
-		return &OutputTooLargeError{Size: len(data), Limit: limit}
-	}
-	return nil
-}
-
 // encodeOutput encodes a job's output with codec, for SetOutput and a
-// lease's result.
-func encodeOutput(codec Codec, v any) ([]byte, error) {
+// lease's result, and refuses one larger than limit, a limit of zero being
+// none, with an *OutputTooLargeError.
+func encodeOutput(codec Codec, v any, limit int) ([]byte, error) {
 	data, err := codec.Marshal(v)
 	if err != nil {
 		return nil, fmt.Errorf("hopper: encode output: %w", err)
+	}
+	if limit > 0 && len(data) > limit {
+		return nil, &OutputTooLargeError{Size: len(data), Limit: limit}
 	}
 	return data, nil
 }
@@ -142,32 +126,24 @@ var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 // before that call.
 //
 // An output larger than Config.MaxOutputBytes, encoded, is refused with an
-// *OutputTooLargeError (errors.Is ErrOutputTooLarge), and the output set
-// before it, if any, is kept. Unless a later call sets an output within the
-// limit, the refusal stands: CompleteTx returns it, and an attempt whose
-// worker returns nil is discarded with it, as if the worker had returned
-// Cancel, rather than complete without the output its dependents and
-// Await expect. So is one whose worker returns a refusal (an error
-// matching ErrOutputTooLarge), as `return hopper.SetOutput(ctx, v)` does,
-// rather than retry to produce the same output, unless a CompleteTx of the
-// attempt committed. The attempt's error is the refusal's. A worker that returns
-// an error of its own fails as that error says.
+// *OutputTooLargeError, which matches ErrOutputTooLarge, and the output set
+// before it, if any, is kept. Return the error: an attempt that fails with
+// it is discarded, not retried, as its output would be as large again. A
+// worker that returns nil instead completes the job with the earlier
+// output, or none.
 func SetOutput(ctx context.Context, v any) error {
 	a, _ := ctx.Value(attemptKey{}).(*attempt)
 	if a == nil {
 		return ErrNotInJob
 	}
-	data, err := encodeOutput(a.codec, v)
+	data, err := encodeOutput(a.codec, v, a.maxOutput)
 	if err != nil {
 		return err
 	}
-	err = checkOutput(data, a.maxOutput)
 	a.mu.Lock()
-	if a.outputErr = err; err == nil {
-		a.output = data
-	}
+	a.output = data
 	a.mu.Unlock()
-	return err
+	return nil
 }
 
 // JobFailedError is returned by Await when the job ended other than

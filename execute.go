@@ -48,22 +48,6 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 
 	unit, err := c.runWorker(jobCtx, row)
 	completed := a.completedTx()
-	// An attempt whose worker returned nil although SetOutput refused its
-	// output is not completed: the job would hand its dependents and Await
-	// no output, or an older one. Nor is one whose worker returned an error
-	// that is a refusal (ErrOutputTooLarge), as `return hopper.SetOutput(ctx,
-	// v)` and CompleteTx's error are, retried, whatever CompleteTx did: the
-	// output's size will not change on a retry. Either is discarded as a
-	// Cancel is, but recorded as the refusal, not as the worker's cancel. A
-	// CompleteTx whose transaction committed has completed the job all the
-	// same, below.
-	var workerCancel *CancelError
-	switch refused := a.refusedOutput(); {
-	case err == nil && completed == nil && refused != nil:
-		err = &outputRefusedError{err: refused}
-	case errors.Is(err, ErrOutputTooLarge) && !errors.As(err, &workerCancel):
-		err = &outputRefusedError{err: err}
-	}
 	state := txUnknown
 	if completed != nil {
 		// CompleteTx wrote the log, or its transaction will, so the
@@ -102,15 +86,6 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 func replaced(jobCtx context.Context) bool {
 	return errors.Is(context.Cause(jobCtx), ErrJobFenced)
 }
-
-// outputRefusedError discards an attempt left with SetOutput's refusal of
-// its output (Config.MaxOutputBytes), as a Cancel does. Its message is
-// err's, so the attempt's error does not read as the worker's cancel.
-type outputRefusedError struct{ err error }
-
-func (e *outputRefusedError) Error() string { return e.err.Error() }
-
-func (e *outputRefusedError) Unwrap() error { return e.err }
 
 // errNotCommitted fails an attempt whose worker completed it with
 // CompleteTx and returned nil, but whose transaction did not commit.
@@ -247,19 +222,17 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 		return f
 	}
 
-	// An attempt the client discards for its refused output ends as if
-	// its worker had returned Cancel.
-	var (
-		cancel  *CancelError
-		refused *outputRefusedError
-	)
-	byWorker := errors.As(err, &cancel) || errors.As(err, &refused)
+	var cancel *CancelError
+	byWorker := errors.As(err, &cancel)
+	// An output past Config.MaxOutputBytes would be as large on a retry, so
+	// its refusal discards the job, unless JobCancel canceled it first.
+	tooLarge := errors.Is(err, ErrOutputTooLarge)
 	canceled := errors.Is(context.Cause(jobCtx), ErrJobCanceled)
 	switch {
 	case !byWorker && canceled:
 		f.State = driver.JobStateCanceled
 		return f
-	case !byWorker && ctx.Err() != nil && row.Attempt < row.MaxAttempts:
+	case !byWorker && !tooLarge && ctx.Err() != nil && row.Attempt < row.MaxAttempts:
 		// The client is stopping (or was fenced) and canceled the job. That
 		// is not the job's fault: retry immediately elsewhere. On its last
 		// attempt it is dead-lettered instead, as a rescued job would be.
@@ -290,7 +263,7 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 			return f
 		}
 	}
-	if byWorker || row.Attempt >= row.MaxAttempts {
+	if byWorker || tooLarge || row.Attempt >= row.MaxAttempts {
 		f.State = driver.JobStateDiscarded
 	} else {
 		f.State = driver.JobStateRetryable
@@ -321,9 +294,7 @@ func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driv
 	}
 	var cancel *CancelError
 	switch {
-	case errors.As(err, &cancel) && f.State == driver.JobStateDiscarded && !errors.Is(err, ErrOutputTooLarge):
-		// The worker's Cancel for an output past Config.MaxOutputBytes is
-		// logged as the client's discard of one is, below, at error level.
+	case errors.As(err, &cancel) && f.State == driver.JobStateDiscarded:
 		c.logger.InfoContext(ctx, "hopper: job canceled by worker", "job_id", row.ID, "kind", row.Kind, "error", err)
 	case f.State == driver.JobStateCanceled:
 		c.logger.InfoContext(ctx, "hopper: job canceled", "job_id", row.ID, "kind", row.Kind)

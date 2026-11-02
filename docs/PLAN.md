@@ -1191,30 +1191,20 @@ RETURNING j.*;
   after it that read it (`StepOpts.Dependencies`), until the workflow completes,
   whatever history's retention and `DeleteCompleted` (§11).
 - `Config.MaxOutputBytes` caps an output as the codec encodes it; zero, the default,
-  sets no limit. The client checks it before anything reaches the database, so every
-  engine applies it alike and no driver or schema changes. `SetOutput` refuses a
-  larger output with an `*OutputTooLargeError` (`errors.Is` `ErrOutputTooLarge`) and
-  keeps the output set before it, so the worker can react: set a smaller one, such as
-  a reference to where it stored the large one, or return an error. The refusal is
-  remembered until a later `SetOutput` sets an output within the limit: `CompleteTx`
-  returns it rather than complete the job, and an attempt whose worker returns nil, or
-  returns a refusal (any error matching `ErrOutputTooLarge`, as `return
-  hopper.SetOutput(ctx, v)` and `CompleteTx`'s error do, whatever `CompleteTx` did
-  before unless its transaction committed), is discarded with it, as if the worker had returned `Cancel`, though its error reads as
-  the refusal, not as the worker's cancel. Completing it
-  would hand `Await` and the steps that read it no output, or an older one, as if the
-  job had produced it; and retrying it would redo the work to produce the same output
-  again, so it is not retried, though `OnError` can choose a retry for a job whose
-  output varies. Such a discard is logged at error level, as a discarded job is. A
-  worker that returns an error of its own fails as that error says. A
-  lease's `Finish` and `FinishTx` refuse a completion's larger `LeaseResult.Output`
-  the same way and write nothing: the holder keeps the lease, to finish again with a
-  smaller output or an error, and one that never does has the lease expire. A
-  failure's output is encoded only if the failure ends the job, as before, and one
-  past the limit is dropped, so a holder can always report a failure. The cap is on
-  the encoded output: PostgreSQL keeps it as jsonb, whose text, as `JobGet` and a
-  claim's dependencies return it, can be longer, with a space after each comma and
-  colon and each number in full (`1e+100` as 101 digits).
+  sets no limit. The client checks it, so every engine applies it alike and no driver
+  or schema changes. `SetOutput` refuses a larger output with an
+  `*OutputTooLargeError` (`errors.Is` `ErrOutputTooLarge`) and keeps the output set
+  before it. Nothing is remembered: the attempt's outcome follows the error the worker
+  returns. One that matches `ErrOutputTooLarge` discards the job, as a `Cancel` does,
+  since a retry would produce as large an output, unless `JobCancel` canceled it
+  first; `OnError` gets the error as returned and can choose otherwise. A worker that
+  returns nil completes the job with the earlier output, or none. A lease's `Finish`
+  and `FinishTx` refuse a completion's larger `LeaseResult.Output` and write nothing,
+  so the holder can finish again; a `LeaseResult.Err` matching `ErrOutputTooLarge`
+  discards the job, and a failure's output past the limit is dropped, with a warning,
+  so a failure is always recorded. PostgreSQL keeps outputs as jsonb, whose text can
+  be longer than the encoded output (a space after each comma and colon, numbers
+  written out in full).
 
 ### 7.5 Finalize
 Results are buffered and written by a per-client finalizer. It flushes every 25ms or

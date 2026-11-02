@@ -39,19 +39,15 @@ type Config struct {
 	// Codec encodes args and outputs. Defaults to JSONCodec.
 	Codec Codec
 	// MaxOutputBytes caps a job's output, as Codec encodes it: SetOutput
-	// refuses a larger one with an *OutputTooLargeError, and an attempt
-	// whose worker returns nil or that error after such a refusal, with no
-	// smaller output set since, is discarded with it, as if the worker had
-	// returned Cancel; CompleteTx refuses to complete it, and a lease's
-	// Finish and FinishTx refuse such a LeaseResult.Output of a
-	// completion, writing nothing, and drop it from a failure. Each
-	// workflow step that reads its dependencies' outputs
-	// (StepOpts.Dependencies) is claimed with them, so the cap, set on
-	// every client that runs them, also bounds each output a claim carries,
-	// as Codec encoded it: PostgreSQL keeps outputs as jsonb, whose text,
-	// as a claim and JobGet return it, can be longer, with a space after
-	// each comma and colon and each number in full (1e+100 as 101 digits).
-	// Zero, the default, sets no limit.
+	// refuses a larger one with an *OutputTooLargeError, as do a lease's
+	// Finish and FinishTx for a completion's LeaseResult.Output, and an
+	// attempt that fails with an error matching ErrOutputTooLarge is
+	// discarded, not retried. Set on every client that runs a workflow's
+	// steps, it also bounds the outputs a step that reads its dependencies'
+	// (StepOpts.Dependencies) is claimed with, though PostgreSQL keeps them
+	// as jsonb, whose text can be longer than the encoded output (a space
+	// after each comma and colon, numbers written out in full). Zero, the
+	// default, sets no limit.
 	MaxOutputBytes int
 	// JobTimeout is how long a job may run before its context is canceled,
 	// unless its worker's Timeout says otherwise. Defaults to one minute.
@@ -62,9 +58,7 @@ type Config struct {
 	// OnError is called for every failed attempt this client runs, of any
 	// kind, with the worker's error: a returned error, a recovered panic
 	// (*PanicError), a timeout (ErrJobTimeout), a Cancel, or a kind with no
-	// worker (*UnknownKindError), or, for a worker that returned nil after
-	// SetOutput refused its output (MaxOutputBytes), that refusal
-	// (ErrOutputTooLarge). It is not called for a Snooze, nor when the
+	// worker (*UnknownKindError). It is not called for a Snooze, nor when the
 	// job was canceled with JobCancel or the client is stopping, nor for a
 	// job the leader rescues from a lost client or RescueStuckAfter. What it
 	// returns overrides the outcome; the zero ErrorOutcome keeps it. It runs

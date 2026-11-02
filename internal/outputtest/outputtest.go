@@ -23,15 +23,13 @@ const limit = 64
 func sized(n int) string { return strings.Repeat("x", n-2) }
 
 // step is a job whose worker sets each of Outputs in turn, an output of
-// that many bytes encoded, and returns nil, ReturnErr's error, with
-// ReturnSetOutput what the last SetOutput returned, or with ReturnFirst
-// what the first returned.
+// that many bytes encoded, and returns the first error SetOutput returned,
+// nil with IgnoreErr, or an error of its own with ReturnErr.
 type step struct {
-	Name            string `json:"name"`
-	Outputs         []int  `json:"outputs,omitempty"`
-	ReturnErr       bool   `json:"return_err,omitempty"`
-	ReturnSetOutput bool   `json:"return_set_output,omitempty"`
-	ReturnFirst     bool   `json:"return_first,omitempty"`
+	Name      string `json:"name"`
+	Outputs   []int  `json:"outputs,omitempty"`
+	IgnoreErr bool   `json:"ignore_err,omitempty"`
+	ReturnErr bool   `json:"return_err,omitempty"`
 }
 
 func (step) Kind() string { return "output_step" }
@@ -60,13 +58,11 @@ func (r *recorder) work(ctx context.Context, job *hopper.Job[step]) error {
 	r.errs[job.Args.Name] = errs
 	r.deps[job.Args.Name] = job.Dependencies
 	r.mu.Unlock()
-	switch {
-	case job.Args.ReturnErr:
+	if job.Args.ReturnErr {
 		return errors.New("worker failed")
-	case job.Args.ReturnSetOutput && len(errs) > 0:
-		return errs[len(errs)-1]
-	case job.Args.ReturnFirst && len(errs) > 0:
-		return errs[0]
+	}
+	if !job.Args.IgnoreErr {
+		return errors.Join(errs...)
 	}
 	return nil
 }
@@ -79,8 +75,8 @@ func (r *recorder) get(name string) ([]error, []driver.Dependency) {
 
 // Run checks Config.MaxOutputBytes on clients of drivers newDriver makes:
 // an output of exactly the limit is kept, a larger one refused and its
-// attempt discarded unless a smaller one follows, no limit by default, a
-// workflow step reading its dependency's output, and a lease's Finish.
+// attempt discarded if the worker returns the refusal, no limit by default,
+// a workflow step reading its dependency's output, and a lease's Finish.
 func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx]) {
 	t.Helper()
 	ctx := context.Background()
@@ -111,17 +107,23 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 		})
 		return c, rec
 	}
-	finished := func(t *testing.T, c *hopper.Client[TTx], id hopper.JobID) *hopper.JobRow {
+	// ended waits for the job to finish, or, with retryable, for its
+	// attempt to be retried.
+	ended := func(t *testing.T, c *hopper.Client[TTx], id hopper.JobID, retryable bool) *hopper.JobRow {
 		t.Helper()
 		for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(20 * time.Millisecond) {
 			j, err := c.JobGet(ctx, id)
-			if err == nil && j.State.Terminal() {
+			if err == nil && (j.State.Terminal() || retryable && j.State == hopper.JobStateRetryable) {
 				return j
 			}
 			if time.Now().After(deadline) {
 				t.Fatalf("job %s not finished: %+v, %v", id, j, err)
 			}
 		}
+	}
+	finished := func(t *testing.T, c *hopper.Client[TTx], id hopper.JobID) *hopper.JobRow {
+		t.Helper()
+		return ended(t, c, id, false)
 	}
 	// insert inserts a job of maxAttempts attempts and waits for it to
 	// finish. A refused output's job is given more than one, to show that
@@ -149,31 +151,23 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 			tooLarge.Size != limit+1 || tooLarge.Limit != limit {
 			t.Fatalf("SetOutput of one byte past the limit = %v, want an *OutputTooLargeError of %d against %d", errs, limit+1, limit)
 		}
-		if over.State != hopper.JobStateDiscarded || over.Attempt != 1 || len(over.Errors) != 1 || over.Errors[0].Error != errs[1].Error() {
-			t.Errorf("job whose worker returned nil after the refusal: %s at attempt %d, errors %v; want discarded with it at once", over.State, over.Attempt, over.Errors)
-		}
-		if len(over.Output) != 8 {
-			t.Errorf("discarded job's output is %d bytes, want the 8 set before the refusal", len(over.Output))
+		if over.State != hopper.JobStateDiscarded || over.Attempt != 1 || len(over.Errors) != 1 || over.Errors[0].Error != errs[1].Error() || len(over.Output) != 8 {
+			t.Errorf("job whose worker returned the refusal: %s at attempt %d with %d bytes, errors %v; want discarded with it at once, with the 8 bytes set before", over.State, over.Attempt, len(over.Output), over.Errors)
 		}
 
-		smaller := insert(t, c, step{Name: "smaller", Outputs: []int{limit + 1, limit - 1}}, 1)
-		if smaller.State != hopper.JobStateCompleted || len(smaller.Output) != limit-1 {
-			t.Errorf("refused, then a smaller output: %s, %d bytes; want completed with the smaller", smaller.State, len(smaller.Output))
+		ignored := insert(t, c, step{Name: "ignored", Outputs: []int{8, limit + 1}, IgnoreErr: true}, 1)
+		if ignored.State != hopper.JobStateCompleted || len(ignored.Output) != 8 {
+			t.Errorf("job whose worker returned nil after the refusal: %s with %d bytes; want completed with the 8 set before", ignored.State, len(ignored.Output))
 		}
 
-		returned := insert(t, c, step{Name: "returned", Outputs: []int{limit + 1}, ReturnSetOutput: true}, 3)
-		if returned.State != hopper.JobStateDiscarded || returned.Attempt != 1 || len(returned.Errors) != 1 || !strings.Contains(returned.Errors[0].Error, "MaxOutputBytes") {
-			t.Errorf("job whose worker returned SetOutput's refusal: %s at attempt %d, errors %v; want discarded with it at once", returned.State, returned.Attempt, returned.Errors)
+		// A worker's own error is retried as that error says.
+		res, err := c.Insert(ctx, step{Name: "failed", Outputs: []int{limit + 1}, ReturnErr: true}, &hopper.InsertOpts{MaxAttempts: 2})
+		if err != nil {
+			t.Fatal(err)
 		}
-
-		first := insert(t, c, step{Name: "first", Outputs: []int{limit + 1, limit + 2}, ReturnFirst: true}, 3)
-		if first.State != hopper.JobStateDiscarded || first.Attempt != 1 || len(first.Errors) != 1 || !strings.Contains(first.Errors[0].Error, "MaxOutputBytes") {
-			t.Errorf("job whose worker returned an earlier refusal: %s at attempt %d, errors %v; want discarded with it at once", first.State, first.Attempt, first.Errors)
-		}
-
-		failed := insert(t, c, step{Name: "failed", Outputs: []int{limit + 1}, ReturnErr: true}, 1)
-		if len(failed.Errors) != 1 || failed.Errors[0].Error != "worker failed" {
-			t.Errorf("a worker that returned its own error after the refusal failed with %v, want its error", failed.Errors)
+		failed := ended(t, c, res.Job.ID, true)
+		if retried := failed.State == hopper.JobStateRetryable || failed.Attempt == 2; !retried || len(failed.Errors) == 0 || failed.Errors[0].Error != "worker failed" {
+			t.Errorf("a worker that returned its own error after the refusal: %s at attempt %d, errors %v; want retried with its error", failed.State, failed.Attempt, failed.Errors)
 		}
 	})
 
@@ -248,6 +242,23 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 		}
 		if j := finished(t, c, ins.Job.ID); j.State != hopper.JobStateDiscarded || len(j.Output) != 0 {
 			t.Errorf("failed job: %s with %d bytes of output; want discarded without it", j.State, len(j.Output))
+		}
+
+		// A holder that finishes with the refusal has the job discarded, as
+		// a worker that returns it does.
+		ins, err = c.Insert(ctx, remote{}, &hopper.InsertOpts{Queue: remoteQueue, MaxAttempts: 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l, err = c.Leases().Claim(ctx, ins.Job.ID, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		refusal := c.Leases().Finish(ctx, l.Token, hopper.LeaseResult{Output: sized(limit + 1)})
+		if err := c.Leases().Finish(ctx, l.Token, hopper.LeaseResult{Err: refusal}); err != nil {
+			t.Fatalf("Finish with the refusal = %v, want it recorded", err)
+		}
+		if j, err := c.JobGet(ctx, ins.Job.ID); err != nil || j.State != hopper.JobStateDiscarded || j.Attempt != 1 {
+			t.Errorf("job finished with the refusal: %+v, %v; want discarded at once", j, err)
 		}
 	})
 }
