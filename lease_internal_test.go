@@ -156,7 +156,7 @@ func TestNewLeaseRecordsPeriodicJobsAtOnce(t *testing.T) {
 		exec := &lostLeaseExec{}
 		logger := slog.New(slog.DiscardHandler)
 		c := &Client[struct{}]{exec: exec, logger: logger, tuning: defaultTuning.withLease(15 * time.Second), events: newEventBus(), periodic: newPeriodicJobs(nil, logger, false)}
-		c.workCtx, c.workCancel = context.WithCancel(ctx)
+		c.workCtx, c.workCancel = context.WithCancelCause(ctx)
 		c.newGeneration()
 		id, err := c.register(ctx)
 		if err != nil {

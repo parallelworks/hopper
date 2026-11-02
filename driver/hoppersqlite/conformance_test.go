@@ -15,6 +15,7 @@ import (
 	"github.com/parallelworks/hopper/drivertest"
 	"github.com/parallelworks/hopper/hoppermigrate"
 	"github.com/parallelworks/hopper/internal/outputtest"
+	"github.com/parallelworks/hopper/internal/stoptest"
 )
 
 // open returns a driver on a new database in the test's temporary
@@ -221,4 +222,9 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 func TestMaxOutputBytes(t *testing.T) {
 	t.Parallel()
 	outputtest.Run(t, fixture{}.NewDriver)
+}
+
+func TestStopAndCancel(t *testing.T) {
+	t.Parallel()
+	stoptest.Run(t, fixture{}.NewDriver)
 }

@@ -75,7 +75,7 @@ func TestFlushNowWaitsForFiringTimer(t *testing.T) {
 func TestStopReturnsWithItsContext(t *testing.T) {
 	exec := newNotifyExec(true)
 	defer close(exec.release)
-	c := &Client[struct{}]{notifier: newNotifier(exec, slog.New(slog.DiscardHandler), time.Millisecond)}
+	c := &Client[struct{}]{notifier: newNotifier(exec, slog.New(slog.DiscardHandler), time.Millisecond), stopped: make(chan struct{})}
 	c.notifier.mark("q")
 	<-exec.entered // the timer fired, and its flush is notifying
 	ctx, cancel := context.WithCancel(context.Background())
@@ -102,7 +102,7 @@ func TestStopAsTheNotifierFires(t *testing.T) {
 	for i := range execs {
 		exec := newNotifyExec(false)
 		execs[i] = exec
-		c := &Client[struct{}]{notifier: newNotifier(exec, slog.New(slog.DiscardHandler), interval)}
+		c := &Client[struct{}]{notifier: newNotifier(exec, slog.New(slog.DiscardHandler), interval), stopped: make(chan struct{})}
 		c.notifier.mark("q")
 		c.notifier.markStream("topic")
 		time.Sleep(time.Duration(i%20) * interval / 10)

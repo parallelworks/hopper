@@ -19,6 +19,7 @@ import (
 	"github.com/parallelworks/hopper/drivertest"
 	"github.com/parallelworks/hopper/hoppermigrate"
 	"github.com/parallelworks/hopper/internal/outputtest"
+	"github.com/parallelworks/hopper/internal/stoptest"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
 
@@ -368,4 +369,9 @@ func TestTagListingReadsAPageOfHistory(t *testing.T) {
 func TestMaxOutputBytes(t *testing.T) {
 	t.Parallel()
 	outputtest.Run(t, newFixture().NewDriver)
+}
+
+func TestStopAndCancel(t *testing.T) {
+	t.Parallel()
+	stoptest.Run(t, newFixture().NewDriver)
 }

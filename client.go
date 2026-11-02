@@ -44,11 +44,16 @@ type Client[TTx any] struct {
 
 	mu    sync.Mutex
 	state clientState
+	// stopped is closed once the client has stopped (Stopped).
+	stopped chan struct{}
 
 	// Contexts for the running phases. All derive from Start's context with
 	// its cancellation removed, so values (loggers, tracers) propagate.
-	claimCtx, workCtx, finCtx, bgCtx             context.Context
-	claimCancel, workCancel, finCancel, bgCancel context.CancelFunc
+	claimCtx, workCtx, finCtx, bgCtx context.Context
+	claimCancel, finCancel, bgCancel context.CancelFunc
+	// workCancel cancels every job's context with ErrClientStopped as the
+	// cause. It is set by Start, under mu.
+	workCancel context.CancelCauseFunc
 
 	// gen is the lease generation: jobs run under a context that is
 	// canceled when the lease is lost, so a fenced client stops its work.
@@ -131,6 +136,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		events:       newEventBus(),
 		running:      map[JobID]*runningJob{},
 		doneWaiters:  map[JobID][]chan struct{}{},
+		stopped:      make(chan struct{}),
 		logRetention: logRetentionState{gate: make(chan struct{}, 1)},
 	}
 	if c.workers == nil {
@@ -175,9 +181,9 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	switch c.state {
-	case clientStarted, clientStopping:
+	case clientStarted:
 		return ErrClientStarted
-	case clientStopped:
+	case clientStopping, clientStopped:
 		return ErrClientStopped
 	case clientIdle:
 	}
@@ -208,10 +214,10 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 
 	// Each phase has its own context, canceled in order by Stop.
 	base := context.WithoutCancel(ctx)
-	c.claimCtx, c.claimCancel = context.WithCancel(base) //nolint:gosec // canceled in Stop
-	c.workCtx, c.workCancel = context.WithCancel(base)   //nolint:gosec // canceled in Stop
-	c.finCtx, c.finCancel = context.WithCancel(base)     //nolint:gosec // canceled in Stop
-	c.bgCtx, c.bgCancel = context.WithCancel(base)       //nolint:gosec // canceled in Stop
+	c.claimCtx, c.claimCancel = context.WithCancel(base)    //nolint:gosec // canceled in Stop
+	c.workCtx, c.workCancel = context.WithCancelCause(base) //nolint:gosec // canceled in Stop
+	c.finCtx, c.finCancel = context.WithCancel(base)        //nolint:gosec // canceled in Stop
+	c.bgCtx, c.bgCancel = context.WithCancel(base)          //nolint:gosec // canceled in Stop
 	c.newGeneration()
 
 	c.finalizer = newFinalizer(c.exec, c.logger, c.tuning, c.cfg.JobLogs.MaxAttempts, c.wakeQueue, c.finalized)
@@ -391,7 +397,7 @@ func (c *Client[TTx]) newGeneration() {
 // attempts left runs under the lease generation, so that a client which
 // loses its lease stops it before another client runs it again. A job on its
 // last attempt will not run again, so canceling it would only discard its
-// work: it runs under the work context, which only a hard stop cancels.
+// work: it runs under the work context, which only a stop cancels.
 func (c *Client[TTx]) jobContext(row *driver.JobRow) context.Context {
 	if row.Attempt >= row.MaxAttempts {
 		return c.workCtx
@@ -409,39 +415,115 @@ func (c *Client[TTx]) generation() context.Context {
 // Stop shuts the client down in three steps: stop claiming and give up
 // leadership; wait for running jobs to finish and flush their results;
 // release the lease. If ctx expires during the wait, every job's context is
-// canceled, whatever finishes within a short grace period is flushed, and
-// ctx's error is returned. Jobs still running then are rescued by another
-// client once this one's lease expires.
+// canceled, as StopAndCancel does, whatever finishes within a short grace
+// period is flushed, and ctx's error is returned. Jobs still running then
+// are rescued by another client once this one's lease expires.
+//
+// Stop and StopAndCancel may be called more than once and from several
+// goroutines: one call stops the client, and the others wait for it to
+// stop, until their ctx expires, which cancels the running jobs as it would
+// for the call that stops it. A StopAndCancel cancels them at once,
+// whichever call came first. Each returns nil once the client has stopped,
+// or ctx's error. Stop before Start stops the client, which can then not
+// be started.
 func (c *Client[TTx]) Stop(ctx context.Context) error {
+	return c.stop(ctx, false)
+}
+
+// StopAndCancel stops the client as Stop does, but cancels every running
+// job's context at once, with ErrClientStopped as its cause, rather than
+// waiting for the jobs to finish. It then waits, as Stop does, for the
+// workers to return and their results to be flushed, until ctx expires.
+//
+// A job whose worker returns once its context is canceled this way, with
+// anything other than nil, a Snooze, a Cancel or an error matching
+// ErrOutputTooLarge, is given its attempt back and runs again at once, as
+// if its worker had returned Snooze(0): the stop is not the job's failure,
+// so it neither counts against MaxAttempts nor discards a job on its last
+// attempt. Config.OnError is not called for it. The same holds for the jobs
+// a Stop cancels when its ctx expires.
+func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
+	return c.stop(ctx, true)
+}
+
+// Stopped returns a channel that is closed once the client has stopped,
+// through Stop, StopAndCancel or Run, when they return. It can be called at
+// any time, before Start too.
+func (c *Client[TTx]) Stopped() <-chan struct{} {
+	return c.stopped
+}
+
+func (c *Client[TTx]) stop(ctx context.Context, cancelJobs bool) error {
 	c.mu.Lock()
 	switch c.state {
-	case clientIdle, clientStopped:
-		c.state = clientStopped
+	case clientStopped:
 		c.mu.Unlock()
 		c.notifier.flushNow(ctx)
 		return nil
 	case clientStopping:
 		c.mu.Unlock()
-		return ErrClientStopped
-	case clientStarted:
+		return c.awaitStop(ctx, cancelJobs)
+	case clientIdle, clientStarted:
 	}
+	// An idle client, or an insert-only one, has nothing running.
+	running := c.state == clientStarted && c.producers != nil
 	c.state = clientStopping
-	insertOnly := c.producers == nil
 	c.mu.Unlock()
 
-	if insertOnly {
-		// Insert-only client.
+	var err error
+	if running {
+		err = c.shutdown(ctx, cancelJobs)
+	} else {
 		c.notifier.flushNow(ctx)
-		c.mu.Lock()
-		c.state = clientStopped
-		c.mu.Unlock()
-		return nil
 	}
+	c.mu.Lock()
+	c.state = clientStopped
+	c.mu.Unlock()
+	close(c.stopped)
+	return err
+}
 
+// awaitStop waits for another call's stop of the client, canceling the
+// running jobs if cancelJobs is set or once ctx expires.
+func (c *Client[TTx]) awaitStop(ctx context.Context, cancelJobs bool) error {
+	if cancelJobs {
+		c.cancelJobs()
+	}
+	select {
+	case <-c.stopped:
+		return nil
+	case <-ctx.Done():
+	}
+	select {
+	case <-c.stopped:
+		return nil
+	default:
+		c.cancelJobs()
+		return ctx.Err()
+	}
+}
+
+// cancelJobs cancels the context of every job the client runs, with
+// ErrClientStopped as its cause.
+func (c *Client[TTx]) cancelJobs() {
+	c.mu.Lock()
+	cancel := c.workCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel(ErrClientStopped)
+	}
+}
+
+// shutdown stops a started client that works queues, canceling its jobs at
+// once if cancelJobs is set.
+func (c *Client[TTx]) shutdown(ctx context.Context, cancelJobs bool) error {
 	// 1. Stop claiming and give up leadership. Producer loops exit once any
 	// in-flight claim returns, and the jobs from that claim are started, so
-	// nothing claimed is lost.
+	// nothing claimed is lost: canceled first, they return at once.
 	c.claimCancel()
+	if cancelJobs {
+		c.cancelJobs()
+	}
 	c.producerWG.Wait()
 	c.leaderWG.Wait()
 
@@ -451,7 +533,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	if !c.waitForJobs(ctx) {
 		stopErr = ctx.Err()
 		c.logger.WarnContext(ctx, "hopper: stop deadline reached; canceling running jobs")
-		c.workCancel()
+		c.cancelJobs()
 		graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.tuning.stopGrace)
 		c.waitForJobs(graceCtx)
 		cancel()
@@ -461,7 +543,7 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	c.notifier.flushNow(ctx)
 
 	// 3. Release the lease.
-	c.workCancel()
+	c.cancelJobs()
 	c.bgCancel()
 	c.listenWG.Wait()
 	c.leaseWG.Wait()
@@ -470,10 +552,6 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 	if err := c.exec.ClientDelete(releaseCtx, c.clientID.Load()); err != nil {
 		c.logger.WarnContext(ctx, "hopper: release client lease", "error", err)
 	}
-
-	c.mu.Lock()
-	c.state = clientStopped
-	c.mu.Unlock()
 	c.logger.InfoContext(ctx, "hopper: client stopped", "client_id", c.clientID.Load())
 	return stopErr
 }

@@ -65,7 +65,7 @@ func (c *Client[TTx]) Abandon() {
 	c.mu.Unlock()
 	c.finalizer.crashed.Store(true)
 	c.claimCancel()
-	c.workCancel()
+	c.workCancel(nil)
 	c.bgCancel()
 	c.finCancel()
 	c.producerWG.Wait()
@@ -73,6 +73,7 @@ func (c *Client[TTx]) Abandon() {
 	c.listenWG.Wait()
 	c.leaseWG.Wait()
 	<-c.finalizer.done
+	close(c.stopped)
 }
 
 // UniqueKey exposes key construction for tests.

@@ -226,6 +226,9 @@ var ErrJobTimeout = errors.New("hopper: job timed out")
 // Sentinel errors from Client lifecycle methods.
 var (
 	ErrClientStarted = errors.New("hopper: client already started")
+	// ErrClientStopped is returned by Start on a stopped client. It is
+	// also the cause of a job's context that StopAndCancel, or a Stop whose
+	// ctx expired, canceled; check it with context.Cause.
 	ErrClientStopped = errors.New("hopper: client stopped")
 	// ErrSchemaOutdated is returned by Start when the database's schema is
 	// older than this release needs. Apply the missing migrations with
