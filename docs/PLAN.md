@@ -253,7 +253,8 @@ client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{
 // client is a *hopper.Client[pgx.Tx]. The driver fixes the transaction type,
 // so InsertTx only accepts a transaction from the right engine.
 
-// Run blocks until ctx is canceled, then drains gracefully. It fits errgroup.
+// Run blocks until ctx is canceled (or another call stops the client), then drains
+// gracefully. It fits errgroup.
 g.Go(func() error { return client.Run(ctx) })
 
 // Or manage the lifecycle explicitly:
@@ -2119,22 +2120,25 @@ rates:
 claiming, rather than when `ctx` expires. Either cancels a job's context with
 `ErrClientStopped` as its cause.
 
-A job that returns once the stop canceled its context, with anything but nil, a
-`Snooze`, a `Cancel` or an output refusal (`ErrOutputTooLarge`), is finalized as a
-`Snooze(0)` is, with `ErrClientStopped` as its snooze reason: it gets its attempt back
-and runs again at once on another client. The stop is not the job's failure, so it
-neither counts against `MaxAttempts`, which would discard a job interrupted on its
-last attempt, nor goes to `Config.OnError`. A job interrupted by a fence (§7.6) is
-retried with its attempt counted instead, as the rescue that may already have run it
-would. The lease keeps being renewed until the finalizer has flushed, so a long drain
-cannot let it lapse.
+A job whose worker returns the stop's cancellation (`ctx.Err()`, or an error wrapping
+it) is finalized as a `Snooze(0)` is, with `ErrClientStopped` as its snooze reason: it
+gets its attempt back and runs again at once on another client. The stop is not the
+job's failure, so it neither counts against `MaxAttempts`, which would discard a job
+interrupted on its last attempt, nor goes to `Config.OnError`; the job's timeout still
+bounds each run. A worker that returns nil, `Snooze` or `Cancel` is finalized as it
+says, and any other error, a panic say, is a failure: retried at once with its attempt
+counted (dead-lettered on the last), as is a job interrupted by a fence (§7.6), like
+the rescue that may already have run it. The lease keeps being renewed until the
+finalizer has flushed, so a long drain cannot let it lapse.
 
-The calls may overlap: the first stops the client, and the others wait for it to stop.
-A `StopAndCancel` cancels the jobs at once whichever call came first, and any call
-whose `ctx` expires cancels them too and returns `ctx.Err()`; the others return nil
-once the client has stopped. `Stopped()` returns a channel closed once, when the
+The calls may overlap: the first stops the client, and the others wait for it to
+stop, until their own `ctx` expires, and return nil once it has, or `ctx.Err()`. Only
+the stopping call's deadline cancels the jobs; a `StopAndCancel` cancels them at once,
+whichever call came first. `Run` also returns nil once another call has stopped the
+client, before its `ctx` ends. `Stopped()` returns a channel closed once, when the
 client has stopped, by whichever call stopped it, or by `Stop` on a client never
-started. The client has no internal error that stops it.
+started; a `Run` whose `Start` fails leaves it open. The client has no internal error
+that stops it.
 
 ### 7.13 Encoding
 Args, outputs and message payloads go through a `Codec`. The default is

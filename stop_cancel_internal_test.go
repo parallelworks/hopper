@@ -3,6 +3,7 @@ package hopper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -97,8 +98,10 @@ func (e *stopExec) result(id driver.JobID) (driver.JobFinalize, bool) {
 }
 
 type stopArgs struct {
-	// Cancel has the worker return Cancel once its context is canceled.
+	// Cancel has the worker return Cancel once its context is canceled,
+	// and Fail an error of its own.
 	Cancel bool `json:"cancel,omitempty"`
+	Fail   bool `json:"fail,omitempty"`
 }
 
 func (stopArgs) Kind() string { return "stop_args" }
@@ -113,10 +116,13 @@ func stopClient(t *testing.T, causes chan<- error, jobs ...*driver.JobRow) (*Cli
 	AddWorkFunc(workers, func(ctx context.Context, job *Job[stopArgs]) error {
 		<-ctx.Done()
 		causes <- context.Cause(ctx)
-		if job.Args.Cancel {
+		switch {
+		case job.Args.Cancel:
 			return Cancel(errors.New("gave up"))
+		case job.Args.Fail:
+			return errors.New("failed")
 		}
-		return ctx.Err()
+		return fmt.Errorf("work: %w", ctx.Err())
 	})
 	c, err := NewClient(stopDriver{exec: exec}, &Config{
 		Queues:    map[string]QueueConfig{QueueDefault: {MaxWorkers: 10}},
@@ -176,14 +182,16 @@ func TestStoppedBeforeStart(t *testing.T) {
 // TestStopAndCancelRacingStop: Stop and StopAndCancel called at once, again
 // and again, all return nil once the client stopped, having canceled its
 // jobs at once with ErrClientStopped. Stopped is closed once (a second
-// close would panic). Each job gets its attempt back, its last one too,
-// except the one whose worker returned Cancel. Nothing the client started
-// is left running when the bubble ends.
+// close would panic). Each job whose worker returned the cancellation gets
+// its attempt back, its last one too; the one whose worker returned Cancel
+// is discarded, and the one that failed otherwise is retried with its
+// attempt counted. Nothing the client started is left running when the
+// bubble ends.
 func TestStopAndCancelRacingStop(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		causes := make(chan error, 3)
-		retried, last, canceled := stopJob(1, 3, `{}`), stopJob(3, 3, `{}`), stopJob(1, 3, `{"cancel":true}`)
-		c, exec := stopClient(t, causes, retried, last, canceled)
+		causes := make(chan error, 4)
+		retried, last, canceled, failed := stopJob(1, 3, `{}`), stopJob(3, 3, `{}`), stopJob(1, 3, `{"cancel":true}`), stopJob(1, 3, `{"fail":true}`)
+		c, exec := stopClient(t, causes, retried, last, canceled, failed)
 		ctx := context.Background()
 		if err := c.Start(ctx); err != nil {
 			t.Fatal(err)
@@ -211,7 +219,7 @@ func TestStopAndCancelRacingStop(t *testing.T) {
 		if d := time.Since(start); d != 0 {
 			t.Errorf("stopping took %s, want no wait for the jobs", d)
 		}
-		for range 3 {
+		for range 4 {
 			if cause := <-causes; !errors.Is(cause, ErrClientStopped) {
 				t.Errorf("a job's context was canceled with %v, want ErrClientStopped", cause)
 			}
@@ -224,15 +232,42 @@ func TestStopAndCancelRacingStop(t *testing.T) {
 		if f, ok := exec.result(canceled.ID); !ok || f.State != driver.JobStateDiscarded {
 			t.Errorf("job whose worker returned Cancel: %+v, %v; want discarded", f, ok)
 		}
+		if f, ok := exec.result(failed.ID); !ok || f.Snooze || f.State != driver.JobStateRetryable || f.Error == nil || f.Error.Error != "failed" {
+			t.Errorf("job whose worker failed: %+v, %v; want retried with its error, its attempt counted", f, ok)
+		}
 		if !exec.deleted {
 			t.Error("the client's lease was not released")
 		}
 	})
 }
 
-// TestStopDeadlineEscalates: a Stop whose ctx expires cancels the jobs, as
-// does a second Stop's that expires while the first waits; the first then
-// returns nil, and the job gets its attempt back.
+// TestRunReturnsOnStop: Run returns nil once a StopAndCancel from elsewhere
+// stopped the client, though its ctx has not ended.
+func TestRunReturnsOnStop(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		causes := make(chan error, 1)
+		c, _ := stopClient(t, causes, stopJob(1, 3, `{}`))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ran := make(chan error, 1)
+		go func() { ran <- c.Run(ctx) }()
+		synctest.Wait() // the job is running
+		if err := c.StopAndCancel(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-ran; err != nil {
+			t.Errorf("Run = %v, want nil once the client stopped", err)
+		}
+		if cause := <-causes; !errors.Is(cause, ErrClientStopped) {
+			t.Errorf("the job's context was canceled with %v, want ErrClientStopped", cause)
+		}
+	})
+}
+
+// TestStopDeadlineEscalates: a second Stop whose ctx expires while the
+// first waits returns its deadline and leaves the jobs running; a
+// StopAndCancel then cancels them, and the first Stop returns nil, with the
+// job given its attempt back. A single Stop's own deadline cancels the jobs.
 func TestStopDeadlineEscalates(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		causes := make(chan error, 1)
@@ -251,8 +286,17 @@ func TestStopDeadlineEscalates(t *testing.T) {
 		if err := c.Stop(second); !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("second Stop = %v, want its deadline", err)
 		}
+		synctest.Wait()
+		select {
+		case cause := <-causes:
+			t.Fatalf("the second Stop's deadline canceled the job, with %v", cause)
+		default:
+		}
+		if err := c.StopAndCancel(ctx); err != nil {
+			t.Errorf("StopAndCancel = %v", err)
+		}
 		if err := <-first; err != nil {
-			t.Errorf("first Stop = %v, want nil once the second's deadline canceled the job", err)
+			t.Errorf("first Stop = %v, want nil once StopAndCancel canceled the job", err)
 		}
 		if cause := <-causes; !errors.Is(cause, ErrClientStopped) {
 			t.Errorf("the job's context was canceled with %v, want ErrClientStopped", cause)

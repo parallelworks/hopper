@@ -61,6 +61,7 @@ func (c *Client[TTx]) Listening() bool { return c.listening.Load() }
 // results, resigning leadership or releasing the lease.
 func (c *Client[TTx]) Abandon() {
 	c.mu.Lock()
+	wasStopped := c.state == clientStopped
 	c.state = clientStopped
 	c.mu.Unlock()
 	c.finalizer.crashed.Store(true)
@@ -73,7 +74,9 @@ func (c *Client[TTx]) Abandon() {
 	c.listenWG.Wait()
 	c.leaseWG.Wait()
 	<-c.finalizer.done
-	close(c.stopped)
+	if !wasStopped {
+		close(c.stopped)
+	}
 }
 
 // UniqueKey exposes key construction for tests.
