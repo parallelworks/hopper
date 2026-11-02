@@ -75,7 +75,10 @@ type Config struct {
 	// hours.
 	RetryPolicy RetryPolicy
 	// StopTimeout bounds how long Run waits for running jobs after its
-	// context is canceled, before canceling them. Defaults to 30 seconds.
+	// context is canceled, before canceling them. If another Stop or
+	// StopAndCancel is already stopping the client, Run waits up to
+	// StopTimeout for that call instead and leaves the jobs to it.
+	// Defaults to 30 seconds.
 	StopTimeout time.Duration
 	// PollInterval is how often an idle producer checks its queue for work
 	// that arrived without a wake-up. Defaults to one second.

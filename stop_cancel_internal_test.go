@@ -317,7 +317,9 @@ func TestStopDeadlineEscalates(t *testing.T) {
 		if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Stop = %v, want its deadline", err)
 		}
-		<-causes
+		if cause := <-causes; !errors.Is(cause, ErrClientStopped) {
+			t.Errorf("Stop's deadline canceled the job with %v, want ErrClientStopped", cause)
+		}
 		if f, ok := exec.result(job.ID); !ok || !f.Snooze {
 			t.Errorf("job after Stop's deadline = %+v, %v; want its attempt given back", f, ok)
 		}

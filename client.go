@@ -442,8 +442,9 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // attempt, and Config.OnError is not called. The job's timeout still
 // bounds each run. A worker that returns nil completes the job, and one
 // that returns Snooze or Cancel snoozes or discards it; any other error,
-// such as a panic, is a failure, retried at once with its attempt counted.
-// The same holds for the jobs a Stop cancels when its ctx expires.
+// such as a panic, is a failure, retried at once with its attempt counted,
+// or, on the job's last attempt, discarded. The same holds for the jobs a
+// Stop cancels when its ctx expires.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	return c.stop(ctx, true)
 }
@@ -489,22 +490,24 @@ func (c *Client[TTx]) stop(ctx context.Context, cancelJobs bool) error {
 }
 
 // awaitStop waits for another call's stop of the client, until ctx
-// expires, canceling the running jobs first if cancelJobs is set.
+// expires, canceling the running jobs first if cancelJobs is set. Once the
+// client has stopped, it flushes the notifier, as a call that finds the
+// client stopped does, for inserts made after the stopping call's flush.
 func (c *Client[TTx]) awaitStop(ctx context.Context, cancelJobs bool) error {
 	if cancelJobs {
 		c.cancelJobs()
 	}
 	select {
 	case <-c.stopped:
-		return nil
 	case <-ctx.Done():
+		select {
+		case <-c.stopped:
+		default:
+			return ctx.Err()
+		}
 	}
-	select {
-	case <-c.stopped:
-		return nil
-	default:
-		return ctx.Err()
-	}
+	c.notifier.flushNow(ctx)
+	return nil
 }
 
 // cancelJobs cancels the context of every job the client runs, with

@@ -75,7 +75,7 @@ func (h *harness) client(cfg *hopper.Config) *hopper.Client[pgxTx] {
 	h.t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := c.Stop(ctx); err != nil && !errors.Is(err, hopper.ErrClientStopped) {
+		if err := c.Stop(ctx); err != nil {
 			h.t.Errorf("Stop: %v", err)
 		}
 	})

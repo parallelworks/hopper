@@ -11,6 +11,7 @@ import (
 
 	"github.com/parallelworks/hopper"
 	"github.com/parallelworks/hopper/driver"
+	"github.com/parallelworks/hopper/hoppertest"
 )
 
 // block is a job whose worker waits for its context, or, after the first
@@ -40,14 +41,7 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.Start(ctx); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_ = c.Stop(sctx)
-		})
+		hoppertest.Start(ctx, t, c)
 		return c
 	}
 

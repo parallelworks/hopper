@@ -61,7 +61,8 @@ func (c *Client[TTx]) Listening() bool { return c.listening.Load() }
 // results, resigning leadership or releasing the lease.
 func (c *Client[TTx]) Abandon() {
 	c.mu.Lock()
-	wasStopped := c.state == clientStopped
+	// A call that is stopping the client closes Stopped itself.
+	closeStopped := c.state != clientStopping && c.state != clientStopped
 	c.state = clientStopped
 	c.mu.Unlock()
 	c.finalizer.crashed.Store(true)
@@ -74,7 +75,7 @@ func (c *Client[TTx]) Abandon() {
 	c.listenWG.Wait()
 	c.leaseWG.Wait()
 	<-c.finalizer.done
-	if !wasStopped {
+	if closeStopped {
 		close(c.stopped)
 	}
 }
