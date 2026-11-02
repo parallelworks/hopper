@@ -52,15 +52,16 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 		// An attempt whose worker returned nil although SetOutput refused
 		// its output is not completed: the job would hand its dependents
 		// and Await no output, or an older one. Nor is one whose worker
-		// returned the refusal itself, as `return hopper.SetOutput(ctx, v)`
-		// and CompleteTx's error do, retried: the output's size will not
-		// change on a retry.
-		var cancel *CancelError
+		// returned a refusal, as `return hopper.SetOutput(ctx, v)` and
+		// CompleteTx's error do, retried: the output's size will not change
+		// on a retry. Either is discarded as a Cancel is, but recorded as
+		// the refusal, not as the worker's cancel.
+		var workerCancel *CancelError
 		switch {
 		case err == nil:
-			err = Cancel(refused)
-		case errors.Is(err, refused) && !errors.As(err, &cancel):
-			err = Cancel(err)
+			err = &outputRefusedError{err: refused}
+		case errors.Is(err, ErrOutputTooLarge) && !errors.As(err, &workerCancel):
+			err = &outputRefusedError{err: err}
 		}
 	}
 	state := txUnknown
@@ -101,6 +102,15 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 func replaced(jobCtx context.Context) bool {
 	return errors.Is(context.Cause(jobCtx), ErrJobFenced)
 }
+
+// outputRefusedError discards an attempt left with SetOutput's refusal of
+// its output (Config.MaxOutputBytes), as a Cancel does. Its message is
+// err's, so the attempt's error does not read as the worker's cancel.
+type outputRefusedError struct{ err error }
+
+func (e *outputRefusedError) Error() string { return e.err.Error() }
+
+func (e *outputRefusedError) Unwrap() error { return e.err }
 
 // errNotCommitted fails an attempt whose worker completed it with
 // CompleteTx and returned nil, but whose transaction did not commit.
@@ -237,8 +247,13 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 		return f
 	}
 
-	var cancel *CancelError
-	byWorker := errors.As(err, &cancel)
+	// An attempt the client discards for its refused output ends as if
+	// its worker had returned Cancel.
+	var (
+		cancel  *CancelError
+		refused *outputRefusedError
+	)
+	byWorker := errors.As(err, &cancel) || errors.As(err, &refused)
 	canceled := errors.Is(context.Cause(jobCtx), ErrJobCanceled)
 	switch {
 	case !byWorker && canceled:
@@ -307,8 +322,8 @@ func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driv
 	var cancel *CancelError
 	switch {
 	case errors.As(err, &cancel) && f.State == driver.JobStateDiscarded && !errors.Is(err, ErrOutputTooLarge):
-		// A Cancel for an output past Config.MaxOutputBytes, the client's
-		// or the worker's, is logged as a discard, below, at error level.
+		// The worker's Cancel for an output past Config.MaxOutputBytes is
+		// logged as the client's discard of one is, below, at error level.
 		c.logger.InfoContext(ctx, "hopper: job canceled by worker", "job_id", row.ID, "kind", row.Kind, "error", err)
 	case f.State == driver.JobStateCanceled:
 		c.logger.InfoContext(ctx, "hopper: job canceled", "job_id", row.ID, "kind", row.Kind)

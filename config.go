@@ -44,9 +44,13 @@ type Config struct {
 	// smaller output set since, is discarded with it, as if the worker had
 	// returned Cancel; CompleteTx refuses to complete it, and a lease's
 	// Finish and FinishTx refuse such a LeaseResult.Output of a
-	// completion, writing nothing, and drop it from a failure. Each workflow step that reads its dependencies' outputs
+	// completion, writing nothing, and drop it from a failure. Each
+	// workflow step that reads its dependencies' outputs
 	// (StepOpts.Dependencies) is claimed with them, so the cap, set on
-	// every client that runs them, also bounds each output a claim carries.
+	// every client that runs them, also bounds each output a claim carries,
+	// as Codec encoded it: PostgreSQL keeps outputs as jsonb, whose text,
+	// as a claim and JobGet return it, can be longer, with a space after
+	// each comma and colon and each number in full (1e+100 as 101 digits).
 	// Zero, the default, sets no limit.
 	MaxOutputBytes int
 	// JobTimeout is how long a job may run before its context is canceled,
@@ -58,7 +62,9 @@ type Config struct {
 	// OnError is called for every failed attempt this client runs, of any
 	// kind, with the worker's error: a returned error, a recovered panic
 	// (*PanicError), a timeout (ErrJobTimeout), a Cancel, or a kind with no
-	// worker (*UnknownKindError). It is not called for a Snooze, nor when the
+	// worker (*UnknownKindError), or, for a worker that returned nil after
+	// SetOutput refused its output (MaxOutputBytes), that refusal
+	// (ErrOutputTooLarge). It is not called for a Snooze, nor when the
 	// job was canceled with JobCancel or the client is stopping, nor for a
 	// job the leader rescues from a lost client or RescueStuckAfter. What it
 	// returns overrides the outcome; the zero ErrorOutcome keeps it. It runs

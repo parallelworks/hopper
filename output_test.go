@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/parallelworks/hopper"
 
@@ -46,7 +47,6 @@ func TestCompleteTxRefusesARefusedOutput(t *testing.T) {
 		Workers:        workers,
 		MaxOutputBytes: 64,
 	})
-	c.SetTuning(fastTuning)
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -54,8 +54,13 @@ func TestCompleteTxRefusesARefusedOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := <-refused; !errors.Is(err, hopper.ErrOutputTooLarge) {
-		t.Fatalf("CompleteTx after a refused output = %v, want ErrOutputTooLarge", err)
+	select {
+	case err := <-refused:
+		if !errors.Is(err, hopper.ErrOutputTooLarge) {
+			t.Fatalf("CompleteTx after a refused output = %v, want ErrOutputTooLarge", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the job's worker did not run")
 	}
 	if j := waitForJob(t, c, res.Job.ID, hopper.JobStateDiscarded, hopper.JobStateCompleted, hopper.JobStateRetryable); j.State != hopper.JobStateDiscarded || j.Attempt != 1 || len(j.Output) != 0 {
 		t.Errorf("job = %s at attempt %d with %d bytes of output, want discarded at once without one", j.State, j.Attempt, len(j.Output))

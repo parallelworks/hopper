@@ -11,7 +11,8 @@ import (
 // Worker performs one kind of job. Embed WorkerDefaults to get default
 // Timeout and NextRetry implementations.
 type Worker[T JobArgs] interface {
-	// Work runs the job. Returning nil completes it. Returning an error
+	// Work runs the job. Returning nil completes it, unless SetOutput
+	// refused its output (Config.MaxOutputBytes). Returning an error
 	// schedules a retry with backoff, or discards the job when it is out of
 	// attempts. Return Snooze(d) to run again later without using an attempt
 	// and Cancel(err) to discard now.

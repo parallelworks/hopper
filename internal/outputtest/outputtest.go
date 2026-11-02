@@ -23,13 +23,15 @@ const limit = 64
 func sized(n int) string { return strings.Repeat("x", n-2) }
 
 // step is a job whose worker sets each of Outputs in turn, an output of
-// that many bytes encoded, and returns nil, ReturnErr's error, or with
-// ReturnSetOutput what the last SetOutput returned.
+// that many bytes encoded, and returns nil, ReturnErr's error, with
+// ReturnSetOutput what the last SetOutput returned, or with ReturnFirst
+// what the first returned.
 type step struct {
 	Name            string `json:"name"`
 	Outputs         []int  `json:"outputs,omitempty"`
 	ReturnErr       bool   `json:"return_err,omitempty"`
 	ReturnSetOutput bool   `json:"return_set_output,omitempty"`
+	ReturnFirst     bool   `json:"return_first,omitempty"`
 }
 
 func (step) Kind() string { return "output_step" }
@@ -63,6 +65,8 @@ func (r *recorder) work(ctx context.Context, job *hopper.Job[step]) error {
 		return errors.New("worker failed")
 	case job.Args.ReturnSetOutput && len(errs) > 0:
 		return errs[len(errs)-1]
+	case job.Args.ReturnFirst && len(errs) > 0:
+		return errs[0]
 	}
 	return nil
 }
@@ -80,7 +84,7 @@ func (r *recorder) get(name string) ([]error, []driver.Dependency) {
 func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx]) {
 	t.Helper()
 	ctx := context.Background()
-	start := func(t *testing.T, max int) (*hopper.Client[TTx], *recorder) {
+	start := func(t *testing.T, maxOutput int) (*hopper.Client[TTx], *recorder) {
 		t.Helper()
 		rec := &recorder{errs: map[string][]error{}, deps: map[string][]driver.Dependency{}}
 		workers := hopper.NewWorkers()
@@ -91,7 +95,7 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 			},
 			Workers:        workers,
 			Logger:         slog.New(slog.DiscardHandler),
-			MaxOutputBytes: max,
+			MaxOutputBytes: maxOutput,
 			PollInterval:   20 * time.Millisecond,
 		})
 		if err != nil {
@@ -134,7 +138,7 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 	t.Run("limit", func(t *testing.T) {
 		c, rec := start(t, limit)
 		at := insert(t, c, step{Name: "at", Outputs: []int{limit}}, 1)
-		if errs, _ := rec.get("at"); at.State != hopper.JobStateCompleted || len(at.Output) != limit || errs[0] != nil {
+		if errs, _ := rec.get("at"); at.State != hopper.JobStateCompleted || len(at.Output) != limit || len(errs) != 1 || errs[0] != nil {
 			t.Errorf("output of exactly the limit: %s, %d bytes, SetOutput = %v; want completed with it", at.State, len(at.Output), errs)
 		}
 
@@ -145,7 +149,7 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 			tooLarge.Size != limit+1 || tooLarge.Limit != limit {
 			t.Fatalf("SetOutput of one byte past the limit = %v, want an *OutputTooLargeError of %d against %d", errs, limit+1, limit)
 		}
-		if over.State != hopper.JobStateDiscarded || over.Attempt != 1 || len(over.Errors) != 1 || !strings.Contains(over.Errors[0].Error, "MaxOutputBytes") {
+		if over.State != hopper.JobStateDiscarded || over.Attempt != 1 || len(over.Errors) != 1 || over.Errors[0].Error != errs[1].Error() {
 			t.Errorf("job whose worker returned nil after the refusal: %s at attempt %d, errors %v; want discarded with it at once", over.State, over.Attempt, over.Errors)
 		}
 		if len(over.Output) != 8 {
@@ -160,6 +164,11 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 		returned := insert(t, c, step{Name: "returned", Outputs: []int{limit + 1}, ReturnSetOutput: true}, 3)
 		if returned.State != hopper.JobStateDiscarded || returned.Attempt != 1 || len(returned.Errors) != 1 || !strings.Contains(returned.Errors[0].Error, "MaxOutputBytes") {
 			t.Errorf("job whose worker returned SetOutput's refusal: %s at attempt %d, errors %v; want discarded with it at once", returned.State, returned.Attempt, returned.Errors)
+		}
+
+		first := insert(t, c, step{Name: "first", Outputs: []int{limit + 1, limit + 2}, ReturnFirst: true}, 3)
+		if first.State != hopper.JobStateDiscarded || first.Attempt != 1 || len(first.Errors) != 1 || !strings.Contains(first.Errors[0].Error, "MaxOutputBytes") {
+			t.Errorf("job whose worker returned an earlier refusal: %s at attempt %d, errors %v; want discarded with it at once", first.State, first.Attempt, first.Errors)
 		}
 
 		failed := insert(t, c, step{Name: "failed", Outputs: []int{limit + 1}, ReturnErr: true}, 1)

@@ -1198,8 +1198,9 @@ RETURNING j.*;
   a reference to where it stored the large one, or return an error. The refusal is
   remembered until a later `SetOutput` sets an output within the limit: `CompleteTx`
   returns it rather than complete the job, and an attempt whose worker returns nil, or
-  returns the refusal itself (`return hopper.SetOutput(ctx, v)`, or `CompleteTx`'s
-  error), is discarded with it, as if the worker had returned `Cancel`. Completing it
+  returns a refusal (`return hopper.SetOutput(ctx, v)`, or `CompleteTx`'s error), is
+  discarded with it, as if the worker had returned `Cancel`, though its error reads as
+  the refusal, not as the worker's cancel. Completing it
   would hand `Await` and the steps that read it no output, or an older one, as if the
   job had produced it; and retrying it would redo the work to produce the same output
   again, so it is not retried, though `OnError` can choose a retry for a job whose
@@ -1209,7 +1210,10 @@ RETURNING j.*;
   the same way and write nothing: the holder keeps the lease, to finish again with a
   smaller output or an error, and one that never does has the lease expire. A
   failure's output is encoded only if the failure ends the job, as before, and one
-  past the limit is dropped, so a holder can always report a failure.
+  past the limit is dropped, so a holder can always report a failure. The cap is on
+  the encoded output: PostgreSQL keeps it as jsonb, whose text, as `JobGet` and a
+  claim's dependencies return it, can be longer, with a space after each comma and
+  colon and each number in full (`1e+100` as 101 digits).
 
 ### 7.5 Finalize
 Results are buffered and written by a per-client finalizer. It flushes every 25ms or

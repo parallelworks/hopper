@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -422,9 +421,9 @@ func (l *Leases[TTx]) result(ctx context.Context, exec driver.Executor, token Le
 	// dropped if it is past the limit, so the failure is still recorded.
 	var output []byte
 	encode := func() error {
-		data, err := c.cfg.Codec.Marshal(res.Output)
+		data, err := encodeOutput(c.cfg.Codec, res.Output)
 		if err != nil {
-			return fmt.Errorf("hopper: encode output: %w", err)
+			return err
 		}
 		if err := checkOutput(data, c.cfg.MaxOutputBytes); err != nil {
 			return err

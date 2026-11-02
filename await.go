@@ -35,12 +35,13 @@ type attempt struct {
 	loggerOnce sync.Once
 	logger     *slog.Logger
 
-	// maxOutput is Config.MaxOutputBytes. outputErr is SetOutput's refusal
-	// of an output past it, until a later SetOutput sets one.
+	// maxOutput is Config.MaxOutputBytes.
 	maxOutput int
 
-	mu        sync.Mutex
-	output    json.RawMessage
+	mu     sync.Mutex
+	output json.RawMessage
+	// outputErr is SetOutput's refusal of an output past maxOutput, until
+	// a later SetOutput sets one.
 	outputErr error
 	completed *driver.JobFinalize
 	// heldByTx reports that a transaction of the worker's wrote the job's
@@ -114,6 +115,16 @@ func checkOutput(data []byte, limit int) error {
 	return nil
 }
 
+// encodeOutput encodes a job's output with codec, for SetOutput and a
+// lease's result.
+func encodeOutput(codec Codec, v any) ([]byte, error) {
+	data, err := codec.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("hopper: encode output: %w", err)
+	}
+	return data, nil
+}
+
 func (a *attempt) completedTx() *driver.JobFinalize {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -136,18 +147,18 @@ var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 // limit, the refusal stands: CompleteTx returns it, and an attempt whose
 // worker returns nil is discarded with it, as if the worker had returned
 // Cancel, rather than complete without the output its dependents and
-// Await expect. So is one whose worker returns the refusal itself, as
+// Await expect. So is one whose worker returns a refusal, as
 // `return hopper.SetOutput(ctx, v)` does, rather than retry to produce the
-// same output. A worker that returns an error of its own fails as that
-// error says.
+// same output. The attempt's error is the refusal's. A worker that returns
+// an error of its own fails as that error says.
 func SetOutput(ctx context.Context, v any) error {
 	a, _ := ctx.Value(attemptKey{}).(*attempt)
 	if a == nil {
 		return ErrNotInJob
 	}
-	data, err := a.codec.Marshal(v)
+	data, err := encodeOutput(a.codec, v)
 	if err != nil {
-		return fmt.Errorf("hopper: encode output: %w", err)
+		return err
 	}
 	err = checkOutput(data, a.maxOutput)
 	a.mu.Lock()
