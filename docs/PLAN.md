@@ -2120,16 +2120,22 @@ rates:
 claiming, rather than when `ctx` expires. Either cancels a job's context with
 `ErrClientStopped` as its cause.
 
-A job whose worker returns the stop's cancellation (`ctx.Err()`, or an error wrapping
-it) is finalized as a `Snooze(0)` is, with `ErrClientStopped` as its snooze reason: it
-gets its attempt back and runs again at once on another client. The stop is not the
-job's failure, so it neither counts against `MaxAttempts`, which would discard a job
-interrupted on its last attempt, nor goes to `Config.OnError`; the job's timeout still
-bounds each run. A worker that returns nil, `Snooze` or `Cancel` is finalized as it
-says, and any other error, a panic say, is a failure: retried at once with its attempt
-counted (dead-lettered on the last), as is a job interrupted by a fence (§7.6), like
-the rescue that may already have run it. The lease keeps being renewed until the
-finalizer has flushed, so a long drain cannot let it lapse.
+An attempt the stop canceled does not count. A job whose worker then returns an error,
+whatever it is, is retried at once with its attempt given back, its last attempt too:
+the stop is not the job's failure, and counting it would let routine deploys use up a
+job's attempts and dead-letter one interrupted on its last. The error, with a panic's
+trace, is recorded in `Errors` and logged, and `Config.OnError` is called, as for any
+failure. An outcome the hook chooses applies (its hook context is not canceled), and a
+retry it chooses also gives the attempt back. The finalize is a retry with `Snooze`
+set, which gives the attempt back, and an `Error`, which is appended: the rerun has
+the same attempt number, so `Errors` holds an entry for each run of it, and, as for a
+snooze, the interrupted run's log replaces that of an earlier snoozed or interrupted run
+of the same number. A worker that returns
+nil, `Snooze`, `Cancel` or an output refusal (`ErrOutputTooLarge`) is finalized as it
+says, and the job's timeout still bounds each run. A job interrupted by a fence (§7.6)
+keeps its attempt counted, as the rescue that may already have run it would. The lease
+keeps being renewed until the finalizer has flushed, so a long drain cannot let it
+lapse.
 
 The calls may overlap: the first stops the client, and the others wait for it to
 stop, until their own `ctx` expires, and return nil once it has, or `ctx.Err()`. Only

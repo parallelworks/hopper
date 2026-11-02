@@ -321,7 +321,7 @@ func (c *Client[TTx]) finalized(job *driver.JobRow, result driver.JobFinalize) {
 	if result.Error != nil {
 		errText = result.Error.Error
 	}
-	if result.Snooze {
+	if result.Snooze && result.Error == nil {
 		errText = result.SnoozeReason
 	}
 	switch result.State {
@@ -435,16 +435,17 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // waiting for the jobs to finish. It then waits, as Stop does, for the
 // workers to return and their results to be flushed, until ctx expires.
 //
-// A job whose worker returns the cancellation, ctx.Err() or an error that
-// wraps it, is given its attempt back and runs again at once, as if its
-// worker had returned Snooze(0): the stop is not the job's failure, so it
-// neither counts against MaxAttempts nor discards a job on its last
-// attempt, and Config.OnError is not called. The job's timeout still
-// bounds each run. A worker that returns nil completes the job, and one
-// that returns Snooze or Cancel snoozes or discards it; any other error,
-// such as a panic, is a failure, retried at once with its attempt counted,
-// or, on the job's last attempt, discarded. The same holds for the jobs a
-// Stop cancels when its ctx expires.
+// An attempt canceled this way does not count against MaxAttempts: a job
+// whose worker then returns an error, whatever it is, is retried at once,
+// its last attempt too, with the attempt given back. The error, with a
+// panic's trace, is recorded in the job's Errors and logged, and
+// Config.OnError is called, as for any failure; an outcome it chooses
+// applies, and a retry it chooses also gives the attempt back. The rerun
+// has the same attempt number, so Errors holds an entry for each run of
+// it. A worker that returns nil, Snooze, Cancel or an output refusal
+// (ErrOutputTooLarge) completes, snoozes or discards the job as usual. The
+// job's timeout still bounds each run. The same holds for the jobs a Stop
+// cancels when its ctx expires.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	return c.stop(ctx, true)
 }

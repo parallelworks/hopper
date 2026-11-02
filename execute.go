@@ -230,28 +230,29 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 	// its refusal discards the job, unless JobCancel canceled it first.
 	tooLarge := errors.Is(err, ErrOutputTooLarge)
 	canceled := errors.Is(context.Cause(jobCtx), ErrJobCanceled)
+	// The client's stop canceled the attempt (StopAndCancel, or a Stop's
+	// deadline): the attempt is not counted, so the job runs again, its
+	// last attempt too, and its failure is recorded and handled as any is.
+	stopped := errors.Is(context.Cause(ctx), ErrClientStopped)
+	giveBack := stopped && !byWorker && !tooLarge
 	switch {
 	case !byWorker && canceled:
 		f.State = driver.JobStateCanceled
 		return f
-	case !byWorker && stopInterrupted(ctx, err):
-		// The client canceled the job to stop (StopAndCancel, or a Stop's
-		// deadline), and the worker returned for it. That is not the job's
-		// failure: it gets its attempt back, its last one too, and runs
-		// again at once elsewhere.
-		return snoozed(row, 0, ErrClientStopped.Error())
-	case !byWorker && !tooLarge && ctx.Err() != nil && row.Attempt < row.MaxAttempts:
-		// The client was fenced, or is stopping, and canceled the job,
-		// which failed: retry it immediately, as a rescue would, counting
-		// the attempt. On its last attempt it is dead-lettered instead, as
-		// a rescued job would be.
+	case !byWorker && !tooLarge && !stopped && ctx.Err() != nil && row.Attempt < row.MaxAttempts:
+		// The client was fenced and canceled the job, which a rescue may
+		// already have run again: retry it immediately, as the rescue
+		// would. On its last attempt it is dead-lettered instead, as a
+		// rescued job would be.
 		f.State = driver.JobStateRetryable
 		return f
 	}
 	// A job canceled with JobCancel stays finished even if its worker
 	// returned Cancel: the hook must not reschedule it.
-	if known && !canceled && ctx.Err() == nil {
-		o := c.onError(ctx, row, err)
+	if known && !canceled && (ctx.Err() == nil || stopped) {
+		// The hook of an attempt the stop canceled gets a context that is
+		// not, so that it can still use the database.
+		o := c.onError(context.WithoutCancel(ctx), row, err)
 		// So does a JobCancel that arrived while the hook ran.
 		if errors.Is(context.Cause(jobCtx), ErrJobCanceled) {
 			f.State = driver.JobStateCanceled
@@ -266,27 +267,26 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 			return f
 		case o.Snooze > 0:
 			return snoozed(row, o.Snooze, err.Error())
-		case !o.RetryAt.IsZero() && row.Attempt < row.MaxAttempts:
+		case !o.RetryAt.IsZero() && (row.Attempt < row.MaxAttempts || giveBack):
 			f.State = driver.JobStateRetryable
 			f.Delay = max(time.Until(o.RetryAt), 0)
+			f.Snooze = giveBack
 			return f
 		}
 	}
-	if byWorker || tooLarge || row.Attempt >= row.MaxAttempts {
+	switch {
+	case giveBack:
+		// Snooze gives the attempt back; the error is recorded all the
+		// same, so Errors holds two entries of the attempt's number.
+		f.State = driver.JobStateRetryable
+		f.Snooze = true
+	case byWorker || tooLarge || row.Attempt >= row.MaxAttempts:
 		f.State = driver.JobStateDiscarded
-	} else {
+	default:
 		f.State = driver.JobStateRetryable
 		f.Delay = c.retryDelay(row, qcfg, unit)
 	}
 	return f
-}
-
-// stopInterrupted reports whether the client's stop canceled ctx and err
-// is that cancellation, as a worker returns ctx.Err() or an error that
-// wraps it. Any other error, a panic say, is the job's own failure.
-func stopInterrupted(ctx context.Context, err error) bool {
-	return errors.Is(context.Cause(ctx), ErrClientStopped) &&
-		(errors.Is(err, context.Canceled) || errors.Is(err, ErrClientStopped))
 }
 
 // snoozed is the result of an attempt snoozed for d, which gives the attempt
@@ -298,12 +298,12 @@ func snoozed(row *driver.JobRow, d time.Duration, reason string) driver.JobFinal
 	}
 }
 
-// logOutcome logs a failed attempt's outcome. An attempt the client's stop
-// gave back, and a retry because the client was fenced or is stopping, are
-// not logged.
+// logOutcome logs a failed attempt's outcome. A retry because the client
+// was fenced is not the job's fault and is not logged; an attempt the
+// client's stop canceled is logged as any failure is.
 func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driver.JobFinalize, err error) {
 	var snooze *SnoozeError
-	if f.Snooze && !errors.As(err, &snooze) && f.SnoozeReason != ErrClientStopped.Error() {
+	if f.Snooze && f.State == driver.JobStateScheduled && !errors.As(err, &snooze) {
 		c.logger.InfoContext(ctx, "hopper: job failed; snoozed by Config.OnError", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "snooze", f.Delay, "error", err)
 		return
 	}
@@ -318,7 +318,7 @@ func (c *Client[TTx]) logOutcome(ctx context.Context, row *driver.JobRow, f driv
 		c.logger.InfoContext(ctx, "hopper: job canceled", "job_id", row.ID, "kind", row.Kind)
 	case f.State == driver.JobStateDiscarded:
 		c.logger.ErrorContext(ctx, "hopper: job discarded", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "error", err)
-	case ctx.Err() == nil:
+	case ctx.Err() == nil || errors.Is(context.Cause(ctx), ErrClientStopped):
 		c.logger.WarnContext(ctx, "hopper: job failed", "job_id", row.ID, "kind", row.Kind, "attempt", row.Attempt, "retry_in", f.Delay, "error", err)
 	}
 }

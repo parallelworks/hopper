@@ -274,8 +274,9 @@ for a queue's completed jobs entirely, for maximum throughput.
   gives up leadership, waits for running jobs, flushes results and releases
   the lease. If the stop context expires first, running jobs are canceled;
   `StopAndCancel` cancels them at once. A canceled job whose worker returns
-  the cancellation in time gets its attempt back and runs again immediately
-  elsewhere, and the rest are rescued after the TTL. `Stopped()` is closed once the client has
+  an error in time is recorded as failed but gets its attempt back, so it
+  runs again immediately elsewhere (its `Errors` then hold two entries with
+  the same attempt number), and the rest are rescued after the TTL. `Stopped()` is closed once the client has
   stopped.
 
 ## Dead letters

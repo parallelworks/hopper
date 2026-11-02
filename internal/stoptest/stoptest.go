@@ -21,9 +21,9 @@ type block struct{}
 func (block) Kind() string { return "stoptest_block" }
 
 // Run checks that StopAndCancel cancels a running job at once, with
-// ErrClientStopped as its context's cause, and gives the job its attempt
-// back, its last one too, so another client runs it again and completes
-// it.
+// ErrClientStopped as its context's cause, records the attempt's error and
+// gives the job its attempt back, its last one too, so another client runs
+// it again and completes it.
 func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx]) {
 	t.Helper()
 	ctx := context.Background()
@@ -79,8 +79,8 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if j.State.Terminal() || j.Attempt != 0 || len(j.Errors) != 0 {
-		t.Fatalf("job after StopAndCancel: %s at attempt %d, errors %v; want waiting with its only attempt given back", j.State, j.Attempt, j.Errors)
+	if j.State != hopper.JobStateRetryable || j.Attempt != 0 || len(j.Errors) != 1 || j.Errors[0].Attempt != 1 {
+		t.Fatalf("job after StopAndCancel: %s at attempt %d, errors %v; want retryable with the interrupted attempt's error, the attempt given back", j.State, j.Attempt, j.Errors)
 	}
 
 	second := start(t, func(context.Context, *hopper.Job[block]) error { return nil })

@@ -753,10 +753,10 @@ func TestStopDeadlineCancelsJobs(t *testing.T) {
 	if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Stop = %v, want DeadlineExceeded", err)
 	}
-	// The interrupted job was given its attempt back, to run again right
-	// away.
+	// The interrupted job was given its attempt back, with its error
+	// recorded, to run again right away.
 	job, err := c.JobGet(ctx, res.Job.ID)
-	if err != nil || job.State != hopper.JobStateScheduled || job.Attempt != 0 || len(job.Errors) != 0 || job.SnoozeReason != hopper.ErrClientStopped.Error() {
+	if err != nil || job.State != hopper.JobStateRetryable || job.Attempt != 0 || len(job.Errors) != 1 {
 		t.Errorf("job after hard stop = %+v, %v", job, err)
 	}
 }

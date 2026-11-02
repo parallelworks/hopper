@@ -253,3 +253,47 @@ func testSnoozeReasonConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		}
 	}
 }
+
+// testRetryGivesAttemptBack finalizes a retry with Snooze and an Error, as
+// the client does for an attempt its stop canceled: the error is appended,
+// with its trace, and the attempt is given back, the last one too, so the
+// job is claimed again under the same attempt number and its errors hold
+// an entry for each run of it.
+func testRetryGivesAttemptBack[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := executor(d, noBatches)
+	p := params("k", 1)
+	p[0].MaxAttempts = 1
+	id := insert(ctx, t, exec, p)[0].Job.ID
+	clientID := register(ctx, t, exec)
+	for run := 1; run <= 2; run++ {
+		f.MakeClaimable(ctx, t, d, id)
+		jobs := claim(ctx, t, exec, clientID, 1)
+		if len(jobs) != 1 || jobs[0].ID != id || jobs[0].Attempt != 1 {
+			t.Fatalf("claim %d = %+v, want the job on attempt 1", run, jobs)
+		}
+		res := driver.JobFinalize{
+			ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Snooze: true,
+			Error: &driver.AttemptError{Attempt: 1, Fence: jobs[0].Fence, Error: "interrupted", Trace: "stack"},
+		}
+		if applied := finalizeCurrent(ctx, t, exec, res); len(applied) != 1 {
+			t.Fatalf("retry %d not applied", run)
+		}
+		j, err := exec.JobGet(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if j.State != driver.JobStateRetryable || j.Attempt != 0 || len(j.Errors) != run {
+			t.Fatalf("job after retry %d: %s at attempt %d with %d errors; want retryable at attempt 0 with %d", run, j.State, j.Attempt, len(j.Errors), run)
+		}
+		for _, e := range j.Errors {
+			if e.Attempt != 1 || e.Error != "interrupted" || e.Trace != "stack" || e.At.IsZero() {
+				t.Errorf("error after retry %d = %+v, want attempt 1's, with its trace and time", run, e)
+			}
+		}
+		if j.SnoozeReason != "" {
+			t.Errorf("retried job has snooze reason %q", j.SnoozeReason)
+		}
+	}
+}

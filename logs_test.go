@@ -745,7 +745,7 @@ func TestLogStoreHardStop(t *testing.T) {
 	if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Stop = %v, want DeadlineExceeded", err)
 	}
-	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State != hopper.JobStateScheduled || job.SnoozeReason != hopper.ErrClientStopped.Error() {
+	if job, err := c.JobGet(ctx, res.Job.ID); err != nil || job.State != hopper.JobStateRetryable || job.Attempt != 0 {
 		t.Errorf("job after a hard stop with the store's Close blocked = %+v, %v", job, err)
 	}
 }
