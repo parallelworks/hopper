@@ -1198,8 +1198,9 @@ RETURNING j.*;
   a reference to where it stored the large one, or return an error. The refusal is
   remembered until a later `SetOutput` sets an output within the limit: `CompleteTx`
   returns it rather than complete the job, and an attempt whose worker returns nil, or
-  returns a refusal (`return hopper.SetOutput(ctx, v)`, or `CompleteTx`'s error), is
-  discarded with it, as if the worker had returned `Cancel`, though its error reads as
+  returns a refusal (any error matching `ErrOutputTooLarge`, as `return
+  hopper.SetOutput(ctx, v)` and `CompleteTx`'s error do, whatever `CompleteTx` did
+  before unless its transaction committed), is discarded with it, as if the worker had returned `Cancel`, though its error reads as
   the refusal, not as the worker's cancel. Completing it
   would hand `Await` and the steps that read it no output, or an older one, as if the
   job had produced it; and retrying it would redo the work to produce the same output

@@ -67,6 +67,46 @@ func TestCompleteTxRefusesARefusedOutput(t *testing.T) {
 	}
 }
 
+// A worker that completed its job with CompleteTx, then had an output
+// refused and rolled its transaction back, returning the refusal, has its
+// job discarded, not retried: a returned refusal discards whatever
+// CompleteTx did.
+func TestCompleteTxRolledBackAfterARefusal(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(ctx context.Context, job *hopper.Job[noop]) error {
+		tx, err := h.pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+		if err := hopper.SetOutput(ctx, "small"); err != nil {
+			return err
+		}
+		if err := hopper.CompleteTx(ctx, tx, job); err != nil {
+			return err
+		}
+		return hopper.SetOutput(ctx, strings.Repeat("x", 100))
+	})
+	c := h.client(&hopper.Config{
+		Queues:         map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers:        workers,
+		MaxOutputBytes: 64,
+	})
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	res, err := c.Insert(ctx, noop{}, &hopper.InsertOpts{MaxAttempts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j := waitForJob(t, c, res.Job.ID, hopper.JobStateDiscarded, hopper.JobStateCompleted, hopper.JobStateRetryable); j.State != hopper.JobStateDiscarded || j.Attempt != 1 {
+		t.Errorf("job = %s at attempt %d, want discarded at once", j.State, j.Attempt)
+	}
+}
+
 func TestMaxOutputBytesIsChecked(t *testing.T) {
 	t.Parallel()
 	if _, err := hopper.NewClient(newHarness(t).d, &hopper.Config{MaxOutputBytes: -1}); err == nil {

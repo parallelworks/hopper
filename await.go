@@ -147,9 +147,10 @@ var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 // limit, the refusal stands: CompleteTx returns it, and an attempt whose
 // worker returns nil is discarded with it, as if the worker had returned
 // Cancel, rather than complete without the output its dependents and
-// Await expect. So is one whose worker returns a refusal, as
-// `return hopper.SetOutput(ctx, v)` does, rather than retry to produce the
-// same output. The attempt's error is the refusal's. A worker that returns
+// Await expect. So is one whose worker returns a refusal (an error
+// matching ErrOutputTooLarge), as `return hopper.SetOutput(ctx, v)` does,
+// rather than retry to produce the same output, unless a CompleteTx of the
+// attempt committed. The attempt's error is the refusal's. A worker that returns
 // an error of its own fails as that error says.
 func SetOutput(ctx context.Context, v any) error {
 	a, _ := ctx.Value(attemptKey{}).(*attempt)

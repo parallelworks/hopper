@@ -48,21 +48,21 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 
 	unit, err := c.runWorker(jobCtx, row)
 	completed := a.completedTx()
-	if refused := a.refusedOutput(); refused != nil && completed == nil {
-		// An attempt whose worker returned nil although SetOutput refused
-		// its output is not completed: the job would hand its dependents
-		// and Await no output, or an older one. Nor is one whose worker
-		// returned a refusal, as `return hopper.SetOutput(ctx, v)` and
-		// CompleteTx's error do, retried: the output's size will not change
-		// on a retry. Either is discarded as a Cancel is, but recorded as
-		// the refusal, not as the worker's cancel.
-		var workerCancel *CancelError
-		switch {
-		case err == nil:
-			err = &outputRefusedError{err: refused}
-		case errors.Is(err, ErrOutputTooLarge) && !errors.As(err, &workerCancel):
-			err = &outputRefusedError{err: err}
-		}
+	// An attempt whose worker returned nil although SetOutput refused its
+	// output is not completed: the job would hand its dependents and Await
+	// no output, or an older one. Nor is one whose worker returned an error
+	// that is a refusal (ErrOutputTooLarge), as `return hopper.SetOutput(ctx,
+	// v)` and CompleteTx's error are, retried, whatever CompleteTx did: the
+	// output's size will not change on a retry. Either is discarded as a
+	// Cancel is, but recorded as the refusal, not as the worker's cancel. A
+	// CompleteTx whose transaction committed has completed the job all the
+	// same, below.
+	var workerCancel *CancelError
+	switch refused := a.refusedOutput(); {
+	case err == nil && completed == nil && refused != nil:
+		err = &outputRefusedError{err: refused}
+	case errors.Is(err, ErrOutputTooLarge) && !errors.As(err, &workerCancel):
+		err = &outputRefusedError{err: err}
 	}
 	state := txUnknown
 	if completed != nil {
