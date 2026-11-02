@@ -25,6 +25,8 @@ var ErrJobFenced = driver.ErrJobFenced
 // completion, once tx commits; on Postgres, a dependent with an any-of
 // group (StepOpts.AfterAny) is promoted by the client once the worker has
 // returned and the client has seen tx commit, or by the leader's sweep.
+// If SetOutput refused the last output it was given (Config.MaxOutputBytes),
+// CompleteTx returns that refusal and writes nothing.
 //
 // The completion is fenced like every finalize: if the attempt no longer
 // owns the job, nothing is written and ErrJobFenced is returned, and the
@@ -71,6 +73,9 @@ func CompleteTx[TTx any, T JobArgs](ctx context.Context, tx TTx, job *Job[T]) er
 	id := a.completion.ID
 	if job == nil || job.JobRow == nil || job.ID != id {
 		return fmt.Errorf("hopper: complete job: ctx belongs to job %s, not this one", id)
+	}
+	if err := a.refusedOutput(); err != nil {
+		return err
 	}
 	exec, err := txExecutor(ctx, tx, id)
 	if err != nil {

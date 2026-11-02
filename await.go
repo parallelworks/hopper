@@ -35,8 +35,13 @@ type attempt struct {
 	loggerOnce sync.Once
 	logger     *slog.Logger
 
+	// maxOutput is Config.MaxOutputBytes. outputErr is SetOutput's refusal
+	// of an output past it, until a later SetOutput sets one.
+	maxOutput int
+
 	mu        sync.Mutex
 	output    json.RawMessage
+	outputErr error
 	completed *driver.JobFinalize
 	// heldByTx reports that a transaction of the worker's wrote the job's
 	// row (CompleteTx, RecordStepTx, RecordCursorTx), which it may still
@@ -74,6 +79,41 @@ func (a *attempt) get() json.RawMessage {
 	return a.output
 }
 
+// refusedOutput returns SetOutput's refusal of the last output it was
+// given, if it refused it.
+func (a *attempt) refusedOutput() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.outputErr
+}
+
+// ErrOutputTooLarge is what an *OutputTooLargeError matches with
+// errors.Is.
+var ErrOutputTooLarge = errors.New("hopper: output larger than Config.MaxOutputBytes")
+
+// OutputTooLargeError reports a job's output larger than
+// Config.MaxOutputBytes: Size bytes as the client's Codec encoded it,
+// against Limit.
+type OutputTooLargeError struct {
+	Size, Limit int
+}
+
+func (e *OutputTooLargeError) Error() string {
+	return fmt.Sprintf("hopper: output of %d bytes is larger than Config.MaxOutputBytes (%d)", e.Size, e.Limit)
+}
+
+// Is reports whether target is ErrOutputTooLarge.
+func (e *OutputTooLargeError) Is(target error) bool { return target == ErrOutputTooLarge }
+
+// checkOutput returns an *OutputTooLargeError if data is larger than
+// limit, a limit of zero being none.
+func checkOutput(data []byte, limit int) error {
+	if limit > 0 && len(data) > limit {
+		return &OutputTooLargeError{Size: len(data), Limit: limit}
+	}
+	return nil
+}
+
 func (a *attempt) completedTx() *driver.JobFinalize {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -89,6 +129,15 @@ var ErrNotInJob = errors.New("hopper: context does not belong to a running job")
 // is kept only for archived jobs, so it is lost on queues with
 // DeleteCompleted. A job finalized with CompleteTx stores the output set
 // before that call.
+//
+// An output larger than Config.MaxOutputBytes, encoded, is refused with an
+// *OutputTooLargeError (errors.Is ErrOutputTooLarge), and the output set
+// before it, if any, is kept. Unless a later call sets an output within the
+// limit, the refusal stands: CompleteTx returns it, and an attempt whose
+// worker returns nil is discarded with it, as if the worker had returned
+// Cancel, rather than complete without the output its dependents and
+// Await expect. A worker that returns an error of its own fails as that
+// error says.
 func SetOutput(ctx context.Context, v any) error {
 	a, _ := ctx.Value(attemptKey{}).(*attempt)
 	if a == nil {
@@ -98,10 +147,13 @@ func SetOutput(ctx context.Context, v any) error {
 	if err != nil {
 		return fmt.Errorf("hopper: encode output: %w", err)
 	}
+	err = checkOutput(data, a.maxOutput)
 	a.mu.Lock()
-	a.output = data
+	if a.outputErr = err; err == nil {
+		a.output = data
+	}
 	a.mu.Unlock()
-	return nil
+	return err
 }
 
 // JobFailedError is returned by Await when the job ended other than

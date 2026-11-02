@@ -194,7 +194,9 @@ type LeaseResult struct {
 	Err error
 	// Output is the completed job's output, encoded with Config.Codec and
 	// kept as SetOutput's is. It is ignored unless the attempt ends the
-	// job.
+	// job. One larger than Config.MaxOutputBytes, encoded, has Finish and
+	// FinishTx return an *OutputTooLargeError and change nothing: the lease
+	// is still the holder's, to finish with a smaller output or an error.
 	Output any
 }
 
@@ -415,6 +417,20 @@ func (l *Leases[TTx]) result(ctx context.Context, exec driver.Executor, token Le
 	// it would for its own attempt (NextRetry, and an ordered delivery's
 	// cap); one whose args do not decode leaves it to the retry policies.
 	// Only a failed attempt's retry asks it, so a success decodes nothing.
+	// The output is encoded and checked against Config.MaxOutputBytes
+	// before anything else, so a refused one runs no OnError and writes
+	// nothing: the holder keeps its lease and can finish again.
+	var output []byte
+	if res.Output != nil {
+		data, err := c.cfg.Codec.Marshal(res.Output)
+		if err != nil {
+			return nil, driver.JobFinalize{}, fmt.Errorf("hopper: encode output: %w", err)
+		}
+		if err := checkOutput(data, c.cfg.MaxOutputBytes); err != nil {
+			return nil, driver.JobFinalize{}, err
+		}
+		output = data
+	}
 	var unit workUnit
 	if info, ok := c.workers.lookup(row.Kind); ok && res.Err != nil {
 		if u, err := info.newUnit(row, c.cfg.Codec); err == nil {
@@ -423,12 +439,8 @@ func (l *Leases[TTx]) result(ctx context.Context, exec driver.Executor, token Le
 	}
 	f := c.outcome(context.WithoutCancel(ctx), jobCtx, row, qcfg, unit, res.Err, true)
 	f.AttemptedBy, f.Lease = 0, token.fenceOf()
-	if f.State.Terminal() && res.Output != nil {
-		data, err := c.cfg.Codec.Marshal(res.Output)
-		if err != nil {
-			return nil, driver.JobFinalize{}, fmt.Errorf("hopper: encode output: %w", err)
-		}
-		f.Output = data
+	if f.State.Terminal() {
+		f.Output = output
 	}
 	return row, f, nil
 }

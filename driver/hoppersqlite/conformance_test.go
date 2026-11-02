@@ -14,6 +14,7 @@ import (
 	"github.com/parallelworks/hopper/driver/hoppersqlite"
 	"github.com/parallelworks/hopper/drivertest"
 	"github.com/parallelworks/hopper/hoppermigrate"
+	"github.com/parallelworks/hopper/internal/outputtest"
 )
 
 // open returns a driver on a new database in the test's temporary
@@ -215,4 +216,9 @@ func TestPeriodicRegistrationsGoWithTheirClient(t *testing.T) {
 	if n := rows(); n != 1 {
 		t.Errorf("%d registrations, want only the live client's: a gone client's survived another client's write", n)
 	}
+}
+
+func TestMaxOutputBytes(t *testing.T) {
+	t.Parallel()
+	outputtest.Run(t, fixture{}.NewDriver)
 }

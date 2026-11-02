@@ -31,7 +31,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	defer cancel(nil)
 	a := &attempt{
 		codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt,
-		row: row, baseLogger: c.logger, logs: c.cfg.JobLogs,
+		row: row, baseLogger: c.logger, logs: c.cfg.JobLogs, maxOutput: c.cfg.MaxOutputBytes,
 	}
 	if c.cfg.JobLogs.Store != nil {
 		// The store's Writer gets the row as claimed: the worker changes its
@@ -48,6 +48,12 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 
 	unit, err := c.runWorker(jobCtx, row)
 	completed := a.completedTx()
+	if refused := a.refusedOutput(); err == nil && completed == nil && refused != nil {
+		// The worker returned nil although SetOutput refused its output:
+		// completed, the job would hand its dependents and Await no output,
+		// or an older one. The output's size will not change on a retry.
+		err = Cancel(refused)
+	}
 	state := txUnknown
 	if completed != nil {
 		// CompleteTx wrote the log, or its transaction will, so the
