@@ -532,9 +532,17 @@ func TestPeriodicRunOnStartOnceAcrossReplicas(t *testing.T) {
 		return c
 	}
 	jobs := h.countN
+	dbNow := func() time.Time {
+		var now time.Time
+		if err := h.pool.QueryRow(ctx, "SELECT now()").Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		return now
+	}
+	from := dbNow()
 	leader := start()
 	waitFor(t, leader.IsLeader)
-	waitFor(t, func() bool { return jobs("7") == 1 })
+	waitFor(t, func() bool { return jobs("7") >= 1 })
 	follower := start()
 	time.Sleep(time.Second)
 	if err := follower.Stop(ctx); err != nil {
@@ -544,8 +552,12 @@ func TestPeriodicRunOnStartOnceAcrossReplicas(t *testing.T) {
 	if !leader.IsLeader() {
 		t.Fatal("leadership moved, which runs RunOnStart again")
 	}
-	if n := jobs("7"); n != 1 {
-		t.Errorf("RunOnStart inserted %d jobs as a replica started and stopped, want 1", n)
+	// The job's hourly slots that came due during the test are inserted
+	// besides RunOnStart's, counted up to after the jobs are.
+	n := jobs("7")
+	slots := int(dbNow().Truncate(time.Hour).Sub(from.Truncate(time.Hour)) / time.Hour)
+	if n < 1 || n > 1+slots {
+		t.Errorf("RunOnStart inserted %d jobs as a replica started and stopped, with %d hourly slots due, want 1", n-slots, slots)
 	}
 }
 
