@@ -211,6 +211,12 @@ func (s minutesUntil) Next(t time.Time) time.Time {
 	return next
 }
 
+// neverDue is a cron expression with no slot, as February has no 30th.
+// Unlike noSlots, a client records it for the leader, so a test of stored
+// definitions that counts RunOnStart's job does not depend on a slot coming
+// due while it runs.
+const neverDue = "0 0 30 2 *"
+
 // A job added mid-term whose last slot is old back-fills CatchUp slots, as
 // at the start of a term, and RunOnStart adds its job to them.
 func TestPeriodicJobsAddCatchesUp(t *testing.T) {
@@ -493,7 +499,7 @@ func TestPeriodicStrictKindsRecordsOnlyWorkedKinds(t *testing.T) {
 		Workers:     workers,
 		StrictKinds: true,
 		NeverLead:   true,
-		Periodic:    []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: 8}, &hopper.PeriodicOpts{RunOnStart: true})},
+		Periodic:    []hopper.PeriodicJob{hopper.Cron(neverDue, noop{N: 8}, &hopper.PeriodicOpts{RunOnStart: true})},
 	})
 	if err := strict.Start(ctx); err != nil {
 		t.Fatal(err)
@@ -523,7 +529,7 @@ func TestPeriodicRunOnStartOnceAcrossReplicas(t *testing.T) {
 		c := h.client(&hopper.Config{
 			Queues:   map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
 			Workers:  noopWorkers(),
-			Periodic: []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: 7}, &hopper.PeriodicOpts{RunOnStart: true})},
+			Periodic: []hopper.PeriodicJob{hopper.Cron(neverDue, noop{N: 7}, &hopper.PeriodicOpts{RunOnStart: true})},
 		})
 		c.SetTuning(tun)
 		if err := c.Start(ctx); err != nil {
@@ -560,7 +566,7 @@ func TestPeriodicLeaderStartsWithItsOwnDefinition(t *testing.T) {
 			Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 2}},
 			Workers:   noopWorkers(),
 			NeverLead: neverLead,
-			Periodic:  []hopper.PeriodicJob{hopper.Every(time.Hour, noop{N: n}, &hopper.PeriodicOpts{Name: "x", RunOnStart: true})},
+			Periodic:  []hopper.PeriodicJob{hopper.Cron(neverDue, noop{N: n}, &hopper.PeriodicOpts{Name: "x", RunOnStart: true})},
 		})
 		if err := c.Start(ctx); err != nil {
 			t.Fatal(err)
