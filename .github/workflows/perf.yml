@@ -9,6 +9,8 @@ name: Performance gate
 # scenario, so the side that runs first follows base, head, head, base
 # over the rounds: each side runs first in half of them (ROUNDS must be
 # even), spread evenly over the job so that drift does not favor either.
+# The first half-minute or so of a job is slow on some runners, whichever
+# binary runs, so an unmeasured warm-up comes first.
 # Noise only ever slows a run down, so the faster half of each side's
 # runs, averaged, is what is compared. Each run drains 300,000 jobs
 # (about ten seconds on a runner): a shorter drain measures start-up
@@ -80,6 +82,11 @@ jobs:
       - name: Benchmark base and PR alternately
         run: |
           if (( ROUNDS % 2 )); then echo "ROUNDS must be even" >&2; exit 1; fi
+          for s in throughput insert; do
+            for side in base head; do
+              "$RUNNER_TEMP/bench-$side" -database-url "$DATABASE_URL" -scenarios "$s" -jobs "$JOBS" -schema warmup > /dev/null
+            done
+          done
           for i in $(seq "$ROUNDS"); do
             order="base head"
             if (( i % 4 / 2 )); then order="head base"; fi

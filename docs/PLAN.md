@@ -2402,8 +2402,9 @@ the partition's extension lock, so the data volume has no size limit.
   on a shared runner only slows runs down). The side that runs first follows base, head,
   head, base over the rounds, so each runs first in half of them, spread over the job:
   whether a run comes first or second of a back-to-back pair shifts it by several
-  percent, slower or faster depending on the scenario. `hopperbench -compare` fails the
-  check on a regression of more than 10%.
+  percent, slower or faster depending on the scenario. An unmeasured warm-up comes first,
+  because the first half-minute or so of a job is slow on some runners.
+  `hopperbench -compare` fails the check on a regression of more than 10%.
 - A nightly soak runs the full scenario set at volume with five million history rows
   and keeps the results as an artifact. The 24h soak at 70% of peak, tracking table and
   index size, autovacuum activity and latency drift, runs on the release hardware.
