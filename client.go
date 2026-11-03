@@ -98,10 +98,6 @@ type Client[TTx any] struct {
 	// running maps jobs running on this client to their latest claim here.
 	runningMu sync.Mutex
 	running   map[JobID]*runningJob
-	// stuck holds the watches of this client's workers whose job's context
-	// was canceled and that have not returned (stuckWatch).
-	stuckMu sync.Mutex
-	stuck   map[*stuckWatch]struct{}
 
 	// doneWaiters are Await callers by job.
 	doneMu      sync.Mutex
@@ -139,7 +135,6 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		periodic:     newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
 		events:       newEventBus(),
 		running:      map[JobID]*runningJob{},
-		stuck:        map[*stuckWatch]struct{}{},
 		doneWaiters:  map[JobID][]chan struct{}{},
 		stopped:      make(chan struct{}),
 		logRetention: logRetentionState{gate: make(chan struct{}, 1)},
@@ -559,7 +554,6 @@ func (c *Client[TTx]) shutdown(ctx context.Context, cancelJobs bool) error {
 	// 2. Wait for running jobs. The lease keeps being renewed meanwhile, so
 	// a long drain cannot let it lapse.
 	var stopErr error
-	gaveUp := false
 	if !c.waitForJobs(ctx) {
 		stopErr = ctx.Err()
 		if cancelJobs {
@@ -569,7 +563,10 @@ func (c *Client[TTx]) shutdown(ctx context.Context, cancelJobs bool) error {
 		}
 		c.cancelJobs()
 		graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.tuning.stopGrace)
-		gaveUp = !c.waitForJobs(graceCtx)
+		if !c.waitForJobs(graceCtx) {
+			c.logger.WarnContext(ctx, "hopper: stop gave up on jobs still running; they are rescued once the client is gone",
+				"jobs", c.runningJobs(maxListedJobs))
+		}
 		cancel()
 	}
 	c.finCancel()
@@ -585,13 +582,6 @@ func (c *Client[TTx]) shutdown(ctx context.Context, cancelJobs bool) error {
 	defer cancel()
 	if err := c.exec.ClientDelete(releaseCtx, c.clientID.Load()); err != nil {
 		c.logger.WarnContext(ctx, "hopper: release client lease", "error", err)
-	}
-	// The workers the stop gave up on are reported only now, once the
-	// results of the jobs that did return are flushed and the lease is
-	// released, so that a Config.OnStuck that exits the process loses
-	// neither.
-	if gaveUp {
-		c.reportStuckNow()
 	}
 	c.logger.InfoContext(ctx, "hopper: client stopped", "client_id", c.clientID.Load())
 	return stopErr

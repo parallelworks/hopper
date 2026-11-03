@@ -1,12 +1,15 @@
 package hopper
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -512,6 +515,7 @@ func (c *Client[TTx]) emit(kind EventKind, job *JobRow, errText string) {
 // which a client of the previous release can reset so that a later claim
 // repeats it.
 type runningJob struct {
+	kind   string
 	cancel context.CancelCauseFunc
 }
 
@@ -519,8 +523,8 @@ type runningJob struct {
 // returns the claim for untrackRunning. A job rescued while its attempt
 // still runs here can be claimed here again: the later claim replaces the
 // earlier, whose attempt is canceled, since its result can no longer apply.
-func (c *Client[TTx]) trackRunning(id JobID, cancel context.CancelCauseFunc) *runningJob {
-	r := &runningJob{cancel: cancel}
+func (c *Client[TTx]) trackRunning(id JobID, kind string, cancel context.CancelCauseFunc) *runningJob {
+	r := &runningJob{kind: kind, cancel: cancel}
 	c.runningMu.Lock()
 	prev := c.running[id]
 	c.running[id] = r
@@ -538,6 +542,26 @@ func (c *Client[TTx]) untrackRunning(id JobID, r *runningJob) {
 		delete(c.running, id)
 	}
 	c.runningMu.Unlock()
+}
+
+// maxListedJobs bounds the jobs a stop's give-up warning lists.
+const maxListedJobs = 100
+
+// runningJobs lists the jobs running on this client, as "<id> (<kind>)" in
+// ID order, up to limit of them, and how many more there are.
+func (c *Client[TTx]) runningJobs(limit int) []string {
+	c.runningMu.Lock()
+	ids := slices.SortedFunc(maps.Keys(c.running), func(a, b JobID) int { return bytes.Compare(a[:], b[:]) })
+	jobs := make([]string, 0, min(len(ids), limit+1))
+	for i, id := range ids {
+		if i == limit {
+			jobs = append(jobs, fmt.Sprintf("and %d more", len(ids)-limit))
+			break
+		}
+		jobs = append(jobs, fmt.Sprintf("%s (%s)", id, c.running[id].kind))
+	}
+	c.runningMu.Unlock()
+	return jobs
 }
 
 // cancelLocal cancels a job running on this client, if it is.

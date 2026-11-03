@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,25 +25,16 @@ type stuckArgs struct {
 func (stuckArgs) Kind() string { return "stuck_args" }
 
 // stuckExec is a stopExec that cancels a running job as a database would:
-// the job stays running, and its client is told. It logs the release of
-// the client's lease to logs.
-type stuckExec struct {
-	*stopExec
-	logs *lockedBuffer
-}
+// the job stays running, and its client is told.
+type stuckExec struct{ *stopExec }
 
 func (stuckExec) JobCancel(_ context.Context, id driver.JobID) (*driver.JobRow, error) {
 	return &driver.JobRow{ID: id, State: driver.JobStateRunning}, nil
 }
 
-func (e stuckExec) ClientDelete(ctx context.Context, id int64) error {
-	_, _ = e.logs.Write([]byte(leaseReleased + "\n"))
-	return e.stopExec.ClientDelete(ctx, id)
-}
-
 const (
-	leaseReleased = "test: lease released"
 	stuckWarning  = "job has not returned since its context was canceled"
+	giveUpWarning = "stop gave up on jobs still running"
 )
 
 type stuckCall struct {
@@ -78,10 +70,10 @@ func (b *lockedBuffer) count(s string) int {
 	return strings.Count(b.buf.String(), s)
 }
 
-func (b *lockedBuffer) index(s string) int {
+func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return strings.Index(b.buf.String(), s)
+	return b.buf.String()
 }
 
 // stuckClient returns an unstarted client over jobs of stuckArgs, with
@@ -111,7 +103,7 @@ func stuckClient(t *testing.T, jobTimeout time.Duration, onStuck func(context.Co
 			h.calls <- stuckCall{at: time.Now(), job: job, cause: cause, client: ok && ctx.Err() == nil}
 		}
 	}
-	c, err := NewClient(managedTestDriver{exec: stuckExec{stopExec: h.exec, logs: h.logs}}, &Config{
+	c, err := NewClient(managedTestDriver{exec: stuckExec{h.exec}}, &Config{
 		Queues:     map[string]QueueConfig{QueueDefault: {MaxWorkers: 10}},
 		Workers:    workers,
 		Logger:     slog.New(slog.NewTextHandler(h.logs, nil)),
@@ -227,12 +219,9 @@ func TestStuckAfterJobCancel(t *testing.T) {
 	})
 }
 
-// TestStuckAfterStop: a stop that gives up on a worker at the end of its
-// grace reports it then, once it has released its lease, with
-// ErrClientStopped, though StuckGrace has not passed, and not again once it
-// has; a stop that waits longer than StuckGrace for a canceled worker has
-// it reported at StuckGrace.
-func TestStuckAfterStop(t *testing.T) {
+// TestStuckDuringStop: a stop that waits for a canceled worker longer than
+// StuckGrace has it reported at StuckGrace, with ErrClientStopped.
+func TestStuckDuringStop(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		job := stuckJob(`{}`)
 		h := stuckClient(t, time.Hour, nil, job)
@@ -241,33 +230,10 @@ func TestStuckAfterStop(t *testing.T) {
 			t.Fatal(err)
 		}
 		synctest.Wait()
-		start := time.Now()
-		stopCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		if err := h.c.StopAndCancel(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("StopAndCancel = %v, want its deadline", err)
-		}
-		call := <-h.calls
-		if want := 3*time.Second + h.c.tuning.stopGrace; call.at.Sub(start) != want || !errors.Is(call.cause, ErrClientStopped) {
-			t.Errorf("OnStuck called %s into the stop with %v, want %s (its deadline and grace) and ErrClientStopped", call.at.Sub(start), call.cause, want)
-		}
-		if released, warned := h.logs.index(leaseReleased), h.logs.index(stuckWarning); released < 0 || warned < released {
-			t.Errorf("lease released at log offset %d, worker reported at %d; want the report after the release", released, warned)
-		}
-		h.noMoreCalls(t)
-		close(h.release)
-		synctest.Wait()
-
-		job = stuckJob(`{}`)
-		h = stuckClient(t, time.Hour, nil, job)
-		if err := h.c.Start(ctx); err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait()
 		stopped := make(chan error, 1)
 		go func() { stopped <- h.c.StopAndCancel(ctx) }()
 		canceled := <-h.canceled
-		call = <-h.calls
+		call := <-h.calls
 		if d := call.at.Sub(canceled); d != DefaultStuckGrace || !errors.Is(call.cause, ErrClientStopped) {
 			t.Errorf("OnStuck called %s after the stop canceled the job, with %v; want %s and ErrClientStopped", d, call.cause, DefaultStuckGrace)
 		}
@@ -281,13 +247,14 @@ func TestStuckAfterStop(t *testing.T) {
 	})
 }
 
-// TestStuckAfterStopDeadline: a Stop whose ctx expires cancels the jobs, and
-// a worker that ignores it is reported at the end of the stop's grace, with
-// ErrClientStopped, once the lease is released.
-func TestStuckAfterStopDeadline(t *testing.T) {
+// TestStopGiveUpListsJobs: a stop that gives up on workers at the end of its
+// grace warns, before it returns, with the ID and kind of each job still
+// running, and does not call OnStuck: StuckGrace after the cancellation does,
+// if the process still runs, though the stop has returned.
+func TestStopGiveUpListsJobs(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		job := stuckJob(`{}`)
-		h := stuckClient(t, time.Hour, nil, job)
+		a, b := stuckJob(`{}`), stuckJob(`{}`)
+		h := stuckClient(t, time.Hour, nil, a, b)
 		ctx := context.Background()
 		if err := h.c.Start(ctx); err != nil {
 			t.Fatal(err)
@@ -299,17 +266,45 @@ func TestStuckAfterStopDeadline(t *testing.T) {
 		if err := h.c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Stop = %v, want its deadline", err)
 		}
-		call := <-h.calls
-		if want := 3*time.Second + h.c.tuning.stopGrace; call.at.Sub(start) != want || !errors.Is(call.cause, ErrClientStopped) {
-			t.Errorf("OnStuck called %s into the stop with %v, want %s (its deadline and grace) and ErrClientStopped", call.at.Sub(start), call.cause, want)
+		logs := h.logs.String()
+		if n := strings.Count(logs, giveUpWarning); n != 1 {
+			t.Errorf("%d give-up warnings logged, want 1", n)
 		}
-		if released, warned := h.logs.index(leaseReleased), h.logs.index(stuckWarning); released < 0 || warned < released {
-			t.Errorf("lease released at log offset %d, worker reported at %d; want the report after the release", released, warned)
+		for _, j := range []*driver.JobRow{a, b} {
+			if want := j.ID.String() + " (stuck_args)"; !strings.Contains(logs, want) {
+				t.Errorf("the give-up warning does not list %q: %s", want, logs)
+			}
+		}
+		select {
+		case call := <-h.calls:
+			t.Errorf("OnStuck called by the stop's give-up, with %v", call.cause)
+		default:
+		}
+		for range 2 {
+			call := <-h.calls
+			if want := 3*time.Second + DefaultStuckGrace; call.at.Sub(start) != want || !errors.Is(call.cause, ErrClientStopped) {
+				t.Errorf("OnStuck called %s into the stop with %v, want %s (its deadline and StuckGrace) and ErrClientStopped", call.at.Sub(start), call.cause, want)
+			}
 		}
 		h.noMoreCalls(t)
 		close(h.release)
 		synctest.Wait()
 	})
+}
+
+// TestRunningJobsLimit: the list of running jobs stops at its limit and
+// says how many more there are.
+func TestRunningJobsLimit(t *testing.T) {
+	h := stuckClient(t, time.Hour, nil)
+	ids := []JobID{{2}, {1}, {3}}
+	for _, id := range ids {
+		h.c.trackRunning(id, "k", func(error) {})
+	}
+	got := h.c.runningJobs(2)
+	want := []string{JobID{1}.String() + " (k)", JobID{2}.String() + " (k)", "and 1 more"}
+	if !slices.Equal(got, want) {
+		t.Errorf("runningJobs(2) = %q, want %q", got, want)
+	}
 }
 
 // TestStuckAfterFence: a worker that ignores the fence of its client's lease,

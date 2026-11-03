@@ -45,7 +45,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	jobCtx = driver.WithOwner(jobCtx, a)
-	claim := c.trackRunning(row.ID, cancel)
+	claim := c.trackRunning(row.ID, row.Kind, cancel)
 	defer c.untrackRunning(row.ID, claim)
 
 	unit, err := c.runWorker(jobCtx, row, a.row)

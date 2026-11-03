@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"runtime/debug"
-	"slices"
 	"sync/atomic"
 	"time"
 
@@ -14,10 +12,8 @@ import (
 )
 
 // stuckWatch watches one attempt's worker for not returning once its
-// context is canceled. It is reported once at most: by its timer, StuckGrace
-// after the cancellation, or by a stop that gives up waiting for the worker.
-// The client registers it in Client.stuck only once the context is
-// canceled, which few attempts are.
+// context is canceled: StuckGrace after the cancellation, its timer reports
+// the worker, unless it has returned by then.
 type stuckWatch struct {
 	ctx context.Context
 	// job is the attempt's copy of the row as claimed (attempt.claimed),
@@ -26,29 +22,24 @@ type stuckWatch struct {
 	job *JobRow
 	// done is set once the worker has returned or was reported.
 	done      atomic.Bool
+	timer     atomic.Pointer[time.Timer]
 	stopAfter func() bool
-	// timer is set, under Client.stuckMu, once the context is canceled.
-	timer *time.Timer
 }
 
 // watchStuck starts watching the worker about to run under ctx, whose row
 // as claimed is claimed; call stuckReturned once it has returned.
 func (c *Client[TTx]) watchStuck(ctx context.Context, claimed *driver.JobRow) *stuckWatch {
 	w := &stuckWatch{ctx: ctx, job: claimed}
-	w.stopAfter = context.AfterFunc(ctx, func() { c.stuckCanceled(w) })
+	w.stopAfter = context.AfterFunc(ctx, func() {
+		t := time.AfterFunc(c.cfg.StuckGrace, func() { c.reportStuck(w) })
+		w.timer.Store(t)
+		// The worker may have returned as the timer was set: either this
+		// sees it, or stuckReturned sees the timer.
+		if w.done.Load() {
+			t.Stop()
+		}
+	})
 	return w
-}
-
-// stuckCanceled registers a watch whose context was canceled and starts its
-// timer, unless its worker has returned.
-func (c *Client[TTx]) stuckCanceled(w *stuckWatch) {
-	c.stuckMu.Lock()
-	defer c.stuckMu.Unlock()
-	if w.done.Load() {
-		return
-	}
-	c.stuck[w] = struct{}{}
-	w.timer = time.AfterFunc(c.cfg.StuckGrace, func() { c.reportStuck(w) })
 }
 
 // stuckReturned ends a watch whose worker has returned.
@@ -57,22 +48,8 @@ func (c *Client[TTx]) stuckReturned(w *stuckWatch) {
 	if w.stopAfter() {
 		return
 	}
-	c.stuckMu.Lock()
-	defer c.stuckMu.Unlock()
-	if w.timer != nil {
-		w.timer.Stop()
-	}
-	delete(c.stuck, w)
-}
-
-// reportStuckNow reports every canceled worker that has not returned, as a
-// stop does once its grace ends.
-func (c *Client[TTx]) reportStuckNow() {
-	c.stuckMu.Lock()
-	watches := slices.Collect(maps.Keys(c.stuck))
-	c.stuckMu.Unlock()
-	for _, w := range watches {
-		c.reportStuck(w)
+	if t := w.timer.Load(); t != nil {
+		t.Stop()
 	}
 }
 

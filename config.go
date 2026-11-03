@@ -80,25 +80,27 @@ type Config struct {
 	// report the outcome.
 	OnError func(ctx context.Context, job *JobRow, err error) ErrorOutcome
 	// OnStuck is called when a job's worker has not returned StuckGrace
-	// after the job's context was canceled, or, if sooner, when a stop
-	// gave up on it at the end of its grace (Stop's deadline or
-	// StopAndCancel's ctx, then a short wait): the stop reports it once it
-	// has flushed the other jobs' results and released its lease, before it
-	// returns, so a hook may exit the process then. A worker StuckGrace
-	// reports while a stop still waits for it is reported then, before the
-	// stop has flushed or released anything. cause is why the
-	// context was canceled: the job's timeout (ErrJobTimeout), JobCancel
-	// (ErrJobCanceled), the client's stop (ErrClientStopped), or a fence
-	// (ErrJobFenced), which a lost lease causes, or a claim of the job on
-	// this client after a rescue. job is the row as claimed. It is called
-	// at most once per run of an attempt (a stop that gives an attempt back
-	// reruns it with the same number), on a goroutine of its own, with a
-	// context that carries the client and is never canceled, and a panic in
-	// it is logged. The client does not wait for it, Stop neither, so a hook
-	// that alerts should bound its own work, and one the stop started may
-	// not have run when Stop returns, nor before a process that exits then
-	// ends; it may also dump goroutine stacks or exit the process. Whether
-	// or not it is set, the client logs a warning and emits EventJobStuck.
+	// after the job's context was canceled, and only then. cause is why
+	// the context was canceled: the job's timeout (ErrJobTimeout),
+	// JobCancel (ErrJobCanceled), the client's stop (ErrClientStopped), or
+	// a fence (ErrJobFenced), which a lost lease causes, or a claim of the
+	// job on this client after a rescue. job is the row as claimed. It is
+	// called at most once per run of an attempt (a stop that gives an
+	// attempt back reruns it with the same number), on a goroutine of its
+	// own, with a context that carries the client and is never canceled,
+	// and a panic in it is logged. The client does not wait for it, so a
+	// hook that alerts should bound its own work; it may also dump
+	// goroutine stacks or exit the process. Whether or not it is set, the
+	// client logs a warning and emits EventJobStuck.
+	//
+	// A stop is no exception: StuckGrace after a stop canceled a worker,
+	// the hook is called, while the stop waits or after it has returned,
+	// if the process still runs. A stop that gives up on workers at the end
+	// of its grace does not call it, but logs a warning, before it
+	// returns, with the ID and kind of each job still running. A hook that
+	// exits the process while a stop runs ends it as a crash would: the
+	// results not yet written are lost, and the jobs are rescued once the
+	// lease expires (delivery is at-least-once).
 	//
 	// Nothing else changes. The attempt keeps its slot in the queue until
 	// the worker returns, and its result is written then, as any is. Until
