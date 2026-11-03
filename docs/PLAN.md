@@ -1290,6 +1290,7 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   `ErrorOutcome` keeps the outcome, and a panic in the hook is logged and keeps it
   too. It is not called for a worker's `Snooze`, a `JobCancel` (even when the worker
   then returns `Cancel`), a fenced attempt, or an attempt the client's stop canceled
+  whose worker then returns an error other than `Cancel` or an output refusal
   (§7.12), none of which is the job failing, nor for a `CompleteTx` attempt whose job
   could not be read, which may have committed. An attempt whose own timeout ended it
   before the stop is a timeout, and the hook is called for it. A job the
@@ -1444,9 +1445,11 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   attempt's result waits for the queued lines and `Close` for up to 5 seconds, so a
   store that saves on `Close` has the log when the job is finished; past that the
   context is canceled and the result goes ahead. An attempt canceled by a stop
-  (or a fence) waits for at most half the stop's grace instead, so its result still
-  reaches the finalizer before it stops. A line logged after the end, by a goroutine
-  the worker left, goes to `Config.Logger` only. Nothing goes to the `logs` column
+  (or a fence) waits for at most half the stop's grace instead, and, once a stop's
+  deadline has begun its grace, not past the grace's first half, so its result still
+  reaches the finalizer before it stops, however late in the grace its worker
+  returns. A line logged after the end, by a goroutine the worker left, goes to
+  `Config.Logger` only. Nothing goes to the `logs` column
   (the result carries no `Log`), so the store costs the database nothing and keeps a
   crashed client's lines up to the crash, less those still queued. Logs are keyed by
   job ID and attempt, which a process that runs the work outside the client (a
@@ -2139,7 +2142,9 @@ refusal (`ErrOutputTooLarge`) is finalized as it says, and the job's timeout sti
 bounds each run: an attempt its timeout ended before the stop came is a timeout, which
 counts and goes to `Config.OnError` as any timeout does, as does a failure the worker
 returned before the stop. `MaxAttempts` does not bound a job that every stop
-interrupts; its timeout does, and each interruption adds an entry to `Errors`. A job
+interrupts, and each interruption adds an entry to `Errors`: only a timeout shorter
+than the time between stops ends such a job, by ending a run before a stop does, and
+one with no timeout, or a longer one, runs again after every stop. A job
 from a claim in flight as the stop cancels the jobs never runs: it gets its attempt
 back with no error, as a `Snooze(0)`. A job interrupted by a fence (§7.6) keeps its
 attempt counted, as the rescue that may already have run it would. A worker must not

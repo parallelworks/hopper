@@ -17,18 +17,10 @@ import (
 	"github.com/parallelworks/hopper/hoppermigrate"
 )
 
-// stopDriver is a driver whose executor hands out the jobs it is given,
-// once, and records their results: enough for a client to start, run them
-// and stop inside a synctest bubble, which fails the test if any goroutine
-// the client started is left behind.
-type stopDriver struct {
-	driver.Driver[struct{}]
-	exec *stopExec
-}
-
-func (d stopDriver) Executor() driver.Executor       { return d.exec }
-func (stopDriver) Capabilities() driver.Capabilities { return driver.Capabilities{} }
-
+// stopExec is an executor, for a managedTestDriver, that hands out the jobs
+// it is given, once, and records their results: enough for a client to
+// start, run them and stop inside a synctest bubble, which fails the test
+// if any goroutine the client started is left behind.
 type stopExec struct {
 	driver.Executor
 	// claimGate, if set, holds the first claim until it is closed, as a
@@ -138,7 +130,7 @@ func stopClientWith(t *testing.T, causes chan<- error, onError func(context.Cont
 		}
 		return fmt.Errorf("work: %w", ctx.Err())
 	})
-	c, err := NewClient(stopDriver{exec: exec}, &Config{
+	c, err := NewClient(managedTestDriver{exec: exec}, &Config{
 		Queues:    map[string]QueueConfig{QueueDefault: {MaxWorkers: 10}},
 		Workers:   workers,
 		Logger:    slog.New(slog.DiscardHandler),
@@ -389,7 +381,7 @@ func slowStopClient(t *testing.T, work func(context.Context) error, onError func
 	exec := &stopExec{jobs: jobs, results: map[driver.JobID]driver.JobFinalize{}}
 	workers := NewWorkers()
 	AddWorkFunc(workers, func(ctx context.Context, _ *Job[stopSlowArgs]) error { return work(ctx) })
-	c, err := NewClient(stopDriver{exec: exec}, &Config{
+	c, err := NewClient(managedTestDriver{exec: exec}, &Config{
 		Queues:     map[string]QueueConfig{QueueDefault: {MaxWorkers: 10}},
 		Workers:    workers,
 		Logger:     slog.New(slog.DiscardHandler),
@@ -518,46 +510,49 @@ func (blockingStore) Writer(ctx context.Context, _ *JobRow) (io.WriteCloser, err
 func (blockingStore) Logs(context.Context, JobID) ([]AttemptLog, error) { return nil, nil }
 
 // TestStopDeadlineLogCloseBounded: a Stop's deadline cancels a job whose
-// worker takes a moment to return and whose store's Close blocks. The log's
-// close waits at most half the stop's grace, and OnError is not consulted,
-// so the result is still written, its attempt given back.
+// worker takes a moment to return, early or late in the stop's grace, and
+// whose store's Close blocks. The log's close waits at most half the
+// stop's grace, and never past the grace's first half, and OnError is not
+// consulted, so the result is still written, its attempt given back.
 func TestStopDeadlineLogCloseBounded(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		job := stopJob(1, 3, `{}`)
-		exec := &stopExec{jobs: []*driver.JobRow{job}, results: map[driver.JobID]driver.JobFinalize{}}
-		workers := NewWorkers()
-		AddWorkFunc(workers, func(ctx context.Context, _ *Job[stopSlowArgs]) error {
-			Logger(ctx).Info("running")
-			<-ctx.Done()
-			time.Sleep(100 * time.Millisecond)
-			return ctx.Err()
+	for _, returnAfter := range []time.Duration{100 * time.Millisecond, defaultTuning.stopGrace * 3 / 4} {
+		synctest.Test(t, func(t *testing.T) {
+			job := stopJob(1, 3, `{}`)
+			exec := &stopExec{jobs: []*driver.JobRow{job}, results: map[driver.JobID]driver.JobFinalize{}}
+			workers := NewWorkers()
+			AddWorkFunc(workers, func(ctx context.Context, _ *Job[stopSlowArgs]) error {
+				Logger(ctx).Info("running")
+				<-ctx.Done()
+				time.Sleep(returnAfter)
+				return ctx.Err()
+			})
+			c, err := NewClient(managedTestDriver{exec: exec}, &Config{
+				Queues:    map[string]QueueConfig{QueueDefault: {MaxWorkers: 1}},
+				Workers:   workers,
+				Logger:    slog.New(slog.DiscardHandler),
+				NeverLead: true,
+				JobLogs:   JobLogsConfig{Store: blockingStore{}},
+				OnError: func(context.Context, *JobRow, error) ErrorOutcome {
+					t.Error("OnError was called for an attempt the stop canceled")
+					return ErrorOutcome{}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			if err := c.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Wait() // the job is running
+			stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("Stop = %v, want its deadline", err)
+			}
+			if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateRetryable {
+				t.Errorf("job returning %s into the grace, its log close blocked: %+v, %v; want its result written, its attempt given back", returnAfter, f, ok)
+			}
 		})
-		c, err := NewClient(stopDriver{exec: exec}, &Config{
-			Queues:    map[string]QueueConfig{QueueDefault: {MaxWorkers: 1}},
-			Workers:   workers,
-			Logger:    slog.New(slog.DiscardHandler),
-			NeverLead: true,
-			JobLogs:   JobLogsConfig{Store: blockingStore{}},
-			OnError: func(context.Context, *JobRow, error) ErrorOutcome {
-				t.Error("OnError was called for an attempt the stop canceled")
-				return ErrorOutcome{}
-			},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx := context.Background()
-		if err := c.Start(ctx); err != nil {
-			t.Fatal(err)
-		}
-		synctest.Wait() // the job is running
-		stopCtx, cancel := context.WithTimeout(ctx, time.Second)
-		defer cancel()
-		if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("Stop = %v, want its deadline", err)
-		}
-		if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateRetryable {
-			t.Errorf("job whose log close blocked: %+v, %v; want its result written, its attempt given back", f, ok)
-		}
-	})
+	}
 }

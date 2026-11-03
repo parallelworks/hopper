@@ -54,6 +54,11 @@ type Client[TTx any] struct {
 	// workCancel cancels every job's context with ErrClientStopped as the
 	// cause. It is set by Start, under mu.
 	workCancel context.CancelCauseFunc
+	// graceHalf, in Unix nanoseconds, is set as a stop's deadline begins
+	// its grace: half the grace in, past which an attempt's log close
+	// waits no longer (logCloseTimeout), so that its result reaches the
+	// finalizer within the grace. Zero until then.
+	graceHalf atomic.Int64
 
 	// gen is the lease generation: jobs run under a context that is
 	// canceled when the lease is lost, so a fenced client stops its work.
@@ -449,12 +454,14 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // attempt back with no error. The same holds for the jobs a Stop cancels
 // when its ctx expires.
 //
-// MaxAttempts does not bound a job that every stop interrupts: its timeout
-// does, and each interruption adds an entry to its Errors. The close of an
-// interrupted attempt's log in Config.JobLogs.Store waits at most half the
-// stop's short grace, so that the result is still written. A worker must
-// not call Stop or StopAndCancel itself: the stop waits for the worker,
-// which then loses its result.
+// MaxAttempts does not bound a job that every stop interrupts, and each
+// interruption adds an entry to its Errors: only a timeout shorter than
+// the time between stops ends such a job, by ending a run before a stop
+// does; one with no timeout, or a longer one, runs again after every stop.
+// The close of an interrupted attempt's log in Config.JobLogs.Store waits
+// at most half the stop's short grace, so that the result is still
+// written. A worker must not call Stop or StopAndCancel itself: the stop
+// waits for the worker, which then loses its result.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	return c.stop(ctx, true)
 }
@@ -470,11 +477,7 @@ func (c *Client[TTx]) Stopped() <-chan struct{} {
 func (c *Client[TTx]) stop(ctx context.Context, cancelJobs bool) error {
 	c.mu.Lock()
 	switch c.state {
-	case clientStopped:
-		c.mu.Unlock()
-		c.notifier.flushNow(ctx)
-		return nil
-	case clientStopping:
+	case clientStopping, clientStopped:
 		c.mu.Unlock()
 		return c.awaitStop(ctx, cancelJobs)
 	case clientIdle, clientStarted:
@@ -500,9 +503,10 @@ func (c *Client[TTx]) stop(ctx context.Context, cancelJobs bool) error {
 }
 
 // awaitStop waits for another call's stop of the client, until ctx
-// expires, canceling the running jobs first if cancelJobs is set. Once the
-// client has stopped, it flushes the notifier, as a call that finds the
-// client stopped does, for inserts made after the stopping call's flush.
+// expires, canceling the running jobs first if cancelJobs is set; it
+// returns at once for a client already stopped. Once the client has
+// stopped, it flushes the notifier, for inserts made after the stopping
+// call's flush.
 func (c *Client[TTx]) awaitStop(ctx context.Context, cancelJobs bool) error {
 	if cancelJobs {
 		c.cancelJobs()
@@ -554,6 +558,8 @@ func (c *Client[TTx]) shutdown(ctx context.Context, cancelJobs bool) error {
 		} else {
 			c.logger.WarnContext(ctx, "hopper: stop deadline reached; canceling running jobs")
 		}
+		// Set before the cancel, so every attempt it cancels sees it.
+		c.graceHalf.Store(time.Now().Add(c.tuning.stopGrace / 2).UnixNano())
 		c.cancelJobs()
 		graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.tuning.stopGrace)
 		c.waitForJobs(graceCtx)
