@@ -4,8 +4,11 @@ name: Performance gate
 # and fails if the PR is more than 10% slower on any scenario. Hosted
 # runners are noisy and drift over a job, so both benchmark binaries are
 # built first and then run alternately, scenario by scenario, for several
-# rounds; noise only ever slows a run down, so the faster half of each
-# side's runs, averaged, is what is compared. Each run drains 300,000 jobs
+# rounds. The second of two back-to-back runs is measurably slower than the
+# first, so the side that runs first swaps every round and each side runs
+# first in half the rounds (ROUNDS must be even). Noise only ever slows a
+# run down, so the faster half of each side's runs, averaged, is what is
+# compared. Each run drains 300,000 jobs
 # (about ten seconds on a runner): a shorter drain measures start-up
 # effects, such as the leader's first statistics refresh, rather than the
 # hot paths. The workflow scenarios, whose jobs each pass through the
@@ -74,12 +77,16 @@ jobs:
           (cd "$RUNNER_TEMP/base" && go build -o "$RUNNER_TEMP/bench-base" ./cmd/hopperbench)
       - name: Benchmark base and PR alternately
         run: |
+          if (( ROUNDS % 2 )); then echo "ROUNDS must be even" >&2; exit 1; fi
           for i in $(seq "$ROUNDS"); do
+            order="base head"
+            if (( i % 2 == 0 )); then order="head base"; fi
             for s in ${SCENARIOS//,/ }; do
               jobs=$JOBS
               case "$s" in workflow*) jobs=$WORKFLOW_JOBS;; esac
-              "$RUNNER_TEMP/bench-base" -database-url "$DATABASE_URL" -scenarios "$s" -jobs "$jobs" -schema "base_$i" >> base.jsonl
-              "$RUNNER_TEMP/bench-head" -database-url "$DATABASE_URL" -scenarios "$s" -jobs "$jobs" -schema "head_$i" >> head.jsonl
+              for side in $order; do
+                "$RUNNER_TEMP/bench-$side" -database-url "$DATABASE_URL" -scenarios "$s" -jobs "$jobs" -schema "${side}_$i" >> "$side.jsonl"
+              done
             done
           done
           echo "== base"; cat base.jsonl
