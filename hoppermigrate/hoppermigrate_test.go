@@ -1606,7 +1606,7 @@ func TestLeaderResignUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := d.Executor()
-	if id, err := exec.LeaderRequestResign(ctx); err != nil || id != 7 {
+	if id, err := exec.LeaderRequestResign(ctx, 7); err != nil || id != 7 {
 		t.Fatalf("resign request after v24 = %d, %v; want the previous release's leader 7", id, err)
 	}
 	if !renew(7) {

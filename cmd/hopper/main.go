@@ -8,7 +8,7 @@
 //	hopper queues list|pause|resume [name]
 //	hopper queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]
 //	hopper clients list
-//	hopper leader resign
+//	hopper leader resign [-leader ID]
 //	hopper stats
 //
 // The database comes from -database-url or HOPPER_DATABASE_URL. Every command
@@ -65,7 +65,7 @@ commands:
   queues pause|resume <name>
   queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]   (omitted limits are removed)
   clients list
-  leader resign                (asks the leader to give up its term)
+  leader resign [-leader ID]   (asks the leader, or only client ID if it leads, to give up its term)
   workflows get <id>
   subscriptions list
   streams consumers
@@ -474,11 +474,25 @@ func (c *cli) clients(ctx context.Context, args []string) error {
 }
 
 // leader asks the current leader to resign its term (Client.LeaderResign).
+// With -leader it asks only that client, and fails if it no longer leads,
+// so that a retry after a takeover does not move leadership again.
 func (c *cli) leader(ctx context.Context, args []string) error {
-	if len(args) != 1 || args[0] != "resign" {
-		return errors.New("leader: resign")
+	if len(args) < 1 || args[0] != "resign" {
+		return errors.New("leader: resign [-leader ID]")
 	}
-	id, err := c.client.LeaderResign(ctx)
+	fs := flag.NewFlagSet("hopper leader resign", flag.ContinueOnError)
+	fs.SetOutput(c.out)
+	leaderID := fs.Int64("leader", 0, "ask only this client, if it leads (default: whichever client leads)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("leader: resign [-leader ID]")
+	}
+	id, err := c.client.LeaderResign(ctx, *leaderID)
+	if errors.Is(err, hopper.ErrNotLeader) {
+		return fmt.Errorf("client %d does not lead: %w", *leaderID, err)
+	}
 	if err != nil {
 		return err
 	}

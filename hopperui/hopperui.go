@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,7 +48,8 @@ const (
 	ActionResume Action = "resume"
 	ActionSeek   Action = "seek"
 	// ActionResign asks the cluster's leader to give up its term
-	// (Client.LeaderResign).
+	// (Client.LeaderResign). The UI names the leader its page showed, so
+	// a stale page asks no client elected since.
 	ActionResign Action = "resign"
 )
 
@@ -58,7 +60,10 @@ type Config struct {
 	// without it.
 	Prefix string
 	// Authorize is asked before every action; returning an error refuses
-	// it with 403. With no hook the UI is read-only.
+	// it with 403. With no hook the UI is read-only. A hook that allows
+	// every action, or every action but some it names, also allows those
+	// added in later releases, such as ActionResign, which moves the
+	// cluster's leadership; list the actions it allows to avoid that.
 	Authorize func(r *http.Request, action Action) error
 	// Title is shown in the header. Defaults to "hopper".
 	Title string
@@ -559,23 +564,45 @@ func (u *ui[TTx]) clients(w http.ResponseWriter, r *http.Request) {
 		u.fail(w, err)
 		return
 	}
-	u.render(w, r, "clients", clients)
+	stats, err := u.client.Stats(r.Context())
+	if err != nil {
+		u.fail(w, err)
+		return
+	}
+	u.render(w, r, "clients", clientsData{Clients: clients, Leader: stats.Leader})
 }
 
 func (u *ui[TTx]) leaderResign(w http.ResponseWriter, r *http.Request) {
 	if !u.authorize(w, r, ActionResign) {
 		return
 	}
-	id, err := u.client.LeaderResign(r.Context())
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The leader the page showed: a page from before a takeover must not
+	// ask the client elected since.
+	leader, err := strconv.ParseInt(r.Form.Get("leader"), 10, 64)
+	if err != nil || leader <= 0 {
+		http.Error(w, "leader: the client ID of the leader to ask", http.StatusBadRequest)
+		return
+	}
+	id, err := u.client.LeaderResign(r.Context(), leader)
+	if errors.Is(err, hopper.ErrNotLeader) {
+		u.back(w, r, "/clients", fmt.Sprintf("client %d no longer leads; no client was asked", leader))
+		return
+	}
 	if err != nil {
 		u.fail(w, err)
 		return
 	}
-	msg := "no leader to ask"
-	if id != 0 {
-		msg = fmt.Sprintf("asked leader client %d to resign", id)
-	}
-	u.back(w, r, "/clients", msg)
+	u.back(w, r, "/clients", fmt.Sprintf("asked leader client %d to resign", id))
+}
+
+type clientsData struct {
+	Clients []*hopper.ClientRow
+	// Leader is the leader's client ID, or 0 if no client leads.
+	Leader int64
 }
 
 // Template helpers.

@@ -2,6 +2,7 @@ package hopper_test
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -105,12 +106,18 @@ func TestLeaderResign(t *testing.T) {
 			waitFor(t, a.IsLeader)
 			b := h.started(hopper.NewWorkers(), 1)
 
-			asker := b
+			// Another client names the leader it means; the leader asks
+			// whichever client leads.
+			asker, of := b, a.ClientID()
 			if from == "leader" {
-				asker = a
+				asker, of = a, 0
+			}
+			// A request that names a client that does not lead asks no one.
+			if _, err := asker.LeaderResign(ctx, b.ClientID()); !errors.Is(err, hopper.ErrNotLeader) {
+				t.Fatalf("LeaderResign of a client that does not lead = %v, want ErrNotLeader", err)
 			}
 			start := time.Now()
-			id, err := asker.LeaderResign(ctx)
+			id, err := asker.LeaderResign(ctx, of)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -152,7 +159,7 @@ func TestLeaderResign(t *testing.T) {
 		h := newHarness(t)
 		a := h.started(hopper.NewWorkers(), 1)
 		waitFor(t, a.IsLeader)
-		if id, err := a.LeaderResign(context.Background()); err != nil || id != a.ClientID() {
+		if id, err := a.LeaderResign(context.Background(), a.ClientID()); err != nil || id != a.ClientID() {
 			t.Fatalf("LeaderResign = %d, %v; want %d", id, err, a.ClientID())
 		}
 		waitFor(t, func() bool { return !a.IsLeader() })
@@ -173,7 +180,10 @@ func TestLeaderResign(t *testing.T) {
 	if err := c.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if id, err := c.LeaderResign(context.Background()); err != nil || id != 0 {
+	if id, err := c.LeaderResign(context.Background(), 0); err != nil || id != 0 {
 		t.Errorf("LeaderResign with no leader = %d, %v; want 0", id, err)
+	}
+	if id, err := c.LeaderResign(context.Background(), 5); !errors.Is(err, hopper.ErrNotLeader) || id != 0 {
+		t.Errorf("LeaderResign of client 5 with no leader = %d, %v; want 0, ErrNotLeader", id, err)
 	}
 }

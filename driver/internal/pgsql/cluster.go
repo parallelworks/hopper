@@ -153,20 +153,21 @@ func (e *Executor) LeaderResign(ctx context.Context, clientID int64) error {
 }
 
 // leaderRequestResignSQL names the holder of a live lease as asked to
-// resign and, only then, signals it. The notification sits in RETURNING,
+// resign, if it is the leader $2 names (0 names any), and, only then,
+// signals it. The notification sits in RETURNING,
 // so it is sent for the row the request updated and for nothing else.
 const leaderRequestResignSQL = `
 WITH asked AS (
   UPDATE {{schema}}.hopper_leader SET resign_client_id = client_id
-  WHERE name = 'default' AND expires_at > now()
+  WHERE name = 'default' AND expires_at > now() AND ($2::bigint = 0 OR client_id = $2::bigint)
   RETURNING client_id, pg_notify($1, 'resign')
 )
 SELECT client_id FROM asked`
 
 // LeaderRequestResign implements driver.Executor.
-func (e *Executor) LeaderRequestResign(ctx context.Context) (int64, error) {
+func (e *Executor) LeaderRequestResign(ctx context.Context, leaderID int64) (int64, error) {
 	var id int64
-	err := e.Conn.QueryRow(ctx, leaderRequestResignSQL, driver.ChannelLeader).Scan(&id)
+	err := e.Conn.QueryRow(ctx, leaderRequestResignSQL, driver.ChannelLeader, leaderID).Scan(&id)
 	if errors.Is(err, ErrNoRows) {
 		return 0, nil
 	}

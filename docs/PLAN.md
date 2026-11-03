@@ -1705,7 +1705,7 @@ Any client can ask, including one that never leads. The request is one statement
 
 ```sql
 UPDATE hopper_leader SET resign_client_id = client_id
-WHERE name = 'default' AND expires_at > now()
+WHERE name = 'default' AND expires_at > now() AND ($leader = 0 OR client_id = $leader)
 RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
 ```
 
@@ -1713,6 +1713,13 @@ RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
   ID, or nothing when no client leads. It names that holder only: a later holder is
   never asked by an earlier request, and a request that loses the race to an election
   asks the new holder or no one, never the client whose lease had expired.
+- The caller names the leader it means (`LeaderResign(ctx, leaderID)`, `hopper leader
+  resign -leader ID`), as `Stats` or the clients list showed it, and the request asks
+  that client only if it holds the live lease; otherwise it asks no one and
+  `LeaderResign` returns `ErrNotLeader`. So a request retried after a takeover, or made
+  from a stale view, cannot move leadership a second time, as a job lease's exact
+  fence keeps a stale holder from acting (§7.14). A `leaderID` of 0 asks whichever
+  client leads. The UI always names the leader its page showed.
 - The request is a column rather than only a notification, because a notification is
   lost when the leader's listener is reconnecting. The notification wakes the leader
   at once; without it the leader sees the request on its next renewal, within 5s.

@@ -16,8 +16,10 @@
   replacement takes over within 15 seconds of the leader stopping.
 - **Moving the leader.** Before a planned restart of the leader's node, or to
   move periodic jobs, rescue and retention off a busy one, ask the leader to
-  resign: `hopper leader resign`, `Client.LeaderResign`, or the UI's clients
-  page. The leader stops its duties, gives the lease up, and stays out of the
+  resign: `hopper leader resign -leader ID`, `Client.LeaderResign`, or the
+  UI's clients page. Naming the leader (`hopper stats` shows it) makes a
+  retry safe: if another client leads by then, the request asks no one and
+  fails, rather than moving leadership again. The leader stops its duties, gives the lease up, and stays out of the
   election for 15 seconds, so another client takes over within a second or
   so. With no other client that can lead, the install has no leader for those
   15 seconds.

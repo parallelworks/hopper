@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -210,9 +211,16 @@ func TestCLI(t *testing.T) {
 		VALUES ('default', 42, now(), now() + interval '1 minute')`); err != nil {
 		t.Fatal(err)
 	}
+	if err := run(ctx, []string{"-schema", schema, "leader", "resign", "-leader", "41"}, new(bytes.Buffer)); !errors.Is(err, hopper.ErrNotLeader) {
+		t.Errorf("leader resign -leader of a client that does not lead = %v, want ErrNotLeader", err)
+	}
+	var unasked *int64
+	if err := pool.QueryRow(ctx, "SELECT resign_client_id FROM hopper_leader").Scan(&unasked); err != nil || unasked != nil {
+		t.Errorf("resign_client_id after a request of another client = %v, %v; want NULL", unasked, err)
+	}
 	var asked map[string]int64
-	if err := json.Unmarshal([]byte(hopperCmd("-json", "leader", "resign")), &asked); err != nil || asked["asked"] != 42 {
-		t.Errorf("json leader resign = %v, %v; want client 42 asked", asked, err)
+	if err := json.Unmarshal([]byte(hopperCmd("-json", "leader", "resign", "-leader", "42")), &asked); err != nil || asked["asked"] != 42 {
+		t.Errorf("json leader resign -leader 42 = %v, %v; want client 42 asked", asked, err)
 	}
 	var flagged int64
 	if err := pool.QueryRow(ctx, "SELECT resign_client_id FROM hopper_leader").Scan(&flagged); err != nil || flagged != 42 {

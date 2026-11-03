@@ -284,12 +284,23 @@ func (c *Client[TTx]) Clients(ctx context.Context) ([]*ClientRow, error) {
 	return c.exec.ClientList(ctx)
 }
 
-// LeaderResign asks the cluster's leader, whichever client holds the
-// term, to give it up, so that another client takes over: before a planned
-// restart of the leader's host, say, or to move the leader's duties off a
-// busy node. Any client can ask, including one that works no queue, and
-// so can `hopper leader resign`. It returns the leader's client ID, or 0 if
-// no client leads.
+// ErrNotLeader is returned by LeaderResign when the client it names does
+// not hold the leader lease: another client was elected since the caller
+// saw it lead, or no client leads.
+var ErrNotLeader = errors.New("hopper: not the leader")
+
+// LeaderResign asks the cluster's leader to give its term up, so that
+// another client takes over: before a planned restart of the leader's
+// host, say, or to move the leader's duties off a busy node. Any client can
+// ask, including one that works no queue, and so can `hopper leader
+// resign` and hopperui.
+//
+// leaderID names the leader meant, as Stats or Clients reported it, so
+// that a retried request, or one made from a stale view, cannot ask a
+// client elected since: if that client does not hold the live lease,
+// LeaderResign asks no one and returns ErrNotLeader. A leaderID of 0 asks
+// whichever client leads, and returns 0 and no error if none does. On
+// success it returns the client ID asked.
 //
 // The request is recorded on the leader lease, so it reaches the leader at
 // its next renewal: at once through a notification where the engine has
@@ -300,12 +311,19 @@ func (c *Client[TTx]) Clients(ctx context.Context) ([]*ClientRow, error) {
 // elected, usually at once. It emits EventLeaderResigned, and runs no
 // duty after it gave the lease up. A cluster with no other
 // client has no leader until the resigned one is elected again. A request
-// names the leader it was made of: if that leader's lease expires first,
-// the next leader is not asked. A leader of an earlier release ignores it.
-func (c *Client[TTx]) LeaderResign(ctx context.Context) (int64, error) {
-	id, err := c.exec.LeaderRequestResign(ctx)
+// is recorded for the leader it asked only: if that leader's lease expires
+// first, the next leader is not asked. A leader of an earlier release
+// ignores it.
+func (c *Client[TTx]) LeaderResign(ctx context.Context, leaderID int64) (int64, error) {
+	if leaderID < 0 {
+		return 0, fmt.Errorf("hopper: leader resign: invalid client ID %d", leaderID)
+	}
+	id, err := c.exec.LeaderRequestResign(ctx, leaderID)
 	if err != nil {
 		return 0, err
+	}
+	if id == 0 && leaderID != 0 {
+		return 0, ErrNotLeader
 	}
 	// The leader may be this client, whose listener may be down.
 	if id != 0 && id == c.clientID.Load() {

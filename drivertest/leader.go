@@ -19,9 +19,10 @@ func leaderAttempt(ctx context.Context, t *testing.T, exec driver.Executor, id i
 	return res
 }
 
-func requestResign(ctx context.Context, t *testing.T, exec driver.Executor) int64 {
+// requestResign asks the leader leaderID names (0 for any) to resign.
+func requestResign(ctx context.Context, t *testing.T, exec driver.Executor, leaderID int64) int64 {
 	t.Helper()
-	id, err := exec.LeaderRequestResign(ctx)
+	id, err := exec.LeaderRequestResign(ctx, leaderID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,21 +31,41 @@ func requestResign(ctx context.Context, t *testing.T, exec driver.Executor) int6
 
 // testLeaderResignRequest checks a request that the leader resign: it
 // names the holder of a live lease, whose renewals report it until the
-// holder resigns; it asks no one with no live lease; and a client that
-// takes the lease over is not asked.
+// holder resigns; it asks no one with no live lease, or when it names a
+// client that does not hold it; and a client that takes the lease over is
+// not asked.
 func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
 	a, b := register(ctx, t, exec), register(ctx, t, exec)
 
-	if id := requestResign(ctx, t, exec); id != 0 {
+	if id := requestResign(ctx, t, exec, 0); id != 0 {
 		t.Fatalf("request with no leader asked client %d", id)
+	}
+	if id := requestResign(ctx, t, exec, a); id != 0 {
+		t.Fatalf("request of client %d with no leader asked client %d", a, id)
 	}
 	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || res.ResignRequested {
 		t.Fatalf("first attempt = %+v, want the lease and no request", res)
 	}
-	if id := requestResign(ctx, t, exec); id != a {
+	// A request that names a client that does not lead asks no one.
+	if id := requestResign(ctx, t, exec, b); id != 0 {
+		t.Fatalf("request of the non-leader %d asked client %d", b, id)
+	}
+	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || res.ResignRequested {
+		t.Fatalf("leader's renewal after a request of another client = %+v, want the lease and no request", res)
+	}
+	if id := requestResign(ctx, t, exec, a); id != a {
+		t.Fatalf("request of the leader asked client %d, want %d", id, a)
+	}
+	if err := exec.LeaderResign(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || res.ResignRequested {
+		t.Fatalf("election after the resign = %+v, want the lease and no request", res)
+	}
+	if id := requestResign(ctx, t, exec, 0); id != a {
 		t.Fatalf("request asked client %d, want the leader %d", id, a)
 	}
 	if res := leaderAttempt(ctx, t, exec, b); res.Leader || res.ResignRequested {
@@ -65,13 +86,15 @@ func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 	// A request of a lease that expired asks no one; one made of a live
 	// lease does not pass to the client that takes it over once it expires.
 	f.ExpireLeader(ctx, t, d)
-	if id := requestResign(ctx, t, exec); id != 0 {
-		t.Fatalf("request of an expired lease asked client %d", id)
+	for _, of := range []int64{0, b} {
+		if id := requestResign(ctx, t, exec, of); id != 0 {
+			t.Fatalf("request (of %d) of an expired lease asked client %d", of, id)
+		}
 	}
 	if res := leaderAttempt(ctx, t, exec, b); !res.Leader || res.ResignRequested {
 		t.Fatalf("renewal of an expired lease = %+v, want the lease and no request", res)
 	}
-	if id := requestResign(ctx, t, exec); id != b {
+	if id := requestResign(ctx, t, exec, 0); id != b {
 		t.Fatalf("request asked client %d, want %d", id, b)
 	}
 	f.ExpireLeader(ctx, t, d)
@@ -83,7 +106,7 @@ func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	// Nor does it pass to the holder's own next term: a holder that takes
 	// its expired lease back is not asked.
-	if id := requestResign(ctx, t, exec); id != a {
+	if id := requestResign(ctx, t, exec, a); id != a {
 		t.Fatalf("request asked client %d, want %d", id, a)
 	}
 	f.ExpireLeader(ctx, t, d)
@@ -94,7 +117,8 @@ func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 
 // testLeaderResignRacesRenewal makes requests while the leader renews,
 // again and again: a request that names the leader is never lost to a
-// renewal it races, so the leader's next renewal reports it.
+// renewal it races, so the leader's next renewal reports it. Rounds
+// alternate between a request of any leader and one that names it.
 func testLeaderResignRacesRenewal[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -115,8 +139,12 @@ func testLeaderResignRacesRenewal[TTx any](t *testing.T, f Fixture[TTx]) {
 				}
 			}
 		})
+		of := int64(0)
+		if round%2 == 1 {
+			of = a
+		}
 		wg.Go(func() {
-			id, err := exec.LeaderRequestResign(ctx)
+			id, err := exec.LeaderRequestResign(ctx, of)
 			if err != nil {
 				t.Error(err)
 			}
@@ -139,12 +167,16 @@ func testLeaderResignRacesRenewal[TTx any](t *testing.T, f Fixture[TTx]) {
 // over an expired lease, again and again: the request asks either no one,
 // before the takeover, or the new leader, after it, never the expired
 // holder; and the new leader is asked if and only if the request named it.
+// Rounds cycle through a request of any leader, one that names the expired
+// holder (a retry made from a view of the cluster before the takeover),
+// which must ask no one, and one that names the new leader.
 func testLeaderResignRacesElection[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
 	a, b := register(ctx, t, exec), register(ctx, t, exec)
-	for round := range 20 {
+	for round := range 30 {
+		of := []int64{0, a, b}[round%3]
 		if res := leaderAttempt(ctx, t, exec, a); !res.Leader {
 			t.Fatalf("round %d: election = %+v", round, res)
 		}
@@ -162,7 +194,7 @@ func testLeaderResignRacesElection[TTx any](t *testing.T, f Fixture[TTx]) {
 			elected = res
 		})
 		wg.Go(func() {
-			id, err := exec.LeaderRequestResign(ctx)
+			id, err := exec.LeaderRequestResign(ctx, of)
 			if err != nil {
 				t.Error(err)
 			}
@@ -172,8 +204,8 @@ func testLeaderResignRacesElection[TTx any](t *testing.T, f Fixture[TTx]) {
 		if !elected.Leader || elected.ResignRequested {
 			t.Fatalf("round %d: takeover = %+v, want the lease and no request", round, elected)
 		}
-		if asked != 0 && asked != b {
-			t.Fatalf("round %d: request asked client %d, want no one or the new leader %d", round, asked, b)
+		if (asked != 0 && asked != b) || (of == a && asked != 0) {
+			t.Fatalf("round %d: request of %d asked client %d, want no one or the new leader %d (no one for a request of the expired holder %d)", round, of, asked, b, a)
 		}
 		if res := leaderAttempt(ctx, t, exec, b); !res.Leader || res.ResignRequested != (asked == b) {
 			t.Fatalf("round %d: new leader's renewal = %+v after a request that asked client %d", round, res, asked)

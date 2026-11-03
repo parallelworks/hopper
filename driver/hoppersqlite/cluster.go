@@ -161,14 +161,15 @@ func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams
 }
 
 // LeaderRequestResign implements driver.Executor: it names the holder of a
-// live lease as asked to resign and, only then, signals it.
-func (e *executor) LeaderRequestResign(ctx context.Context) (int64, error) {
+// live lease as asked to resign, if it is the leader leaderID names (0
+// names any), and, only then, signals it.
+func (e *executor) LeaderRequestResign(ctx context.Context, leaderID int64) (int64, error) {
 	var id int64
 	err := e.write(ctx, func(x *w) error {
 		err := x.QueryRowContext(ctx, `
 			UPDATE hopper_leader SET resign_client_id = client_id
-			WHERE name = 'default' AND expires_at > ?
-			RETURNING client_id`, x.us()).Scan(&id)
+			WHERE name = 'default' AND expires_at > ?1 AND (?2 = 0 OR client_id = ?2)
+			RETURNING client_id`, x.us(), leaderID).Scan(&id)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}

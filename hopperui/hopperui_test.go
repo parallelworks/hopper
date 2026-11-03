@@ -290,25 +290,46 @@ func TestUI(t *testing.T) {
 	code, body = post(admin, "/consumers/nobody/seek", url.Values{"to": {"sideways"}}, true)
 	want(400, body, code)
 	code, body = get(admin, "/clients")
-	want(200, body, code, `action="/hopper/clients/leader/resign"`)
-	code, body = get(readOnly, "/clients")
-	want(200, body, code)
+	want(200, body, code, "No client leads")
 	if strings.Contains(body, "/clients/leader/resign") {
-		t.Error("read-only UI offers to ask the leader to resign")
+		t.Error("UI offers to ask a leader to resign with no leader")
 	}
-	code, body = post(readOnly, "/clients/leader/resign", nil, true)
-	want(403, body, code)
-	code, body = post(admin, "/clients/leader/resign", nil, false)
-	want(403, body, code)
 	if _, err := pool.Exec(ctx, `INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
 		VALUES ('default', 42, now(), now() + interval '1 minute')`); err != nil {
 		t.Fatal(err)
 	}
+	code, body = get(admin, "/clients")
+	want(200, body, code, `action="/hopper/clients/leader/resign"`, `name="leader" value="42"`)
+	code, body = get(readOnly, "/clients")
+	want(200, body, code, "Leader: client 42")
+	if strings.Contains(body, "/clients/leader/resign") {
+		t.Error("read-only UI offers to ask the leader to resign")
+	}
+	leaderForm := func(id string) url.Values { return url.Values{"leader": {id}} }
+	code, body = post(readOnly, "/clients/leader/resign", leaderForm("42"), true)
+	want(403, body, code)
+	code, body = post(admin, "/clients/leader/resign", leaderForm("42"), false)
+	want(403, body, code)
 	code, body = post(admin, "/clients/leader/resign", nil, true)
+	want(400, body, code)
+	resignAsked := func() *int64 {
+		t.Helper()
+		var asked *int64
+		if err := pool.QueryRow(ctx, "SELECT resign_client_id FROM hopper_leader").Scan(&asked); err != nil {
+			t.Fatal(err)
+		}
+		return asked
+	}
+	// A page that showed another leader asks no one.
+	code, body = post(admin, "/clients/leader/resign", leaderForm("41"), true)
 	want(303, body, code)
-	var asked int64
-	if err := pool.QueryRow(ctx, "SELECT resign_client_id FROM hopper_leader").Scan(&asked); err != nil || asked != 42 {
-		t.Errorf("resign_client_id after the resign action = %d, %v; want 42", asked, err)
+	if asked := resignAsked(); asked != nil {
+		t.Errorf("resign_client_id after a stale page's request = %d, want NULL", *asked)
+	}
+	code, body = post(admin, "/clients/leader/resign", leaderForm("42"), true)
+	want(303, body, code)
+	if asked := resignAsked(); asked == nil || *asked != 42 {
+		t.Errorf("resign_client_id after the resign action = %v, want 42", asked)
 	}
 	code, body = post(admin, "/jobs/"+job.Job.ID.String()+"/explode", nil, true)
 	want(404, body, code)

@@ -325,10 +325,11 @@ type Executor interface {
 	// LeaderRequestResign asks the client that holds a live leader lease,
 	// by database time, to give it up: it records the request on the lease,
 	// naming that client, which the holder's next LeaderAttempt reports,
-	// and signals ChannelLeader with "resign". It returns the holder's
-	// client ID, or 0 if no client holds a live lease. A request names the
-	// holder it was made of only, so a later holder is never asked.
-	LeaderRequestResign(ctx context.Context) (int64, error)
+	// and signals ChannelLeader with "resign". A leaderID of 0 asks whichever
+	// client holds the lease; another asks only if that client holds it. It
+	// returns the client ID asked, or 0 if it asked no one. A request names
+	// the holder it was made of only, so a later holder is never asked.
+	LeaderRequestResign(ctx context.Context, leaderID int64) (int64, error)
 
 	// QueueEnsure records queues a client works, so they are listed even
 	// before any job is inserted.
