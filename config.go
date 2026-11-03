@@ -97,10 +97,10 @@ type Config struct {
 	// the hook is called, while the stop waits or after it has returned,
 	// if the process still runs. A stop that gives up on workers at the end
 	// of its grace does not call it, but logs a warning, before it
-	// returns, with the ID and kind of each job still running. A hook that
-	// exits the process while a stop runs ends it as a crash would: the
-	// results not yet written are lost, and the jobs are rescued once the
-	// lease expires (delivery is at-least-once).
+	// returns, with the ID and kind of each job whose worker still runs. A
+	// hook that exits the process while a stop runs ends it as a crash
+	// would: the results not yet written are lost, and the jobs are rescued
+	// once the lease expires (delivery is at-least-once).
 	//
 	// Nothing else changes. The attempt keeps its slot in the queue until
 	// the worker returns, and its result is written then, as any is. Until

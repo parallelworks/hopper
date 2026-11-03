@@ -42,7 +42,12 @@ type stuckCall struct {
 	job    *JobRow
 	cause  error
 	client bool
+	// started reports that the hook's context has the values of Start's.
+	started bool
 }
+
+// stuckStartKey marks the context a test starts its client with.
+type stuckStartKey struct{}
 
 type stuckHarness struct {
 	c        *Client[struct{}]
@@ -100,7 +105,10 @@ func stuckClient(t *testing.T, jobTimeout time.Duration, onStuck func(context.Co
 	if onStuck == nil {
 		onStuck = func(ctx context.Context, job *JobRow, cause error) {
 			_, ok := ClientFromContext[struct{}](ctx)
-			h.calls <- stuckCall{at: time.Now(), job: job, cause: cause, client: ok && ctx.Err() == nil}
+			h.calls <- stuckCall{
+				at: time.Now(), job: job, cause: cause, client: ok && ctx.Err() == nil,
+				started: ctx.Value(stuckStartKey{}) != nil,
+			}
 		}
 	}
 	c, err := NewClient(managedTestDriver{exec: stuckExec{h.exec}}, &Config{
@@ -138,13 +146,13 @@ func (h *stuckHarness) noMoreCalls(t *testing.T) {
 
 // TestStuckAfterTimeout: a worker that ignores its timeout is reported
 // StuckGrace after the timeout, once, with ErrJobTimeout, a context that
-// carries the client and is not canceled, a warning and an EventJobStuck;
-// its result is written once it returns.
+// carries the client and Start's values and is not canceled, a warning and
+// an EventJobStuck; its result is written once it returns.
 func TestStuckAfterTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		job := stuckJob(`{}`)
 		h := stuckClient(t, time.Second, nil, job)
-		ctx := context.Background()
+		ctx := context.WithValue(context.Background(), stuckStartKey{}, true)
 		evCtx, evCancel := context.WithCancel(ctx)
 		defer evCancel()
 		events := make(chan Event, 4)
@@ -162,8 +170,9 @@ func TestStuckAfterTimeout(t *testing.T) {
 		if d := call.at.Sub(canceled); d != DefaultStuckGrace {
 			t.Errorf("OnStuck called %s after the timeout, want %s", d, DefaultStuckGrace)
 		}
-		if !errors.Is(call.cause, ErrJobTimeout) || call.job.ID != job.ID || !call.client {
-			t.Errorf("OnStuck(job %s, %v), client in a live context %v; want job %s, ErrJobTimeout, true", call.job.ID, call.cause, call.client, job.ID)
+		if !errors.Is(call.cause, ErrJobTimeout) || call.job.ID != job.ID || !call.client || !call.started {
+			t.Errorf("OnStuck(job %s, %v), client in a live context %v, Start's values %v; want job %s, ErrJobTimeout, true, true",
+				call.job.ID, call.cause, call.client, call.started, job.ID)
 		}
 		synctest.Wait()
 		select {
@@ -289,6 +298,79 @@ func TestStopGiveUpListsJobs(t *testing.T) {
 		h.noMoreCalls(t)
 		close(h.release)
 		synctest.Wait()
+	})
+}
+
+// TestStopGiveUpListsReplaced: an attempt that a later claim of its job on
+// the same client replaced runs on until its worker returns, and a stop that
+// gives up on it lists it, as replaced, beside the claim that replaced it.
+func TestStopGiveUpListsReplaced(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		first := stuckJob(`{}`)
+		again := *first
+		again.Fence++
+		h := stuckClient(t, time.Hour, nil, first, &again)
+		ctx := context.Background()
+		if err := h.c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		stopCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if err := h.c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Stop = %v, want its deadline", err)
+		}
+		logs := h.logs.String()
+		for _, want := range []string{first.ID.String() + " (stuck_args, replaced)", first.ID.String() + " (stuck_args)"} {
+			if !strings.Contains(logs, want) {
+				t.Errorf("the give-up warning does not list %q: %s", want, logs)
+			}
+		}
+		// The replaced attempt is reported StuckGrace after its replacement,
+		// the other StuckGrace after the stop's deadline canceled it.
+		for _, want := range []error{ErrJobFenced, ErrClientStopped} {
+			if call := <-h.calls; !errors.Is(call.cause, want) {
+				t.Errorf("OnStuck called with %v, want %v", call.cause, want)
+			}
+		}
+		close(h.release)
+		synctest.Wait()
+	})
+}
+
+// TestStuckWithoutHook: with no OnStuck, a stuck worker is still logged and
+// emitted, its own StuckGrace after its cancellation.
+func TestStuckWithoutHook(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		job := stuckJob(`{}`)
+		h := stuckClient(t, time.Second, nil, job)
+		const grace = 3 * time.Second
+		h.c.cfg.OnStuck, h.c.cfg.StuckGrace = nil, grace
+		ctx := context.Background()
+		evCtx, evCancel := context.WithCancel(ctx)
+		defer evCancel()
+		events := make(chan Event, 4)
+		go func() {
+			for ev := range h.c.Events(evCtx, EventJobStuck) {
+				events <- ev
+			}
+		}()
+		synctest.Wait()
+		if err := h.c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		canceled := <-h.canceled
+		ev := <-events
+		if d := ev.At.Sub(canceled); d != grace || ev.Job == nil || ev.Job.ID != job.ID || ev.Error != ErrJobTimeout.Error() {
+			t.Errorf("event %+v %s after the timeout, want job %s with %q after %s", ev, d, job.ID, ErrJobTimeout, grace)
+		}
+		if n := h.logs.count(stuckWarning); n != 1 {
+			t.Errorf("%d warnings logged, want 1", n)
+		}
+		close(h.release)
+		if err := h.c.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
 	})
 }
 

@@ -510,11 +510,12 @@ func (c *Client[TTx]) emit(kind EventKind, job *JobRow, errText string) {
 	c.events.emit(Event{Kind: kind, At: time.Now(), Job: job, Error: errText, ClientID: c.clientID.Load()})
 }
 
-// runningJob is a claim of a job running on this client: its cancel
-// function. A claim is told from another by the pointer, not by its fence,
-// which a client of the previous release can reset so that a later claim
-// repeats it.
+// runningJob is a claim of a job running on this client: the job's ID and
+// kind, and its cancel function. A claim is told from another by the
+// pointer, not by its fence, which a client of the previous release can
+// reset so that a later claim repeats it.
 type runningJob struct {
+	id     JobID
 	kind   string
 	cancel context.CancelCauseFunc
 }
@@ -523,11 +524,16 @@ type runningJob struct {
 // returns the claim for untrackRunning. A job rescued while its attempt
 // still runs here can be claimed here again: the later claim replaces the
 // earlier, whose attempt is canceled, since its result can no longer apply.
+// The replaced claim is kept in c.replaced until its worker returns, so that
+// a stop that gives up on it lists it.
 func (c *Client[TTx]) trackRunning(id JobID, kind string, cancel context.CancelCauseFunc) *runningJob {
-	r := &runningJob{kind: kind, cancel: cancel}
+	r := &runningJob{id: id, kind: kind, cancel: cancel}
 	c.runningMu.Lock()
 	prev := c.running[id]
 	c.running[id] = r
+	if prev != nil {
+		c.replaced[prev] = struct{}{}
+	}
 	c.runningMu.Unlock()
 	if prev != nil {
 		prev.cancel(ErrJobFenced)
@@ -535,11 +541,13 @@ func (c *Client[TTx]) trackRunning(id JobID, kind string, cancel context.CancelC
 	return r
 }
 
-// untrackRunning removes a job's claim, unless a later claim replaced it.
+// untrackRunning removes a job's claim, the latest or a replaced one.
 func (c *Client[TTx]) untrackRunning(id JobID, r *runningJob) {
 	c.runningMu.Lock()
 	if c.running[id] == r {
 		delete(c.running, id)
+	} else {
+		delete(c.replaced, r)
 	}
 	c.runningMu.Unlock()
 }
@@ -547,20 +555,27 @@ func (c *Client[TTx]) untrackRunning(id JobID, r *runningJob) {
 // maxListedJobs bounds the jobs a stop's give-up warning lists.
 const maxListedJobs = 100
 
-// runningJobs lists the jobs running on this client, as "<id> (<kind>)" in
-// ID order, up to limit of them, and how many more there are.
+// runningJobs lists the attempts running on this client, as "<id> (<kind>)"
+// in ID order, up to limit of them, and how many more there are. An attempt
+// a later claim of its job replaced runs on until its worker returns, and is
+// listed as "<id> (<kind>, replaced)".
 func (c *Client[TTx]) runningJobs(limit int) []string {
 	c.runningMu.Lock()
-	ids := slices.SortedFunc(maps.Keys(c.running), func(a, b JobID) int { return bytes.Compare(a[:], b[:]) })
-	jobs := make([]string, 0, min(len(ids), limit+1))
-	for i, id := range ids {
+	defer c.runningMu.Unlock()
+	claims := slices.AppendSeq(slices.Collect(maps.Values(c.running)), maps.Keys(c.replaced))
+	slices.SortFunc(claims, func(a, b *runningJob) int { return bytes.Compare(a.id[:], b.id[:]) })
+	jobs := make([]string, 0, min(len(claims), limit+1))
+	for i, r := range claims {
 		if i == limit {
-			jobs = append(jobs, fmt.Sprintf("and %d more", len(ids)-limit))
+			jobs = append(jobs, fmt.Sprintf("and %d more", len(claims)-limit))
 			break
 		}
-		jobs = append(jobs, fmt.Sprintf("%s (%s)", id, c.running[id].kind))
+		if _, replaced := c.replaced[r]; replaced {
+			jobs = append(jobs, fmt.Sprintf("%s (%s, replaced)", r.id, r.kind))
+		} else {
+			jobs = append(jobs, fmt.Sprintf("%s (%s)", r.id, r.kind))
+		}
 	}
-	c.runningMu.Unlock()
 	return jobs
 }
 

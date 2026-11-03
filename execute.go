@@ -186,7 +186,7 @@ func (c *Client[TTx]) runWorker(ctx context.Context, row, claimed *driver.JobRow
 	// Deferred, so that a worker that exits its goroutine (runtime.Goexit,
 	// as t.FailNow does), which safeWork cannot recover, still ends its
 	// watch before the timeout's cancel above would start it.
-	defer c.stuckReturned(c.watchStuck(jobCtx, claimed))
+	defer c.watchStuck(jobCtx, claimed).returned()
 	err = safeWork(jobCtx, work)
 	if err != nil && jobTimeoutCause(jobCtx) {
 		err = fmt.Errorf("%w after %s: %w", ErrJobTimeout, timeout, err)

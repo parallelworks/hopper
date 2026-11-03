@@ -1633,7 +1633,9 @@ word.
   canceled is reported `StuckGrace` later, while the stop waits or after it has
   returned, if the process still runs. A stop that gives up on workers at the end of
   its grace (§7.12) does not report them, but logs, before it returns, the ID and kind
-  of each job still running (up to 100). A hook that exits the process during a stop
+  of each job still running (up to 100), an attempt a later claim of its job replaced
+  among them, marked as replaced; an attempt whose worker has returned but that is
+  still closing its log or handing in its result is not listed. A hook that exits the process during a stop
   ends it as a crash would: results not yet written are lost, and the jobs are rescued
   once the lease expires, at-least-once. An earlier design also reported, from the
   stop, the workers it gave up on; it needed a client-wide set of watches and could

@@ -27,14 +27,14 @@ type stuckWatch struct {
 }
 
 // watchStuck starts watching the worker about to run under ctx, whose row
-// as claimed is claimed; call stuckReturned once it has returned.
+// as claimed is claimed; call returned once it has returned.
 func (c *Client[TTx]) watchStuck(ctx context.Context, claimed *driver.JobRow) *stuckWatch {
 	w := &stuckWatch{ctx: ctx, job: claimed}
 	w.stopAfter = context.AfterFunc(ctx, func() {
 		t := time.AfterFunc(c.cfg.StuckGrace, func() { c.reportStuck(w) })
 		w.timer.Store(t)
 		// The worker may have returned as the timer was set: either this
-		// sees it, or stuckReturned sees the timer.
+		// sees it, or returned sees the timer.
 		if w.done.Load() {
 			t.Stop()
 		}
@@ -42,8 +42,8 @@ func (c *Client[TTx]) watchStuck(ctx context.Context, claimed *driver.JobRow) *s
 	return w
 }
 
-// stuckReturned ends a watch whose worker has returned.
-func (c *Client[TTx]) stuckReturned(w *stuckWatch) {
+// returned ends a watch whose worker has returned.
+func (w *stuckWatch) returned() {
 	w.done.Store(true)
 	if w.stopAfter() {
 		return
@@ -56,8 +56,10 @@ func (c *Client[TTx]) stuckReturned(w *stuckWatch) {
 // reportStuck logs a worker that has not returned since its context was
 // canceled, emits EventJobStuck and starts Config.OnStuck on a goroutine of
 // its own, unless the worker has returned or was reported already. The
-// event and the hook each get a copy of the row, which they may change
-// without racing each other or the attempt's log.
+// event and the hook each get a shallow copy of the row: they may set its
+// fields without racing each other or the attempt's log, but share the
+// contents of its Args, Metadata, Errors and Tags, which none of them may
+// change.
 func (c *Client[TTx]) reportStuck(w *stuckWatch) {
 	if !w.done.CompareAndSwap(false, true) {
 		return
@@ -71,8 +73,11 @@ func (c *Client[TTx]) reportStuck(w *stuckWatch) {
 		return
 	}
 	// The hook's goroutine holds only its copy of the row and the job's ID
-	// and kind, not the watch, whose context carries the attempt.
+	// and kind, not the watch, whose context carries the attempt. Its
+	// context has the values of Start's, as Config.OnError's does, but not
+	// its cancellation.
 	job, id, kind := *w.job, w.job.ID, w.job.Kind
+	hookCtx := context.WithValue(context.WithoutCancel(c.workCtx), clientKey{}, c)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -80,7 +85,7 @@ func (c *Client[TTx]) reportStuck(w *stuckWatch) {
 					"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 			}
 		}()
-		c.cfg.OnStuck(context.WithValue(context.Background(), clientKey{}, c), &job, cause)
+		c.cfg.OnStuck(hookCtx, &job, cause)
 	}()
 }
 
