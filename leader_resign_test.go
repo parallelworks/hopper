@@ -96,10 +96,17 @@ func TestLeaderResign(t *testing.T) {
 			})
 			events, stopEvents := context.WithCancel(ctx)
 			defer stopEvents()
+			// The term ends on request once: the count catches a second
+			// event, which a send on a full channel would hide.
+			var resignedN atomic.Int32
 			resigned := make(chan struct{}, 1)
 			go func() {
 				for range a.Events(events, hopper.EventLeaderResigned) {
-					resigned <- struct{}{}
+					resignedN.Add(1)
+					select {
+					case resigned <- struct{}{}:
+					default:
+					}
 				}
 			}()
 			if err := a.Start(ctx); err != nil {
@@ -149,6 +156,9 @@ func TestLeaderResign(t *testing.T) {
 			}
 			if n := exec.overlapped.Load(); n != 0 {
 				t.Errorf("the resigned client gave the lease up while a duty of its term ran (%d times)", n)
+			}
+			if n := resignedN.Load(); n != 1 {
+				t.Errorf("%d EventLeaderResigned, want 1", n)
 			}
 		})
 	}

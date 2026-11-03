@@ -177,44 +177,41 @@ func (c *Client[TTx]) resign(ctx context.Context, id int64) {
 	if !c.isLeader.Swap(false) {
 		return
 	}
-	deleted, err := c.giveUpLease(ctx, id)
-	switch {
-	case err != nil:
-		c.logger.WarnContext(ctx, "hopper: resign leadership", "client_id", id, "error", err)
-	case !deleted:
-		c.logger.InfoContext(ctx, "hopper: stopped leading; the lease had already passed on", "client_id", id)
-	default:
-		c.logger.InfoContext(ctx, "hopper: resigned leadership", "client_id", id)
-	}
+	c.giveUpLease(ctx, id, "")
 }
 
 // giveUpLease deletes the leader lease if client id holds it, and then
-// signals the other clients to elect a replacement, and reports whether it
-// deleted it. It runs on a context of its own, so that a stopping client
-// still gives the lease up.
-func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64) (bool, error) {
+// signals the other clients to elect a replacement, and logs which way the
+// lease went; why ("" or " on request") says what ended the term. It runs
+// on a context of its own, so that a stopping client still gives the lease
+// up. If the statement fails, the lease expires instead, within the TTL
+// its last renewal left it.
+func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64, why string) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	return c.exec.LeaderResign(rctx, id)
+	deleted, err := c.exec.LeaderResign(rctx, id)
+	switch {
+	case err != nil:
+		c.logger.WarnContext(ctx, "hopper: resign leadership"+why+"; the lease expires instead", "client_id", id, "error", err)
+	case !deleted:
+		c.logger.InfoContext(ctx, "hopper: stopped leading"+why+"; the lease had already passed on", "client_id", id)
+	default:
+		c.logger.InfoContext(ctx, "hopper: resigned leadership"+why, "client_id", id)
+	}
 }
 
 // resignOnRequest ends a term on a resign request, once the term's loops
 // have ended: it gives the lease client id holds up and signals the other
-// clients to elect a replacement. If the statement fails, the lease
-// expires instead, within the TTL its last renewal left it. The event
-// marks the end of the term, whichever way the lease went.
+// clients to elect a replacement. The event marks the end of the term,
+// whichever way the lease went, and only of a term the client announced
+// (EventLeaderElected): an attempt that took the lease but failed to
+// report it started none.
 func (c *Client[TTx]) resignOnRequest(ctx context.Context, id int64) {
-	c.isLeader.Store(false)
-	deleted, err := c.giveUpLease(ctx, id)
-	switch {
-	case err != nil:
-		c.logger.WarnContext(ctx, "hopper: resign leadership on request; the lease expires instead", "client_id", id, "error", err)
-	case !deleted:
-		c.logger.InfoContext(ctx, "hopper: stopped leading on request; the lease had already passed on", "client_id", id)
-	default:
-		c.logger.InfoContext(ctx, "hopper: resigned leadership on request", "client_id", id)
+	led := c.isLeader.Swap(false)
+	c.giveUpLease(ctx, id, " on request")
+	if led {
+		c.emit(EventLeaderResigned, nil, "")
 	}
-	c.emit(EventLeaderResigned, nil, "")
 }
 
 // rescue moves running jobs whose client has lost its lease back to

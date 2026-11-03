@@ -139,9 +139,20 @@ func (e *executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (driver.LeaderResult, error) {
 	var res driver.LeaderResult
 	err := e.write(ctx, func(x *w) error {
+		// Whether the attempt renews the client's own live lease, read
+		// before the statement changes the row, which nothing else writes
+		// meanwhile (one writer at a time). The new row's elected_at cannot
+		// tell: the database's clock gives the same time again while the
+		// host's is stepped back (database.clock), so a renewal then would
+		// look like a new term.
+		var renewal bool
+		if err := x.QueryRowContext(ctx, `SELECT client_id = ?1 AND expires_at >= ?2 FROM hopper_leader WHERE name = 'default'`,
+			params.ClientID, x.us()).Scan(&renewal); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 		var (
-			id            int64
-			resign, fresh bool
+			id     int64
+			resign bool
 		)
 		err := x.QueryRowContext(ctx, `
 			INSERT INTO hopper_leader (name, client_id, elected_at, expires_at) VALUES ('default', ?1, ?2, ?3)
@@ -155,13 +166,13 @@ func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams
 			  resign_client_id = CASE WHEN hopper_leader.client_id = excluded.client_id AND hopper_leader.expires_at >= ?2
 			                          THEN hopper_leader.resign_client_id END
 			WHERE hopper_leader.expires_at < ?2 OR hopper_leader.client_id = excluded.client_id
-			RETURNING client_id, coalesce(resign_client_id = client_id, 0), elected_at = ?2`, params.ClientID, x.us(), x.at(params.TTL)).Scan(&id, &resign, &fresh)
+			RETURNING client_id, coalesce(resign_client_id = client_id, 0)`, params.ClientID, x.us(), x.at(params.TTL)).Scan(&id, &resign)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		res.Leader = err == nil && id == params.ClientID
 		res.ResignRequested = res.Leader && resign
-		res.NewTerm = res.Leader && fresh
+		res.NewTerm = res.Leader && !renewal
 		return err
 	})
 	if err != nil {
