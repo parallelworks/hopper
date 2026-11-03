@@ -4,11 +4,13 @@ name: Performance gate
 # and fails if the PR is more than 10% slower on any scenario. Hosted
 # runners are noisy and drift over a job, so both benchmark binaries are
 # built first and then run alternately, scenario by scenario, for several
-# rounds. The second of two back-to-back runs is measurably slower than the
-# first, so the side that runs first swaps every round and each side runs
-# first in half the rounds (ROUNDS must be even). Noise only ever slows a
-# run down, so the faster half of each side's runs, averaged, is what is
-# compared. Each run drains 300,000 jobs
+# rounds. Whether a run comes first or second of a back-to-back pair
+# shifts it by several percent, slower or faster depending on the
+# scenario, so the side that runs first follows base, head, head, base
+# over the rounds: each side runs first in half of them (ROUNDS must be
+# even), spread evenly over the job so that drift does not favor either.
+# Noise only ever slows a run down, so the faster half of each side's
+# runs, averaged, is what is compared. Each run drains 300,000 jobs
 # (about ten seconds on a runner): a shorter drain measures start-up
 # effects, such as the leader's first statistics refresh, rather than the
 # hot paths. The workflow scenarios, whose jobs each pass through the
@@ -80,7 +82,7 @@ jobs:
           if (( ROUNDS % 2 )); then echo "ROUNDS must be even" >&2; exit 1; fi
           for i in $(seq "$ROUNDS"); do
             order="base head"
-            if (( i % 2 == 0 )); then order="head base"; fi
+            if (( i % 4 / 2 )); then order="head base"; fi
             for s in ${SCENARIOS//,/ }; do
               jobs=$JOBS
               case "$s" in workflow*) jobs=$WORKFLOW_JOBS;; esac

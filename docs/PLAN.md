@@ -2399,9 +2399,11 @@ the partition's extension lock, so the data volume has no size limit.
 - CI runs a reduced benchmark on every PR that touches the insert, claim or finalize
   paths, on the PR and on its base alternately on the same runner, scenario by scenario
   for several rounds, comparing the average of the faster half of each side's runs (noise
-  on a shared runner only slows runs down). The side that runs first swaps every round,
-  because the second of two back-to-back runs is several percent slower. `hopperbench -compare` fails the check on a
-  regression of more than 10%.
+  on a shared runner only slows runs down). The side that runs first follows base, head,
+  head, base over the rounds, so each runs first in half of them, spread over the job:
+  whether a run comes first or second of a back-to-back pair shifts it by several
+  percent, slower or faster depending on the scenario. `hopperbench -compare` fails the
+  check on a regression of more than 10%.
 - A nightly soak runs the full scenario set at volume with five million history rows
   and keeps the results as an artifact. The 24h soak at 70% of peak, tracking table and
   index size, autovacuum activity and latency drift, runs on the release hardware.
