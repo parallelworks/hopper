@@ -104,8 +104,9 @@ func (e *Executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 }
 
 // leaderSQL takes the lease if it is free or expired, or renews it for the
-// holder. No row is returned when another client holds it. A renewal keeps
-// a resign request, and reports one that names the holder; a takeover
+// holder. No row is returned when another client holds it. A renewal of a
+// live lease keeps a resign request, and reports one that names the holder;
+// a takeover of an expired lease, even the holder's own, starts a term and
 // clears it.
 const leaderSQL = `
 INSERT INTO {{schema}}.hopper_leader (name, client_id, elected_at, expires_at)
@@ -114,7 +115,7 @@ ON CONFLICT (name) DO UPDATE SET
   client_id  = EXCLUDED.client_id,
   elected_at = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.elected_at ELSE now() END,
   expires_at = EXCLUDED.expires_at,
-  resign_client_id = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.resign_client_id END
+  resign_client_id = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id AND hopper_leader.expires_at >= now() THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = EXCLUDED.client_id
 RETURNING client_id, coalesce(resign_client_id = client_id, false)`
 
@@ -152,14 +153,15 @@ func (e *Executor) LeaderResign(ctx context.Context, clientID int64) error {
 }
 
 // leaderRequestResignSQL names the holder of a live lease as asked to
-// resign and, only then, signals it.
+// resign and, only then, signals it. The notification sits in RETURNING,
+// so it is sent for the row the request updated and for nothing else.
 const leaderRequestResignSQL = `
 WITH asked AS (
   UPDATE {{schema}}.hopper_leader SET resign_client_id = client_id
   WHERE name = 'default' AND expires_at > now()
-  RETURNING client_id
+  RETURNING client_id, pg_notify($1, 'resign')
 )
-SELECT a.client_id FROM asked a CROSS JOIN LATERAL (SELECT pg_notify($1, 'resign')) n`
+SELECT client_id FROM asked`
 
 // LeaderRequestResign implements driver.Executor.
 func (e *Executor) LeaderRequestResign(ctx context.Context) (int64, error) {

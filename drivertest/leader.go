@@ -81,6 +81,15 @@ func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 	if res := leaderAttempt(ctx, t, exec, b); res.Leader || res.ResignRequested {
 		t.Fatalf("former holder's attempt = %+v, want neither", res)
 	}
+	// Nor does it pass to the holder's own next term: a holder that takes
+	// its expired lease back is not asked.
+	if id := requestResign(ctx, t, exec); id != a {
+		t.Fatalf("request asked client %d, want %d", id, a)
+	}
+	f.ExpireLeader(ctx, t, d)
+	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || res.ResignRequested {
+		t.Fatalf("holder's takeover of its own expired lease = %+v, want the lease and no request", res)
+	}
 }
 
 // testLeaderResignRacesRenewal makes requests while the leader renews,

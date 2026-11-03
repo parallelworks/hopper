@@ -63,7 +63,11 @@ func (c *Client[TTx]) listenOnce(ctx context.Context) error {
 		case driver.ChannelInsert:
 			c.wakeQueue(n.Payload)
 		case driver.ChannelLeader:
-			c.pokeLeader()
+			// A request that the leader resign ("resign") concerns the
+			// leader only; a resignation ("resigned") starts an election.
+			if n.Payload != "resign" || c.isLeader.Load() {
+				c.pokeLeader()
+			}
 		case driver.ChannelControl:
 			c.control(ctx, n.Payload)
 		case driver.ChannelDone:

@@ -317,7 +317,7 @@ type Executor interface {
 	// LeaderAttempt takes or renews the leader lease for a client and
 	// reports whether the client holds it afterwards and, if it does,
 	// whether a LeaderRequestResign asked it to give the lease up. A client
-	// that takes the lease over from another clears that request.
+	// that takes an expired lease over, even its own, clears that request.
 	LeaderAttempt(ctx context.Context, params LeaderParams) (LeaderResult, error)
 	// LeaderResign gives up leadership if the client holds it, and signals
 	// other clients to elect a replacement.

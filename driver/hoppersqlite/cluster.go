@@ -128,8 +128,9 @@ func (e *executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 }
 
 // LeaderAttempt implements driver.Executor: it takes the lease if it is
-// free or expired, or renews it for the holder. A renewal keeps a resign
-// request, and reports one that names the holder; a takeover clears it.
+// free or expired, or renews it for the holder. A renewal of a live lease
+// keeps a resign request, and reports one that names the holder; a
+// takeover of an expired lease, even the holder's own, clears it.
 func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (driver.LeaderResult, error) {
 	var res driver.LeaderResult
 	err := e.write(ctx, func(x *w) error {
@@ -143,7 +144,7 @@ func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams
 			  client_id  = excluded.client_id,
 			  elected_at = CASE WHEN hopper_leader.client_id = excluded.client_id THEN hopper_leader.elected_at ELSE excluded.elected_at END,
 			  expires_at = excluded.expires_at,
-			  resign_client_id = CASE WHEN hopper_leader.client_id = excluded.client_id THEN hopper_leader.resign_client_id END
+			  resign_client_id = CASE WHEN hopper_leader.client_id = excluded.client_id AND hopper_leader.expires_at >= ?2 THEN hopper_leader.resign_client_id END
 			WHERE hopper_leader.expires_at < ?2 OR hopper_leader.client_id = excluded.client_id
 			RETURNING client_id, coalesce(resign_client_id = client_id, 0)`, params.ClientID, x.us(), x.at(params.TTL)).Scan(&id, &resign)
 		if errors.Is(err, sql.ErrNoRows) {

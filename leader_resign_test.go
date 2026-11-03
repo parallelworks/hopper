@@ -23,6 +23,10 @@ type dutyExec struct {
 	driver.Executor
 	resigned atomic.Bool
 	after    atomic.Int32
+	// running counts the term's live-table passes in progress, and
+	// overlapped the resigns made while one was.
+	running    atomic.Int32
+	overlapped atomic.Int32
 }
 
 func (e *dutyExec) duty() {
@@ -32,6 +36,9 @@ func (e *dutyExec) duty() {
 }
 
 func (e *dutyExec) LeaderResign(ctx context.Context, clientID int64) error {
+	if e.running.Load() > 0 {
+		e.overlapped.Add(1)
+	}
 	err := e.Executor.LeaderResign(ctx, clientID)
 	e.resigned.Store(true)
 	return err
@@ -45,6 +52,17 @@ func (e *dutyExec) JobRescueCandidates(ctx context.Context, p driver.JobRescuePa
 func (e *dutyExec) ClientPruneExpired(ctx context.Context) (int64, error) {
 	e.duty()
 	return e.Executor.ClientPruneExpired(ctx)
+}
+
+// JobsMaintain stands for a duty of the term's own loops (the live loop's)
+// that lasts until the term ends, so that a resign that does not wait for
+// the term's loops gives the lease up while it runs.
+func (e *dutyExec) JobsMaintain(ctx context.Context) (driver.JobsMaintainResult, error) {
+	e.duty()
+	e.running.Add(1)
+	defer e.running.Add(-1)
+	<-ctx.Done()
+	return driver.JobsMaintainResult{}, ctx.Err()
 }
 
 // TestLeaderResign asks the leader to resign, from another client and
@@ -119,6 +137,9 @@ func TestLeaderResign(t *testing.T) {
 			}
 			if n := exec.after.Load(); n != 0 {
 				t.Errorf("the resigned client ran %d leader duties after it gave the lease up", n)
+			}
+			if n := exec.overlapped.Load(); n != 0 {
+				t.Errorf("the resigned client gave the lease up while a duty of its term ran (%d times)", n)
 			}
 		})
 	}

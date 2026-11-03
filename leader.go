@@ -35,16 +35,20 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		heldOff time.Time
 	)
 	for {
-		if time.Now().Before(heldOff) {
+		if wait := time.Until(heldOff); wait > 0 {
+			// The client attempts again as soon as the hold-off ends, not
+			// at the next tick after it.
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-			case <-c.leaderPoke:
+			case <-time.After(wait):
 			}
 			continue
 		}
-		res, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: c.clientID.Load(), TTL: c.tuning.leaderTTL})
+		// The attempt's ID is the one a resign gives the lease up for: a
+		// fence may re-register the client under another meanwhile.
+		id := c.clientID.Load()
+		res, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: c.tuning.leaderTTL})
 		switch {
 		case err != nil:
 			if ctx.Err() != nil {
@@ -57,7 +61,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			// duty of this client overlaps the next leader's.
 			term.end()
 			term = nil
-			c.resignOnRequest(ctx)
+			c.resignOnRequest(ctx, id)
 			heldOff = time.Now().Add(c.tuning.leaderTTL)
 		case res.Leader:
 			if !c.isLeader.Swap(true) {
@@ -146,24 +150,30 @@ func (c *Client[TTx]) resign(ctx context.Context) {
 	if !c.isLeader.Swap(false) {
 		return
 	}
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := c.exec.LeaderResign(rctx, c.clientID.Load()); err != nil {
+	id := c.clientID.Load()
+	if err := c.giveUpLease(ctx, id); err != nil {
 		c.logger.WarnContext(ctx, "hopper: resign leadership", "error", err)
 		return
 	}
-	c.logger.InfoContext(ctx, "hopper: resigned leadership", "client_id", c.clientID.Load())
+	c.logger.InfoContext(ctx, "hopper: resigned leadership", "client_id", id)
 }
 
-// resignOnRequest gives the lease up after a resign request, once the
-// term's loops have ended, and signals the other clients to elect a
-// replacement. If the statement fails, the lease expires instead.
-func (c *Client[TTx]) resignOnRequest(ctx context.Context) {
-	id := c.clientID.Load()
-	c.isLeader.Store(false)
+// giveUpLease deletes the leader lease if client id holds it, and then
+// signals the other clients to elect a replacement. It runs on a context
+// of its own, so that a stopping client still gives the lease up.
+func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64) error {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := c.exec.LeaderResign(rctx, id); err != nil {
+	return c.exec.LeaderResign(rctx, id)
+}
+
+// resignOnRequest gives the lease client id holds up after a resign
+// request, once the term's loops have ended, and signals the other clients
+// to elect a replacement. If the statement fails, the lease expires
+// instead.
+func (c *Client[TTx]) resignOnRequest(ctx context.Context, id int64) {
+	c.isLeader.Store(false)
+	if err := c.giveUpLease(ctx, id); err != nil {
 		c.logger.WarnContext(ctx, "hopper: resign leadership on request; the lease expires instead", "client_id", id, "error", err)
 	} else {
 		c.logger.InfoContext(ctx, "hopper: resigned leadership on request", "client_id", id)

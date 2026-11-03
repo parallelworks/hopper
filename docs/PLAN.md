@@ -729,9 +729,11 @@ release's probe of the edges that read matches neither, and reads a finished job
 `hopper_job_deps_depends_on` during a rolling upgrade. Its down script turns the edges
 of groups into `ignore` edges, which is how the previous release treats them.
 Schema v24 adds `resign_client_id` to `hopper_leader`, the holder a resign request
-asked to give its term up (§7.8). A nullable column with no default rewrites nothing,
-and only the leader's renewal and the request touch the one-row table, each in a
-statement of its own, so the `ALTER` takes its lock without a loop.
+asked to give its term up (§7.8). A nullable column with no default rewrites nothing.
+The `ALTER` tries as v10's does, with a short `lock_timeout` per try in a loop: every
+leader renewal and `Stats` reads the table, and would otherwise queue behind the
+`ALTER` while it waits for a session that holds a lock on the table for long, such as
+a `pg_dump`.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -1685,7 +1687,8 @@ Leadership is a lease row in `hopper_leader`:
 INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
 VALUES ('default', $me, now(), now() + $ttl)
 ON CONFLICT (name) DO UPDATE SET client_id = $me, elected_at = now(), expires_at = now() + $ttl,
-  resign_client_id = CASE WHEN hopper_leader.client_id = $me THEN hopper_leader.resign_client_id END
+  resign_client_id = CASE WHEN hopper_leader.client_id = $me AND hopper_leader.expires_at >= now()
+                      THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $me
 RETURNING client_id = $me, coalesce(resign_client_id = client_id, false);
 ```
@@ -1713,15 +1716,20 @@ RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
 - The request is a column rather than only a notification, because a notification is
   lost when the leader's listener is reconnecting. The notification wakes the leader
   at once; without it the leader sees the request on its next renewal, within 5s.
-- A renewal by the holder keeps the column, and its `RETURNING` reports a request that
-  names it. A takeover by another client clears it, so the request does not outlive the
-  term it was made in.
+- A renewal of the live lease by its holder keeps the column, and its `RETURNING`
+  reports a request that names it. A takeover of an expired lease clears it, even the
+  holder's own (its lease lapsed, so its term ended), so the request does not outlive
+  the term it was made in.
 - The leader that sees the request ends its term first: it cancels the loops the term
   runs (periodic jobs, stream delivery, the live and index maintenance, log retention)
   and waits for them, and runs none of the duties on the leader loop again. Only then
   does it delete its row and send the `resigned` notification, as on a graceful stop. No duty of the resigning
-  client runs after the row is gone, so its duties never overlap the next leader's. If
-  the delete fails, the lease expires instead.
+  client runs after the row is gone, so its duties never overlap the next leader's,
+  except a log retention call into a `LogStore` that ignores its context's cancellation,
+  which the term does not wait for (§7.5). If the delete fails, the lease
+  expires instead.
+- Only the leader acts on the `resign` notification; the other clients' listeners
+  ignore it, so a request costs no election attempts until the `resigned` one.
 - It emits `EventLeaderResigned` and then stays out of the election for one TTL, by its
   own clock (the hold-off schedules its own attempts and compares no stored time), so
   that another client wins the election the notification starts rather than it again.
