@@ -23,18 +23,13 @@ type stuckWatch struct {
 	// job is the attempt's copy of the row as claimed (attempt.claimed),
 	// which the worker cannot change, as it does its own row's Progress
 	// with RecordStep.
-	job       *JobRow
-	state     atomic.Int32
+	job *JobRow
+	// done is set once the worker has returned or was reported.
+	done      atomic.Bool
 	stopAfter func() bool
 	// timer is set, under Client.stuckMu, once the context is canceled.
 	timer *time.Timer
 }
-
-const (
-	watchRunning int32 = iota
-	watchReturned
-	watchReported
-)
 
 // watchStuck starts watching the worker about to run under ctx, whose row
 // as claimed is claimed; call stuckReturned once it has returned.
@@ -49,7 +44,7 @@ func (c *Client[TTx]) watchStuck(ctx context.Context, claimed *driver.JobRow) *s
 func (c *Client[TTx]) stuckCanceled(w *stuckWatch) {
 	c.stuckMu.Lock()
 	defer c.stuckMu.Unlock()
-	if w.state.Load() != watchRunning {
+	if w.done.Load() {
 		return
 	}
 	c.stuck[w] = struct{}{}
@@ -58,7 +53,7 @@ func (c *Client[TTx]) stuckCanceled(w *stuckWatch) {
 
 // stuckReturned ends a watch whose worker has returned.
 func (c *Client[TTx]) stuckReturned(w *stuckWatch) {
-	w.state.CompareAndSwap(watchRunning, watchReturned)
+	w.done.Store(true)
 	if w.stopAfter() {
 		return
 	}
@@ -87,22 +82,24 @@ func (c *Client[TTx]) reportStuckNow() {
 // event and the hook each get a copy of the row, which they may change
 // without racing each other or the attempt's log.
 func (c *Client[TTx]) reportStuck(w *stuckWatch) {
-	if !w.state.CompareAndSwap(watchRunning, watchReported) {
+	if !w.done.CompareAndSwap(false, true) {
 		return
 	}
 	cause := stuckCause(w.ctx)
-	c.logger.Warn("hopper: job has not returned since its context was canceled",
+	c.logger.WarnContext(w.ctx, "hopper: job has not returned since its context was canceled",
 		"job_id", w.job.ID, "kind", w.job.Kind, "attempt", w.job.Attempt, "cause", cause)
 	evJob := *w.job
 	c.emit(EventJobStuck, &evJob, cause.Error())
 	if c.cfg.OnStuck == nil {
 		return
 	}
-	job := *w.job
+	// The hook's goroutine holds only its copy of the row and the job's ID
+	// and kind, not the watch, whose context carries the attempt.
+	job, id, kind := *w.job, w.job.ID, w.job.Kind
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				c.logger.Error("hopper: Config.OnStuck panicked", "job_id", w.job.ID, "kind", w.job.Kind,
+				c.logger.Error("hopper: Config.OnStuck panicked", "job_id", id, "kind", kind,
 					"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 			}
 		}()

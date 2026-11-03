@@ -84,17 +84,21 @@ type Config struct {
 	// gave up on it at the end of its grace (Stop's deadline or
 	// StopAndCancel's ctx, then a short wait): the stop reports it once it
 	// has flushed the other jobs' results and released its lease, before it
-	// returns, so a hook may exit the process then. cause is why the
+	// returns, so a hook may exit the process then. A worker StuckGrace
+	// reports while a stop still waits for it is reported then, before the
+	// stop has flushed or released anything. cause is why the
 	// context was canceled: the job's timeout (ErrJobTimeout), JobCancel
 	// (ErrJobCanceled), the client's stop (ErrClientStopped), or a fence
 	// (ErrJobFenced), which a lost lease causes, or a claim of the job on
 	// this client after a rescue. job is the row as claimed. It is called
-	// at most once per attempt, on a goroutine of its own, with a context
-	// that carries the client and is never canceled, and a panic in it is
-	// logged. The client does not wait for it, Stop neither, so a hook that
-	// alerts should bound its own work; it may also dump goroutine stacks
-	// or exit the process. Whether or not it is set, the client logs a
-	// warning and emits EventJobStuck.
+	// at most once per run of an attempt (a stop that gives an attempt back
+	// reruns it with the same number), on a goroutine of its own, with a
+	// context that carries the client and is never canceled, and a panic in
+	// it is logged. The client does not wait for it, Stop neither, so a hook
+	// that alerts should bound its own work, and one the stop started may
+	// not have run when Stop returns, nor before a process that exits then
+	// ends; it may also dump goroutine stacks or exit the process. Whether
+	// or not it is set, the client logs a warning and emits EventJobStuck.
 	//
 	// Nothing else changes. The attempt keeps its slot in the queue until
 	// the worker returns, and its result is written then, as any is. Until

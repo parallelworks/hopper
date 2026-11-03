@@ -1628,10 +1628,13 @@ word.
   (whose cancellation has no cause of its own) as well as a claim that replaced the
   attempt. A stop that gives up on a worker at the end of its grace (§7.12) reports it,
   if that is sooner, once it has flushed the other jobs' results and released its
-  lease, before `Stop` returns, so a hook that exits the process then loses neither.
-  Each attempt is reported once at most. The hook runs on a goroutine of its own, with
-  a context that carries the client and is never canceled; nothing waits for it,
-  `Stop` neither, and a panic in it is logged. The report changes nothing else: the
+  lease, before `Stop` returns, so a hook that exits the process then loses neither; a
+  worker `StuckGrace` reports while the stop still waits is reported then, before the
+  stop has flushed or released anything. Each run of an attempt is reported once at
+  most (a stop that gives the attempt back reruns it with the same number). The hook
+  runs on a goroutine of its own, with a context that carries the client and is never
+  canceled; nothing waits for it, `Stop` neither, so a hook the stop started may not
+  have run when `Stop` returns, and a panic in it is logged. The report changes nothing else: the
   attempt keeps its slot in the queue until its worker returns, and its result is
   written then, as usual. Until then the job stays `running` under its client, whose
   live lease keeps it from rescue, unless `RescueStuckAfter` applies, the client is

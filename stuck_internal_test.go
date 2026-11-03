@@ -281,6 +281,63 @@ func TestStuckAfterStop(t *testing.T) {
 	})
 }
 
+// TestStuckAfterStopDeadline: a Stop whose ctx expires cancels the jobs, and
+// a worker that ignores it is reported at the end of the stop's grace, with
+// ErrClientStopped, once the lease is released.
+func TestStuckAfterStopDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		job := stuckJob(`{}`)
+		h := stuckClient(t, time.Hour, nil, job)
+		ctx := context.Background()
+		if err := h.c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		start := time.Now()
+		stopCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if err := h.c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Stop = %v, want its deadline", err)
+		}
+		call := <-h.calls
+		if want := 3*time.Second + h.c.tuning.stopGrace; call.at.Sub(start) != want || !errors.Is(call.cause, ErrClientStopped) {
+			t.Errorf("OnStuck called %s into the stop with %v, want %s (its deadline and grace) and ErrClientStopped", call.at.Sub(start), call.cause, want)
+		}
+		if released, warned := h.logs.index(leaseReleased), h.logs.index(stuckWarning); released < 0 || warned < released {
+			t.Errorf("lease released at log offset %d, worker reported at %d; want the report after the release", released, warned)
+		}
+		h.noMoreCalls(t)
+		close(h.release)
+		synctest.Wait()
+	})
+}
+
+// TestStuckAfterFence: a worker that ignores the fence of its client's lease,
+// which cancels with no cause of its own, is reported StuckGrace after it,
+// with ErrJobFenced.
+func TestStuckAfterFence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		job := stuckJob(`{}`)
+		h := stuckClient(t, time.Hour, nil, job)
+		ctx := context.Background()
+		if err := h.c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		h.c.fence(ctx, h.c.clientID.Load())
+		canceled := <-h.canceled
+		call := <-h.calls
+		if d := call.at.Sub(canceled); d != DefaultStuckGrace || !errors.Is(call.cause, ErrJobFenced) {
+			t.Errorf("OnStuck called %s after the fence with %v, want %s and ErrJobFenced", d, call.cause, DefaultStuckGrace)
+		}
+		h.noMoreCalls(t)
+		close(h.release)
+		if err := h.c.Stop(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 // TestStuckGraceEdges: a worker that returns just before StuckGrace is not
 // reported; one that returns just after it is, once.
 func TestStuckGraceEdges(t *testing.T) {
