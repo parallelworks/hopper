@@ -28,7 +28,11 @@ type attempt struct {
 	// completion is the attempt's result if it succeeds, without output.
 	completion driver.JobFinalize
 	// row, baseLogger and logs make the attempt's logger, which Logger
-	// builds on first use.
+	// builds on first use. For a job the client runs, row is &claimed, the
+	// row as claimed: the worker changes its own, as RecordStep does
+	// Progress, which the log store's Writer and the stuck watch
+	// (watchStuck), reading it from other goroutines, would race.
+	claimed    driver.JobRow
 	row        *driver.JobRow
 	baseLogger *slog.Logger
 	logs       JobLogsConfig

@@ -1619,6 +1619,36 @@ word.
   stuck, and the rescue's error says so. The rescue does not reach the stuck attempt:
   it runs on until it returns, and its result is dropped, unless its own client claims
   the job again, which cancels it (§7.5).
+- **Stuck workers.** A worker that has not returned `Config.StuckGrace` (10 s by
+  default) after its job's context was canceled is reported, then and only then: the
+  client logs a warning, emits `job.stuck` (`EventJobStuck`, with the cancellation's
+  cause as `Event.Error`) and calls `Config.OnStuck(ctx, job, cause)`, where an
+  operator can alert, dump goroutine stacks or exit the process. The cause is
+  `ErrJobTimeout`, `ErrJobCanceled`, `ErrClientStopped` or `ErrJobFenced`, which stands
+  for a lost lease (whose cancellation has no cause of its own) as well as a claim that
+  replaced the attempt. Each run of an attempt is reported once at most (a stop that
+  gives the attempt back reruns it with the same number). The hook runs on a goroutine
+  of its own, with a context that carries the client and is never canceled; nothing
+  waits for it, and a panic in it is logged. A stop is no exception: a worker it
+  canceled is reported `StuckGrace` later, while the stop waits or after it has
+  returned, if the process still runs. A stop that gives up on workers at the end of
+  its grace (§7.12) does not report them, but logs, before it returns, the ID and kind
+  of each job still running (up to 100), an attempt a later claim of its job replaced
+  among them, marked as replaced; an attempt whose worker has returned but that is
+  still closing its log or handing in its result is not listed. A hook that exits the process during a stop
+  ends it as a crash would: results not yet written are lost, and the jobs are rescued
+  once the lease expires, at-least-once. An earlier design also reported, from the
+  stop, the workers it gave up on; it needed a client-wide set of watches and could
+  start a hook that never ran before the process exited, so the synchronous warning
+  replaced it. The report changes nothing else: the attempt keeps its slot in the
+  queue until its worker returns, and its result is written then, as usual. Until then
+  the job stays `running` under its client, whose live lease keeps it from rescue,
+  unless `RescueStuckAfter` applies, the client is fenced or it stops. Each attempt is
+  watched with a `context.AfterFunc` on its context, which starts a timer once the
+  context is canceled, and with the attempt's copy of the row as claimed, which its
+  log also reads (the worker can change its own, as `RecordStep` does `Progress`); the
+  event and the hook each get a copy of their own. An attempt takes no lock the client
+  shares for it.
 - **Graceful stop** deletes the lease after the finalizer flushes, so nothing needs
   rescuing.
 
@@ -2118,7 +2148,8 @@ rates:
 2. Wait for running jobs to finish, then flush the finalizer.
 3. If `ctx` expires first, cancel all job contexts, wait a short grace period, flush
    whatever finished, release the lease and return `ctx.Err()`. Jobs that are still
-   unfinished are rescued by another client (at-least-once).
+   unfinished are rescued by another client (at-least-once), and their workers are
+   listed, by ID and kind, in a warning logged before `Stop` returns (§7.6).
 
 `StopAndCancel(ctx)` is the same, but cancels every job's context as it stops
 claiming, rather than when `ctx` expires. Either cancels a job's context with
@@ -2964,8 +2995,9 @@ observability without new machinery.
 
 - **Logging:** `log/slog` throughout, defaulting to `slog.Default()`. A worker's
   `hopper.Logger(ctx)` lines are also kept with its job, per attempt (§7.5).
-- **Events:** `client.Events(ctx, kinds...)` streams job lifecycle, leadership and lease
-  events as an `iter.Seq[Event]`, for tests and custom metrics. Delivery is best-effort:
+- **Events:** `client.Events(ctx, kinds...)` streams job lifecycle (including
+  `job.stuck`, §7.6), leadership and lease events as an `iter.Seq[Event]`, for tests
+  and custom metrics. Delivery is best-effort:
   a consumer that falls behind by more than a buffer misses events rather than slowing
   the client.
 - **Stats:** `Stats(ctx)` returns per-queue depth by state, the age of the oldest
