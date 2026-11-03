@@ -438,22 +438,23 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // An attempt canceled this way does not count against MaxAttempts: a job
 // whose worker then returns an error, whatever it is, is retried at once,
 // its last attempt too, with the attempt given back. The error, with a
-// panic's trace, is recorded in the job's Errors and logged, and
-// Config.OnError is called, as for any failure; an outcome it chooses
-// applies, and a retry it chooses also gives the attempt back. The rerun
-// has the same attempt number, so Errors holds an entry for each run of
-// it. A worker that returns nil, Snooze, Cancel or an output refusal
-// (ErrOutputTooLarge) completes, snoozes or discards the job as usual. The
-// job's timeout still bounds each run, and an attempt its timeout ended
-// before the stop came counts, as any timeout does. A job from a claim in
-// flight as the stop begins never runs, and gets its attempt back with no
-// error. The same holds for the jobs a Stop cancels when its ctx expires.
+// panic's trace, is recorded in the job's Errors and logged, but
+// Config.OnError is not consulted. The rerun has the same attempt number,
+// so Errors holds an entry for each run of it that fails. A worker that
+// returns nil, Snooze, Cancel or an output refusal (ErrOutputTooLarge)
+// completes, snoozes or discards the job as usual. The job's timeout still
+// bounds each run, and an attempt its timeout ended before the stop came
+// is a timeout: it counts, and OnError is called, as for any timeout. A
+// job from a claim in flight as the stop begins never runs, and gets its
+// attempt back with no error. The same holds for the jobs a Stop cancels
+// when its ctx expires.
 //
 // MaxAttempts does not bound a job that every stop interrupts: its timeout
-// does, and each interruption adds an entry to its Errors. OnError, and
-// then the close of the attempt's log in Config.JobLogs.Store, share half
-// the stop's short grace, so that the result is still written. A worker must not call Stop or StopAndCancel itself:
-// the stop waits for the worker, which then loses its result.
+// does, and each interruption adds an entry to its Errors. The close of an
+// interrupted attempt's log in Config.JobLogs.Store waits at most half the
+// stop's short grace, so that the result is still written. A worker must
+// not call Stop or StopAndCancel itself: the stop waits for the worker,
+// which then loses its result.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	return c.stop(ctx, true)
 }

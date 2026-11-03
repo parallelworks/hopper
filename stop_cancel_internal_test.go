@@ -341,25 +341,19 @@ func TestStopDeadlineEscalates(t *testing.T) {
 	})
 }
 
-// TestStopAndCancelOnError: Config.OnError is called for an attempt the stop
-// canceled, with a context that is not canceled, and the outcome it
-// chooses applies: a discard discards the job, and a retry it schedules
-// gives the attempt back, on the last attempt too.
-func TestStopAndCancelOnError(t *testing.T) {
+// TestStopAndCancelSkipsOnError: Config.OnError is not consulted for an
+// attempt the stop canceled: the job is retried at once with its error
+// recorded and its attempt given back, the last attempt too, whatever the
+// hook would have chosen.
+func TestStopAndCancelSkipsOnError(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		causes := make(chan error, 2)
-		discard, later := stopJob(1, 3, `{"fail":true}`), stopJob(3, 3, `{}`)
-		var hookCtxErr error
-		var mu sync.Mutex
-		c, exec := stopClientWith(t, causes, func(ctx context.Context, row *JobRow, _ error) ErrorOutcome {
-			mu.Lock()
-			hookCtxErr = errors.Join(hookCtxErr, ctx.Err())
-			mu.Unlock()
-			if row.ID == discard.ID {
-				return ErrorOutcome{Discard: true}
-			}
-			return ErrorOutcome{RetryAt: time.Now().Add(time.Minute)}
-		}, discard, later)
+		failed, last := stopJob(1, 3, `{"fail":true}`), stopJob(3, 3, `{}`)
+		var hooks atomic.Int32
+		c, exec := stopClientWith(t, causes, func(context.Context, *JobRow, error) ErrorOutcome {
+			hooks.Add(1)
+			return ErrorOutcome{Discard: true}
+		}, failed, last)
 		ctx := context.Background()
 		if err := c.Start(ctx); err != nil {
 			t.Fatal(err)
@@ -373,14 +367,13 @@ func TestStopAndCancelOnError(t *testing.T) {
 				t.Errorf("a job's context was canceled with %v, want ErrClientStopped", cause)
 			}
 		}
-		if hookCtxErr != nil {
-			t.Errorf("OnError's context was canceled: %v", hookCtxErr)
+		if n := hooks.Load(); n != 0 {
+			t.Errorf("OnError was called %d times for attempts the stop canceled", n)
 		}
-		if f, ok := exec.result(discard.ID); !ok || f.State != driver.JobStateDiscarded || f.Error == nil {
-			t.Errorf("job OnError discarded: %+v, %v", f, ok)
-		}
-		if f, ok := exec.result(later.ID); !ok || f.State != driver.JobStateRetryable || !f.Snooze || f.Delay != time.Minute {
-			t.Errorf("job on its last attempt OnError retried in a minute: %+v, %v; want that retry, its attempt given back", f, ok)
+		for _, j := range []*driver.JobRow{failed, last} {
+			if f, ok := exec.result(j.ID); !ok || f.State != driver.JobStateRetryable || !f.Snooze || f.Delay != 0 || f.Error == nil {
+				t.Errorf("job on attempt %d of %d: %+v, %v; want retried at once with its error, its attempt given back", j.Attempt, j.MaxAttempts, f, ok)
+			}
 		}
 	})
 }
@@ -412,14 +405,19 @@ func slowStopClient(t *testing.T, work func(context.Context) error, onError func
 
 // TestStopAfterTimeoutCounts: an attempt whose own timeout ended it before
 // StopAndCancel came, though its worker returns only after the stop, timed
-// out: its attempt counts, and on its last attempt it is discarded.
+// out: its attempt counts, OnError is called for it as for any timeout,
+// and on its last attempt it is discarded.
 func TestStopAfterTimeoutCounts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		retried, last := stopJob(1, 3, `{}`), stopJob(3, 3, `{}`)
+		var hooks atomic.Int32
 		c, exec := slowStopClient(t, func(context.Context) error {
 			time.Sleep(5 * time.Second) // past its timeout, ignoring its context
 			return errors.New("slow")
-		}, nil, retried, last)
+		}, func(context.Context, *JobRow, error) ErrorOutcome {
+			hooks.Add(1)
+			return ErrorOutcome{}
+		}, retried, last)
 		ctx := context.Background()
 		if err := c.Start(ctx); err != nil {
 			t.Fatal(err)
@@ -433,6 +431,9 @@ func TestStopAfterTimeoutCounts(t *testing.T) {
 		}
 		if f, ok := exec.result(last.ID); !ok || f.State != driver.JobStateDiscarded {
 			t.Errorf("timed-out job on its last attempt: %+v, %v; want discarded", f, ok)
+		}
+		if n := hooks.Load(); n != 2 {
+			t.Errorf("OnError was called %d times for the two timeouts, want 2", n)
 		}
 	})
 }
@@ -516,12 +517,11 @@ func (blockingStore) Writer(ctx context.Context, _ *JobRow) (io.WriteCloser, err
 
 func (blockingStore) Logs(context.Context, JobID) ([]AttemptLog, error) { return nil, nil }
 
-// TestStopDeadlineHookAndLogShareGrace: a Stop's deadline cancels a job
-// whose worker takes a moment to return, whose OnError waits for its
-// context and whose store's Close blocks. The hook and the log's close
-// share half the stop's grace, so the result is still written, its
-// attempt given back.
-func TestStopDeadlineHookAndLogShareGrace(t *testing.T) {
+// TestStopDeadlineLogCloseBounded: a Stop's deadline cancels a job whose
+// worker takes a moment to return and whose store's Close blocks. The log's
+// close waits at most half the stop's grace, and OnError is not consulted,
+// so the result is still written, its attempt given back.
+func TestStopDeadlineLogCloseBounded(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		job := stopJob(1, 3, `{}`)
 		exec := &stopExec{jobs: []*driver.JobRow{job}, results: map[driver.JobID]driver.JobFinalize{}}
@@ -538,8 +538,8 @@ func TestStopDeadlineHookAndLogShareGrace(t *testing.T) {
 			Logger:    slog.New(slog.DiscardHandler),
 			NeverLead: true,
 			JobLogs:   JobLogsConfig{Store: blockingStore{}},
-			OnError: func(ctx context.Context, _ *JobRow, _ error) ErrorOutcome {
-				<-ctx.Done()
+			OnError: func(context.Context, *JobRow, error) ErrorOutcome {
+				t.Error("OnError was called for an attempt the stop canceled")
 				return ErrorOutcome{}
 			},
 		})
@@ -557,7 +557,7 @@ func TestStopDeadlineHookAndLogShareGrace(t *testing.T) {
 			t.Errorf("Stop = %v, want its deadline", err)
 		}
 		if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateRetryable {
-			t.Errorf("job whose hook and log close outlasted half the grace: %+v, %v; want its result written, its attempt given back", f, ok)
+			t.Errorf("job whose log close blocked: %+v, %v; want its result written, its attempt given back", f, ok)
 		}
 	})
 }

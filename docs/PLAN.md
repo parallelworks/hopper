@@ -1286,14 +1286,13 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   (`*PanicError`), a timeout, a `Cancel`, or a kind with no worker. It can change the
   outcome: `Discard` (as `Cancel`), `Snooze` (as `Snooze`, without using up the
   attempt, with the error as the snooze reason) or `RetryAt` (a retry at that time,
-  using up the attempt; the last attempt is discarded all the same, unless the client's
-  stop canceled the attempt, which gives it back, §7.12). The zero `ErrorOutcome` keeps
-  the outcome, and a panic in the hook is logged and keeps it too. It is not called for
-  a worker's `Snooze`, a `JobCancel` (even when the worker then returns `Cancel`), or a
-  fenced attempt, none of which is the job failing, nor for a `CompleteTx` attempt
-  whose job could not be read, which may have committed, nor for an attempt its timeout
-  ended before the client's stop canceled it. It is called for an attempt the client's
-  stop canceled, with a context that is not canceled (§7.12). A job the
+  using up the attempt; the last attempt is discarded all the same). The zero
+  `ErrorOutcome` keeps the outcome, and a panic in the hook is logged and keeps it
+  too. It is not called for a worker's `Snooze`, a `JobCancel` (even when the worker
+  then returns `Cancel`), a fenced attempt, or an attempt the client's stop canceled
+  (§7.12), none of which is the job failing, nor for a `CompleteTx` attempt whose job
+  could not be read, which may have committed. An attempt whose own timeout ended it
+  before the stop is a timeout, and the hook is called for it. A job the
   leader rescues (§7.6) is retried or discarded without it. It runs on the worker's
   goroutine before the result is buffered, so it should be quick.
   A `JobCancel` that arrives while it runs wins over what it returns. Its context
@@ -2127,24 +2126,25 @@ An attempt the stop canceled does not count. A job whose worker then returns an 
 whatever it is, is retried at once with its attempt given back, its last attempt too:
 the stop is not the job's failure, and counting it would let routine deploys use up a
 job's attempts and dead-letter one interrupted on its last. The error, with a panic's
-trace, is recorded in `Errors` and logged, and `Config.OnError` is called, as for any
-failure. An outcome the hook chooses applies (its context is not canceled, but it
-shares half the stop's grace with the close of the attempt's log in a `LogStore`, so
-the result is still written), and a retry it chooses also gives the attempt back. Whether the stop canceled the attempt is read as
-the worker returns. The finalize is a retry with `Snooze`
-set, which gives the attempt back, and an `Error`, which is appended: the rerun has
-the same attempt number, so `Errors` holds an entry for each run of it, and, as for a
-snooze, the interrupted run's log replaces that of an earlier snoozed or interrupted run
-of the same number, and is marked snoozed. A worker that returns nil, `Snooze`, `Cancel`
-or an output refusal (`ErrOutputTooLarge`) is finalized as it says, and the job's
-timeout still bounds each run: an attempt its timeout ended before the stop came counts,
-as any timeout does, and is retried at once without the hook, as a fenced one is. `MaxAttempts` does not bound a job that every stop interrupts; its
-timeout does, and each interruption adds an entry to `Errors`. A job from a claim in
-flight as the stop cancels the jobs never runs: it gets its attempt back with no error,
-as a `Snooze(0)`. A job interrupted by a fence (§7.6) keeps its attempt counted, as the
-rescue that may already have run it would. A worker must not stop its own client: the
-stop waits for it. The lease keeps being renewed until the finalizer has flushed, so a
-long drain cannot let it lapse.
+trace, is recorded in `Errors` and logged, but `Config.OnError` is not consulted: a
+hook would have to run inside the stop's short grace, where its result could miss the
+finalizer, so nothing runs there but the close of the attempt's log in a `LogStore`,
+bounded by half the grace. Whether the stop canceled the attempt is read as the worker
+returns. The finalize is a retry with `Snooze` set, which gives the attempt back, and
+an `Error`, which is appended: the rerun has the same attempt number, so `Errors`
+holds an entry for each run of it that fails, and, as for a snooze, the interrupted
+run's log replaces that of an earlier snoozed or interrupted run of the same number,
+and is marked snoozed. A worker that returns nil, `Snooze`, `Cancel` or an output
+refusal (`ErrOutputTooLarge`) is finalized as it says, and the job's timeout still
+bounds each run: an attempt its timeout ended before the stop came is a timeout, which
+counts and goes to `Config.OnError` as any timeout does, as does a failure the worker
+returned before the stop. `MaxAttempts` does not bound a job that every stop
+interrupts; its timeout does, and each interruption adds an entry to `Errors`. A job
+from a claim in flight as the stop cancels the jobs never runs: it gets its attempt
+back with no error, as a `Snooze(0)`. A job interrupted by a fence (§7.6) keeps its
+attempt counted, as the rescue that may already have run it would. A worker must not
+stop its own client: the stop waits for it. The lease keeps being renewed until the
+finalizer has flushed, so a long drain cannot let it lapse.
 
 The calls may overlap: the first stops the client, and the others wait for it to
 stop, until their own `ctx` expires, and return nil once it has, or `ctx.Err()`. Only

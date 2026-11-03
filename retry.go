@@ -17,8 +17,6 @@ import (
 type ErrorOutcome struct {
 	// RetryAt retries the job at this time, using up the attempt as any
 	// failure does: on its last attempt the job is discarded all the same.
-	// An attempt the client's stop canceled is not counted, so its retry
-	// gives the attempt back, on the last attempt too (StopAndCancel).
 	RetryAt time.Time
 	// Snooze reschedules the job after this long without using up the
 	// attempt, as if the worker had returned Snooze. The error is kept as the

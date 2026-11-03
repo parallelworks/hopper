@@ -268,8 +268,8 @@ func (a *attempt) closeLog(timeout time.Duration) {
 // canceled jobs only for the stop's grace, so their attempts wait for at
 // most half of it and their results still reach the finalizer; so does a
 // fenced attempt's, which is ctx's other cancellation. An attempt the stop
-// canceled waits only until stopBy, if set, the half of the grace its
-// Config.OnError shares.
+// canceled waits only until stopBy, if set, half the stop's grace after
+// its worker returned.
 func (c *Client[TTx]) logCloseTimeout(ctx context.Context, stopBy time.Time) time.Duration {
 	if !stopBy.IsZero() {
 		return min(c.tuning.logCloseTimeout, max(time.Until(stopBy), 0))

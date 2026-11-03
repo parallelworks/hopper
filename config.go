@@ -60,12 +60,11 @@ type Config struct {
 	// (*PanicError), a timeout (ErrJobTimeout), a Cancel, or a kind with no
 	// worker (*UnknownKindError). It is not called for a Snooze, nor when the
 	// job was canceled with JobCancel or the client lost its lease, nor for
-	// an attempt whose timeout ended it before the client's stop canceled
-	// it, nor for a job the leader rescues from a lost client or
-	// RescueStuckAfter. It is called for an attempt the client's stop
-	// canceled (StopAndCancel), with a context that the stop does not
-	// cancel, bounded by half its grace, which the close of the attempt's
-	// log in JobLogs.Store shares. What it returns overrides the outcome;
+	// an attempt the client's stop canceled (StopAndCancel, or a Stop's
+	// deadline), which is retried with its attempt given back, nor for a job
+	// the leader rescues from a lost client or RescueStuckAfter. An attempt
+	// whose own timeout ended it before the stop is a timeout, and is
+	// handled as one. What it returns overrides the outcome;
 	// the zero ErrorOutcome keeps it. It runs on the worker's goroutine,
 	// concurrently with other jobs, before the result is written, so it
 	// should return quickly; a panic in it is logged and keeps the outcome.
