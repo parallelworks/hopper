@@ -636,7 +636,8 @@ CREATE TABLE hopper_leader (
   name       text PRIMARY KEY DEFAULT 'default',
   client_id  bigint      NOT NULL,
   elected_at timestamptz NOT NULL,
-  expires_at timestamptz NOT NULL
+  expires_at timestamptz NOT NULL,
+  resign_client_id bigint             -- the holder a resign request asked (v24)
 );
 
 CREATE TABLE hopper_queues (
@@ -727,6 +728,10 @@ the promotion and the cancel look a dependent's groups up (§11), in the same lo
 release's probe of the edges that read matches neither, and reads a finished job's edges by
 `hopper_job_deps_depends_on` during a rolling upgrade. Its down script turns the edges
 of groups into `ignore` edges, which is how the previous release treats them.
+Schema v24 adds `resign_client_id` to `hopper_leader`, the holder a resign request
+asked to give its term up (§7.8). A nullable column with no default rewrites nothing,
+and only the leader's renewal and the request touch the one-row table, each in a
+statement of its own, so the `ALTER` takes its lock without a loop.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -1679,14 +1684,51 @@ Leadership is a lease row in `hopper_leader`:
 ```sql
 INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
 VALUES ('default', $me, now(), now() + $ttl)
-ON CONFLICT (name) DO UPDATE SET client_id = $me, elected_at = now(), expires_at = now() + $ttl
+ON CONFLICT (name) DO UPDATE SET client_id = $me, elected_at = now(), expires_at = now() + $ttl,
+  resign_client_id = CASE WHEN hopper_leader.client_id = $me THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $me
-RETURNING client_id = $me;
+RETURNING client_id = $me, coalesce(resign_client_id = client_id, false);
 ```
 
 - The TTL is 15s, and the leader renews every 5s.
 - On graceful stop the leader deletes its row and sends a `hopper_leader` notification,
   so a replacement takes over immediately.
+
+**Resigning on request.** `Client.LeaderResign` (and `hopper leader resign`, and the
+UI's resign action) asks the current leader to give its term up, so that another
+client takes over without waiting for the leader to stop or its lease to expire:
+before a planned restart of the leader's node, or to move the duties off a busy one.
+Any client can ask, including one that never leads. The request is one statement:
+
+```sql
+UPDATE hopper_leader SET resign_client_id = client_id
+WHERE name = 'default' AND expires_at > now()
+RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
+```
+
+- The request names the holder of the live lease, by database time, and returns its
+  ID, or nothing when no client leads. It names that holder only: a later holder is
+  never asked by an earlier request, and a request that loses the race to an election
+  asks the new holder or no one, never the client whose lease had expired.
+- The request is a column rather than only a notification, because a notification is
+  lost when the leader's listener is reconnecting. The notification wakes the leader
+  at once; without it the leader sees the request on its next renewal, within 5s.
+- A renewal by the holder keeps the column, and its `RETURNING` reports a request that
+  names it. A takeover by another client clears it, so the request does not outlive the
+  term it was made in.
+- The leader that sees the request ends its term first: it cancels the loops the term
+  runs (periodic jobs, stream delivery, the live and index maintenance, log retention)
+  and waits for them, and runs none of the duties on the leader loop again. Only then
+  does it delete its row and send the `resigned` notification, as on a graceful stop. No duty of the resigning
+  client runs after the row is gone, so its duties never overlap the next leader's. If
+  the delete fails, the lease expires instead.
+- It emits `EventLeaderResigned` and then stays out of the election for one TTL, by its
+  own clock (the hold-off schedules its own attempts and compares no stored time), so
+  that another client wins the election the notification starts rather than it again.
+  A cluster whose only leader-eligible client resigned is leaderless for that TTL, and
+  then the same client is elected again.
+- A leader of the previous release never reads the column and ignores the request,
+  which then asks no one once its term ends.
 
 A lease table is used instead of `pg_advisory_lock` for three reasons: it works behind
 PgBouncer in transaction mode and behind RDS Proxy, it can be inspected with plain SQL,
@@ -2980,7 +3022,7 @@ observability without new machinery.
   gauges for queue depth by state, the oldest claimable job's age and live clients from
   `Stats`. Prometheus users export through the OTel exporter.
 - **CLI (`cmd/hopper`, core module):** `migrate up|down|version`, `jobs list|get|retry|cancel|delete`,
-  `queues list|pause|resume|limit`, `clients list`, `workflows get`, `subscriptions list`,
+  `queues list|pause|resume|limit`, `clients list`, `leader resign`, `workflows get`, `subscriptions list`,
   `streams consumers|seek` and `stats`, all with `-json`. Benchmarks are the separate
   `hopperbench` command.
 - **Web UI (`hopperui` module):** `hopperui.New(client, cfg)` is an embeddable
@@ -2988,7 +3030,7 @@ observability without new machinery.
   (depths, limits, paused state), jobs and history (filtered by queue, state, kind and
   tag, paged by ID), a job's tags, args, metadata, output and errors, workflows as a DAG (SVG, laid
   out by dependency depth), subscriptions, stream consumers and clients. Retry, cancel,
-  delete (behind a confirmation), pause, resume and seek are offered only when the application supplies
+  delete (behind a confirmation), pause, resume, seek and asking the leader to resign are offered only when the application supplies
   `Config.Authorize`, which is asked before every action; without it the UI is
   read-only. Actions are POSTs, and a browser's cross-site request to one is refused
   (`http.CrossOriginProtection`). It is server-rendered HTML with no scripts and no external assets, so it

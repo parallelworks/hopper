@@ -53,11 +53,14 @@ func testLeader[TTx any](t *testing.T, f Fixture[TTx]) {
 	a, b := register(ctx, t, exec), register(ctx, t, exec)
 	attempt := func(id int64) bool {
 		t.Helper()
-		ok, err := exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: time.Hour})
+		res, err := exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: time.Hour})
 		if err != nil {
 			t.Fatal(err)
 		}
-		return ok
+		if res.ResignRequested {
+			t.Errorf("client %d was asked to resign, though no client asked", id)
+		}
+		return res.Leader
 	}
 	if !attempt(a) {
 		t.Fatal("first attempt failed")

@@ -27,16 +27,39 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		c.resign(ctx)
 	}()
 
-	var lastMaintenance time.Time
+	var (
+		lastMaintenance time.Time
+		// heldOff is until when the client, having resigned on request,
+		// stays out of the election, so that another client takes the
+		// lease rather than it again.
+		heldOff time.Time
+	)
 	for {
-		ok, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: c.clientID.Load(), TTL: c.tuning.leaderTTL})
+		if time.Now().Before(heldOff) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			case <-c.leaderPoke:
+			}
+			continue
+		}
+		res, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: c.clientID.Load(), TTL: c.tuning.leaderTTL})
 		switch {
 		case err != nil:
 			if ctx.Err() != nil {
 				return
 			}
 			c.logger.WarnContext(ctx, "hopper: leader attempt", "error", err)
-		case ok:
+		case res.ResignRequested:
+			// Asked to resign (Client.LeaderResign): no duty runs again in
+			// this term. Its loops end before the lease is given up, so no
+			// duty of this client overlaps the next leader's.
+			term.end()
+			term = nil
+			c.resignOnRequest(ctx)
+			heldOff = time.Now().Add(c.tuning.leaderTTL)
+		case res.Leader:
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", c.clientID.Load())
 				c.emit(EventLeaderElected, nil, "")
@@ -130,6 +153,22 @@ func (c *Client[TTx]) resign(ctx context.Context) {
 		return
 	}
 	c.logger.InfoContext(ctx, "hopper: resigned leadership", "client_id", c.clientID.Load())
+}
+
+// resignOnRequest gives the lease up after a resign request, once the
+// term's loops have ended, and signals the other clients to elect a
+// replacement. If the statement fails, the lease expires instead.
+func (c *Client[TTx]) resignOnRequest(ctx context.Context) {
+	id := c.clientID.Load()
+	c.isLeader.Store(false)
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := c.exec.LeaderResign(rctx, id); err != nil {
+		c.logger.WarnContext(ctx, "hopper: resign leadership on request; the lease expires instead", "client_id", id, "error", err)
+	} else {
+		c.logger.InfoContext(ctx, "hopper: resigned leadership on request", "client_id", id)
+	}
+	c.emit(EventLeaderResigned, nil, "")
 }
 
 // rescue moves running jobs whose client has lost its lease back to

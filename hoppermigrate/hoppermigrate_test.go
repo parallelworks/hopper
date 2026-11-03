@@ -3,6 +3,7 @@ package hoppermigrate_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -34,7 +35,7 @@ func TestMigrationsAreWellFormed(t *testing.T) {
 	}
 	// Every migration changes this line, so two branches that each add the
 	// next version conflict here instead of both merging.
-	const latest = 23
+	const latest = 24
 	if hoppermigrate.Latest() != latest {
 		t.Errorf("Latest() = %d; a new migration updates the latest version here to %d", hoppermigrate.Latest(), hoppermigrate.Latest())
 	}
@@ -1569,5 +1570,71 @@ func TestAnyOfEdgesUpgrade(t *testing.T) {
 	}
 	if err := rows.Err(); err != nil || len(policies) != 2 || policies[0] != "cancel" || policies[1] != "ignore" {
 		t.Errorf("edges after down = %v, %v; want the edge that reads to cancel and the group's to ignore", policies, err)
+	}
+}
+
+// TestLeaderResignUpgrade upgrades to v24 under a leader of the previous
+// release: its lease survives, a resign request names it, its renewal (the
+// previous release's statement) keeps the lease and the request, and a takeover by a client of this release clears the request.
+// The down script drops the column and keeps the lease.
+func TestLeaderResignUpgrade(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := testdb.EmptyPool(t, 0)
+	d := testdb.Driver(pool)
+	logger := slog.New(slog.DiscardHandler)
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 23}); err != nil {
+		t.Fatal(err)
+	}
+	// The previous release's election and renewal.
+	renew := func(id int64) bool {
+		t.Helper()
+		var leader bool
+		if err := pool.QueryRow(ctx, `INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
+			VALUES ('default', $1, now(), now() + interval '1 minute')
+			ON CONFLICT (name) DO UPDATE SET client_id = $1, elected_at = now(), expires_at = now() + interval '1 minute'
+			WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $1
+			RETURNING client_id = $1`, id).Scan(&leader); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		return leader
+	}
+	if !renew(7) {
+		t.Fatal("the previous release's client was not elected")
+	}
+	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 24}); err != nil {
+		t.Fatal(err)
+	}
+	exec := d.Executor()
+	if id, err := exec.LeaderRequestResign(ctx); err != nil || id != 7 {
+		t.Fatalf("resign request after v24 = %d, %v; want the previous release's leader 7", id, err)
+	}
+	if !renew(7) {
+		t.Fatal("the previous release's leader lost its lease to its renewal after v24")
+	}
+	var asked *int64
+	if err := pool.QueryRow(ctx, `SELECT resign_client_id FROM hopper_leader`).Scan(&asked); err != nil || asked == nil || *asked != 7 {
+		t.Errorf("resign_client_id after the previous release's renewal = %v, %v; want 7", asked, err)
+	}
+	// Its lease expires; a client of this release takes over and is not asked.
+	if _, err := pool.Exec(ctx, `UPDATE hopper_leader SET expires_at = now() - interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	res, err := exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: 8, TTL: time.Minute})
+	if err != nil || !res.Leader || res.ResignRequested {
+		t.Fatalf("takeover after v24 = %+v, %v; want leader, not asked", res, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT resign_client_id FROM hopper_leader`).Scan(&asked); err != nil || asked != nil {
+		t.Errorf("resign_client_id after a takeover = %v, %v; want NULL", asked, err)
+	}
+	if _, err := hoppermigrate.Down(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 23}); err != nil {
+		t.Fatal(err)
+	}
+	var holder int64
+	if err := pool.QueryRow(ctx, `SELECT client_id FROM hopper_leader`).Scan(&holder); err != nil || holder != 8 {
+		t.Errorf("leader after v24's down script = %d, %v; want 8", holder, err)
+	}
+	if !renew(8) {
+		t.Error("the leader's lease could not be renewed by the previous release after v24's down script")
 	}
 }

@@ -203,6 +203,21 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("clients", "list"); !strings.Contains(got, "ID") {
 		t.Errorf("clients list = %q", got)
 	}
+	if got := hopperCmd("leader", "resign"); !strings.Contains(got, "no leader") {
+		t.Errorf("leader resign with no leader = %q", got)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
+		VALUES ('default', 42, now(), now() + interval '1 minute')`); err != nil {
+		t.Fatal(err)
+	}
+	var asked map[string]int64
+	if err := json.Unmarshal([]byte(hopperCmd("-json", "leader", "resign")), &asked); err != nil || asked["asked"] != 42 {
+		t.Errorf("json leader resign = %v, %v; want client 42 asked", asked, err)
+	}
+	var flagged int64
+	if err := pool.QueryRow(ctx, "SELECT resign_client_id FROM hopper_leader").Scan(&flagged); err != nil || flagged != 42 {
+		t.Errorf("resign_client_id = %d, %v; want 42", flagged, err)
+	}
 	if got := hopperCmd("stats"); !strings.Contains(got, "q1") {
 		t.Errorf("stats = %q", got)
 	}

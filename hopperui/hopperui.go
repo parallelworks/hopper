@@ -1,7 +1,7 @@
 // Package hopperui is a web UI for hopper: an http.Handler that browses
 // queues, jobs, history, workflows, subscriptions, stream consumers and
-// clients, and can retry, cancel, delete, pause, resume and seek when the
-// application allows it.
+// clients, and can retry, cancel, delete, pause, resume, seek and ask the
+// leader to resign when the application allows it.
 //
 //	mux.Handle("/hopper/", http.StripPrefix("/hopper", hopperui.New(client, &hopperui.Config{
 //	    Prefix:    "/hopper",
@@ -46,6 +46,9 @@ const (
 	ActionPause  Action = "pause"
 	ActionResume Action = "resume"
 	ActionSeek   Action = "seek"
+	// ActionResign asks the cluster's leader to give up its term
+	// (Client.LeaderResign).
+	ActionResign Action = "resign"
 )
 
 // Config tunes the UI. A nil *Config means the defaults.
@@ -99,6 +102,7 @@ func New[TTx any](client *hopper.Client[TTx], cfg *Config) http.Handler {
 	mux.HandleFunc("GET /consumers", u.consumers)
 	mux.HandleFunc("POST /consumers/{name}/seek", u.seek)
 	mux.HandleFunc("GET /clients", u.clients)
+	mux.HandleFunc("POST /clients/leader/resign", u.leaderResign)
 	mux.HandleFunc("GET /static/style.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		http.ServeContent(w, r, "style.css", time.Time{}, bytes.NewReader(styleCSS))
@@ -556,6 +560,22 @@ func (u *ui[TTx]) clients(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u.render(w, r, "clients", clients)
+}
+
+func (u *ui[TTx]) leaderResign(w http.ResponseWriter, r *http.Request) {
+	if !u.authorize(w, r, ActionResign) {
+		return
+	}
+	id, err := u.client.LeaderResign(r.Context())
+	if err != nil {
+		u.fail(w, err)
+		return
+	}
+	msg := "no leader to ask"
+	if id != 0 {
+		msg = fmt.Sprintf("asked leader client %d to resign", id)
+	}
+	u.back(w, r, "/clients", msg)
 }
 
 // Template helpers.

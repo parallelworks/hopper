@@ -104,28 +104,35 @@ func (e *Executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 }
 
 // leaderSQL takes the lease if it is free or expired, or renews it for the
-// holder. No row is returned when another client holds it.
+// holder. No row is returned when another client holds it. A renewal keeps
+// a resign request, and reports one that names the holder; a takeover
+// clears it.
 const leaderSQL = `
 INSERT INTO {{schema}}.hopper_leader (name, client_id, elected_at, expires_at)
 VALUES ('default', $1, now(), now() + make_interval(secs => $2::float8))
 ON CONFLICT (name) DO UPDATE SET
   client_id  = EXCLUDED.client_id,
   elected_at = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.elected_at ELSE now() END,
-  expires_at = EXCLUDED.expires_at
+  expires_at = EXCLUDED.expires_at,
+  resign_client_id = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = EXCLUDED.client_id
-RETURNING client_id`
+RETURNING client_id, coalesce(resign_client_id = client_id, false)`
 
 // LeaderAttempt implements driver.Executor.
-func (e *Executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (bool, error) {
-	var id int64
-	err := e.Conn.QueryRow(ctx, leaderSQL, params.ClientID, params.TTL.Seconds()).Scan(&id)
+func (e *Executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (driver.LeaderResult, error) {
+	var (
+		id     int64
+		resign bool
+	)
+	err := e.Conn.QueryRow(ctx, leaderSQL, params.ClientID, params.TTL.Seconds()).Scan(&id, &resign)
 	if errors.Is(err, ErrNoRows) {
-		return false, nil
+		return driver.LeaderResult{}, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("hopper: leader attempt: %w", err)
+		return driver.LeaderResult{}, fmt.Errorf("hopper: leader attempt: %w", err)
 	}
-	return id == params.ClientID, nil
+	leader := id == params.ClientID
+	return driver.LeaderResult{Leader: leader, ResignRequested: leader && resign}, nil
 }
 
 // leaderResignSQL deletes the lease if this client holds it and, only then,
@@ -142,6 +149,29 @@ func (e *Executor) LeaderResign(ctx context.Context, clientID int64) error {
 		return fmt.Errorf("hopper: leader resign: %w", err)
 	}
 	return nil
+}
+
+// leaderRequestResignSQL names the holder of a live lease as asked to
+// resign and, only then, signals it.
+const leaderRequestResignSQL = `
+WITH asked AS (
+  UPDATE {{schema}}.hopper_leader SET resign_client_id = client_id
+  WHERE name = 'default' AND expires_at > now()
+  RETURNING client_id
+)
+SELECT a.client_id FROM asked a CROSS JOIN LATERAL (SELECT pg_notify($1, 'resign')) n`
+
+// LeaderRequestResign implements driver.Executor.
+func (e *Executor) LeaderRequestResign(ctx context.Context) (int64, error) {
+	var id int64
+	err := e.Conn.QueryRow(ctx, leaderRequestResignSQL, driver.ChannelLeader).Scan(&id)
+	if errors.Is(err, ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("hopper: leader resign request: %w", err)
+	}
+	return id, nil
 }
 
 // QueueEnsure implements driver.Executor.

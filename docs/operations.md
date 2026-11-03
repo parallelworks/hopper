@@ -14,6 +14,13 @@
   every replica except one with `Config.NeverLead` also competes for
   leadership; only the leader runs periodic jobs, rescue and retention, and a
   replacement takes over within 15 seconds of the leader stopping.
+- **Moving the leader.** Before a planned restart of the leader's node, or to
+  move periodic jobs, rescue and retention off a busy one, ask the leader to
+  resign: `hopper leader resign`, `Client.LeaderResign`, or the UI's clients
+  page. The leader stops its duties, gives the lease up, and stays out of the
+  election for 15 seconds, so another client takes over within a second or
+  so. With no other client that can lead, the install has no leader for those
+  15 seconds.
 - **Clients that must not lead.** Set `Config.NeverLead` on a client that
   shares an install it should not run, such as a developer's process pointed
   at a shared environment. It claims and works jobs like any other, but never

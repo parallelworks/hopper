@@ -284,6 +284,36 @@ func (c *Client[TTx]) Clients(ctx context.Context) ([]*ClientRow, error) {
 	return c.exec.ClientList(ctx)
 }
 
+// LeaderResign asks the cluster's leader, whichever client holds the
+// term, to give it up, so that another client takes over: before a planned
+// restart of the leader's host, say, or to move the leader's duties off a
+// busy node. Any client can ask, including one that works no queue, and
+// so can `hopper leader resign`. It returns the leader's client ID, or 0 if
+// no client leads.
+//
+// The request is recorded on the leader lease, so it reaches the leader at
+// its next renewal: at once through a notification where the engine has
+// them, and within the 5 seconds between renewals otherwise. The leader
+// then stops its duties, finishing or abandoning those in progress as it
+// does when it loses the lease, gives the lease up and sits out the
+// election for the 15 seconds of a lease, so that another client is
+// elected, usually at once. It emits EventLeaderResigned, and runs no
+// duty after it gave the lease up. A cluster with no other
+// client has no leader until the resigned one is elected again. A request
+// names the leader it was made of: if that leader's lease expires first,
+// the next leader is not asked. A leader of an earlier release ignores it.
+func (c *Client[TTx]) LeaderResign(ctx context.Context) (int64, error) {
+	id, err := c.exec.LeaderRequestResign(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// The leader may be this client, whose listener may be down.
+	if id != 0 && id == c.clientID.Load() {
+		c.pokeLeader()
+	}
+	return id, nil
+}
+
 // Stats is a snapshot of queue depths and cluster state.
 type Stats = driver.Stats
 
@@ -424,7 +454,10 @@ const (
 	EventJobRescued    EventKind = "job.rescued"
 	EventLeaderElected EventKind = "leader.elected"
 	EventLeaderLost    EventKind = "leader.lost"
-	EventLeaseLost     EventKind = "lease.lost"
+	// EventLeaderResigned is emitted, in place of EventLeaderLost, by a
+	// leader that gave its term up on request (Client.LeaderResign).
+	EventLeaderResigned EventKind = "leader.resigned"
+	EventLeaseLost      EventKind = "lease.lost"
 )
 
 // Event is one occurrence on a client.

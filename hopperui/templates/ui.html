@@ -242,4 +242,5 @@
 {{else}}<tr><td colspan="5" class="dim">no clients</td></tr>{{end}}
 </tbody>
 </table>
+{{if .CanAct}}<form method="post" action="{{.Prefix}}/clients/leader/resign"><button title="The leader gives up its term and another client takes over">ask the leader to resign</button></form>{{end}}
 {{end}}

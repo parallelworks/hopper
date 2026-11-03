@@ -8,6 +8,7 @@
 //	hopper queues list|pause|resume [name]
 //	hopper queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]
 //	hopper clients list
+//	hopper leader resign
 //	hopper stats
 //
 // The database comes from -database-url or HOPPER_DATABASE_URL. Every command
@@ -64,6 +65,7 @@ commands:
   queues pause|resume <name>
   queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]   (omitted limits are removed)
   clients list
+  leader resign                (asks the leader to give up its term)
   workflows get <id>
   subscriptions list
   streams consumers
@@ -123,6 +125,8 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		return c.queues(ctx, rest[1:])
 	case "clients":
 		return c.clients(ctx, rest[1:])
+	case "leader":
+		return c.leader(ctx, rest[1:])
 	case "workflows":
 		return c.workflows(ctx, rest[1:])
 	case "subscriptions":
@@ -466,6 +470,24 @@ func (c *cli) clients(ctx context.Context, args []string) error {
 			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", cl.ID, cl.Hostname, cl.StartedAt.Local().Format(time.RFC3339), lease, cl.Info)
 		}
 		tw.Flush()
+	})
+}
+
+// leader asks the current leader to resign its term (Client.LeaderResign).
+func (c *cli) leader(ctx context.Context, args []string) error {
+	if len(args) != 1 || args[0] != "resign" {
+		return errors.New("leader: resign")
+	}
+	id, err := c.client.LeaderResign(ctx)
+	if err != nil {
+		return err
+	}
+	return c.print(map[string]int64{"asked": id}, func(w io.Writer) {
+		if id == 0 {
+			fmt.Fprintln(w, "no leader")
+			return
+		}
+		fmt.Fprintf(w, "asked leader client %d to resign\n", id)
 	})
 }
 

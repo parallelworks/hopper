@@ -128,29 +128,58 @@ func (e *executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 }
 
 // LeaderAttempt implements driver.Executor: it takes the lease if it is
-// free or expired, or renews it for the holder.
-func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (bool, error) {
-	var leader bool
+// free or expired, or renews it for the holder. A renewal keeps a resign
+// request, and reports one that names the holder; a takeover clears it.
+func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (driver.LeaderResult, error) {
+	var res driver.LeaderResult
 	err := e.write(ctx, func(x *w) error {
-		var id int64
+		var (
+			id     int64
+			resign bool
+		)
 		err := x.QueryRowContext(ctx, `
 			INSERT INTO hopper_leader (name, client_id, elected_at, expires_at) VALUES ('default', ?1, ?2, ?3)
 			ON CONFLICT (name) DO UPDATE SET
 			  client_id  = excluded.client_id,
 			  elected_at = CASE WHEN hopper_leader.client_id = excluded.client_id THEN hopper_leader.elected_at ELSE excluded.elected_at END,
-			  expires_at = excluded.expires_at
+			  expires_at = excluded.expires_at,
+			  resign_client_id = CASE WHEN hopper_leader.client_id = excluded.client_id THEN hopper_leader.resign_client_id END
 			WHERE hopper_leader.expires_at < ?2 OR hopper_leader.client_id = excluded.client_id
-			RETURNING client_id`, params.ClientID, x.us(), x.at(params.TTL)).Scan(&id)
+			RETURNING client_id, coalesce(resign_client_id = client_id, 0)`, params.ClientID, x.us(), x.at(params.TTL)).Scan(&id, &resign)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
-		leader = err == nil && id == params.ClientID
+		res.Leader = err == nil && id == params.ClientID
+		res.ResignRequested = res.Leader && resign
 		return err
 	})
 	if err != nil {
-		return false, fmt.Errorf("hopper: leader attempt: %w", err)
+		return driver.LeaderResult{}, fmt.Errorf("hopper: leader attempt: %w", err)
 	}
-	return leader, nil
+	return res, nil
+}
+
+// LeaderRequestResign implements driver.Executor: it names the holder of a
+// live lease as asked to resign and, only then, signals it.
+func (e *executor) LeaderRequestResign(ctx context.Context) (int64, error) {
+	var id int64
+	err := e.write(ctx, func(x *w) error {
+		err := x.QueryRowContext(ctx, `
+			UPDATE hopper_leader SET resign_client_id = client_id
+			WHERE name = 'default' AND expires_at > ?
+			RETURNING client_id`, x.us()).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return x.notify(ctx, driver.ChannelLeader, "resign")
+	})
+	if err != nil {
+		return 0, fmt.Errorf("hopper: leader resign request: %w", err)
+	}
+	return id, nil
 }
 
 // LeaderResign implements driver.Executor: it gives the lease up if this

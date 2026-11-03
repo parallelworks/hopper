@@ -289,6 +289,27 @@ func TestUI(t *testing.T) {
 	want(404, body, code)
 	code, body = post(admin, "/consumers/nobody/seek", url.Values{"to": {"sideways"}}, true)
 	want(400, body, code)
+	code, body = get(admin, "/clients")
+	want(200, body, code, `action="/hopper/clients/leader/resign"`)
+	code, body = get(readOnly, "/clients")
+	want(200, body, code)
+	if strings.Contains(body, "/clients/leader/resign") {
+		t.Error("read-only UI offers to ask the leader to resign")
+	}
+	code, body = post(readOnly, "/clients/leader/resign", nil, true)
+	want(403, body, code)
+	code, body = post(admin, "/clients/leader/resign", nil, false)
+	want(403, body, code)
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
+		VALUES ('default', 42, now(), now() + interval '1 minute')`); err != nil {
+		t.Fatal(err)
+	}
+	code, body = post(admin, "/clients/leader/resign", nil, true)
+	want(303, body, code)
+	var asked int64
+	if err := pool.QueryRow(ctx, "SELECT resign_client_id FROM hopper_leader").Scan(&asked); err != nil || asked != 42 {
+		t.Errorf("resign_client_id after the resign action = %d, %v; want 42", asked, err)
+	}
 	code, body = post(admin, "/jobs/"+job.Job.ID.String()+"/explode", nil, true)
 	want(404, body, code)
 }

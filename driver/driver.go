@@ -126,8 +126,10 @@ func Owner(ctx context.Context) fmt.Stringer {
 const (
 	// ChannelInsert carries the queue name of a committed insert.
 	ChannelInsert = "hopper_insert"
-	// ChannelLeader is signaled when a leader resigns, so a replacement is
-	// elected without waiting for the lease to expire.
+	// ChannelLeader is signaled when a leader resigns ("resigned"), so a
+	// replacement is elected without waiting for the lease to expire, and
+	// when a client asks the leader to resign ("resign"), so the leader
+	// renews, and finds the request, at once.
 	ChannelLeader = "hopper_leader"
 	// ChannelControl carries operator actions: "cancel:<job id>",
 	// "pause:<queue>", "resume:<queue>" and "limit:<queue>" (limits
@@ -312,12 +314,21 @@ type Executor interface {
 	// notifications return nil.
 	Notify(ctx context.Context, channel string, payloads []string) error
 
-	// LeaderAttempt takes or renews the leader lease for a client. It
-	// returns true if the client is the leader afterwards.
-	LeaderAttempt(ctx context.Context, params LeaderParams) (bool, error)
+	// LeaderAttempt takes or renews the leader lease for a client and
+	// reports whether the client holds it afterwards and, if it does,
+	// whether a LeaderRequestResign asked it to give the lease up. A client
+	// that takes the lease over from another clears that request.
+	LeaderAttempt(ctx context.Context, params LeaderParams) (LeaderResult, error)
 	// LeaderResign gives up leadership if the client holds it, and signals
 	// other clients to elect a replacement.
 	LeaderResign(ctx context.Context, clientID int64) error
+	// LeaderRequestResign asks the client that holds a live leader lease,
+	// by database time, to give it up: it records the request on the lease,
+	// naming that client, which the holder's next LeaderAttempt reports,
+	// and signals ChannelLeader with "resign". It returns the holder's
+	// client ID, or 0 if no client holds a live lease. A request names the
+	// holder it was made of only, so a later holder is never asked.
+	LeaderRequestResign(ctx context.Context) (int64, error)
 
 	// QueueEnsure records queues a client works, so they are listed even
 	// before any job is inserted.
@@ -1228,6 +1239,15 @@ type RescueCandidate struct {
 type LeaderParams struct {
 	ClientID int64
 	TTL      time.Duration
+}
+
+// LeaderResult is the outcome of a leadership attempt.
+type LeaderResult struct {
+	// Leader reports that the client holds the lease afterwards.
+	Leader bool
+	// ResignRequested reports that a LeaderRequestResign asked the client,
+	// as the lease's holder, to give it up.
+	ResignRequested bool
 }
 
 // HistoryMaintainParams sets retention per outcome.
