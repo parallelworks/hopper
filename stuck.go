@@ -20,9 +20,10 @@ import (
 // canceled, which few attempts are.
 type stuckWatch struct {
 	ctx context.Context
-	// job is the row as claimed, copied before the worker can change it,
-	// as RecordStep does its Progress.
-	job       JobRow
+	// job is the attempt's copy of the row as claimed (attempt.claimed),
+	// which the worker cannot change, as it does its own row's Progress
+	// with RecordStep.
+	job       *JobRow
 	state     atomic.Int32
 	stopAfter func() bool
 	// timer is set, under Client.stuckMu, once the context is canceled.
@@ -35,10 +36,10 @@ const (
 	watchReported
 )
 
-// watchStuck starts watching the worker about to run row under ctx; call
-// stuckReturned once it has returned.
-func (c *Client[TTx]) watchStuck(ctx context.Context, row *driver.JobRow) *stuckWatch {
-	w := &stuckWatch{ctx: ctx, job: *row}
+// watchStuck starts watching the worker about to run under ctx, whose row
+// as claimed is claimed; call stuckReturned once it has returned.
+func (c *Client[TTx]) watchStuck(ctx context.Context, claimed *driver.JobRow) *stuckWatch {
+	w := &stuckWatch{ctx: ctx, job: claimed}
 	w.stopAfter = context.AfterFunc(ctx, func() { c.stuckCanceled(w) })
 	return w
 }
@@ -82,7 +83,9 @@ func (c *Client[TTx]) reportStuckNow() {
 
 // reportStuck logs a worker that has not returned since its context was
 // canceled, emits EventJobStuck and starts Config.OnStuck on a goroutine of
-// its own, unless the worker has returned or was reported already.
+// its own, unless the worker has returned or was reported already. The
+// event and the hook each get a copy of the row, which they may change
+// without racing each other or the attempt's log.
 func (c *Client[TTx]) reportStuck(w *stuckWatch) {
 	if !w.state.CompareAndSwap(watchRunning, watchReported) {
 		return
@@ -90,10 +93,12 @@ func (c *Client[TTx]) reportStuck(w *stuckWatch) {
 	cause := stuckCause(w.ctx)
 	c.logger.Warn("hopper: job has not returned since its context was canceled",
 		"job_id", w.job.ID, "kind", w.job.Kind, "attempt", w.job.Attempt, "cause", cause)
-	c.emit(EventJobStuck, &w.job, cause.Error())
+	evJob := *w.job
+	c.emit(EventJobStuck, &evJob, cause.Error())
 	if c.cfg.OnStuck == nil {
 		return
 	}
+	job := *w.job
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -101,7 +106,7 @@ func (c *Client[TTx]) reportStuck(w *stuckWatch) {
 					"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
 			}
 		}()
-		c.cfg.OnStuck(context.WithValue(context.Background(), clientKey{}, c), &w.job, cause)
+		c.cfg.OnStuck(context.WithValue(context.Background(), clientKey{}, c), &job, cause)
 	}()
 }
 

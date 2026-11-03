@@ -24,12 +24,26 @@ type stuckArgs struct {
 func (stuckArgs) Kind() string { return "stuck_args" }
 
 // stuckExec is a stopExec that cancels a running job as a database would:
-// the job stays running, and its client is told.
-type stuckExec struct{ *stopExec }
+// the job stays running, and its client is told. It logs the release of
+// the client's lease to logs.
+type stuckExec struct {
+	*stopExec
+	logs *lockedBuffer
+}
 
 func (stuckExec) JobCancel(_ context.Context, id driver.JobID) (*driver.JobRow, error) {
 	return &driver.JobRow{ID: id, State: driver.JobStateRunning}, nil
 }
+
+func (e stuckExec) ClientDelete(ctx context.Context, id int64) error {
+	_, _ = e.logs.Write([]byte(leaseReleased + "\n"))
+	return e.stopExec.ClientDelete(ctx, id)
+}
+
+const (
+	leaseReleased = "test: lease released"
+	stuckWarning  = "job has not returned since its context was canceled"
+)
 
 type stuckCall struct {
 	at     time.Time
@@ -64,6 +78,12 @@ func (b *lockedBuffer) count(s string) int {
 	return strings.Count(b.buf.String(), s)
 }
 
+func (b *lockedBuffer) index(s string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Index(b.buf.String(), s)
+}
+
 // stuckClient returns an unstarted client over jobs of stuckArgs, with
 // Config.OnStuck reporting each call. The worker sends the time its
 // context was canceled to canceled.
@@ -91,7 +111,7 @@ func stuckClient(t *testing.T, jobTimeout time.Duration, onStuck func(context.Co
 			h.calls <- stuckCall{at: time.Now(), job: job, cause: cause, client: ok && ctx.Err() == nil}
 		}
 	}
-	c, err := NewClient(managedTestDriver{exec: stuckExec{h.exec}}, &Config{
+	c, err := NewClient(managedTestDriver{exec: stuckExec{stopExec: h.exec, logs: h.logs}}, &Config{
 		Queues:     map[string]QueueConfig{QueueDefault: {MaxWorkers: 10}},
 		Workers:    workers,
 		Logger:     slog.New(slog.NewTextHandler(h.logs, nil)),
@@ -107,11 +127,9 @@ func stuckClient(t *testing.T, jobTimeout time.Duration, onStuck func(context.Co
 }
 
 func stuckJob(args string) *driver.JobRow {
-	n := stopJobs.Add(1)
-	return &driver.JobRow{
-		ID: driver.JobID{byte(n >> 8), byte(n)}, Kind: "stuck_args", Queue: QueueDefault, Args: []byte(args),
-		Attempt: 1, MaxAttempts: 3, Fence: 1, State: driver.JobStateRunning,
-	}
+	job := stopJob(1, 3, args)
+	job.Kind = stuckArgs{}.Kind()
+	return job
 }
 
 // noMoreCalls fails the test if OnStuck is called again within a minute.
@@ -164,7 +182,7 @@ func TestStuckAfterTimeout(t *testing.T) {
 		default:
 			t.Error("no EventJobStuck")
 		}
-		if n := h.logs.count("job has not returned since its context was canceled"); n != 1 {
+		if n := h.logs.count(stuckWarning); n != 1 {
 			t.Errorf("%d warnings logged, want 1", n)
 		}
 		h.noMoreCalls(t)
@@ -210,9 +228,10 @@ func TestStuckAfterJobCancel(t *testing.T) {
 }
 
 // TestStuckAfterStop: a stop that gives up on a worker at the end of its
-// grace reports it then, with ErrClientStopped, though StuckGrace has not
-// passed, and not again once it has; a stop that waits longer than
-// StuckGrace for a canceled worker has it reported at StuckGrace.
+// grace reports it then, once it has released its lease, with
+// ErrClientStopped, though StuckGrace has not passed, and not again once it
+// has; a stop that waits longer than StuckGrace for a canceled worker has
+// it reported at StuckGrace.
 func TestStuckAfterStop(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		job := stuckJob(`{}`)
@@ -231,6 +250,9 @@ func TestStuckAfterStop(t *testing.T) {
 		call := <-h.calls
 		if want := 3*time.Second + h.c.tuning.stopGrace; call.at.Sub(start) != want || !errors.Is(call.cause, ErrClientStopped) {
 			t.Errorf("OnStuck called %s into the stop with %v, want %s (its deadline and grace) and ErrClientStopped", call.at.Sub(start), call.cause, want)
+		}
+		if released, warned := h.logs.index(leaseReleased), h.logs.index(stuckWarning); released < 0 || warned < released {
+			t.Errorf("lease released at log offset %d, worker reported at %d; want the report after the release", released, warned)
 		}
 		h.noMoreCalls(t)
 		close(h.release)

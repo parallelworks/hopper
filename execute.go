@@ -38,14 +38,9 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	defer cancel(nil)
 	a := &attempt{
 		codec: c.cfg.Codec, completion: completedResult(row, qcfg), exec: c.exec, attempt: row.Attempt,
-		row: row, baseLogger: c.logger, logs: c.cfg.JobLogs, maxOutput: c.cfg.MaxOutputBytes,
+		claimed: *row, baseLogger: c.logger, logs: c.cfg.JobLogs, maxOutput: c.cfg.MaxOutputBytes,
 	}
-	if c.cfg.JobLogs.Store != nil {
-		// The store's Writer gets the row as claimed: the worker changes its
-		// own, as RecordStep does Progress, which a Writer reading it races.
-		claimed := *row
-		a.row = &claimed
-	}
+	a.row = &a.claimed
 	defer func() { a.closeLog(c.logCloseTimeout(ctx)) }()
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
@@ -53,7 +48,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	claim := c.trackRunning(row.ID, cancel)
 	defer c.untrackRunning(row.ID, claim)
 
-	unit, err := c.runWorker(jobCtx, row)
+	unit, err := c.runWorker(jobCtx, row, a.row)
 	// Whether the client's stop canceled the attempt is read as the worker
 	// returns, before anything below can wait. An attempt its own timeout
 	// ended first timed out (runWorker wraps ErrJobTimeout only then), which
@@ -158,7 +153,9 @@ func completedResult(row *driver.JobRow, qcfg QueueConfig) driver.JobFinalize {
 	return driver.JobFinalize{ID: row.ID, AttemptedBy: row.AttemptedBy, Fence: row.Fence, State: driver.JobStateCompleted, Archive: !qcfg.DeleteCompleted}
 }
 
-func (c *Client[TTx]) runWorker(ctx context.Context, row *driver.JobRow) (workUnit, error) {
+// runWorker runs row's worker under ctx, watching it for not returning once
+// ctx is canceled (watchStuck) with claimed, the row as claimed.
+func (c *Client[TTx]) runWorker(ctx context.Context, row, claimed *driver.JobRow) (workUnit, error) {
 	info, ok := c.workers.lookup(row.Kind)
 	if !ok {
 		return nil, &UnknownKindError{Kind: row.Kind}
@@ -186,9 +183,11 @@ func (c *Client[TTx]) runWorker(ctx context.Context, row *driver.JobRow) (workUn
 		m, inner := c.cfg.Middleware[i], work
 		work = func(ctx context.Context) error { return m.Work(ctx, row, inner) }
 	}
-	watch := c.watchStuck(jobCtx, row)
+	// Deferred, so that a worker that exits its goroutine (runtime.Goexit,
+	// as t.FailNow does), which safeWork cannot recover, still ends its
+	// watch before the timeout's cancel above would start it.
+	defer c.stuckReturned(c.watchStuck(jobCtx, claimed))
 	err = safeWork(jobCtx, work)
-	c.stuckReturned(watch)
 	if err != nil && jobTimeoutCause(jobCtx) {
 		err = fmt.Errorf("%w after %s: %w", ErrJobTimeout, timeout, err)
 	}

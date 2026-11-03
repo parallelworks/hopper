@@ -276,7 +276,8 @@ for a queue's completed jobs entirely, for maximum throughput.
   called, once, on a goroutine of its own, to alert, dump goroutine stacks
   (`runtime/pprof`'s `goroutine` profile) or exit the process. The job keeps
   its slot until the worker returns. A stop that gives up on such a worker
-  reports it at once, and the job is rescued once the client is gone.
+  reports it before returning, once it has flushed results and released its
+  lease, and the job is rescued once the client is gone.
 - **Graceful stop.** `Stop` (or `Run` when its context ends) stops claiming,
   gives up leadership, waits for running jobs, flushes results and releases
   the lease. If the stop context expires first, running jobs are canceled;

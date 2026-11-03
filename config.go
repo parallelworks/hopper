@@ -81,9 +81,11 @@ type Config struct {
 	OnError func(ctx context.Context, job *JobRow, err error) ErrorOutcome
 	// OnStuck is called when a job's worker has not returned StuckGrace
 	// after the job's context was canceled, or, if sooner, when a stop
-	// gives up on it at the end of its grace (Stop's deadline or
-	// StopAndCancel's ctx, then a short wait). cause is why the context was
-	// canceled: the job's timeout (ErrJobTimeout), JobCancel
+	// gave up on it at the end of its grace (Stop's deadline or
+	// StopAndCancel's ctx, then a short wait): the stop reports it once it
+	// has flushed the other jobs' results and released its lease, before it
+	// returns, so a hook may exit the process then. cause is why the
+	// context was canceled: the job's timeout (ErrJobTimeout), JobCancel
 	// (ErrJobCanceled), the client's stop (ErrClientStopped), or a fence
 	// (ErrJobFenced), which a lost lease causes, or a claim of the job on
 	// this client after a rescue. job is the row as claimed. It is called
