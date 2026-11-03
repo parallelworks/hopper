@@ -77,7 +77,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		case res.Leader:
 			leaseID = id
 			if !c.isLeader.Swap(true) {
-				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", c.clientID.Load())
+				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)
 				c.emit(EventLeaderElected, nil, "")
 				lastMaintenance = time.Time{}
 				term = c.startTerm(ctx)
@@ -95,7 +95,8 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			}
 		default:
 			if c.isLeader.Swap(false) {
-				c.logger.WarnContext(ctx, "hopper: lost leadership", "client_id", c.clientID.Load())
+				// The ID it led under: a fence may have moved the client on.
+				c.logger.WarnContext(ctx, "hopper: lost leadership", "client_id", leaseID)
 				c.emit(EventLeaderLost, nil, "")
 				term.end()
 				term = nil
