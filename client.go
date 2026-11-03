@@ -417,9 +417,10 @@ func (c *Client[TTx]) generation() context.Context {
 // release the lease. If ctx expires during the wait, every job's context is
 // canceled, as StopAndCancel does, whatever finishes within a short grace
 // period is flushed, and ctx's error is returned. Jobs still running then
-// are rescued by another client once this one's lease expires. A job the
-// deadline canceled gets its attempt back, as StopAndCancel says: a stop
-// never uses up an attempt, so a job with MaxAttempts 1 runs again.
+// are rescued by another client once this one's lease expires, and that
+// rescue counts the attempt, as any does. A job the deadline canceled whose
+// worker returns within the grace gets its attempt back, as StopAndCancel
+// says, so a job with MaxAttempts 1 runs again.
 //
 // Stop and StopAndCancel may be called more than once and from several
 // goroutines: one call stops the client, and the others wait for it to
@@ -446,23 +447,24 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // returns nil, Snooze, Cancel or an output refusal (ErrOutputTooLarge)
 // completes, snoozes or discards the job as usual. The job's timeout still
 // bounds each run, and an attempt its timeout ended before the stop came
-// is a timeout: it counts, and OnError is called, as for any timeout. A
-// job from a claim in flight as the stop begins never runs, and gets its
-// attempt back with no error. The same holds for the jobs a Stop cancels
-// when its ctx expires.
+// is a timeout: it counts, and OnError is called, as for any timeout. The
+// same holds for the jobs a Stop cancels when its ctx expires. A job from a
+// claim in flight as the stop begins never runs, and gets its attempt back
+// with no error. A worker still running when the stop's grace ends is
+// rescued once the client is gone, and that rescue counts the attempt.
 //
 // MaxAttempts does not bound a job that every stop interrupts, and each
 // interruption adds an entry to its Errors: only a timeout shorter than
 // the time between stops ends such a job, by ending a run before a stop
 // does; one with no timeout, or a longer one, runs again after every stop.
-// Since a stop never uses up an attempt, a job with MaxAttempts 1 that a
-// stop interrupts runs again: delivery is at-least-once anyway, as a rescue
-// reruns a crashed client's jobs, so a job that must not repeat should be
-// idempotent. The close of an interrupted attempt's log in
-// Config.JobLogs.Store waits at most half the stop's short grace, within
-// which its result can still be written. A worker must not call Stop or
-// StopAndCancel itself: the stop waits for the worker, which then loses its
-// result.
+// Since a stop uses up no attempt whose worker returns within its grace, a
+// job with MaxAttempts 1 that a stop interrupts runs again: delivery is
+// at-least-once anyway, as a rescue reruns a crashed client's jobs, so a
+// job that must not repeat should be idempotent. The close of an
+// interrupted attempt's log in Config.JobLogs.Store waits at most half the
+// stop's short grace, within which its result can still be written. A
+// worker must not call Stop or StopAndCancel itself: the stop waits for the
+// worker, which then loses its result.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	return c.stop(ctx, true)
 }

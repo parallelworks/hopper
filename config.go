@@ -54,9 +54,10 @@ type Config struct {
 	JobTimeout time.Duration
 	// MaxAttempts is the default number of attempts before a job is
 	// discarded. Defaults to 25. An attempt the client's stop canceled
-	// (StopAndCancel, or a Stop whose ctx expired) does not count, so even a
-	// job with one attempt runs again after a stop interrupts it: delivery
-	// is at-least-once, and a job that must not repeat should be idempotent.
+	// (StopAndCancel, or a Stop whose ctx expired) does not count if its
+	// worker returns within the stop's grace, so even a job with one attempt
+	// runs again after a stop interrupts it: delivery is at-least-once, and
+	// a job that must not repeat should be idempotent.
 	MaxAttempts int
 	// OnError is called for every failed attempt this client runs, of any
 	// kind, with the worker's error: a returned error, a recovered panic

@@ -2131,10 +2131,11 @@ job's attempts and dead-letter one interrupted on its last. The error, with a pa
 trace, is recorded in `Errors` and logged, but `Config.OnError` is not consulted: a
 hook would have to run inside the stop's short grace, where its result could miss the
 finalizer, so nothing runs there but the close of the attempt's log in a `LogStore`,
-bounded by half the grace. Since a stop never uses up an attempt, a job with
-`MaxAttempts: 1` that a stop interrupts runs again: delivery is at-least-once anyway,
-as a rescue reruns a crashed client's jobs, and a job that must not repeat should be
-idempotent. Whether the stop canceled the attempt is read as the worker returns. The
+bounded by half the grace. A worker still running when the grace ends is rescued once
+the client is gone, and that rescue counts the attempt, as any does; since a stop uses
+up no other attempt, a job with `MaxAttempts: 1` that a stop interrupts runs again:
+delivery is at-least-once anyway, as a rescue reruns a crashed client's jobs, and a job
+that must not repeat should be idempotent. Whether the stop canceled the attempt is read as the worker returns. The
 finalize is a retry with `Snooze` set, which gives the attempt back, and an `Error`,
 which is appended: the rerun has the same attempt number, so `Errors` holds an entry
 for each run of it that fails, and, as for a snooze, the interrupted run's log
