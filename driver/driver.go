@@ -315,14 +315,17 @@ type Executor interface {
 	Notify(ctx context.Context, channel string, payloads []string) error
 
 	// LeaderAttempt takes or renews the leader lease for a client and
-	// reports whether the client holds it afterwards and, if it does,
-	// whether a LeaderRequestResign asked it to give the lease up. A request
-	// lasts until the holder gives the lease up or another client takes it
-	// over; the holder's late renewal of its lapsed lease keeps it.
+	// reports whether the client holds it afterwards, whether the attempt
+	// started a term, and whether a LeaderRequestResign asked the holder to
+	// give the lease up. A term is one live lease: taking a free or expired
+	// lease, even the client's own, starts one, and clears a request. The
+	// holder's renewal of its live lease keeps a request, and once it
+	// reports one, does not extend the lease.
 	LeaderAttempt(ctx context.Context, params LeaderParams) (LeaderResult, error)
-	// LeaderResign gives up leadership if the client holds it, and signals
-	// other clients to elect a replacement.
-	LeaderResign(ctx context.Context, clientID int64) error
+	// LeaderResign gives up leadership if the client holds the lease, and
+	// then signals other clients to elect a replacement. It reports whether
+	// it deleted the lease: false if another client holds it, or none does.
+	LeaderResign(ctx context.Context, clientID int64) (bool, error)
 	// LeaderRequestResign asks the client that holds a live leader lease,
 	// by database time, to give it up: it records the request on the lease,
 	// naming that client, which the holder's next LeaderAttempt reports,
@@ -1247,6 +1250,10 @@ type LeaderParams struct {
 type LeaderResult struct {
 	// Leader reports that the client holds the lease afterwards.
 	Leader bool
+	// NewTerm reports that the attempt took a free or expired lease, even
+	// the client's own, rather than renewing a live one: the client's
+	// previous term, if any, has ended.
+	NewTerm bool
 	// ResignRequested reports that a LeaderRequestResign asked the client,
 	// as the lease's holder, to give it up.
 	ResignRequested bool

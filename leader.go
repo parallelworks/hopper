@@ -68,13 +68,26 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			c.logger.WarnContext(ctx, "hopper: leader attempt", "error", err)
 		case res.ResignRequested:
 			// Asked to resign (Client.LeaderResign): no duty runs again in
-			// this term. Its loops end before the lease is given up, so no
-			// duty of this client overlaps the next leader's.
+			// this term. Its loops end before the lease is given up, and
+			// within the lease it holds (the renewal that reported the
+			// request did not extend it), so no duty of this client overlaps
+			// the next leader's.
 			term.end()
 			term = nil
 			c.resignOnRequest(ctx, id)
 			heldOff = time.Now().Add(c.tuning.leaderTTL)
 		case res.Leader:
+			// A term is one live lease. A client that took over a lease that
+			// had lapsed, even its own and under the same ID, or its old one
+			// under the ID a fence gave it, left its term when the lease
+			// lapsed, and another client may have led since: that term ends,
+			// with its event, before the new one starts.
+			if res.NewTerm && c.isLeader.Swap(false) {
+				c.logger.WarnContext(ctx, "hopper: leader lease lapsed; starting a new term", "client_id", leaseID, "new_client_id", id)
+				c.emit(EventLeaderLost, nil, "")
+				term.end()
+				term = nil
+			}
 			leaseID = id
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)
@@ -164,39 +177,44 @@ func (c *Client[TTx]) resign(ctx context.Context, id int64) {
 	if !c.isLeader.Swap(false) {
 		return
 	}
-	if err := c.giveUpLease(ctx, id); err != nil {
-		c.logger.WarnContext(ctx, "hopper: resign leadership", "error", err)
-		return
+	deleted, err := c.giveUpLease(ctx, id)
+	switch {
+	case err != nil:
+		c.logger.WarnContext(ctx, "hopper: resign leadership", "client_id", id, "error", err)
+	case !deleted:
+		c.logger.InfoContext(ctx, "hopper: stopped leading; the lease had already passed on", "client_id", id)
+	default:
+		c.logger.InfoContext(ctx, "hopper: resigned leadership", "client_id", id)
 	}
-	c.logger.InfoContext(ctx, "hopper: resigned leadership", "client_id", id)
 }
 
 // giveUpLease deletes the leader lease if client id holds it, and then
-// signals the other clients to elect a replacement. It runs on a context
-// of its own, so that a stopping client still gives the lease up.
-func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64) error {
+// signals the other clients to elect a replacement, and reports whether it
+// deleted it. It runs on a context of its own, so that a stopping client
+// still gives the lease up.
+func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64) (bool, error) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	return c.exec.LeaderResign(rctx, id)
 }
 
-// resignOnRequest gives the lease client id holds up after a resign
-// request, once the term's loops have ended, and signals the other clients
-// to elect a replacement. If the statement fails, the lease expires
-// instead.
+// resignOnRequest ends a term on a resign request, once the term's loops
+// have ended: it gives the lease client id holds up and signals the other
+// clients to elect a replacement. If the statement fails, the lease
+// expires instead, within the TTL its last renewal left it. The event
+// marks the end of the term, whichever way the lease went.
 func (c *Client[TTx]) resignOnRequest(ctx context.Context, id int64) {
-	// A client that was not leading retook, after a failed delete, a lease
-	// it had already been asked to give up: it gives it up again, with no
-	// event, as it emitted none for the retake.
-	wasLeader := c.isLeader.Swap(false)
-	if err := c.giveUpLease(ctx, id); err != nil {
+	c.isLeader.Store(false)
+	deleted, err := c.giveUpLease(ctx, id)
+	switch {
+	case err != nil:
 		c.logger.WarnContext(ctx, "hopper: resign leadership on request; the lease expires instead", "client_id", id, "error", err)
-	} else {
+	case !deleted:
+		c.logger.InfoContext(ctx, "hopper: stopped leading on request; the lease had already passed on", "client_id", id)
+	default:
 		c.logger.InfoContext(ctx, "hopper: resigned leadership on request", "client_id", id)
 	}
-	if wasLeader {
-		c.emit(EventLeaderResigned, nil, "")
-	}
+	c.emit(EventLeaderResigned, nil, "")
 }
 
 // rescue moves running jobs whose client has lost its lease back to

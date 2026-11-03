@@ -290,7 +290,7 @@ func TestUI(t *testing.T) {
 	code, body = post(admin, "/consumers/nobody/seek", url.Values{"to": {"sideways"}}, true)
 	want(400, body, code)
 	code, body = get(admin, "/clients")
-	want(200, body, code, "No client leads")
+	want(200, body, code, "No listed client holds the leader lease")
 	if strings.Contains(body, "/clients/leader/resign") {
 		t.Error("UI offers to ask a leader to resign with no leader")
 	}

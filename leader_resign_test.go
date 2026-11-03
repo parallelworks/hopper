@@ -3,6 +3,8 @@ package hopper_test
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,13 +38,13 @@ func (e *dutyExec) duty() {
 	}
 }
 
-func (e *dutyExec) LeaderResign(ctx context.Context, clientID int64) error {
+func (e *dutyExec) LeaderResign(ctx context.Context, clientID int64) (bool, error) {
 	if e.running.Load() > 0 {
 		e.overlapped.Add(1)
 	}
-	err := e.Executor.LeaderResign(ctx, clientID)
+	deleted, err := e.Executor.LeaderResign(ctx, clientID)
 	e.resigned.Store(true)
-	return err
+	return deleted, err
 }
 
 func (e *dutyExec) JobRescueCandidates(ctx context.Context, p driver.JobRescueParams) ([]driver.RescueCandidate, error) {
@@ -185,5 +187,78 @@ func TestLeaderResign(t *testing.T) {
 	}
 	if id, err := c.LeaderResign(context.Background(), 5); !errors.Is(err, hopper.ErrNotLeader) || id != 0 {
 		t.Errorf("LeaderResign of client 5 with no leader = %d, %v; want 0, ErrNotLeader", id, err)
+	}
+}
+
+// TestLeaderLapseStartsTerm lets the leader's lease lapse while the client
+// still runs: the client takes it back as a new term, so it emits
+// EventLeaderLost and then EventLeaderElected, and the new term inserts the
+// RunOnStart job again.
+func TestLeaderLapseStartsTerm(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	c := h.client(&hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers: noopWorkers(),
+		Periodic: []hopper.PeriodicJob{
+			{Name: "on-start", Schedule: noSlots{}, Args: noop{N: 41}, Opts: &hopper.PeriodicOpts{RunOnStart: true}},
+		},
+	})
+	events, stopEvents := context.WithCancel(ctx)
+	defer stopEvents()
+	var (
+		mu    sync.Mutex
+		kinds []hopper.EventKind
+	)
+	go func() {
+		for ev := range c.Events(events, hopper.EventLeaderElected, hopper.EventLeaderLost) {
+			mu.Lock()
+			kinds = append(kinds, ev.Kind)
+			mu.Unlock()
+		}
+	}()
+	seen := func() []hopper.EventKind {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(kinds)
+	}
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return h.countN("41") == 1 && len(seen()) == 1 })
+	if _, err := h.pool.Exec(ctx, `UPDATE hopper_leader SET expires_at = now() - interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	want := []hopper.EventKind{hopper.EventLeaderElected, hopper.EventLeaderLost, hopper.EventLeaderElected}
+	waitFor(t, func() bool { return len(seen()) >= len(want) })
+	if got := seen(); !slices.Equal(got, want) {
+		t.Errorf("leader events = %v, want %v", got, want)
+	}
+	waitFor(t, func() bool { return h.countN("41") == 2 })
+	if !c.IsLeader() {
+		t.Error("the client does not lead after taking its lapsed lease back")
+	}
+}
+
+// TestLeaderStopAfterFence stops a leader that a fence has moved to
+// another client ID before its leader loop noticed: the stop deletes the
+// lease under the ID the lease was held under, so another client need not
+// wait for it to expire.
+func TestLeaderStopAfterFence(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	tun := fastTuning
+	tun.LeaseTTL, tun.LeaseRenew, tun.LeaderInterval = time.Minute, 30*time.Second, time.Hour
+	c := h.startedWith(hopper.NewWorkers(), 1, tun)
+	waitFor(t, c.IsLeader)
+	c.FenceTo(c.ClientID() + 1_000_000)
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.Stop(sctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := h.count(`SELECT count(*) FROM hopper_leader`); n != 0 {
+		t.Errorf("leader leases after the stop = %d, want 0", n)
 	}
 }

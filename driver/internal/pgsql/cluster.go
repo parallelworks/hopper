@@ -107,29 +107,35 @@ ORDER BY c.id`))
 	return clients, nil
 }
 
-// leaderSQL takes the lease if it is free or expired, or renews it for the
-// holder. No row is returned when another client holds it. The holder's
-// renewal keeps a resign request, and reports one that names it, even
-// after its lease lapsed (it never left its term); a takeover by another
-// client clears it.
+// leaderSQL takes the lease if it is free or expired, starting a term, or
+// renews it for the holder of the live lease. No row is returned when
+// another client holds it. A term is one live lease: a takeover of an
+// expired lease, even the holder's own, starts a new one (elected_at is
+// now()) and clears a resign request. The holder's renewal keeps a
+// request, reports one that names it, and then does not extend the lease,
+// so the holder gives it up within the lease it already has.
 const leaderSQL = `
 INSERT INTO {{schema}}.hopper_leader (name, client_id, elected_at, expires_at)
 VALUES ('default', $1, now(), now() + make_interval(secs => $2::float8))
 ON CONFLICT (name) DO UPDATE SET
   client_id  = EXCLUDED.client_id,
-  elected_at = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.elected_at ELSE now() END,
-  expires_at = EXCLUDED.expires_at,
-  resign_client_id = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.resign_client_id END
+  elected_at = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id AND hopper_leader.expires_at >= now()
+                    THEN hopper_leader.elected_at ELSE now() END,
+  expires_at = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id AND hopper_leader.expires_at >= now()
+                     AND hopper_leader.resign_client_id = hopper_leader.client_id
+                    THEN hopper_leader.expires_at ELSE EXCLUDED.expires_at END,
+  resign_client_id = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id AND hopper_leader.expires_at >= now()
+                          THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = EXCLUDED.client_id
-RETURNING client_id, coalesce(resign_client_id = client_id, false)`
+RETURNING client_id, coalesce(resign_client_id = client_id, false), elected_at = now()`
 
 // LeaderAttempt implements driver.Executor.
 func (e *Executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (driver.LeaderResult, error) {
 	var (
-		id     int64
-		resign bool
+		id            int64
+		resign, fresh bool
 	)
-	err := e.Conn.QueryRow(ctx, leaderSQL, params.ClientID, params.TTL.Seconds()).Scan(&id, &resign)
+	err := e.Conn.QueryRow(ctx, leaderSQL, params.ClientID, params.TTL.Seconds()).Scan(&id, &resign, &fresh)
 	if errors.Is(err, ErrNoRows) {
 		return driver.LeaderResult{}, nil
 	}
@@ -137,23 +143,29 @@ func (e *Executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams
 		return driver.LeaderResult{}, fmt.Errorf("hopper: leader attempt: %w", err)
 	}
 	leader := id == params.ClientID
-	return driver.LeaderResult{Leader: leader, ResignRequested: leader && resign}, nil
+	return driver.LeaderResult{Leader: leader, NewTerm: leader && fresh, ResignRequested: leader && resign}, nil
 }
 
 // leaderResignSQL deletes the lease if this client holds it and, only then,
 // signals other clients to elect a replacement.
+//
+// The notification sits in the DELETE's RETURNING, which a data-modifying
+// CTE evaluates for every row it deletes, and the count reports whether it
+// deleted the lease.
 const leaderResignSQL = `
 WITH resigned AS (
-  DELETE FROM {{schema}}.hopper_leader WHERE name = 'default' AND client_id = $1 RETURNING client_id
+  DELETE FROM {{schema}}.hopper_leader WHERE name = 'default' AND client_id = $1
+  RETURNING client_id, pg_notify($2, 'resigned')
 )
-SELECT pg_notify($2, 'resigned') FROM resigned`
+SELECT count(*) FROM resigned`
 
 // LeaderResign implements driver.Executor.
-func (e *Executor) LeaderResign(ctx context.Context, clientID int64) error {
-	if _, err := e.Conn.Exec(ctx, leaderResignSQL, clientID, driver.ChannelLeader); err != nil {
-		return fmt.Errorf("hopper: leader resign: %w", err)
+func (e *Executor) LeaderResign(ctx context.Context, clientID int64) (bool, error) {
+	var n int64
+	if err := e.Conn.QueryRow(ctx, leaderResignSQL, clientID, driver.ChannelLeader).Scan(&n); err != nil {
+		return false, fmt.Errorf("hopper: leader resign: %w", err)
 	}
-	return nil
+	return n > 0, nil
 }
 
 // leaderRequestResignSQL names the holder of a live lease as asked to

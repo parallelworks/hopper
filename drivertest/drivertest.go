@@ -153,6 +153,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},
 		{"Leader", testLeader[TTx]},
+		{"LeaderTerm", testLeaderTerm[TTx]},
 		{"LeaderResignRequest", testLeaderResignRequest[TTx]},
 		{"LeaderResignRacesRenewal", testLeaderResignRacesRenewal[TTx]},
 		{"LeaderResignRacesElection", testLeaderResignRacesElection[TTx]},

@@ -242,5 +242,5 @@
 {{else}}<tr><td colspan="5" class="dim">no clients</td></tr>{{end}}
 </tbody>
 </table>
-{{if .Data.Leader}}<p>Leader: client {{.Data.Leader}}.</p>{{if .CanAct}}<form method="post" action="{{.Prefix}}/clients/leader/resign"><input type="hidden" name="leader" value="{{.Data.Leader}}"><button title="The leader gives up its term and another client takes over">ask client {{.Data.Leader}} to resign</button></form>{{end}}{{else}}<p class="dim">No client leads.</p>{{end}}
+{{if .Data.Leader}}<p>Leader: client {{.Data.Leader}}.</p>{{if .CanAct}}<form method="post" action="{{.Prefix}}/clients/leader/resign"><input type="hidden" name="leader" value="{{.Data.Leader}}"><button title="The leader gives up its term and another client takes over">ask client {{.Data.Leader}} to resign</button></form>{{end}}{{else}}<p class="dim">No listed client holds the leader lease.</p>{{end}}
 {{end}}

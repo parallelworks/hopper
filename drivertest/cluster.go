@@ -76,14 +76,14 @@ func testLeader[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("leader in stats = %d, %v; want %d", stats.Leader, err, a)
 	}
 	// A non-holder's resign is a no-op.
-	if err := exec.LeaderResign(ctx, b); err != nil {
-		t.Fatal(err)
+	if deleted, err := exec.LeaderResign(ctx, b); err != nil || deleted {
+		t.Fatalf("non-holder's resign = %v, %v; want nothing deleted", deleted, err)
 	}
 	if attempt(b) {
 		t.Fatal("non-holder's resign freed the lease")
 	}
-	if err := exec.LeaderResign(ctx, a); err != nil {
-		t.Fatal(err)
+	if deleted, err := exec.LeaderResign(ctx, a); err != nil || !deleted {
+		t.Fatalf("holder's resign = %v, %v; want the lease deleted", deleted, err)
 	}
 	if !attempt(b) {
 		t.Fatal("b could not take the lease after a resigned")

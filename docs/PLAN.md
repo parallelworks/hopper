@@ -1684,17 +1684,31 @@ still belong late in the transaction, as `CompleteTx` does.
 Leadership is a lease row in `hopper_leader`:
 
 ```sql
+-- renewal: the holder's own lease, still live
 INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
 VALUES ('default', $me, now(), now() + $ttl)
-ON CONFLICT (name) DO UPDATE SET client_id = $me, elected_at = now(), expires_at = now() + $ttl,
-  resign_client_id = CASE WHEN hopper_leader.client_id = $me THEN hopper_leader.resign_client_id END
+ON CONFLICT (name) DO UPDATE SET client_id = $me,
+  elected_at = CASE WHEN renewal THEN hopper_leader.elected_at ELSE now() END,
+  expires_at = CASE WHEN renewal AND hopper_leader.resign_client_id = $me
+                    THEN hopper_leader.expires_at ELSE now() + $ttl END,
+  resign_client_id = CASE WHEN renewal THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $me
-RETURNING client_id = $me, coalesce(resign_client_id = client_id, false);
+RETURNING client_id = $me, coalesce(resign_client_id = client_id, false),
+          elected_at = now();   -- a new term
 ```
 
 - The TTL is 15s, and the leader renews every 5s.
 - On graceful stop the leader deletes its row and sends a `hopper_leader` notification,
-  so a replacement takes over immediately.
+  so a replacement takes over immediately. It deletes the row under the client ID it
+  last renewed it with, which a fence (§7.6) may since have replaced.
+- **A term is one live lease.** Taking a free or expired lease starts a term, even when
+  the client takes its own lease back after it lapsed, under the same ID or under the
+  one a fence gave it: while the lease was lapsed another client may have led. The
+  statement reports a new term (`elected_at` set now), and a client that still
+  considered itself leader ends the old term, with `EventLeaderLost`, before it starts
+  the new one, with `EventLeaderElected`. The new term starts as any does, so each
+  periodic job with `RunOnStart` inserts a job again (§7.9). Earlier releases kept the
+  term across a lapse that no other client filled.
 
 **Resigning on request.** `Client.LeaderResign` (and `hopper leader resign`, and the
 UI's resign action) asks the current leader to give its term up, so that another
@@ -1723,24 +1737,26 @@ RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
 - The request is a column rather than only a notification, because a notification is
   lost when the leader's listener is reconnecting. The notification wakes the leader
   at once; without it the leader sees the request on its next renewal, within 5s.
-- A renewal by the holder keeps the column, and its `RETURNING` reports a request that
-  names it, even a late renewal of a lease that lapsed: the holder never left its term
-  (the leader loop starts a term only on a client that was not leading), so the request
-  still applies. A takeover by another client clears it, so the request does not
-  outlive the term it was made in. A holder that retakes its lease after a failed
-  delete (below) is asked again, and gives the lease up again, without the events of a
-  term.
+- A request lives as long as the one live lease it was made of. The holder's renewal of
+  its live lease keeps the column, and its `RETURNING` reports a request that names it.
+  Any takeover of an expired lease starts a term and clears it, even the holder's own,
+  so a request never outlives the term it was made in, and a lapse ends both together.
+- A renewal that reports a request does not extend the lease: the holder gives it up
+  within the lease it already holds, and if the delete fails, the lease expires when it
+  would have.
 - The leader that sees the request ends its term first: it cancels the loops the term
   runs (periodic jobs, stream delivery, the live and index maintenance, log retention)
   and waits for them, and runs none of the duties on the leader loop again. Only then
   does it delete its row and send the `resigned` notification, as on a graceful stop. No duty of the resigning
   client runs after the row is gone, so its duties never overlap the next leader's,
   except a log retention call into a `LogStore` that ignores its context's cancellation,
-  which the term does not wait for (§7.5). If the delete fails, the lease
-  expires instead.
+  which the term does not wait for (§7.5). The delete reports whether it removed the
+  lease, and the log tells a lease given up from one that had already passed on; if
+  the delete fails, the lease expires instead. Either way `EventLeaderResigned` marks
+  the end of the term, once.
 - Only the leader acts on the `resign` notification; the other clients' listeners
   ignore it, so a request costs no election attempts until the `resigned` one.
-- It emits `EventLeaderResigned` and then stays out of the election for one TTL, by its
+- It then stays out of the election for one TTL, by its
   own clock (the hold-off schedules its own attempts and compares no stored time), so
   that another client wins the election the notification starts rather than it again.
   A cluster whose only leader-eligible client resigned is leaderless for that TTL, and

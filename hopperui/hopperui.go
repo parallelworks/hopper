@@ -602,7 +602,10 @@ func (u *ui[TTx]) leaderResign(w http.ResponseWriter, r *http.Request) {
 
 type clientsData struct {
 	Clients []*hopper.ClientRow
-	// Leader is the leader's client ID, or 0 if no client leads.
+	// Leader is the ID of the listed client that holds the live leader
+	// lease, or 0. A lease whose holder's row was pruned (its client lease
+	// lapsed, and its leader lease lapses within a TTL) has none, while
+	// Stats, which reads the lease alone, still reports it.
 	Leader int64
 }
 
