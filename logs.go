@@ -47,7 +47,7 @@ type LogStore interface {
 	// time the job is finished; past that, the context is canceled and the
 	// result goes ahead. An attempt the client's stop canceled
 	// (StopAndCancel, or a Stop whose ctx expired) waits for at most half the
-	// stop's grace, so its result is still written. A
+	// stop's grace, so that its result can still be written within it. A
 	// job completed with CompleteTx is finished when the worker's
 	// transaction commits, which may be before. Lines logged after the
 	// close go to Config.Logger only.
@@ -266,25 +266,16 @@ func (a *attempt) closeLog(timeout time.Duration) {
 }
 
 // logCloseTimeout is how long an attempt that ran with ctx waits for its log
-// in the LogStore to close. A hard stop, which cancels ctx, waits for the
-// canceled jobs only for the stop's grace, so their attempts wait for at
-// most half of it and their results still reach the finalizer; so does a
-// fenced attempt's, which is ctx's other cancellation. An attempt the stop
-// canceled waits only until stopBy, if set, half the stop's grace after
-// its worker returned. Once a stop's deadline has begun its grace, none
-// waits past the grace's first half (graceHalf): a worker that returns
-// late in the grace still hands its result in before the grace ends.
-func (c *Client[TTx]) logCloseTimeout(ctx context.Context, stopBy time.Time) time.Duration {
-	if stopBy.IsZero() && ctx.Err() == nil {
-		return c.tuning.logCloseTimeout
+// in the LogStore to close. A stop that cancels jobs (StopAndCancel, or a
+// Stop whose ctx expired), which cancels ctx, may wait for them only for
+// the stop's grace, so their attempts wait for at most half of it and
+// their results can still reach the finalizer; so does a fenced attempt's,
+// which is ctx's other cancellation.
+func (c *Client[TTx]) logCloseTimeout(ctx context.Context) time.Duration {
+	if ctx.Err() != nil {
+		return min(c.tuning.logCloseTimeout, c.tuning.stopGrace/2)
 	}
-	if stopBy.IsZero() {
-		stopBy = time.Now().Add(c.tuning.stopGrace / 2)
-	}
-	if half := c.graceHalf.Load(); half != 0 && half < stopBy.UnixNano() {
-		stopBy = time.Unix(0, half)
-	}
-	return min(c.tuning.logCloseTimeout, max(time.Until(stopBy), 0))
+	return c.tuning.logCloseTimeout
 }
 
 // storePending bounds the bytes of an attempt's lines that wait for the

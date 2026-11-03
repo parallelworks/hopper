@@ -54,11 +54,6 @@ type Client[TTx any] struct {
 	// workCancel cancels every job's context with ErrClientStopped as the
 	// cause. It is set by Start, under mu.
 	workCancel context.CancelCauseFunc
-	// graceHalf, in Unix nanoseconds, is set as a stop's deadline begins
-	// its grace: half the grace in, past which an attempt's log close
-	// waits no longer (logCloseTimeout), so that its result reaches the
-	// finalizer within the grace. Zero until then.
-	graceHalf atomic.Int64
 
 	// gen is the lease generation: jobs run under a context that is
 	// canceled when the lease is lost, so a fenced client stops its work.
@@ -422,7 +417,9 @@ func (c *Client[TTx]) generation() context.Context {
 // release the lease. If ctx expires during the wait, every job's context is
 // canceled, as StopAndCancel does, whatever finishes within a short grace
 // period is flushed, and ctx's error is returned. Jobs still running then
-// are rescued by another client once this one's lease expires.
+// are rescued by another client once this one's lease expires. A job the
+// deadline canceled gets its attempt back, as StopAndCancel says: a stop
+// never uses up an attempt, so a job with MaxAttempts 1 runs again.
 //
 // Stop and StopAndCancel may be called more than once and from several
 // goroutines: one call stops the client, and the others wait for it to
@@ -458,10 +455,14 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // interruption adds an entry to its Errors: only a timeout shorter than
 // the time between stops ends such a job, by ending a run before a stop
 // does; one with no timeout, or a longer one, runs again after every stop.
-// The close of an interrupted attempt's log in Config.JobLogs.Store waits
-// at most half the stop's short grace, so that the result is still
-// written. A worker must not call Stop or StopAndCancel itself: the stop
-// waits for the worker, which then loses its result.
+// Since a stop never uses up an attempt, a job with MaxAttempts 1 that a
+// stop interrupts runs again: delivery is at-least-once anyway, as a rescue
+// reruns a crashed client's jobs, so a job that must not repeat should be
+// idempotent. The close of an interrupted attempt's log in
+// Config.JobLogs.Store waits at most half the stop's short grace, within
+// which its result can still be written. A worker must not call Stop or
+// StopAndCancel itself: the stop waits for the worker, which then loses its
+// result.
 func (c *Client[TTx]) StopAndCancel(ctx context.Context) error {
 	return c.stop(ctx, true)
 }
@@ -558,8 +559,6 @@ func (c *Client[TTx]) shutdown(ctx context.Context, cancelJobs bool) error {
 		} else {
 			c.logger.WarnContext(ctx, "hopper: stop deadline reached; canceling running jobs")
 		}
-		// Set before the cancel, so every attempt it cancels sees it.
-		c.graceHalf.Store(time.Now().Add(c.tuning.stopGrace / 2).UnixNano())
 		c.cancelJobs()
 		graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.tuning.stopGrace)
 		c.waitForJobs(graceCtx)

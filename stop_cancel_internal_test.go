@@ -509,50 +509,50 @@ func (blockingStore) Writer(ctx context.Context, _ *JobRow) (io.WriteCloser, err
 
 func (blockingStore) Logs(context.Context, JobID) ([]AttemptLog, error) { return nil, nil }
 
-// TestStopDeadlineLogCloseBounded: a Stop's deadline cancels a job whose
-// worker takes a moment to return, early or late in the stop's grace, and
-// whose store's Close blocks. The log's close waits at most half the
-// stop's grace, and never past the grace's first half, and OnError is not
-// consulted, so the result is still written, its attempt given back.
-func TestStopDeadlineLogCloseBounded(t *testing.T) {
-	for _, returnAfter := range []time.Duration{100 * time.Millisecond, defaultTuning.stopGrace * 3 / 4} {
-		synctest.Test(t, func(t *testing.T) {
-			job := stopJob(1, 3, `{}`)
-			exec := &stopExec{jobs: []*driver.JobRow{job}, results: map[driver.JobID]driver.JobFinalize{}}
-			workers := NewWorkers()
-			AddWorkFunc(workers, func(ctx context.Context, _ *Job[stopSlowArgs]) error {
-				Logger(ctx).Info("running")
-				<-ctx.Done()
-				time.Sleep(returnAfter)
-				return ctx.Err()
-			})
-			c, err := NewClient(managedTestDriver{exec: exec}, &Config{
-				Queues:    map[string]QueueConfig{QueueDefault: {MaxWorkers: 1}},
-				Workers:   workers,
-				Logger:    slog.New(slog.DiscardHandler),
-				NeverLead: true,
-				JobLogs:   JobLogsConfig{Store: blockingStore{}},
-				OnError: func(context.Context, *JobRow, error) ErrorOutcome {
-					t.Error("OnError was called for an attempt the stop canceled")
-					return ErrorOutcome{}
-				},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			ctx := context.Background()
-			if err := c.Start(ctx); err != nil {
-				t.Fatal(err)
-			}
-			synctest.Wait() // the job is running
-			stopCtx, cancel := context.WithTimeout(ctx, time.Second)
-			defer cancel()
-			if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
-				t.Errorf("Stop = %v, want its deadline", err)
-			}
-			if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateRetryable {
-				t.Errorf("job returning %s into the grace, its log close blocked: %+v, %v; want its result written, its attempt given back", returnAfter, f, ok)
-			}
+// TestStopDeadlineSlowLogClose: a slow LogStore Close cannot hold a Stop
+// past its grace. A job whose worker returns at once when the deadline
+// cancels it has its result written, its attempt given back, though its
+// store's Close blocks; OnError is not consulted for it.
+func TestStopDeadlineSlowLogClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		job := stopJob(1, 3, `{}`)
+		exec := &stopExec{jobs: []*driver.JobRow{job}, results: map[driver.JobID]driver.JobFinalize{}}
+		workers := NewWorkers()
+		AddWorkFunc(workers, func(ctx context.Context, _ *Job[stopSlowArgs]) error {
+			Logger(ctx).Info("running")
+			<-ctx.Done()
+			return ctx.Err()
 		})
-	}
+		c, err := NewClient(managedTestDriver{exec: exec}, &Config{
+			Queues:    map[string]QueueConfig{QueueDefault: {MaxWorkers: 1}},
+			Workers:   workers,
+			Logger:    slog.New(slog.DiscardHandler),
+			NeverLead: true,
+			JobLogs:   JobLogsConfig{Store: blockingStore{}},
+			OnError: func(context.Context, *JobRow, error) ErrorOutcome {
+				t.Error("OnError was called for an attempt the stop canceled")
+				return ErrorOutcome{}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait() // the job is running
+		stopCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		start := time.Now()
+		if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Stop = %v, want its deadline", err)
+		}
+		if d := time.Since(start); d > time.Second+c.tuning.stopGrace {
+			t.Errorf("Stop took %s, past its deadline and grace (%s)", d, time.Second+c.tuning.stopGrace)
+		}
+		if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateRetryable {
+			t.Errorf("job whose log close blocked: %+v, %v; want its result written, its attempt given back", f, ok)
+		}
+	})
 }

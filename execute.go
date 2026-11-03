@@ -46,11 +46,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 		claimed := *row
 		a.row = &claimed
 	}
-	// stopBy is set as the worker returns, for an attempt the client's stop
-	// canceled: the log's close waits until it at most, half the stop's
-	// grace, so that the result still reaches the finalizer within it.
-	var stopBy time.Time
-	defer func() { a.closeLog(c.logCloseTimeout(ctx, stopBy)) }()
+	defer func() { a.closeLog(c.logCloseTimeout(ctx)) }()
 	jobCtx = context.WithValue(jobCtx, attemptKey{}, a)
 	jobCtx = context.WithValue(jobCtx, clientKey{}, c)
 	jobCtx = driver.WithOwner(jobCtx, a)
@@ -62,9 +58,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	// returns, before anything below can wait. An attempt its own timeout
 	// ended first timed out (runWorker wraps ErrJobTimeout only then), which
 	// counts as any timeout does.
-	if errors.Is(context.Cause(jobCtx), ErrClientStopped) && !errors.Is(err, ErrJobTimeout) {
-		stopBy = time.Now().Add(c.tuning.stopGrace / 2)
-	}
+	stopped := errors.Is(context.Cause(jobCtx), ErrClientStopped) && !errors.Is(err, ErrJobTimeout)
 	completed := a.completedTx()
 	state := txUnknown
 	if completed != nil {
@@ -83,7 +77,7 @@ func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg Queu
 	// A job completed with CompleteTx whose read failed may have committed:
 	// its failure is neither logged nor shown to Config.OnError.
 	known := completed == nil || state != txUnknown
-	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err, known, !stopBy.IsZero())
+	f := c.outcome(ctx, jobCtx, row, qcfg, unit, err, known, stopped)
 	if f.State.Terminal() {
 		f.Output = a.get()
 	}
