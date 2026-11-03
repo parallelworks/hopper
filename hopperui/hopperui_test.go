@@ -294,6 +294,10 @@ func TestUI(t *testing.T) {
 	if strings.Contains(body, "/clients/leader/resign") {
 		t.Error("UI offers to ask a leader to resign with no leader")
 	}
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_clients (id, hostname, expires_at) OVERRIDING SYSTEM VALUE
+		VALUES (42, 'leader-host', now() + interval '1 minute')`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(ctx, `INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
 		VALUES ('default', 42, now(), now() + interval '1 minute')`); err != nil {
 		t.Fatal(err)

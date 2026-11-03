@@ -1586,18 +1586,22 @@ func TestLeaderResignUpgrade(t *testing.T) {
 	if _, err := hoppermigrate.Up(ctx, d, &hoppermigrate.Options{Logger: logger, Target: 23}); err != nil {
 		t.Fatal(err)
 	}
-	// The previous release's election and renewal.
+	// The previous release's election and renewal (its leaderSQL, with a
+	// TTL of a minute).
 	renew := func(id int64) bool {
 		t.Helper()
-		var leader bool
+		var holder int64
 		if err := pool.QueryRow(ctx, `INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
 			VALUES ('default', $1, now(), now() + interval '1 minute')
-			ON CONFLICT (name) DO UPDATE SET client_id = $1, elected_at = now(), expires_at = now() + interval '1 minute'
-			WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $1
-			RETURNING client_id = $1`, id).Scan(&leader); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			ON CONFLICT (name) DO UPDATE SET
+			  client_id  = EXCLUDED.client_id,
+			  elected_at = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.elected_at ELSE now() END,
+			  expires_at = EXCLUDED.expires_at
+			WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = EXCLUDED.client_id
+			RETURNING client_id`, id).Scan(&holder); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatal(err)
 		}
-		return leader
+		return holder == id
 	}
 	if !renew(7) {
 		t.Fatal("the previous release's client was not elected")

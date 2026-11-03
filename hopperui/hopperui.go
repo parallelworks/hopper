@@ -564,12 +564,13 @@ func (u *ui[TTx]) clients(w http.ResponseWriter, r *http.Request) {
 		u.fail(w, err)
 		return
 	}
-	stats, err := u.client.Stats(r.Context())
-	if err != nil {
-		u.fail(w, err)
-		return
+	data := clientsData{Clients: clients}
+	for _, c := range clients {
+		if c.Leader {
+			data.Leader = c.ID
+		}
 	}
-	u.render(w, r, "clients", clientsData{Clients: clients, Leader: stats.Leader})
+	u.render(w, r, "clients", data)
 }
 
 func (u *ui[TTx]) leaderResign(w http.ResponseWriter, r *http.Request) {

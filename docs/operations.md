@@ -22,7 +22,8 @@
   fails, rather than moving leadership again. The leader stops its duties, gives the lease up, and stays out of the
   election for 15 seconds, so another client takes over within a second or
   so. With no other client that can lead, the install has no leader for those
-  15 seconds.
+  15 seconds. The new term starts like any other, so periodic jobs with
+  `RunOnStart` insert a job again.
 - **Clients that must not lead.** Set `Config.NeverLead` on a client that
   shares an install it should not run, such as a developer's process pointed
   at a shared environment. It claims and works jobs like any other, but never

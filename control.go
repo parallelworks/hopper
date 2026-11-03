@@ -310,7 +310,9 @@ var ErrNotLeader = errors.New("hopper: not the leader")
 // election for the 15 seconds of a lease, so that another client is
 // elected, usually at once. It emits EventLeaderResigned, and runs no
 // duty after it gave the lease up. A cluster with no other
-// client has no leader until the resigned one is elected again. A request
+// client has no leader until the resigned one is elected again. The next
+// term starts as any term does, so each periodic job with RunOnStart
+// inserts a job again. A request
 // is recorded for the leader it asked only: if that leader's lease expires
 // first, the next leader is not asked. A leader of an earlier release
 // ignores it.

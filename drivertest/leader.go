@@ -49,6 +49,15 @@ func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || res.ResignRequested {
 		t.Fatalf("first attempt = %+v, want the lease and no request", res)
 	}
+	clients, err := exec.ClientList(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range clients {
+		if c.Leader != (c.ID == a) {
+			t.Errorf("client %d listed as leader: %v, want %v", c.ID, c.Leader, c.ID == a)
+		}
+	}
 	// A request that names a client that does not lead asks no one.
 	if id := requestResign(ctx, t, exec, b); id != 0 {
 		t.Fatalf("request of the non-leader %d asked client %d", b, id)
@@ -86,6 +95,15 @@ func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 	// A request of a lease that expired asks no one; one made of a live
 	// lease does not pass to the client that takes it over once it expires.
 	f.ExpireLeader(ctx, t, d)
+	if clients, err := exec.ClientList(ctx); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, c := range clients {
+			if c.Leader {
+				t.Errorf("client %d listed as leader of an expired lease", c.ID)
+			}
+		}
+	}
 	for _, of := range []int64{0, b} {
 		if id := requestResign(ctx, t, exec, of); id != 0 {
 			t.Fatalf("request (of %d) of an expired lease asked client %d", of, id)
@@ -104,14 +122,14 @@ func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 	if res := leaderAttempt(ctx, t, exec, b); res.Leader || res.ResignRequested {
 		t.Fatalf("former holder's attempt = %+v, want neither", res)
 	}
-	// Nor does it pass to the holder's own next term: a holder that takes
-	// its expired lease back is not asked.
+	// A holder whose renewal comes late, after its lease lapsed, is still
+	// in the term it was asked in, so the request holds.
 	if id := requestResign(ctx, t, exec, a); id != a {
 		t.Fatalf("request asked client %d, want %d", id, a)
 	}
 	f.ExpireLeader(ctx, t, d)
-	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || res.ResignRequested {
-		t.Fatalf("holder's takeover of its own expired lease = %+v, want the lease and no request", res)
+	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || !res.ResignRequested {
+		t.Fatalf("holder's late renewal of its lapsed lease = %+v, want the lease with the request", res)
 	}
 }
 

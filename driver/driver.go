@@ -316,8 +316,9 @@ type Executor interface {
 
 	// LeaderAttempt takes or renews the leader lease for a client and
 	// reports whether the client holds it afterwards and, if it does,
-	// whether a LeaderRequestResign asked it to give the lease up. A client
-	// that takes an expired lease over, even its own, clears that request.
+	// whether a LeaderRequestResign asked it to give the lease up. A request
+	// lasts until the holder gives the lease up or another client takes it
+	// over; the holder's late renewal of its lapsed lease keeps it.
 	LeaderAttempt(ctx context.Context, params LeaderParams) (LeaderResult, error)
 	// LeaderResign gives up leadership if the client holds it, and signals
 	// other clients to elect a replacement.
@@ -1499,6 +1500,9 @@ type ClientRow struct {
 	StartedAt time.Time
 	ExpiresAt time.Time
 	Info      json.RawMessage
+	// Leader reports that the client holds the live leader lease, by
+	// database time.
+	Leader bool
 }
 
 // ClientRenewParams extends a lease.

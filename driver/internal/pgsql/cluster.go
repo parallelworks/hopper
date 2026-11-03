@@ -93,10 +93,14 @@ func (e *Executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 			c    driver.ClientRow
 			info jsonText
 		)
-		err := r.Scan(&c.ID, &c.Hostname, &c.StartedAt, &c.ExpiresAt, &info)
+		err := r.Scan(&c.ID, &c.Hostname, &c.StartedAt, &c.ExpiresAt, &info, &c.Leader)
 		c.Info = info.raw()
 		return &c, err
-	})(e.Conn.Query(ctx, `SELECT id, hostname, started_at, expires_at, info FROM {{schema}}.hopper_clients ORDER BY id`))
+	})(e.Conn.Query(ctx, `
+SELECT c.id, c.hostname, c.started_at, c.expires_at, c.info, l.client_id IS NOT NULL
+FROM {{schema}}.hopper_clients c
+LEFT JOIN {{schema}}.hopper_leader l ON l.name = 'default' AND l.client_id = c.id AND l.expires_at > now()
+ORDER BY c.id`))
 	if err != nil {
 		return nil, fmt.Errorf("hopper: list clients: %w", err)
 	}
@@ -104,10 +108,10 @@ func (e *Executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 }
 
 // leaderSQL takes the lease if it is free or expired, or renews it for the
-// holder. No row is returned when another client holds it. A renewal of a
-// live lease keeps a resign request, and reports one that names the holder;
-// a takeover of an expired lease, even the holder's own, starts a term and
-// clears it.
+// holder. No row is returned when another client holds it. The holder's
+// renewal keeps a resign request, and reports one that names it, even
+// after its lease lapsed (it never left its term); a takeover by another
+// client clears it.
 const leaderSQL = `
 INSERT INTO {{schema}}.hopper_leader (name, client_id, elected_at, expires_at)
 VALUES ('default', $1, now(), now() + make_interval(secs => $2::float8))
@@ -115,7 +119,7 @@ ON CONFLICT (name) DO UPDATE SET
   client_id  = EXCLUDED.client_id,
   elected_at = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.elected_at ELSE now() END,
   expires_at = EXCLUDED.expires_at,
-  resign_client_id = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id AND hopper_leader.expires_at >= now() THEN hopper_leader.resign_client_id END
+  resign_client_id = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = EXCLUDED.client_id
 RETURNING client_id, coalesce(resign_client_id = client_id, false)`
 

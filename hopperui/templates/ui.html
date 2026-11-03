@@ -238,7 +238,7 @@
 <thead><tr><th class="n">id</th><th>host</th><th>started</th><th>lease</th><th>info</th></tr></thead>
 <tbody>
 {{range .Data.Clients}}
-<tr><td class="n">{{.ID}}{{if eq .ID $.Data.Leader}} <span class="state ok">leader</span>{{end}}</td><td>{{.Hostname}}</td><td title="{{ts .StartedAt}}">{{since .StartedAt}}</td><td>{{if .ExpiresAt.After now}}<span class="state ok">live</span>{{else}}<span class="state discarded">expired</span>{{end}}</td><td><code>{{printf "%s" .Info}}</code></td></tr>
+<tr><td class="n">{{.ID}}{{if .Leader}} <span class="state ok">leader</span>{{end}}</td><td>{{.Hostname}}</td><td title="{{ts .StartedAt}}">{{since .StartedAt}}</td><td>{{if .ExpiresAt.After now}}<span class="state ok">live</span>{{else}}<span class="state discarded">expired</span>{{end}}</td><td><code>{{printf "%s" .Info}}</code></td></tr>
 {{else}}<tr><td colspan="5" class="dim">no clients</td></tr>{{end}}
 </tbody>
 </table>

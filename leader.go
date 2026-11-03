@@ -22,9 +22,13 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	// term is the current leadership: the periodic loop runs under it and
 	// stops when it ends.
 	var term *leaderTerm
+	// leaseID is the client ID the lease was last taken or renewed under,
+	// which a stop gives it up for: a fence may re-register the client
+	// under another before the next attempt notices.
+	var leaseID int64
 	defer func() {
 		term.end()
-		c.resign(ctx)
+		c.resign(ctx, leaseID)
 	}()
 
 	var (
@@ -42,6 +46,13 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-time.After(wait):
+			}
+			// A tick or poke from during the hold-off is stale: the attempt
+			// that follows covers it, so it must not repeat that attempt.
+			ticker.Reset(c.tuning.leaderInterval)
+			select {
+			case <-c.leaderPoke:
+			default:
 			}
 			continue
 		}
@@ -64,6 +75,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			c.resignOnRequest(ctx, id)
 			heldOff = time.Now().Add(c.tuning.leaderTTL)
 		case res.Leader:
+			leaseID = id
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", c.clientID.Load())
 				c.emit(EventLeaderElected, nil, "")
@@ -146,11 +158,11 @@ func (c *Client[TTx]) pokeLeader() {
 }
 
 // resign gives up leadership on stop so a replacement takes over at once.
-func (c *Client[TTx]) resign(ctx context.Context) {
+// id is the client ID the lease was taken or last renewed under.
+func (c *Client[TTx]) resign(ctx context.Context, id int64) {
 	if !c.isLeader.Swap(false) {
 		return
 	}
-	id := c.clientID.Load()
 	if err := c.giveUpLease(ctx, id); err != nil {
 		c.logger.WarnContext(ctx, "hopper: resign leadership", "error", err)
 		return
@@ -172,13 +184,18 @@ func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64) error {
 // to elect a replacement. If the statement fails, the lease expires
 // instead.
 func (c *Client[TTx]) resignOnRequest(ctx context.Context, id int64) {
-	c.isLeader.Store(false)
+	// A client that was not leading retook, after a failed delete, a lease
+	// it had already been asked to give up: it gives it up again, with no
+	// event, as it emitted none for the retake.
+	wasLeader := c.isLeader.Swap(false)
 	if err := c.giveUpLease(ctx, id); err != nil {
 		c.logger.WarnContext(ctx, "hopper: resign leadership on request; the lease expires instead", "client_id", id, "error", err)
 	} else {
 		c.logger.InfoContext(ctx, "hopper: resigned leadership on request", "client_id", id)
 	}
-	c.emit(EventLeaderResigned, nil, "")
+	if wasLeader {
+		c.emit(EventLeaderResigned, nil, "")
+	}
 }
 
 // rescue moves running jobs whose client has lost its lease back to

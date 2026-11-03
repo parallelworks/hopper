@@ -115,12 +115,15 @@ func (e *executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 			started, expires int64
 			info             string
 		)
-		if err := r.Scan(&c.ID, &c.Hostname, &started, &expires, &info); err != nil {
+		if err := r.Scan(&c.ID, &c.Hostname, &started, &expires, &info, &c.Leader); err != nil {
 			return nil, err
 		}
 		c.StartedAt, c.ExpiresAt, c.Info = time.UnixMicro(started).UTC(), time.UnixMicro(expires).UTC(), json.RawMessage(info)
 		return &c, nil
-	}, `SELECT id, hostname, started_at, expires_at, info FROM hopper_clients ORDER BY id`)
+	}, `SELECT c.id, c.hostname, c.started_at, c.expires_at, c.info, l.client_id IS NOT NULL
+		FROM hopper_clients c
+		LEFT JOIN hopper_leader l ON l.name = 'default' AND l.client_id = c.id AND l.expires_at > ?
+		ORDER BY c.id`, e.clock().UnixMicro())
 	if err != nil {
 		return nil, fmt.Errorf("hopper: list clients: %w", err)
 	}
@@ -128,9 +131,9 @@ func (e *executor) ClientList(ctx context.Context) ([]*driver.ClientRow, error) 
 }
 
 // LeaderAttempt implements driver.Executor: it takes the lease if it is
-// free or expired, or renews it for the holder. A renewal of a live lease
-// keeps a resign request, and reports one that names the holder; a
-// takeover of an expired lease, even the holder's own, clears it.
+// free or expired, or renews it for the holder. The holder's renewal keeps
+// a resign request, and reports one that names it, even after its lease
+// lapsed; a takeover by another client clears it.
 func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (driver.LeaderResult, error) {
 	var res driver.LeaderResult
 	err := e.write(ctx, func(x *w) error {
@@ -144,7 +147,7 @@ func (e *executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams
 			  client_id  = excluded.client_id,
 			  elected_at = CASE WHEN hopper_leader.client_id = excluded.client_id THEN hopper_leader.elected_at ELSE excluded.elected_at END,
 			  expires_at = excluded.expires_at,
-			  resign_client_id = CASE WHEN hopper_leader.client_id = excluded.client_id AND hopper_leader.expires_at >= ?2 THEN hopper_leader.resign_client_id END
+			  resign_client_id = CASE WHEN hopper_leader.client_id = excluded.client_id THEN hopper_leader.resign_client_id END
 			WHERE hopper_leader.expires_at < ?2 OR hopper_leader.client_id = excluded.client_id
 			RETURNING client_id, coalesce(resign_client_id = client_id, 0)`, params.ClientID, x.us(), x.at(params.TTL)).Scan(&id, &resign)
 		if errors.Is(err, sql.ErrNoRows) {

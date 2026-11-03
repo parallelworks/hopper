@@ -1687,8 +1687,7 @@ Leadership is a lease row in `hopper_leader`:
 INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
 VALUES ('default', $me, now(), now() + $ttl)
 ON CONFLICT (name) DO UPDATE SET client_id = $me, elected_at = now(), expires_at = now() + $ttl,
-  resign_client_id = CASE WHEN hopper_leader.client_id = $me AND hopper_leader.expires_at >= now()
-                      THEN hopper_leader.resign_client_id END
+  resign_client_id = CASE WHEN hopper_leader.client_id = $me THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $me
 RETURNING client_id = $me, coalesce(resign_client_id = client_id, false);
 ```
@@ -1719,14 +1718,18 @@ RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
   `LeaderResign` returns `ErrNotLeader`. So a request retried after a takeover, or made
   from a stale view, cannot move leadership a second time, as a job lease's exact
   fence keeps a stale holder from acting (§7.14). A `leaderID` of 0 asks whichever
-  client leads. The UI always names the leader its page showed.
+  client leads. The UI always names the leader its page showed, which it reads from `Clients`: each
+  `ClientRow` reports whether that client holds the live lease (`Leader`).
 - The request is a column rather than only a notification, because a notification is
   lost when the leader's listener is reconnecting. The notification wakes the leader
   at once; without it the leader sees the request on its next renewal, within 5s.
-- A renewal of the live lease by its holder keeps the column, and its `RETURNING`
-  reports a request that names it. A takeover of an expired lease clears it, even the
-  holder's own (its lease lapsed, so its term ended), so the request does not outlive
-  the term it was made in.
+- A renewal by the holder keeps the column, and its `RETURNING` reports a request that
+  names it, even a late renewal of a lease that lapsed: the holder never left its term
+  (the leader loop starts a term only on a client that was not leading), so the request
+  still applies. A takeover by another client clears it, so the request does not
+  outlive the term it was made in. A holder that retakes its lease after a failed
+  delete (below) is asked again, and gives the lease up again, without the events of a
+  term.
 - The leader that sees the request ends its term first: it cancels the loops the term
   runs (periodic jobs, stream delivery, the live and index maintenance, log retention)
   and waits for them, and runs none of the duties on the leader loop again. Only then
@@ -1741,7 +1744,8 @@ RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
   own clock (the hold-off schedules its own attempts and compares no stored time), so
   that another client wins the election the notification starts rather than it again.
   A cluster whose only leader-eligible client resigned is leaderless for that TTL, and
-  then the same client is elected again.
+  then the same client is elected again. Either way the next term starts as any term
+  does, so each periodic job with `RunOnStart` inserts a job again (§7.9).
 - A leader of the previous release never reads the column and ignores the request,
   which then asks no one once its term ends.
 
@@ -3037,7 +3041,7 @@ observability without new machinery.
   gauges for queue depth by state, the oldest claimable job's age and live clients from
   `Stats`. Prometheus users export through the OTel exporter.
 - **CLI (`cmd/hopper`, core module):** `migrate up|down|version`, `jobs list|get|retry|cancel|delete`,
-  `queues list|pause|resume|limit`, `clients list`, `leader resign`, `workflows get`, `subscriptions list`,
+  `queues list|pause|resume|limit`, `clients list` (which marks the leader), `leader resign [-leader ID]`, `workflows get`, `subscriptions list`,
   `streams consumers|seek` and `stats`, all with `-json`. Benchmarks are the separate
   `hopperbench` command.
 - **Web UI (`hopperui` module):** `hopperui.New(client, cfg)` is an embeddable

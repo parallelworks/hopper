@@ -461,13 +461,17 @@ func (c *cli) clients(ctx context.Context, args []string) error {
 	}
 	return c.print(clients, func(w io.Writer) {
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tHOST\tSTARTED\tLEASE\tINFO")
+		fmt.Fprintln(tw, "ID\tHOST\tSTARTED\tLEASE\tLEADER\tINFO")
 		for _, cl := range clients {
 			lease := "expired"
 			if until := time.Until(cl.ExpiresAt); until > 0 {
 				lease = "live (" + until.Round(time.Second).String() + ")"
 			}
-			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", cl.ID, cl.Hostname, cl.StartedAt.Local().Format(time.RFC3339), lease, cl.Info)
+			leader := ""
+			if cl.Leader {
+				leader = "leader"
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", cl.ID, cl.Hostname, cl.StartedAt.Local().Format(time.RFC3339), lease, leader, cl.Info)
 		}
 		tw.Flush()
 	})
