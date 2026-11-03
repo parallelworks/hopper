@@ -15,8 +15,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/hopper"
+	"github.com/parallelworks/hopper/driver"
 	"github.com/parallelworks/hopper/driver/hopperpgx"
 	"github.com/parallelworks/hopper/hoppermigrate"
+	"github.com/parallelworks/hopper/internal/stoptest"
 	"github.com/parallelworks/hopper/internal/testdb"
 )
 
@@ -73,7 +75,7 @@ func (h *harness) client(cfg *hopper.Config) *hopper.Client[pgxTx] {
 	h.t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := c.Stop(ctx); err != nil && !errors.Is(err, hopper.ErrClientStopped) {
+		if err := c.Stop(ctx); err != nil {
 			h.t.Errorf("Stop: %v", err)
 		}
 	})
@@ -751,11 +753,17 @@ func TestStopDeadlineCancelsJobs(t *testing.T) {
 	if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Stop = %v, want DeadlineExceeded", err)
 	}
-	// The interrupted job was flushed as retryable, to run again right away.
+	// The interrupted job was given its attempt back, with its error
+	// recorded, to run again right away.
 	job, err := c.JobGet(ctx, res.Job.ID)
-	if err != nil || job.State != hopper.JobStateRetryable || len(job.Errors) != 1 {
+	if err != nil || job.State != hopper.JobStateRetryable || job.Attempt != 0 || len(job.Errors) != 1 {
 		t.Errorf("job after hard stop = %+v, %v", job, err)
 	}
+}
+
+func TestStopAndCancel(t *testing.T) {
+	t.Parallel()
+	stoptest.Run(t, func(t *testing.T) driver.Driver[pgxTx] { return newHarness(t).d })
 }
 
 func TestRunStopsOnContextCancel(t *testing.T) {

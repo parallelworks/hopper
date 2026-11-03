@@ -7,7 +7,9 @@
 //
 // The middleware propagates trace context from insert to work through the
 // job's metadata, records a span per attempt, and counts attempts and their
-// duration by kind, queue and outcome. RegisterStats adds observable gauges
+// duration by kind, queue and outcome: completed, snoozed, canceled (the
+// worker's Cancel), interrupted (an error after the client's stop canceled
+// the attempt, which does not count against MaxAttempts) or failed. RegisterStats adds observable gauges
 // for queue depth and the age of the oldest claimable job.
 package hopperotel
 
@@ -139,7 +141,7 @@ func (m *middleware) Work(ctx context.Context, job *hopper.JobRow, next func(con
 	err := next(ctx)
 	elapsed := time.Since(start)
 
-	outcome := outcomeOf(err)
+	outcome := outcomeOf(ctx, err)
 	span.SetAttributes(attribute.String("hopper.job.outcome", outcome))
 	var snooze *hopper.SnoozeError
 	switch {
@@ -161,7 +163,10 @@ func (m *middleware) Work(ctx context.Context, job *hopper.JobRow, next func(con
 	return err
 }
 
-func outcomeOf(err error) string {
+// outcomeOf names an attempt's outcome. An error from an attempt the
+// client's stop canceled (ErrClientStopped) is "interrupted": the client
+// records it, but gives the attempt back.
+func outcomeOf(ctx context.Context, err error) string {
 	var (
 		snooze *hopper.SnoozeError
 		cancel *hopper.CancelError
@@ -173,6 +178,9 @@ func outcomeOf(err error) string {
 		return "snoozed"
 	case errors.As(err, &cancel):
 		return "canceled"
+	case errors.Is(context.Cause(ctx), hopper.ErrClientStopped) && !errors.Is(err, hopper.ErrOutputTooLarge):
+		// An output refusal discards the job whatever canceled the attempt.
+		return "interrupted"
 	default:
 		return "failed"
 	}

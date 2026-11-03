@@ -253,12 +253,15 @@ client, err := hopper.NewClient(hopperpgx.New(pool), &hopper.Config{
 // client is a *hopper.Client[pgx.Tx]. The driver fixes the transaction type,
 // so InsertTx only accepts a transaction from the right engine.
 
-// Run blocks until ctx is canceled, then drains gracefully. It fits errgroup.
+// Run blocks until ctx is canceled (or another call stops the client), then drains
+// gracefully. It fits errgroup.
 g.Go(func() error { return client.Run(ctx) })
 
 // Or manage the lifecycle explicitly:
 err = client.Start(ctx)
 err = client.Stop(ctx) // stop claiming, drain, flush; when ctx expires, cancel job contexts
+err = client.StopAndCancel(ctx) // the same, canceling job contexts at once
+<-client.Stopped()     // closed once the client has stopped
 ```
 
 ### 4.3 Inserting
@@ -1177,7 +1180,7 @@ RETURNING j.*;
 - Each queue runs a bounded pool of goroutines. Workers are started only once a slot is
   free, so there is no unbounded fan-out.
 - Each job gets a context that is canceled on timeout (the worker's `Timeout()` or the
-  queue default), on `JobCancel`, on lease loss (§7.6), or on a hard stop.
+  queue default), on `JobCancel`, on lease loss (§7.6), or on a stop that cancels jobs (§7.12).
 - A panic is recovered and recorded as an error with its stack trace, then treated as
   a normal failure, which `Config.OnError` sees as a `*PanicError`.
 - `Middleware` (an interface with `Work` and `Insert` methods; `WorkMiddleware` and
@@ -1286,10 +1289,13 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   using up the attempt; the last attempt is discarded all the same). The zero
   `ErrorOutcome` keeps the outcome, and a panic in the hook is logged and keeps it
   too. It is not called for a worker's `Snooze`, a `JobCancel` (even when the worker
-  then returns `Cancel`), or a client that is stopping, none of which is the job
-  failing, nor for a `CompleteTx` attempt whose job could not be read, which may have
-  committed. A job the leader rescues (§7.6) is retried or discarded without it. It
-  runs on the worker's goroutine before the result is buffered, so it should be quick.
+  then returns `Cancel`), a fenced attempt, or an attempt the client's stop canceled
+  whose worker then returns an error other than `Cancel` or an output refusal
+  (§7.12), none of which is the job failing, nor for a `CompleteTx` attempt whose job
+  could not be read, which may have committed. An attempt whose own timeout ended it
+  before the stop is a timeout, and the hook is called for it. A job the
+  leader rescues (§7.6) is retried or discarded without it. It runs on the worker's
+  goroutine before the result is buffered, so it should be quick.
   A `JobCancel` that arrives while it runs wins over what it returns. Its context
   carries the client (`ClientFromContext`), and it runs after `Middleware`:
   `hopperotel`'s span records what the worker returned, and the job's events the
@@ -1438,10 +1444,11 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   hopper stops waiting for it. The log is ended once the worker returns, and the
   attempt's result waits for the queued lines and `Close` for up to 5 seconds, so a
   store that saves on `Close` has the log when the job is finished; past that the
-  context is canceled and the result goes ahead. An attempt canceled by a hard stop
-  (or a fence) waits for at most half the stop's grace instead, so its result still
-  reaches the finalizer before it stops. A line logged after the end, by a goroutine
-  the worker left, goes to `Config.Logger` only. Nothing goes to the `logs` column
+  context is canceled and the result goes ahead. An attempt canceled by a stop
+  (or a fence) waits for at most half the stop's grace instead, so its result can
+  still reach the finalizer before it stops; one whose worker returns late in the
+  grace may miss it, and is rescued. A line logged after the end, by a goroutine the worker left, goes to
+  `Config.Logger` only. Nothing goes to the `logs` column
   (the result carries no `Log`), so the store costs the database nothing and keeps a
   crashed client's lines up to the crash, less those still queued. Logs are keyed by
   job ID and attempt, which a process that runs the work outside the client (a
@@ -2113,10 +2120,48 @@ rates:
    whatever finished, release the lease and return `ctx.Err()`. Jobs that are still
    unfinished are rescued by another client (at-least-once).
 
-A job that returns because its context was canceled by the stop is finalized as
-`retryable` with no delay, so it runs again immediately on another client. The
-interrupted attempt still counts, as it does for a rescued job. The lease keeps being
-renewed until the finalizer has flushed, so a long drain cannot let it lapse.
+`StopAndCancel(ctx)` is the same, but cancels every job's context as it stops
+claiming, rather than when `ctx` expires. Either cancels a job's context with
+`ErrClientStopped` as its cause.
+
+An attempt the stop canceled does not count. A job whose worker then returns an error,
+whatever it is, is retried at once with its attempt given back, its last attempt too:
+the stop is not the job's failure, and counting it would let routine deploys use up a
+job's attempts and dead-letter one interrupted on its last. The error, with a panic's
+trace, is recorded in `Errors` and logged, but `Config.OnError` is not consulted: a
+hook would have to run inside the stop's short grace, where its result could miss the
+finalizer, so nothing runs there but the close of the attempt's log in a `LogStore`,
+bounded by half the grace. A worker still running when the grace ends is rescued once
+the client is gone, and that rescue counts the attempt, as any does; since a stop uses
+up no other attempt, a job with `MaxAttempts: 1` that a stop interrupts runs again:
+delivery is at-least-once anyway, as a rescue reruns a crashed client's jobs, and a job
+that must not repeat should be idempotent. Whether the stop canceled the attempt is read as the worker returns. The
+finalize is a retry with `Snooze` set, which gives the attempt back, and an `Error`,
+which is appended: the rerun has the same attempt number, so `Errors` holds an entry
+for each run of it that fails, and, as for a snooze, the interrupted run's log
+replaces that of an earlier snoozed or interrupted run of the same number, and is
+marked snoozed. A worker that returns nil, `Snooze`, `Cancel` or an output refusal
+(`ErrOutputTooLarge`) is finalized as it says, and the job's timeout still bounds each
+run: an attempt its timeout ended before the stop came is a timeout, which counts and
+goes to `Config.OnError` as any timeout does, as does a failure the worker returned
+before the stop. `MaxAttempts` does not bound a job that every stop interrupts, and
+each interruption adds an entry to `Errors`: only a timeout shorter than the time
+between stops ends such a job, by ending a run before a stop does, and one with no
+timeout, or a longer one, runs again after every stop. A job from a claim in flight as
+the stop cancels the jobs never runs: it gets its attempt back with no error, as a
+`Snooze(0)`. A job interrupted by a fence (§7.6) keeps its attempt counted, as the
+rescue that may already have run it would. A worker must not stop its own client: the
+stop waits for it. The lease keeps being renewed until the finalizer has flushed, so a
+long drain cannot let it lapse.
+
+The calls may overlap: the first stops the client, and the others wait for it to
+stop, until their own `ctx` expires, and return nil once it has, or `ctx.Err()`. Only
+the stopping call's deadline cancels the jobs; a `StopAndCancel` cancels them at once,
+whichever call came first. `Run` also returns nil once another call has stopped the
+client, before its `ctx` ends. `Stopped()` returns a channel closed once, when the
+client has stopped, by whichever call stopped it, or by `Stop` on a client never
+started; a `Run` whose `Start` fails leaves it open. The client has no internal error
+that stops it.
 
 ### 7.13 Encoding
 Args, outputs and message payloads go through a `Codec`. The default is

@@ -53,21 +53,31 @@ type Config struct {
 	// unless its worker's Timeout says otherwise. Defaults to one minute.
 	JobTimeout time.Duration
 	// MaxAttempts is the default number of attempts before a job is
-	// discarded. Defaults to 25.
+	// discarded. Defaults to 25. An attempt the client's stop canceled
+	// (StopAndCancel, or a Stop whose ctx expired) does not count if its
+	// worker returns within the stop's grace, so even a job with one attempt
+	// runs again after a stop interrupts it: delivery is at-least-once, and
+	// a job that must not repeat should be idempotent.
 	MaxAttempts int
 	// OnError is called for every failed attempt this client runs, of any
 	// kind, with the worker's error: a returned error, a recovered panic
 	// (*PanicError), a timeout (ErrJobTimeout), a Cancel, or a kind with no
 	// worker (*UnknownKindError). It is not called for a Snooze, nor when the
-	// job was canceled with JobCancel or the client is stopping, nor for a
-	// job the leader rescues from a lost client or RescueStuckAfter. What it
-	// returns overrides the outcome; the zero ErrorOutcome keeps it. It runs
-	// on the worker's goroutine, concurrently with other jobs, before the
-	// result is written, so it should return quickly; a panic in it is
-	// logged and keeps the outcome. Its context carries the client
-	// (ClientFromContext) and outlives the job's. It runs after Middleware,
-	// which sees the worker's error, not the outcome OnError chooses; the
-	// job's events report the outcome.
+	// job was canceled with JobCancel or the client lost its lease, nor for
+	// an attempt the client's stop canceled (StopAndCancel, or a Stop's
+	// deadline) whose worker then returns an error other than a Cancel or
+	// an output refusal, which is retried with its attempt given back; for
+	// those two, it is called with a context the stop has canceled. Nor is
+	// it called for a job the leader rescues from a lost client or
+	// RescueStuckAfter. An attempt whose own timeout ended it before the
+	// stop is a timeout, and is handled as one. What it returns overrides
+	// the outcome; the zero ErrorOutcome keeps it. It runs on the worker's
+	// goroutine, concurrently with other jobs, before the result is
+	// written, so it should return quickly; a panic in it is logged and
+	// keeps the outcome. Its context carries the client (ClientFromContext)
+	// and outlives the job's. It runs after Middleware, which sees the
+	// worker's error, not the outcome OnError chooses; the job's events
+	// report the outcome.
 	OnError func(ctx context.Context, job *JobRow, err error) ErrorOutcome
 	// RetryPolicy chooses when a failed job runs again, for workers whose
 	// NextRetry returns the zero time, unless the queue's RetryPolicy does.
@@ -75,7 +85,10 @@ type Config struct {
 	// hours.
 	RetryPolicy RetryPolicy
 	// StopTimeout bounds how long Run waits for running jobs after its
-	// context is canceled, before canceling them. Defaults to 30 seconds.
+	// context is canceled, before canceling them. If another Stop or
+	// StopAndCancel is already stopping the client, Run waits up to
+	// StopTimeout for that call instead and leaves the jobs to it.
+	// Defaults to 30 seconds.
 	StopTimeout time.Duration
 	// PollInterval is how often an idle producer checks its queue for work
 	// that arrived without a wake-up. Defaults to one second.

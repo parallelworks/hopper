@@ -20,7 +20,6 @@ package hoppertest
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -291,7 +290,7 @@ func Start[TTx any](ctx context.Context, tb testing.TB, client *hopper.Client[TT
 	tb.Cleanup(func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if err := client.Stop(stopCtx); err != nil && !errors.Is(err, hopper.ErrClientStopped) {
+		if err := client.Stop(stopCtx); err != nil {
 			tb.Errorf("hoppertest: stop client: %v", err)
 		}
 	})

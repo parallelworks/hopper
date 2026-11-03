@@ -273,8 +273,12 @@ for a queue's completed jobs entirely, for maximum throughput.
 - **Graceful stop.** `Stop` (or `Run` when its context ends) stops claiming,
   gives up leadership, waits for running jobs, flushes results and releases
   the lease. If the stop context expires first, running jobs are canceled;
-  those that return in time are finalized as `retryable` and run again
-  immediately elsewhere, and the rest are rescued after the TTL.
+  `StopAndCancel` cancels them at once. A canceled job whose worker returns
+  an error in time is recorded as failed but gets its attempt back, so it
+  runs again immediately elsewhere under the same attempt number (if that
+  run fails too, its `Errors` hold an entry for each run of the number), and
+  the rest are rescued after the TTL. `Stopped()` is closed once the client
+  has stopped.
 
 ## Dead letters
 

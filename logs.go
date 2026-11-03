@@ -45,14 +45,16 @@ type LogStore interface {
 	// queued lines and Close for up to 5 seconds before it hands in the
 	// attempt's result, so a store that saves on Close has the log by the
 	// time the job is finished; past that, the context is canceled and the
-	// result goes ahead. A client that stops hard waits for at most half its
-	// stop grace, so the result of the job it canceled is still written. A
+	// result goes ahead. An attempt the client's stop canceled
+	// (StopAndCancel, or a Stop whose ctx expired) waits for at most half the
+	// stop's grace, so that its result can still be written within it. A
 	// job completed with CompleteTx is finished when the worker's
 	// transaction commits, which may be before. Lines logged after the
 	// close go to Config.Logger only.
 	//
-	// A snooze gives the attempt back, so the run after it calls Writer
-	// again with the same job ID and attempt: keep both, in order. A failed
+	// A snooze, or an error from an attempt the client's stop canceled,
+	// gives the attempt back, so the run after it calls Writer again with
+	// the same job ID and attempt: keep both, in order. A failed
 	// or panicking Writer, Write or Close, or a nil writer, is logged to
 	// Config.Logger once and drops the attempt's remaining lines; the job's
 	// outcome does not depend on it.
@@ -264,10 +266,11 @@ func (a *attempt) closeLog(timeout time.Duration) {
 }
 
 // logCloseTimeout is how long an attempt that ran with ctx waits for its log
-// in the LogStore to close. A hard stop, which cancels ctx, waits for the
-// canceled jobs only for the stop's grace, so their attempts wait for at
-// most half of it and their results still reach the finalizer; so does a
-// fenced attempt's, which is ctx's other cancellation.
+// in the LogStore to close. A stop that cancels jobs (StopAndCancel, or a
+// Stop whose ctx expired), which cancels ctx, may wait for them only for
+// the stop's grace, so their attempts wait for at most half of it and
+// their results can still reach the finalizer; so does a fenced attempt's,
+// which is ctx's other cancellation.
 func (c *Client[TTx]) logCloseTimeout(ctx context.Context) time.Duration {
 	if ctx.Err() != nil {
 		return min(c.tuning.logCloseTimeout, c.tuning.stopGrace/2)

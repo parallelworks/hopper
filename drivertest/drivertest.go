@@ -11,7 +11,7 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing to the claim (also inside a caller's transaction), snooze reasons, leases, claims by ID and their job leases, leader election, rescue candidates,
+// fencing to the claim (also inside a caller's transaction), snooze reasons, a retry that gives its attempt back, leases, claims by ID and their job leases, leader election, rescue candidates,
 // cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
 // notifications and history maintenance. What depends on whether the engine
 // locks rows or runs one writer at a time (driver.Capabilities.SingleWriter)
@@ -163,6 +163,8 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"SnoozeReason", func(t *testing.T, f Fixture[TTx]) { testSnoozeReason(t, f, false) }},
 		{"SnoozeReasonNoBatches", func(t *testing.T, f Fixture[TTx]) { testSnoozeReason(t, f, true) }},
 		{"SnoozeReasonConcurrent", testSnoozeReasonConcurrent[TTx]},
+		{"RetryGivesAttemptBack", func(t *testing.T, f Fixture[TTx]) { testRetryGivesAttemptBack(t, f, false) }},
+		{"RetryGivesAttemptBackNoBatches", func(t *testing.T, f Fixture[TTx]) { testRetryGivesAttemptBack(t, f, true) }},
 		{"List", testList[TTx]},
 		{"ListOrderingKeyLane", testListOrderingKeyLane[TTx]},
 		{"JobRecordProgress", testJobRecordProgress[TTx]},

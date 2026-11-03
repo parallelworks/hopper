@@ -61,11 +61,17 @@ func (c *Client[TTx]) Listening() bool { return c.listening.Load() }
 // results, resigning leadership or releasing the lease.
 func (c *Client[TTx]) Abandon() {
 	c.mu.Lock()
-	c.state = clientStopped
+	// A call that is stopping the client closes Stopped itself. Otherwise
+	// the client is stopping until Abandon has closed it, so that a stop
+	// call meanwhile waits for it, as for any stop.
+	closeStopped := c.state != clientStopping && c.state != clientStopped
+	if closeStopped {
+		c.state = clientStopping
+	}
 	c.mu.Unlock()
 	c.finalizer.crashed.Store(true)
 	c.claimCancel()
-	c.workCancel()
+	c.workCancel(nil)
 	c.bgCancel()
 	c.finCancel()
 	c.producerWG.Wait()
@@ -73,6 +79,12 @@ func (c *Client[TTx]) Abandon() {
 	c.listenWG.Wait()
 	c.leaseWG.Wait()
 	<-c.finalizer.done
+	if closeStopped {
+		c.mu.Lock()
+		c.state = clientStopped
+		close(c.stopped)
+		c.mu.Unlock()
+	}
 }
 
 // UniqueKey exposes key construction for tests.
