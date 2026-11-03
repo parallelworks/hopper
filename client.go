@@ -95,9 +95,12 @@ type Client[TTx any] struct {
 	events       *eventBus
 	logRetention logRetentionState
 
-	// running maps jobs running on this client to their latest claim here.
+	// running maps jobs running on this client to their latest claim here,
+	// and replaced holds the earlier claims a later one replaced whose
+	// workers have not returned (trackRunning).
 	runningMu sync.Mutex
 	running   map[JobID]*runningJob
+	replaced  map[*runningJob]struct{}
 
 	// doneWaiters are Await callers by job.
 	doneMu      sync.Mutex
@@ -135,6 +138,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		periodic:     newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
 		events:       newEventBus(),
 		running:      map[JobID]*runningJob{},
+		replaced:     map[*runningJob]struct{}{},
 		doneWaiters:  map[JobID][]chan struct{}{},
 		stopped:      make(chan struct{}),
 		logRetention: logRetentionState{gate: make(chan struct{}, 1)},
@@ -563,7 +567,10 @@ func (c *Client[TTx]) shutdown(ctx context.Context, cancelJobs bool) error {
 		}
 		c.cancelJobs()
 		graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.tuning.stopGrace)
-		c.waitForJobs(graceCtx)
+		if !c.waitForJobs(graceCtx) {
+			c.logger.WarnContext(ctx, "hopper: stop gave up on jobs still running; they are rescued once the client is gone",
+				"jobs", c.runningJobs(maxListedJobs))
+		}
 		cancel()
 	}
 	c.finCancel()
