@@ -1619,6 +1619,25 @@ word.
   stuck, and the rescue's error says so. The rescue does not reach the stuck attempt:
   it runs on until it returns, and its result is dropped, unless its own client claims
   the job again, which cancels it (§7.5).
+- **Stuck workers.** A worker that has not returned `Config.StuckGrace` (10 s by
+  default) after its job's context was canceled is reported: the client logs a
+  warning, emits `job.stuck` (`EventJobStuck`, with the cancellation's cause as
+  `Event.Error`) and calls `Config.OnStuck(ctx, job, cause)`, where an operator can
+  alert, dump goroutine stacks or exit the process. The cause is `ErrJobTimeout`,
+  `ErrJobCanceled`, `ErrClientStopped` or `ErrJobFenced`, which stands for a lost lease
+  (whose cancellation has no cause of its own) as well as a claim that replaced the
+  attempt. A stop that gives up on a worker at the end of its grace (§7.12) reports it
+  then, if that is sooner. Each attempt is reported once at most. The hook runs on a
+  goroutine of its own, with a context that carries the client and is never canceled;
+  nothing waits for it, `Stop` neither, and a panic in it is logged. The report changes
+  nothing else: the attempt keeps its slot in the queue until its worker returns, and
+  its result is written then, as usual. Until then the job stays `running` under its
+  client, whose live lease keeps it from rescue, unless `RescueStuckAfter` applies, the
+  client is fenced or it stops. Each attempt is watched with a `context.AfterFunc` on
+  its context and a copy of the row as claimed (the worker can change its own, as
+  `RecordStep` does `Progress`); the watch joins the client's set of watches, which a
+  stop's give-up reads, and starts its timer only once the context is canceled, so an
+  attempt that is not canceled takes no lock the client shares.
 - **Graceful stop** deletes the lease after the finalizer flushes, so nothing needs
   rescuing.
 
@@ -2118,7 +2137,9 @@ rates:
 2. Wait for running jobs to finish, then flush the finalizer.
 3. If `ctx` expires first, cancel all job contexts, wait a short grace period, flush
    whatever finished, release the lease and return `ctx.Err()`. Jobs that are still
-   unfinished are rescued by another client (at-least-once).
+   unfinished are rescued by another client (at-least-once), and their workers are
+   reported as stuck (§7.6) as the grace ends, if `Config.StuckGrace` has not reported
+   them already.
 
 `StopAndCancel(ctx)` is the same, but cancels every job's context as it stops
 claiming, rather than when `ctx` expires. Either cancels a job's context with
@@ -2964,8 +2985,9 @@ observability without new machinery.
 
 - **Logging:** `log/slog` throughout, defaulting to `slog.Default()`. A worker's
   `hopper.Logger(ctx)` lines are also kept with its job, per attempt (§7.5).
-- **Events:** `client.Events(ctx, kinds...)` streams job lifecycle, leadership and lease
-  events as an `iter.Seq[Event]`, for tests and custom metrics. Delivery is best-effort:
+- **Events:** `client.Events(ctx, kinds...)` streams job lifecycle (including
+  `job.stuck`, §7.6), leadership and lease events as an `iter.Seq[Event]`, for tests
+  and custom metrics. Delivery is best-effort:
   a consumer that falls behind by more than a buffer misses events rather than slowing
   the client.
 - **Stats:** `Stats(ctx)` returns per-queue depth by state, the age of the oldest

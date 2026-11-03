@@ -79,6 +79,33 @@ type Config struct {
 	// worker's error, not the outcome OnError chooses; the job's events
 	// report the outcome.
 	OnError func(ctx context.Context, job *JobRow, err error) ErrorOutcome
+	// OnStuck is called when a job's worker has not returned StuckGrace
+	// after the job's context was canceled, or, if sooner, when a stop
+	// gives up on it at the end of its grace (Stop's deadline or
+	// StopAndCancel's ctx, then a short wait). cause is why the context was
+	// canceled: the job's timeout (ErrJobTimeout), JobCancel
+	// (ErrJobCanceled), the client's stop (ErrClientStopped), or a fence
+	// (ErrJobFenced), which a lost lease causes, or a claim of the job on
+	// this client after a rescue. job is the row as claimed. It is called
+	// at most once per attempt, on a goroutine of its own, with a context
+	// that carries the client and is never canceled, and a panic in it is
+	// logged. The client does not wait for it, Stop neither, so a hook that
+	// alerts should bound its own work; it may also dump goroutine stacks
+	// or exit the process. Whether or not it is set, the client logs a
+	// warning and emits EventJobStuck.
+	//
+	// Nothing else changes. The attempt keeps its slot in the queue until
+	// the worker returns, and its result is written then, as any is. Until
+	// then the job stays running under this client, whose lease keeps it
+	// from rescue, unless RescueStuckAfter rescues it, the client is fenced
+	// (the job is rescued, and the worker's late result dropped) or the
+	// client stops: once its lease is released, the job is rescued, which
+	// counts the attempt.
+	OnStuck func(ctx context.Context, job *JobRow, cause error)
+	// StuckGrace is how long a worker may take to return once its job's
+	// context is canceled, before OnStuck is called. Defaults to 10
+	// seconds.
+	StuckGrace time.Duration
 	// RetryPolicy chooses when a failed job runs again, for workers whose
 	// NextRetry returns the zero time, unless the queue's RetryPolicy does.
 	// Defaults to attempt^4 + 5 seconds with ±10% jitter, capped at 24
@@ -194,6 +221,7 @@ const (
 	DefaultMaxAttempts        = 25
 	DefaultStopTimeout        = 30 * time.Second
 	DefaultPollInterval       = time.Second
+	DefaultStuckGrace         = 10 * time.Second
 	DefaultLeaseTTL           = 15 * time.Second
 	DefaultCompletedRetention = 24 * time.Hour
 	DefaultFailedRetention    = 7 * 24 * time.Hour
@@ -230,6 +258,9 @@ func (cfg *Config) withDefaults() (Config, error) {
 	if out.PollInterval == 0 {
 		out.PollInterval = DefaultPollInterval
 	}
+	if out.StuckGrace == 0 {
+		out.StuckGrace = DefaultStuckGrace
+	}
 	if out.LeaseTTL == 0 {
 		out.LeaseTTL = DefaultLeaseTTL
 	}
@@ -260,7 +291,7 @@ func (cfg *Config) withDefaults() (Config, error) {
 	if out.JobLogs, err = withJobLogDefaults(out.JobLogs); err != nil {
 		return out, err
 	}
-	if out.JobTimeout < 0 || out.StopTimeout < 0 || out.PollInterval < 0 || out.RescueStuckAfter < 0 || out.JobLeaseGrace < 0 {
+	if out.JobTimeout < 0 || out.StopTimeout < 0 || out.PollInterval < 0 || out.RescueStuckAfter < 0 || out.JobLeaseGrace < 0 || out.StuckGrace < 0 {
 		return out, errors.New("hopper: Config durations must be positive")
 	}
 	if out.LeaseTTL < time.Second {

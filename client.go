@@ -98,6 +98,9 @@ type Client[TTx any] struct {
 	// running maps jobs running on this client to their latest claim here.
 	runningMu sync.Mutex
 	running   map[JobID]*runningJob
+	// stuck holds the watches of the workers running on this client.
+	stuckMu sync.Mutex
+	stuck   map[*stuckWatch]struct{}
 
 	// doneWaiters are Await callers by job.
 	doneMu      sync.Mutex
@@ -135,6 +138,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		periodic:     newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
 		events:       newEventBus(),
 		running:      map[JobID]*runningJob{},
+		stuck:        map[*stuckWatch]struct{}{},
 		doneWaiters:  map[JobID][]chan struct{}{},
 		stopped:      make(chan struct{}),
 		logRetention: logRetentionState{gate: make(chan struct{}, 1)},
@@ -563,7 +567,9 @@ func (c *Client[TTx]) shutdown(ctx context.Context, cancelJobs bool) error {
 		}
 		c.cancelJobs()
 		graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.tuning.stopGrace)
-		c.waitForJobs(graceCtx)
+		if !c.waitForJobs(graceCtx) {
+			c.reportStuckNow()
+		}
 		cancel()
 	}
 	c.finCancel()

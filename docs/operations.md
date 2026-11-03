@@ -269,7 +269,14 @@ for a queue's completed jobs entirely, for maximum throughput.
 - **A worker hangs** ignoring its context. Timeouts (`Config.JobTimeout`, one
   minute by default, or the worker's `Timeout`) cover the common case.
   `Config.RescueStuckAfter` additionally rescues any job running longer than
-  the given duration, whatever its client's state.
+  the given duration, whatever its client's state. A worker that has not
+  returned `Config.StuckGrace` (10 s by default) after its job's context was
+  canceled, by its timeout, `JobCancel`, a stop or a lost lease, is logged as
+  a warning and emitted as a `job.stuck` event, and `Config.OnStuck` is
+  called, once, on a goroutine of its own, to alert, dump goroutine stacks
+  (`runtime/pprof`'s `goroutine` profile) or exit the process. The job keeps
+  its slot until the worker returns. A stop that gives up on such a worker
+  reports it at once, and the job is rescued once the client is gone.
 - **Graceful stop.** `Stop` (or `Run` when its context ends) stops claiming,
   gives up leadership, waits for running jobs, flushes results and releases
   the lease. If the stop context expires first, running jobs are canceled;

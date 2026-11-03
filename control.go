@@ -422,6 +422,7 @@ const (
 	EventJobCanceled   EventKind = "job.canceled"
 	EventJobDiscarded  EventKind = "job.discarded"
 	EventJobRescued    EventKind = "job.rescued"
+	EventJobStuck      EventKind = "job.stuck" // a canceled job's worker has not returned; see Config.OnStuck
 	EventLeaderElected EventKind = "leader.elected"
 	EventLeaderLost    EventKind = "leader.lost"
 	EventLeaseLost     EventKind = "lease.lost"
@@ -435,7 +436,8 @@ type Event struct {
 	// for the EventJobRescued of a job lease's expiry, the row after it.
 	Job *JobRow
 	// Error is the attempt's error text for failed, discarded and
-	// canceled jobs, and the snooze reason, if any, for snoozed jobs.
+	// canceled jobs, the snooze reason, if any, for snoozed jobs, and the
+	// cancellation's cause for stuck jobs.
 	Error string
 	// ClientID is the client the event happened on.
 	ClientID int64

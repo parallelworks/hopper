@@ -186,7 +186,9 @@ func (c *Client[TTx]) runWorker(ctx context.Context, row *driver.JobRow) (workUn
 		m, inner := c.cfg.Middleware[i], work
 		work = func(ctx context.Context) error { return m.Work(ctx, row, inner) }
 	}
+	watch := c.watchStuck(jobCtx, row)
 	err = safeWork(jobCtx, work)
+	c.stuckReturned(watch)
 	if err != nil && jobTimeoutCause(jobCtx) {
 		err = fmt.Errorf("%w after %s: %w", ErrJobTimeout, timeout, err)
 	}
