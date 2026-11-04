@@ -81,10 +81,12 @@ type Client[TTx any] struct {
 	isLeader   atomic.Bool
 	leaderPoke chan struct{}
 	// settleAfter and promoteAfter are where the leader's next batch and
-	// workflow sweeps resume, ddlDeferrals counts its consecutive passes
-	// with deferred partition work, and keptLogged and pruneDeferredLogged
-	// are when it last logged partitions kept past retention for their index
-	// and DEFAULT partitions' prunes deferred.
+	// workflow sweeps resume. ddlDeferrals counts its history maintenance's
+	// consecutive passes with deferred partition work, and keptLogged and
+	// pruneDeferredLogged are when it last logged partitions kept past
+	// retention for their index and DEFAULT partitions' prunes deferred;
+	// only the term's maintenance loop uses them, and a term's loops end
+	// before the next term's start.
 	settleAfter, promoteAfter driver.JobID
 	// resultsSweptAt is when the leader last deleted orphaned dependency
 	// results.

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/hopper"
@@ -590,6 +591,107 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 				time.Sleep(100 * time.Millisecond)
 			}
 		})
+	}
+}
+
+// slowHistoryPrune fills the failed DEFAULT history partition with rows
+// past retention, each of whose deletes sleeps for half a second, so that
+// retention's prune of the partition runs for rows/2 seconds, as a prune of
+// a backlog does. It returns a session outside the harness's pool and a
+// function that reports whether that prune is running.
+func slowHistoryPrune(t *testing.T, h *harness, rows int) (*pgx.Conn, func() bool) {
+	t.Helper()
+	ctx := context.Background()
+	for _, q := range []string{
+		`CREATE FUNCTION slow_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.5); RETURN OLD; END $$`,
+		`CREATE TRIGGER slow_delete BEFORE DELETE ON hopper_job_history_failed_default FOR EACH ROW EXECUTE FUNCTION slow_delete()`,
+		fmt.Sprintf(`INSERT INTO hopper_job_history (id, seq, kind, queue, state, priority, attempt, max_attempts, scheduled_at, args, metadata, errors, await, created_at, finalized_at)
+			SELECT hopper_uuidv7(), i, 'k', 'default', 'discarded', 2, 1, 1, now(), '{}', '{}', '[]', false, now(), now() - interval '30 days'
+			FROM generate_series(1, %d) i`, rows),
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	probe := h.session()
+	pruning := func() bool {
+		t.Helper()
+		var n int
+		if err := probe.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active'
+			AND query LIKE 'DELETE FROM%hopper_job_history_failed_default%' AND strpos(query, current_schema()) > 0`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+	return probe, pruning
+}
+
+// TestLeaderRenewsLeaseThroughLongHistoryPrune runs a history maintenance
+// pass whose prune of a DEFAULT partition takes several of the lease's TTLs,
+// as a prune of the backlog an outage left does. Maintenance runs beside the
+// leader loop, so the leader renews its lease meanwhile, in the same term.
+func TestLeaderRenewsLeaseThroughLongHistoryPrune(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	probe, pruning := slowHistoryPrune(t, h, 20)
+	c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, pruning)
+	var electedAt time.Time
+	if err := probe.QueryRow(ctx, "SELECT elected_at FROM hopper_leader").Scan(&electedAt); err != nil {
+		t.Fatal(err)
+	}
+	// The prune runs for 10s; the lease's TTL is 2s.
+	started := time.Now()
+	for time.Since(started) < 3*fastTuning.LeaderTTL && pruning() {
+		var n int
+		if err := probe.QueryRow(ctx, "SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 || !c.IsLeader() {
+			t.Fatalf("the leader's lease lapsed %s into a history prune", time.Since(started).Round(time.Millisecond))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if time.Since(started) < 3*fastTuning.LeaderTTL {
+		t.Fatalf("the prune ended after %s, before the check", time.Since(started).Round(time.Millisecond))
+	}
+}
+
+// TestHistoryMaintenanceStopsWithoutLeaseRenewal holds the leader lease's
+// row so that the leader's renewal waits, while a history prune runs. The
+// leader loop does not see its lease go, but the lease fences maintenance:
+// the prune is canceled once the lease may have expired, within its TTL,
+// rather than run on beside the leader that may follow.
+func TestHistoryMaintenanceStopsWithoutLeaseRenewal(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	_, pruning := slowHistoryPrune(t, h, 60)
+	c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, pruning)
+	holder := h.session("idle_in_transaction_session_timeout=60000")
+	if _, err := holder.Exec(ctx, "BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = holder.Exec(ctx, "ROLLBACK") }()
+	if _, err := holder.Exec(ctx, "SELECT 1 FROM hopper_leader FOR UPDATE"); err != nil {
+		t.Fatal(err)
+	}
+	held := time.Now()
+	// The last renewal before the hold left the lease at most a TTL; the
+	// prune, 30s long, must stop by then and a little after.
+	for pruning() {
+		if time.Since(held) > fastTuning.LeaderTTL+2*time.Second {
+			t.Fatalf("the history prune ran on %s after the lease's renewal stopped", time.Since(held).Round(time.Millisecond))
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

@@ -254,8 +254,8 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 //
 // It skips the rows another transaction holds, which the next pass takes:
 // a JobRetryTx or JobDeleteTx held open deletes its job's history row, and
-// a prune that waited for it would hold up the leader's loop, and its
-// lease's renewal, for as long as the caller kept its transaction open. The
+// a prune that waited for it would hold up history maintenance for as long
+// as the caller kept its transaction open. The
 // rows are locked by a subquery and deleted by their ctid, which a row
 // locked by the statement keeps: the DEFAULT partition is a table, not a
 // partitioned one.
@@ -284,7 +284,7 @@ func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.D
 	// one of history's DEFAULT partitions, or the other tags group's,
 	// which reads them too, is deferred this pass, it would most likely
 	// wait for the same lock, so it is deferred untried rather than wait
-	// the lock timeout again on the leader's loop.
+	// the lock timeout again.
 	if g.mirrors != "" && slices.ContainsFunc(res.PruneDeferred, historyDefault) {
 		res.PruneDeferred = append(res.PruneDeferred, name)
 		return false, nil

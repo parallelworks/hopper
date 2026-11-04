@@ -12,9 +12,10 @@ import (
 )
 
 // leaderLoop competes for the leader lease and, while holding it, runs the
-// singleton duties: rescuing jobs from lost clients, pruning expired client
-// rows and maintaining history retention. Duties are idempotent, because two
-// leaders can briefly overlap during a partition.
+// singleton duties: rescuing jobs from lost clients and pruning expired
+// client rows, and starts the term's loops, among them history retention's
+// (maintenanceLoop). Duties are idempotent, because two leaders can briefly
+// overlap during a partition.
 func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaderInterval)
 	defer ticker.Stop()
@@ -34,11 +35,13 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		c.resign(ctx, leaseID)
 	}()
 
-	var lastMaintenance time.Time
 	for {
 		// The attempt's ID is the one a resign gives the lease up for: a
 		// fence may re-register the client under another meanwhile.
 		id := c.clientID.Load()
+		// The lease the attempt takes or renews expires a TTL after the
+		// server's now(), which is no earlier than this.
+		attempted := time.Now()
 		res, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: c.tuning.leaderTTL})
 		// A term is one live lease, identified by its elected_at. A client
 		// that took over a lease that had lapsed, even its own and under the
@@ -92,8 +95,9 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)
 				c.emit(EventLeaderElected, nil, "")
-				lastMaintenance = time.Time{}
-				term = c.startTerm(ctx)
+				term = c.startTerm(ctx, attempted.Add(c.tuning.leaderTTL))
+			} else {
+				term.lease.renewed(attempted.Add(c.tuning.leaderTTL))
 			}
 			c.rescue(ctx)
 			c.expireJobLeases(ctx)
@@ -102,10 +106,6 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			c.promoteReady(ctx)
 			c.age(ctx)
 			c.pruneClients(ctx)
-			if time.Since(lastMaintenance) >= c.tuning.maintenanceInterval && c.maintainHistory(ctx) {
-				lastMaintenance = time.Now()
-				term.maintainedOnce()
-			}
 		default:
 			if c.isLeader.Swap(false) {
 				// The ID it led under: a fence may have moved the client on.
@@ -124,8 +124,8 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	}
 }
 
-// leaderTerm is one stretch of leadership. The periodic and stream loops
-// run for its duration.
+// leaderTerm is one stretch of leadership. The periodic, stream and
+// history loops run for its duration.
 type leaderTerm struct {
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -133,14 +133,20 @@ type leaderTerm struct {
 	// run, which the index loop waits for (see indexLoop).
 	maintained chan struct{}
 	once       sync.Once
+	// lease is how long the term's lease is known to be held, which fences
+	// history maintenance (see maintenanceLoop).
+	lease leaseFence
 }
 
 func (t *leaderTerm) maintainedOnce() { t.once.Do(func() { close(t.maintained) }) }
 
-func (c *Client[TTx]) startTerm(ctx context.Context) *leaderTerm {
+// startTerm starts a term whose lease expires no earlier than until.
+func (c *Client[TTx]) startTerm(ctx context.Context, until time.Time) *leaderTerm {
 	termCtx, cancel := context.WithCancel(ctx)
 	t := &leaderTerm{cancel: cancel, done: make(chan struct{}), maintained: make(chan struct{})}
+	t.lease.renewed(until)
 	var wg sync.WaitGroup
+	wg.Go(func() { c.maintenanceLoop(termCtx, t) })
 	wg.Go(func() { c.periodicLoop(termCtx) })
 	wg.Go(func() { c.streamLoop(termCtx) })
 	wg.Go(func() { c.liveLoop(termCtx) })
@@ -662,11 +668,93 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 	}
 }
 
+// maintenanceLoop maintains history (maintainHistory) on the leader at
+// the start of its term and then every maintenance interval, or at the
+// next leader interval while a pass deferred partition work. It runs beside
+// the leader loop, not in it, so that no retention statement holds up the
+// lease's renewal: a prune of a DEFAULT partition that grew during an
+// outage deletes a backlog in one statement, and every DDL waits up to its
+// lock timeout. The lease fences each pass: a pass runs only while the
+// lease the leader loop last took or renewed is unexpired, and is canceled,
+// statement and all, once it may have expired without a renewal, even if
+// the leader loop has not yet seen it go (a renewal that keeps failing does
+// not end the term). The end of the term cancels it too, before another
+// term of this client starts. A pass cut short is retried at the next
+// leader interval.
+func (c *Client[TTx]) maintenanceLoop(ctx context.Context, t *leaderTerm) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		pass, cancel := t.lease.context(ctx)
+		done := c.maintainHistory(pass)
+		fenced := pass.Err() != nil
+		cancel()
+		if fenced && ctx.Err() == nil {
+			c.logger.WarnContext(ctx, "hopper: history maintenance stopped: the leader lease may have expired without a renewal")
+		}
+		wait := c.tuning.maintenanceInterval
+		switch {
+		case fenced || !done:
+			wait = c.tuning.leaderInterval
+		default:
+			t.maintainedOnce()
+		}
+		timer.Reset(wait)
+	}
+}
+
+// leaseFence tracks how long a leader term's lease is known to be held.
+type leaseFence struct {
+	mu sync.Mutex
+	// until is when the lease last taken or renewed expires at the
+	// earliest, by the local clock: a TTL after the attempt was sent.
+	until time.Time
+}
+
+// renewed records a renewal of the lease that lasts until until.
+func (f *leaseFence) renewed(until time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.until = until
+}
+
+// context returns a context derived from parent that is canceled once the
+// lease may have expired: when its last renewal's until passes without a
+// later one. Its cancel function must be called.
+func (f *leaseFence) context(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	go func() {
+		timer := time.NewTimer(0)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+			f.mu.Lock()
+			left := time.Until(f.until)
+			f.mu.Unlock()
+			if left <= 0 {
+				cancel()
+				return
+			}
+			timer.Reset(left)
+		}
+	}()
+	return ctx, cancel
+}
+
 // maintainHistory creates and drops history partitions. It reports false
-// when a partition's creation or drop was deferred, for the next leader pass
-// to retry rather than the next maintenance interval: a partition ahead that
-// is missing when its period starts sends that period's history to the
-// DEFAULT partition.
+// when a partition's creation or drop was deferred, for the next leader
+// interval to retry rather than the next maintenance interval: a partition
+// ahead that is missing when its period starts sends that period's history
+// to the DEFAULT partition.
 func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	timeout := ddlLockTimeout(c.ddlDeferrals)
 	res, err := c.exec.HistoryMaintain(ctx, driver.HistoryMaintainParams{
@@ -678,7 +766,7 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	// Each group is maintained on its own, so a pass that failed in one may
 	// still have done the others' work, which is logged as usual. It is
 	// retried at the next maintenance interval, its deferred work with it,
-	// rather than on every leader pass, but work it deferred still lengthens
+	// rather than at every leader interval, but work it deferred still lengthens
 	// the next try's lock timeout: a failure that lasts must not hold the
 	// other groups' deferred work at the shortest timeout for good.
 	c.ddlDeferrals = nextDeferrals(c.ddlDeferrals, len(res.Deferred) > 0, err != nil)
@@ -691,9 +779,9 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
 	}
-	// A prune that could not get its locks does not make the leader retry on
-	// its next pass: it is not urgent, and a pass that retried it would wait
-	// the lock timeout again on the leader's loop. A pass that retries
+	// A prune that could not get its locks does not make the leader retry at
+	// its next interval: it is not urgent, and a pass that retried it would
+	// wait the lock timeout again. A pass that retries
 	// deferred partitions retries it too, so, as kept partitions are, it is
 	// logged once per maintenance interval.
 	if len(res.PruneDeferred) > 0 && time.Since(c.pruneDeferredLogged) >= c.tuning.maintenanceInterval {
@@ -703,7 +791,7 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	}
 	// A kept partition waits for its build, whose failures the index loop
 	// warns about, so it is only logged, once per maintenance interval: the
-	// passes that retry deferred work in between, on every leader pass, are
+	// passes that retry deferred work in between, every leader interval, are
 	// left out, without silencing a run of them that outlasts the interval.
 	if len(res.Kept) > 0 && time.Since(c.keptLogged) >= c.tuning.maintenanceInterval {
 		c.keptLogged = time.Now()
@@ -795,7 +883,7 @@ func repeatLevel(passes int) slog.Level {
 	return slog.LevelDebug
 }
 
-// Deferred partition work is retried on every leader pass, each time
+// Deferred partition work is retried every leader interval, each time
 // waiting longer for its lock: doubling from 200 ms to at most 2 s, so that
 // transactions that keep overlapping cannot hold retention and the
 // partitions ahead off forever, while each attempt holds the table's
