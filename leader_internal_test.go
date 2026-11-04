@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,6 +147,29 @@ func TestMaintainHistoryCountsDeferralsPastFailure(t *testing.T) {
 	want := []time.Duration{ddlLockTimeout(0), ddlLockTimeout(1), ddlLockTimeout(2), ddlLockTimeout(3), ddlLockTimeout(3)}
 	if !slices.Equal(exec.timeouts, want) || c.ddlDeferrals != 0 {
 		t.Errorf("lock timeouts = %v, then %d deferrals; want %v, then 0", exec.timeouts, c.ddlDeferrals, want)
+	}
+}
+
+// A prune deferred behind a lock neither makes the leader retry on its next
+// pass nor lengthens the partitions' lock timeout. A pass that retries
+// deferred partitions retries the prune too, whose deferral is logged once
+// per maintenance interval rather than on every such pass.
+func TestMaintainHistoryPruneDeferred(t *testing.T) {
+	ctx := context.Background()
+	var logged atomic.Int64
+	exec := &maintainExec{res: driver.HistoryMaintainResult{PruneDeferred: []string{"d"}}}
+	c := &Client[struct{}]{exec: exec, logger: slog.New(messageCounter{"prune deferred", &logged}), tuning: defaultTuning}
+	if !c.maintainHistory(ctx) || c.ddlDeferrals != 0 {
+		t.Fatalf("a pass that deferred only a prune asked to be retried on the next leader pass, or counted %d deferrals", c.ddlDeferrals)
+	}
+	exec.res.Deferred = []string{"p"}
+	for range 3 {
+		if c.maintainHistory(ctx) {
+			t.Fatal("a pass that deferred a partition did not ask to be retried on the next leader pass")
+		}
+	}
+	if n := logged.Load(); n != 1 {
+		t.Errorf("prune deferral logged %d times within a maintenance interval, want once", n)
 	}
 }
 

@@ -82,15 +82,17 @@ type Client[TTx any] struct {
 	leaderPoke chan struct{}
 	// settleAfter and promoteAfter are where the leader's next batch and
 	// workflow sweeps resume, ddlDeferrals counts its consecutive passes
-	// with deferred partition work, and keptLogged is when it last logged
-	// partitions kept past retention for their index.
+	// with deferred partition work, and keptLogged and pruneDeferredLogged
+	// are when it last logged partitions kept past retention for their index
+	// and DEFAULT partitions' prunes deferred.
 	settleAfter, promoteAfter driver.JobID
 	// resultsSweptAt is when the leader last deleted orphaned dependency
 	// results.
-	resultsSweptAt time.Time
-	ddlDeferrals   int
-	keptLogged     time.Time
-	streamPoke     chan struct{}
+	resultsSweptAt      time.Time
+	ddlDeferrals        int
+	keptLogged          time.Time
+	pruneDeferredLogged time.Time
+	streamPoke          chan struct{}
 
 	events       *eventBus
 	logRetention logRetentionState

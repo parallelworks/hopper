@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/parallelworks/hopper"
@@ -111,6 +112,26 @@ func (h *harness) count(query string, args ...any) int {
 		h.t.Fatalf("%s: %v", query, err)
 	}
 	return n
+}
+
+// session opens a connection in the harness's schema, outside its pool, for
+// a test to hold locks or transactions on without taking the client's
+// connections. settings are name=value server settings for the session,
+// such as timeouts that end what the test holds should it hang. Cleanup
+// closes it.
+func (h *harness) session(settings ...string) *pgx.Conn {
+	h.t.Helper()
+	cfg := h.pool.Config().ConnConfig.Copy()
+	for _, s := range settings {
+		name, value, _ := strings.Cut(s, "=")
+		cfg.RuntimeParams[name] = value
+	}
+	conn, err := pgx.ConnectConfig(context.Background(), cfg)
+	if err != nil {
+		h.t.Fatalf("connect: %v", err)
+	}
+	h.t.Cleanup(func() { _ = conn.Close(context.Background()) })
+	return conn
 }
 
 // waitFor polls cond until it is true or the deadline passes.

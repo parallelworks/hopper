@@ -487,6 +487,112 @@ func TestLeaderMaintainsHistoryPartitions(t *testing.T) {
 	})
 }
 
+// TestLeaderKeepsLeaseBehindPendingHistoryLock queues a request for an
+// ACCESS EXCLUSIVE lock on a history partition behind a transaction that
+// read it, as an operator's DDL waiting for a long report would. Every
+// statement that needs that partition queues behind the request, the
+// prunes of the DEFAULT partitions included, which history maintenance runs
+// on the leader's loop: the failed DEFAULT partition's own prune, or, for a
+// time partition, the tags' prunes, which read every history partition.
+// They wait no longer than the maintenance lock timeout and are deferred,
+// so the leader keeps renewing its lease rather than stall behind the
+// request for as long as the reader stays open.
+func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
+	t.Parallel()
+	for _, partition := range []string{"hopper_job_history_failed_default", "hopper_job_history_failed_21000101"} {
+		t.Run(partition, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			ctx := context.Background()
+			if partition != "hopper_job_history_failed_default" {
+				// Far ahead of the partitions the leader creates, so that
+				// no attach of its own waits for the pending lock.
+				for _, q := range []string{
+					"CREATE TABLE " + partition + " (LIKE hopper_job_history INCLUDING DEFAULTS INCLUDING CONSTRAINTS)",
+					"ALTER TABLE hopper_job_history_failed ATTACH PARTITION " + partition + " FOR VALUES FROM ('2100-01-01') TO ('2100-01-02')",
+				} {
+					if _, err := h.pool.Exec(ctx, q); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			// The leader's index loop would build the time partition's index,
+			// which the test's table lacks, and that build would queue behind
+			// the pending lock for as long as it stays, holding a pool
+			// connection and a snapshot that every other build in the
+			// database waits for. Indexed first, the partitions leave the
+			// leader only its bounded waits.
+			if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
+				t.Fatal(err)
+			}
+			// The reader and the pending LOCK run on sessions of their own,
+			// out of the client's pool, and the server ends both within a
+			// minute even if the test hangs, so that neither can stall the
+			// client's pool or other tests' builds for longer: the LOCK's
+			// session also once the LOCK is granted, should the reader's end.
+			reader := h.session("idle_in_transaction_session_timeout=60000")
+			if _, err := reader.Exec(ctx, "BEGIN"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+partition); err != nil {
+				t.Fatal(err)
+			}
+			ddl := h.session("lock_timeout=60000", "statement_timeout=60000", "idle_in_transaction_session_timeout=60000")
+			if _, err := ddl.Exec(ctx, "BEGIN"); err != nil {
+				t.Fatal(err)
+			}
+			locked := make(chan error, 1)
+			go func() {
+				_, err := ddl.Exec(ctx, "LOCK TABLE "+partition+" IN ACCESS EXCLUSIVE MODE")
+				locked <- err
+			}()
+			// The reader's end grants the LOCK, released in turn before the
+			// client stops.
+			defer func() {
+				_, _ = reader.Exec(ctx, "ROLLBACK")
+				if err := <-locked; err != nil {
+					t.Errorf("LOCK TABLE: %v", err)
+				}
+				_, _ = ddl.Exec(ctx, "ROLLBACK")
+			}()
+			waitFor(t, func() bool {
+				return h.count(`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND mode = 'AccessExclusiveLock' AND NOT granted`, partition) == 1
+			})
+
+			c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
+			// Maintenance on every leader pass, under a lease that outlasts a
+			// pass's bounded waits for the pending lock: for the DEFAULT
+			// partition, the attach of a failed partition ahead, up to the
+			// maintenance lock timeout, which grows to 2s while passes defer;
+			// and one prune, up to 200ms, the failed DEFAULT partition's or,
+			// for the time partition, the completed tags', the tags' prunes
+			// after it deferred untried. Only an unbounded wait lets it lapse.
+			// The check outlasts the first passes at 2s, and the lease's
+			// elected_at catches a lapse that the client took back at once,
+			// as a new term, between two checks.
+			tun := fastTuning
+			tun.Maintenance = 100 * time.Millisecond
+			tun.LeaderTTL = 6 * time.Second
+			c.SetTuning(tun)
+			if err := c.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, c.IsLeader)
+			var electedAt time.Time
+			if err := h.pool.QueryRow(ctx, "SELECT elected_at FROM hopper_leader").Scan(&electedAt); err != nil {
+				t.Fatal(err)
+			}
+			elected := time.Now()
+			for time.Since(elected) < 3*tun.LeaderTTL {
+				if h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 || !c.IsLeader() {
+					t.Fatalf("the leader's lease lapsed %s after the election, behind the pending lock on %s", time.Since(elected).Round(time.Millisecond), partition)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		})
+	}
+}
+
 // TestLeaderRetriesDeferredPartitions holds off the attach of the
 // partitions ahead with a transaction that writes to the DEFAULT history
 // partition, as an open CompleteTx does. The leader defers them, and creates
@@ -1190,13 +1296,11 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	// timeout (doubling from 0.2s to 2s on the fifth pass), the leader loop's
 	// prunes of the two tags tables' DEFAULT partitions, which read every
 	// history partition, queue behind it. At this maintenance interval they
-	// run on every leader pass, and the index loop retries its attach as soon
-	// as the last one times out, so a pass's two prunes can wait out two
-	// attaches in a row: 0.8 and then 1.6 seconds before the fifth pass, past
-	// fastTuning's 2s lease. The lapse ends the term (docs/PLAN.md §7.8) and
-	// with it the index loop and its count of deferred passes, which would
-	// start over before reaching five. The lease outlasts two of the longest
-	// waits, as the default 15s lease does.
+	// run on every leader pass, but the first gives up after its own 200ms
+	// lock timeout and the second is deferred untried (docs/PLAN.md §7.8). A
+	// lapse would end the term and with it the index loop and its count of
+	// deferred passes, which would start over before reaching five, so the
+	// lease keeps a wide margin over a pass's waits.
 	tun.LeaderTTL = 10 * time.Second
 	c.SetTuning(tun)
 	if err := c.Start(ctx); err != nil {
