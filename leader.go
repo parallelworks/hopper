@@ -34,35 +34,27 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		c.resign(ctx, leaseID)
 	}()
 
-	var (
-		lastMaintenance time.Time
-		// heldOff is until when the client, having resigned on request,
-		// stays out of the election, so that another client takes the
-		// lease rather than it again.
-		heldOff time.Time
-	)
+	var lastMaintenance time.Time
 	for {
-		if wait := time.Until(heldOff); wait > 0 {
-			// The client attempts again as soon as the hold-off ends, not
-			// at the next tick after it.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(wait):
-			}
-			// A tick or poke from during the hold-off is stale: the attempt
-			// that follows covers it, so it must not repeat that attempt.
-			ticker.Reset(c.tuning.leaderInterval)
-			select {
-			case <-c.leaderPoke:
-			default:
-			}
-			continue
-		}
 		// The attempt's ID is the one a resign gives the lease up for: a
 		// fence may re-register the client under another meanwhile.
 		id := c.clientID.Load()
 		res, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: c.tuning.leaderTTL})
+		// A term is one live lease, identified by its elected_at. A client
+		// that took over a lease that had lapsed, even its own and under the
+		// same ID, or its old one under the ID a fence gave it, left its term
+		// when the lease lapsed, and another client may have led since: that
+		// term ends, with its event, before the new one starts or, if the new
+		// one was asked to resign, is resigned. Comparing elected_at rather
+		// than asking whether this attempt took the lease catches a takeover
+		// whose response was lost, which the next renewal reports with the
+		// new term's.
+		if err == nil && res.Leader && !res.ElectedAt.Equal(electedAt) && c.isLeader.Swap(false) {
+			c.logger.WarnContext(ctx, "hopper: leader lease lapsed; its term ended", "client_id", leaseID, "new_client_id", id)
+			c.emit(EventLeaderLost, nil, "")
+			term.end()
+			term = nil
+		}
 		switch {
 		case err != nil:
 			if ctx.Err() != nil {
@@ -78,22 +70,24 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			term.end()
 			term = nil
 			c.resignOnRequest(ctx, id)
-			heldOff = time.Now().Add(c.tuning.leaderTTL)
-		case res.Leader:
-			// A term is one live lease, identified by its elected_at. A
-			// client that took over a lease that had lapsed, even its own and
-			// under the same ID, or its old one under the ID a fence gave it,
-			// left its term when the lease lapsed, and another client may
-			// have led since: that term ends, with its event, before the new
-			// one starts. Comparing elected_at rather than asking whether this
-			// attempt took the lease catches a takeover whose response was
-			// lost, which the next renewal reports with the new term's.
-			if !res.ElectedAt.Equal(electedAt) && c.isLeader.Swap(false) {
-				c.logger.WarnContext(ctx, "hopper: leader lease lapsed; starting a new term", "client_id", leaseID, "new_client_id", id)
-				c.emit(EventLeaderLost, nil, "")
-				term.end()
-				term = nil
+			// It stays out of the election for a lease's TTL, so that
+			// another client takes the lease rather than it again, and
+			// attempts again as soon as the hold-off ends, not at the next
+			// tick after it.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(c.tuning.leaderTTL):
 			}
+			// A tick or poke from during the hold-off is stale: the attempt
+			// that follows covers it, so it must not repeat that attempt.
+			ticker.Reset(c.tuning.leaderInterval)
+			select {
+			case <-c.leaderPoke:
+			default:
+			}
+			continue
+		case res.Leader:
 			leaseID, electedAt = id, res.ElectedAt
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)

@@ -287,8 +287,11 @@ type lossyExec struct {
 	driver.Executor
 	mu    sync.Mutex
 	armed bool
-	last  time.Time // the elected_at of the last term an attempt returned
-	lost  int
+	// ask has the takeover whose response is lost followed by a request
+	// that the new term's holder resign, before the client's next renewal.
+	ask  bool
+	last time.Time // the elected_at of the last term an attempt returned
+	lost int
 }
 
 func (e *lossyExec) LeaderAttempt(ctx context.Context, p driver.LeaderParams) (driver.LeaderResult, error) {
@@ -301,6 +304,11 @@ func (e *lossyExec) LeaderAttempt(ctx context.Context, p driver.LeaderParams) (d
 	if e.armed && !res.ElectedAt.Equal(e.last) {
 		e.armed = false
 		e.lost++
+		if e.ask {
+			if _, err := e.LeaderRequestResign(ctx, p.ClientID); err != nil {
+				return driver.LeaderResult{}, err
+			}
+		}
 		return driver.LeaderResult{}, errors.New("connection reset after the takeover committed")
 	}
 	e.last = res.ElectedAt
@@ -374,4 +382,72 @@ func TestLeaderLostTakeoverResponseStartsTerm(t *testing.T) {
 		t.Errorf("lost takeover responses = %d, want 1", lost)
 	}
 	waitFor(t, func() bool { return h.countN("43") == 2 })
+}
+
+// TestLeaderLostTakeoverResponseThenResign loses the response of the
+// attempt that took the client's lapsed lease back, and asks the new term's
+// holder to resign before its next renewal: that renewal reports the
+// request with the new term's elected_at, so the client ends the term it
+// announced as lost (EventLeaderLost), and resigns the new one, which it
+// never announced, without EventLeaderResigned.
+func TestLeaderLostTakeoverResponseThenResign(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	exec := &lossyExec{Executor: h.d.Executor(), ask: true}
+	c, err := hopper.NewClient[pgxTx](lossyDriver{Driver: h.d, exec: exec}, &hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers: noopWorkers(),
+		Logger:  testLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetTuning(fastTuning)
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = c.Stop(sctx)
+	})
+	events, stopEvents := context.WithCancel(ctx)
+	defer stopEvents()
+	var (
+		mu    sync.Mutex
+		kinds []hopper.EventKind
+	)
+	go func() {
+		for ev := range c.Events(events, hopper.EventLeaderElected, hopper.EventLeaderLost, hopper.EventLeaderResigned) {
+			mu.Lock()
+			kinds = append(kinds, ev.Kind)
+			mu.Unlock()
+		}
+	}()
+	seen := func() []hopper.EventKind {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(kinds)
+	}
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return len(seen()) == 1 })
+	exec.mu.Lock()
+	exec.armed = true
+	exec.mu.Unlock()
+	if _, err := h.pool.Exec(ctx, `UPDATE hopper_leader SET expires_at = now() - interval '1 second'`); err != nil {
+		t.Fatal(err)
+	}
+	// The resigned client is alone, so it is elected again after the
+	// hold-off.
+	want := []hopper.EventKind{hopper.EventLeaderElected, hopper.EventLeaderLost, hopper.EventLeaderElected}
+	waitFor(t, func() bool { return len(seen()) >= len(want) })
+	if got := seen(); !slices.Equal(got, want) {
+		t.Errorf("leader events = %v, want %v", got, want)
+	}
+	exec.mu.Lock()
+	lost := exec.lost
+	exec.mu.Unlock()
+	if lost != 1 {
+		t.Errorf("lost takeover responses = %d, want 1", lost)
+	}
 }

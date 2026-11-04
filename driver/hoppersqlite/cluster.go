@@ -206,7 +206,6 @@ func (e *executor) LeaderRequestResign(ctx context.Context, leaderID int64) (int
 func (e *executor) LeaderResign(ctx context.Context, clientID int64) (bool, error) {
 	var deleted bool
 	err := e.write(ctx, func(x *w) error {
-		deleted = false
 		res, err := x.ExecContext(ctx, `DELETE FROM hopper_leader WHERE name = 'default' AND client_id = ?`, clientID)
 		if err != nil {
 			return err

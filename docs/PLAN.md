@@ -1723,7 +1723,8 @@ ON CONFLICT (name) DO UPDATE SET client_id = $me,
                     THEN hopper_leader.expires_at ELSE now() + $ttl END,
   resign_client_id = CASE WHEN renewal THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $me
-RETURNING client_id = $me, coalesce(resign_client_id = client_id, false),
+RETURNING client_id,   -- $me: the client leads
+          coalesce(resign_client_id = client_id, false),
           elected_at;           -- the term
 ```
 
@@ -1741,7 +1742,9 @@ RETURNING client_id = $me, coalesce(resign_client_id = client_id, false),
   term started with, and an attempt that returns another one ends the old term, with
   `EventLeaderLost`, before the new one starts, with `EventLeaderElected`. So a
   takeover whose response was lost cannot merge two terms: the renewal after it reports
-  the new term's `elected_at`. The new term starts as any does, so each
+  the new term's `elected_at`. If that renewal also reports a resign request, the old
+  term still ends with `EventLeaderLost`, and the new one, never announced, is resigned
+  without `EventLeaderResigned`. The new term starts as any does, so each
   periodic job with `RunOnStart` inserts a job again (§7.9). Earlier releases kept the
   term across a lapse that no other client filled.
 
