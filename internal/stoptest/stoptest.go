@@ -96,6 +96,11 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 			if j.State != hopper.JobStateCompleted || j.Attempt != 1 {
 				t.Errorf("job run again: %s at attempt %d, want completed on attempt 1", j.State, j.Attempt)
 			}
+			// The rerun, of the same number, logged nothing: the
+			// interrupted run's log goes to history as it was.
+			if logs, err := second.JobLogs(ctx, res.Job.ID); err != nil || len(logs) != 1 || !logs[0].Interrupted {
+				t.Errorf("logs once run again = %+v, %v; want the interrupted run's, marked Interrupted", logs, err)
+			}
 			return
 		}
 		if time.Now().After(deadline) {

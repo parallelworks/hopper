@@ -4,7 +4,8 @@
 // that a direct SQL write left in another form reads as what can be made of
 // it, rather than failing the read, so that one such row fails neither the
 // claim that takes it (whose update has committed by the time it is read)
-// nor a listing or the rescuer.
+// nor a listing or the rescuer. It also checks the results a finalize
+// writes, which every engine refuses alike (CheckFinalize).
 package jobcodec
 
 import (
@@ -39,10 +40,17 @@ func MarshalAttemptError(e *driver.AttemptError) ([]byte, error) {
 	}{e.Attempt, e.Fence, StorableText(e.Error), StorableText(e.Trace), string(e.Rescue)})
 }
 
-// CheckGiveBack refuses a result that gives its attempt back as an
-// interruption (JobFinalize.GiveBack) and also snoozes, or that finishes
-// the job, which then has no attempt to give back.
-func CheckGiveBack(f driver.JobFinalize) error {
+// CheckFinalize refuses a result no engine applies: one whose state is not
+// a finalize state, or that gives its attempt back as an interruption
+// (JobFinalize.GiveBack) and also snoozes, or finishes the job, which then
+// has no attempt to give back.
+func CheckFinalize(f driver.JobFinalize) error {
+	switch f.State {
+	case driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded,
+		driver.JobStateRetryable, driver.JobStateScheduled:
+	default:
+		return fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
+	}
 	switch {
 	case f.GiveBack && f.Snooze:
 		return errors.New("hopper: finalize jobs: a result both snoozes and gives its attempt back")

@@ -1246,16 +1246,19 @@ stops the producers. A flush that hits its 30 s timeout is retried as two halves
 down to single results, so one statement the database cannot finish in time degrades
 into smaller ones instead of being sent again as it was. Retries and snoozes are
 updated in place, a snooze with its reason. Terminal outcomes are moved to history.
+`give_back` is 0 for a result that counts its attempt, 1 for a snooze and 2 for an
+attempt the client's stop interrupted (`JobFinalize.GiveBack`, §7.12): both give the
+attempt back, and only a snooze stores a reason or replaces a snooze's log.
 
 ```sql
-WITH r AS (SELECT * FROM unnest($ids, $attempted_by, $states, $delays, $snoozes, $errors, $outputs, $archives,
+WITH r AS (SELECT * FROM unnest($ids, $attempted_by, $states, $delays, $give_backs, $errors, $outputs, $archives,
                                  $snooze_reasons, $fences) AS r(...)),
 retry AS (
   UPDATE hopper_jobs j SET state = r.state,
          scheduled_at = CASE WHEN j.wake_requested_at >= j.attempted_at THEN now() ELSE now() + r.delay END,
-         attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
+         attempt = CASE WHEN r.give_back > 0 THEN j.attempt - 1 ELSE j.attempt END,
          errors = j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())), attempted_by = NULL,
-         snooze_reason = CASE WHEN r.snooze AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false) THEN r.snooze_reason END,
+         snooze_reason = CASE WHEN r.give_back = 1 AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false) THEN r.snooze_reason END,
          wake_requested_at = NULL
   FROM r WHERE j.id = r.id AND r.state IN ('retryable','scheduled')
     AND j.state::text = 'running' AND j.attempted_by = r.attempted_by AND j.fence = r.fence

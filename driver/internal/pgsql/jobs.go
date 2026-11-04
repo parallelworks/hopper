@@ -811,13 +811,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		if leased {
 			tokens[i], f.Fence = f.Lease.Token, f.Lease.Fence
 		}
-		switch f.State {
-		case driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded,
-			driver.JobStateRetryable, driver.JobStateScheduled:
-		default:
-			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
-		}
-		if err := jobcodec.CheckGiveBack(f); err != nil {
+		if err := jobcodec.CheckFinalize(f); err != nil {
 			return nil, err
 		}
 		ids[i], attemptedBy[i], fences[i], states[i] = f.ID, f.AttemptedBy, f.Fence, string(f.State)

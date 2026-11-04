@@ -174,7 +174,7 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
-	for round := range 32 {
+	for round := range 40 {
 		id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 		owner := register(ctx, t, exec)
 		if jobs := claim(ctx, t, exec, owner, 1); len(jobs) != 1 || jobs[0].ID != id {

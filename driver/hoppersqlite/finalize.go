@@ -221,13 +221,7 @@ type result struct {
 func encodeResults(jobs []driver.JobFinalize) ([]result, error) {
 	out := make([]result, len(jobs))
 	for i, f := range jobs {
-		switch f.State {
-		case driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded,
-			driver.JobStateRetryable, driver.JobStateScheduled:
-		default:
-			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
-		}
-		if err := jobcodec.CheckGiveBack(f); err != nil {
+		if err := jobcodec.CheckFinalize(f); err != nil {
 			return nil, err
 		}
 		r := result{JobFinalize: f, err: f.Error, reason: nullable(jobcodec.StorableText(f.SnoozeReason))}

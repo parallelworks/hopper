@@ -70,7 +70,9 @@ func testJobGiveBack[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	run(driver.JobFinalize{State: driver.JobStateRetryable, GiveBack: true, Error: stopped, Log: logOf(again)})
 	check("after a second interrupted run", 2, interrupted, again)
 	run(driver.JobFinalize{State: driver.JobStateScheduled, Snooze: true, Log: logOf(snoozed)})
-	run(driver.JobFinalize{State: driver.JobStateScheduled, GiveBack: true})
+	// A job reports a snooze reason only while scheduled, so it is this
+	// give-back's reason that shows whether one is stored.
+	run(driver.JobFinalize{State: driver.JobStateScheduled, GiveBack: true, SnoozeReason: "not a snooze"})
 	check("after a give-back that logged nothing", 2, interrupted, again, snoozed)
 
 	j := claimNext()
