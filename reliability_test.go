@@ -1186,14 +1186,17 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	}
 	tun := fastTuning
 	tun.Maintenance = 100 * time.Millisecond
-	// While the repair's attach waits for the reader, up to its lock timeout
-	// (2s from the fifth pass), the leader loop's prune of the tags' DEFAULT
-	// partition, which reads every history partition, queues behind it. With
-	// fastTuning's 2s lease that wait can outlast the leader's lease, whose
-	// lapse ends the term (§7.8) and with it the index loop and its count of
-	// deferred passes, so the count would start over before reaching five.
-	// The lease outlasts the longest lock wait here, as the default 15s
-	// lease does.
+	// While the repair's attach waits for the reader, for up to its lock
+	// timeout (doubling from 0.2s to 2s on the fifth pass), the leader loop's
+	// prunes of the two tags tables' DEFAULT partitions, which read every
+	// history partition, queue behind it. At this maintenance interval they
+	// run on every leader pass, and the index loop retries its attach as soon
+	// as the last one times out, so a pass's two prunes can wait out two
+	// attaches in a row: 0.8 and then 1.6 seconds before the fifth pass, past
+	// fastTuning's 2s lease. The lapse ends the term (docs/PLAN.md §7.8) and
+	// with it the index loop and its count of deferred passes, which would
+	// start over before reaching five. The lease outlasts two of the longest
+	// waits, as the default 15s lease does.
 	tun.LeaderTTL = 10 * time.Second
 	c.SetTuning(tun)
 	if err := c.Start(ctx); err != nil {
