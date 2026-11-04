@@ -2782,32 +2782,33 @@ observability without new machinery.
     finalizer runs it on the batches of a flush once the flush has committed, waiting
     for a batch row another settle holds, so of the two the one settling second sees
     the other's progress and completes the batch.
-    The wait is bounded (`lock_timeout` 500 ms, below `deadlock_timeout`, so a settle that
-    would deadlock with a finalize completing several batches gives up before the deadlock
-    is detected; against a leader's finalize under the same bound (§7.8), whichever
-    waited first gives up, and the leader tries its finalize again on its next pass). A
-    settle that cannot get a batch row settles none of the batches it names and returns
-    `driver.ErrRowsHeld`. The finalizer keeps those batches and settles them again beside
-    its loop, so that waiting for a held row never holds up a flush. Each has a delay of
-    its own, first the flush interval and then doubling while its row stays held, and a
-    retry settles each batch in a statement of its own, so that only the batches whose
-    rows are held keep waiting, and waiting for one holds no other batch's row. A batch whose settle gives up again while a
-    retry of it is in flight is kept, even if that retry settles it, since the retry may
-    have missed the progress the second settle was for. When the client stops, the
-    finalizer cuts short a retry in flight and makes one last attempt at every batch it
-    holds, within 2 s, before it exits. A workflow
-    whose last jobs finished in concurrent statements so completes at the client's next
-    attempt once the row is free rather than on the leader's next pass, and a cluster
-    stopped right after its last jobs finished leaves one open only if the stop's attempt
-    gives up too. Once a batch's next delay would
+    The wait is bounded (`lock_timeout` 500 ms, below `deadlock_timeout`, so a settle
+    that would deadlock with a finalize completing several batches gives up before the
+    deadlock is detected; against a leader's finalize under the same bound (§7.8),
+    whichever waited first gives up, and the leader tries its finalize again on its next
+    pass). A settle that cannot get a batch row, or whose wait the deadlock detector
+    ends first where `deadlock_timeout` is set below the bound, settles none of the
+    batches it names and returns `driver.ErrRowsHeld`. The finalizer keeps those batches
+    and settles them again beside its loop, so that waiting for a held row never holds
+    up a flush. Each has a delay of its own, first the flush interval and then doubling
+    while its row stays held, and a retry settles each batch in a statement of its own,
+    so that only the batches whose rows are held keep waiting, and waiting for one holds
+    no other batch's row. A batch whose settle gives up again while a retry of it is in
+    flight is kept, even if that retry settles it, since the retry may have missed the
+    progress the second settle was for. When the client stops, the finalizer cuts short
+    a retry in flight and makes one last attempt at every batch it holds, within 2 s,
+    before it exits. A workflow whose last jobs finished in concurrent statements so
+    completes at the client's next attempt once the row is free rather than on the
+    leader's next pass, and a cluster stopped right after its last jobs finished leaves
+    one open only if the stop's attempt gives up too. Once a batch's next delay would
     pass a leader interval, or the stop's attempt gives up too, the batches are left to
     the leader, as are those of a `Leases.Finish` or a batch insert whose settle gave
     up; on every pass it sweeps batches with progress rows in ID order (`SKIP LOCKED`,
     resuming where a pass stopped) and deletes progress rows whose batch no longer
     exists. The sweep covers a client that stopped between commit and settle, and
-    results the leader itself applies (rescue). Settling after every flush keeps the progress table to the
-    flushes in flight. An uncommitted progress row is invisible to a settle and
-    stays until it commits.
+    results the leader itself applies (rescue). Settling after every flush keeps the
+    progress table to the flushes in flight. An uncommitted progress row is invisible to
+    a settle and stays until it commits.
   - **Jobs outside batches.** A flush whose jobs all have no batch (and therefore no
     workflow dependents) sets `JobFinalizeParams.NoBatches`, and the engine runs a
     finalize without the batch and dependency steps, which roughly halves the cost of

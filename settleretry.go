@@ -135,7 +135,8 @@ func (r *settleRetrier) nextDue() (time.Time, bool) {
 // one. A batch whose row is still held is tried again later, its delay
 // doubled; once that would pass maxDelay, or when final, it is left to the
 // leader's sweep. A batch a settle gave up on again during the attempt is
-// tried again after the flush interval, even if the attempt settled it. A
+// tried again after the flush interval, whether the attempt settled it or
+// found its row still held. A
 // non-final attempt runs on ctx, and leaves the batches it did not settle
 // before ctx was done as they are, for the final one.
 func (r *settleRetrier) attempt(ctx context.Context, final bool) {
@@ -160,10 +161,7 @@ func (r *settleRetrier) attempt(ctx context.Context, final bool) {
 	if final {
 		parent, cancel = context.WithTimeout(context.WithoutCancel(ctx), stopSettleTimeout)
 	}
-	still := map[driver.JobID]bool{}
-	for _, id := range r.settle(ctx, parent, ids) {
-		still[id] = true
-	}
+	still := r.settle(parent, ids)
 	stopped := !final && ctx.Err() != nil
 	cancel()
 	now = time.Now()
@@ -175,7 +173,7 @@ func (r *settleRetrier) attempt(ctx context.Context, final bool) {
 		case final:
 		case still[id] && stopped:
 			continue
-		case !still[id] && h.again:
+		case h.again:
 			r.held[id] = heldBatch{delay: r.first, due: now.Add(r.first)}
 			continue
 		case still[id] && h.delay*2 <= r.maxDelay:
@@ -197,19 +195,21 @@ func (r *settleRetrier) attempt(ctx context.Context, final bool) {
 
 // settle settles each of ids in a statement of its own, so that waiting
 // for a held row holds no other batch's row, and returns those whose rows
-// are still held. Once parent is done, the rest, and one whose settle it
-// cut short, are returned as they are.
-func (r *settleRetrier) settle(ctx, parent context.Context, ids []driver.JobID) (still []driver.JobID) {
-	for i, id := range ids {
-		if parent.Err() != nil {
-			return append(still, ids[i:]...)
+// are still held. Once ctx is done, the rest, and one whose settle it cut
+// short, are returned as they are.
+func (r *settleRetrier) settle(ctx context.Context, ids []driver.JobID) (still map[driver.JobID]bool) {
+	still = make(map[driver.JobID]bool)
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			still[id] = true
+			continue
 		}
-		opCtx, cancel := context.WithTimeout(parent, flushTimeout)
+		opCtx, cancel := context.WithTimeout(ctx, flushTimeout)
 		_, err := r.exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: []driver.JobID{id}})
 		cancel()
 		switch {
-		case errors.Is(err, driver.ErrRowsHeld), err != nil && parent.Err() != nil:
-			still = append(still, id)
+		case errors.Is(err, driver.ErrRowsHeld), err != nil && ctx.Err() != nil:
+			still[id] = true
 		case err != nil:
 			r.logger.WarnContext(ctx, "hopper: settle batch; the leader will", "batch_id", id, "error", err)
 		}

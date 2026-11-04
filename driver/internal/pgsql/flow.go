@@ -292,6 +292,12 @@ func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 		res.Last = last.ID
 		return res, err
 	})
+	if !e.InTx && deadlocked(err) {
+		// A deadlock_timeout set below heldLockTimeout lets the deadlock
+		// detector end the wait first; the settle rolled back, as one that
+		// gave up does, and is as much worth settling again.
+		err = driver.ErrRowsHeld
+	}
 	if err != nil {
 		return driver.BatchSettleResult{}, fmt.Errorf("hopper: settle batches: %w", err)
 	}

@@ -904,28 +904,48 @@ func TestSettleRetrierKeepsEachHeldBatchOnce(t *testing.T) {
 }
 
 // A batch whose settle gives up again while an attempt at it is in flight
-// is kept even when that attempt settles it: the attempt's statement may
-// have begun before the progress the second settle was for committed.
+// is kept, due after the flush interval, whether that attempt settles it
+// (its statement may have begun before the progress the second settle was
+// for committed) or finds its row still held when its backoff has run out.
 func TestSettleRetrierKeepsABatchHeldAgainDuringItsAttempt(t *testing.T) {
-	x := driver.JobID{1}
-	settling, release := make(chan struct{}), make(chan struct{})
-	// The follow-up's settle is recorded first, so that the attempt's waits.
-	exec := &settleExec{settles: [][]driver.JobID{{x}}, wait: func() { close(settling); <-release }}
-	r := newSettleRetrier(exec, slog.New(slog.DiscardHandler), time.Millisecond, time.Hour)
-	r.add([]driver.JobID{x})
-	r.mu.Lock()
-	r.held[x] = heldBatch{delay: 4 * time.Millisecond, due: time.Now()}
-	r.mu.Unlock()
-	done := make(chan struct{})
-	go func() { defer close(done); r.attempt(context.Background(), false) }()
-	<-settling
-	r.add([]driver.JobID{x})
-	close(release)
-	<-done
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if h, ok := r.held[x]; !ok || h.delay != time.Millisecond || h.again {
-		t.Errorf("batch held again during its attempt = %+v, %t; want it kept, due after the flush interval", h, ok)
+	for _, stillHeld := range []bool{false, true} {
+		x := driver.JobID{1}
+		settling, release := make(chan struct{}), make(chan struct{})
+		// The follow-up's settle is recorded first, so that the attempt's waits.
+		exec := &settleExec{settles: [][]driver.JobID{{x}}, wait: func() { close(settling); <-release }}
+		if stillHeld {
+			exec.holds = func([]driver.JobID) bool { return true }
+		}
+		// The attempt's doubled delay would pass maxDelay.
+		r := newSettleRetrier(exec, slog.New(slog.DiscardHandler), time.Millisecond, 4*time.Millisecond)
+		r.add([]driver.JobID{x})
+		r.mu.Lock()
+		r.held[x] = heldBatch{delay: 4 * time.Millisecond, due: time.Now()}
+		r.mu.Unlock()
+		// Bounded, and released on the way out, so that a regression fails
+		// the test rather than hanging it.
+		releaseOnce := sync.OnceFunc(func() { close(release) })
+		done := make(chan struct{})
+		go func() { defer close(done); r.attempt(context.Background(), false) }()
+		select {
+		case <-settling:
+		case <-time.After(5 * time.Second):
+			releaseOnce()
+			t.Fatal("the attempt did not settle the batch")
+		}
+		r.add([]driver.JobID{x})
+		releaseOnce()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the attempt did not return")
+		}
+		r.mu.Lock()
+		h, ok := r.held[x]
+		r.mu.Unlock()
+		if !ok || h.delay != time.Millisecond || h.again {
+			t.Errorf("still held %t: batch held again during its attempt = %+v, %t; want it kept, due after the flush interval", stillHeld, h, ok)
+		}
 	}
 }
 
@@ -952,6 +972,9 @@ func TestFinalizerStopCutsShortASettleRetry(t *testing.T) {
 		exec := &settleUntilDone{}
 		tun := tuning{finalizeInterval: time.Millisecond, finalizeBatch: 1, finalizeBuffer: 4, leaderInterval: time.Hour}
 		f, stop := newTestFinalizer(exec, tun, nil)
+		// A failure before the stop below must not leave the finalizer
+		// blocked in the bubble; stopping twice is harmless.
+		defer stop()
 		f.submit(batchResult(1, driver.JobID{9}))
 		time.Sleep(10 * time.Millisecond)
 		synctest.Wait()
