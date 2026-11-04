@@ -220,20 +220,22 @@ finished AS (
 	"CASE WHEN j.cancel_requested_at IS NOT NULL THEN 'canceled' ELSE 'discarded' END", "$2") + `
 ),
 ` + finalizeTailSQL("$2", "$3") + `
-SELECT ` + finishedSelectColumns + ` FROM finished
+SELECT ` + finishedSelectColumns + `, false FROM finished
 UNION ALL
-SELECT ` + strings.Replace(JobColumns(""), ", state,", ", state::text,", 1) + `, NULL::timestamptz, NULL::jsonb FROM retry`
+SELECT ` + strings.Replace(JobColumns(""), ", state,", ", state::text,", 1) + `, NULL::timestamptz, NULL::jsonb, false FROM retry
+UNION ALL
+SELECT ` + finishedSelectColumns + `, true FROM cascaded`
 
 // JobExpireLeases implements driver.Executor. It waits only briefly for
 // rows another transaction holds (briefly), expiring nothing, with
 // driver.ErrRowsHeld, if it has to.
-func (e *Executor) JobExpireLeases(ctx context.Context, params driver.JobExpireLeasesParams) ([]*driver.JobRow, error) {
-	jobs, err := briefly(ctx, e, func(c Conn) ([]*driver.JobRow, error) {
-		return historyJobs(c.Query(ctx, jobExpireLeasesSQL, max(params.Limit, 1), driver.ChannelDone, driver.ChannelInsert,
+func (e *Executor) JobExpireLeases(ctx context.Context, params driver.JobExpireLeasesParams) ([]*driver.JobRow, []driver.JobID, error) {
+	out, err := briefly(ctx, e, func(c Conn) (ended, error) {
+		return endedJobs(c.Query(ctx, jobExpireLeasesSQL, max(params.Limit, 1), driver.ChannelDone, driver.ChannelInsert,
 			params.ClientID, max(params.Grace, 0).Seconds()))
 	})
 	if err != nil {
-		return nil, fmt.Errorf("hopper: expire job leases: %w", err)
+		return nil, nil, fmt.Errorf("hopper: expire job leases: %w", err)
 	}
-	return jobs, nil
+	return out.jobs, out.cascaded, nil
 }

@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"cmp"
+	"context"
 	"time"
 )
 
@@ -101,3 +102,10 @@ var DefaultBackoff = defaultBackoff
 // FenceTo moves the client to another client ID as a fence's
 // re-registration does, without the loops noticing yet.
 func (c *Client[TTx]) FenceTo(id int64) { c.clientID.Store(id) }
+
+// ExpireJobs runs the leader's expiry of job leases and of TTLs once,
+// whether or not the client leads.
+func (c *Client[TTx]) ExpireJobs(ctx context.Context) {
+	c.expireJobLeases(ctx)
+	c.expire(ctx)
+}

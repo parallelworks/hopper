@@ -883,8 +883,9 @@ func (e *executor) JobRetryOrderingKey(ctx context.Context, params driver.JobRet
 }
 
 // JobDiscardExpired implements driver.Executor.
-func (e *executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.JobRow, error) {
+func (e *executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.JobRow, []driver.JobID, error) {
 	var jobs []*driver.JobRow
+	var cascaded []driver.JobID
 	err := e.write(ctx, func(x *w) error {
 		jobs = jobs[:0]
 		rows, err := queryAll(ctx, x, scanLive, `SELECT `+liveRowColumns+` FROM hopper_jobs
@@ -910,13 +911,13 @@ func (e *executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 			}
 			jobs = append(jobs, job)
 		}
-		_, err = x.tail(ctx, done)
+		cascaded, err = x.tailCascaded(ctx, done)
 		return err
 	})
 	if err != nil {
-		return nil, fmt.Errorf("hopper: discard expired jobs: %w", err)
+		return nil, nil, fmt.Errorf("hopper: discard expired jobs: %w", err)
 	}
-	return jobs, nil
+	return jobs, cascaded, nil
 }
 
 // JobRescueCandidates implements driver.Executor: running jobs whose

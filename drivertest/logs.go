@@ -120,7 +120,7 @@ func testJobLogs[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	// An expired job takes its logs to history too.
 	run(other, driver.JobFinalize{State: driver.JobStateRetryable, Error: &driver.AttemptError{Attempt: 1, Error: "x"}, Log: &a1}, 2, false)
 	f.ExpireJob(ctx, t, d, other)
-	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 1 || expired[0].ID != other {
+	if expired, _, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 1 || expired[0].ID != other {
 		t.Fatalf("expired = %v, %v", expired, err)
 	}
 	check("expired", logs(other), a1)
