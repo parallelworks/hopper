@@ -225,7 +225,7 @@ func TestLeaderExpiryFollowsUpWorkflows(t *testing.T) {
 			remote := &hopper.InsertOpts{Queue: remoteQueue, MaxAttempts: 1}
 			first := &hopper.StepOpts{Insert: remote}
 			if how == "ttl" {
-				first = &hopper.StepOpts{Insert: &hopper.InsertOpts{Queue: remoteQueue, TTL: 50 * time.Millisecond}}
+				first = &hopper.StepOpts{Insert: &hopper.InsertOpts{Queue: remoteQueue, TTL: time.Hour}}
 			}
 			wf := hopper.NewWorkflow("expired", nil)
 			s0 := wf.Add(remoteJob{N: 0}, first)
@@ -243,8 +243,8 @@ func TestLeaderExpiryFollowsUpWorkflows(t *testing.T) {
 				if _, err := h.pool.Exec(ctx, `UPDATE hopper_job_leases SET expires_at = now() - interval '1 second'`); err != nil {
 					t.Fatal(err)
 				}
-			} else {
-				time.Sleep(100 * time.Millisecond)
+			} else if _, err := h.pool.Exec(ctx, `UPDATE hopper_jobs SET expires_at = now() - interval '1 second' WHERE id = $1`, res.Jobs[0].Job.ID); err != nil {
+				t.Fatal(err)
 			}
 			c.ExpireJobs(ctx)
 			for i, want := range []hopper.JobState{hopper.JobStateDiscarded, hopper.JobStateCanceled, hopper.JobStateCanceled, hopper.JobStateAvailable} {
@@ -263,12 +263,14 @@ func TestLeaderExpiryFollowsUpWorkflows(t *testing.T) {
 }
 
 // TestLeaderExpiryRacesFinish ends two steps of a workflow at once, one by
-// the leader's expiry of its job lease and one by a lease's Finish, so
-// that each statement may see the other step live and leave the workflow
-// to the follow-ups: in even rounds the steps are an any-of group, which
-// they exhaust, and in odd rounds the workflow's last steps, which
-// complete it. Whichever follows up second cancels the dependent and
-// completes the workflow, with no sweep: no client leads.
+// the leader's expiry, of its job lease or of its TTL, and one by a
+// lease's Finish, so that each statement may see the other step live and
+// leave the workflow to the follow-ups: in even rounds the steps are an
+// any-of group, which they exhaust, and in odd rounds the workflow's last
+// steps, which complete it; every other pair of rounds expires the first
+// step's TTL rather than its lease. Whichever follows up second cancels
+// the dependent and completes the workflow, with no sweep: no client
+// leads.
 func TestLeaderExpiryRacesFinish(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
@@ -278,9 +280,14 @@ func TestLeaderExpiryRacesFinish(t *testing.T) {
 	}
 	c := leaseClient(h, &hopper.Config{})
 	remote := &hopper.InsertOpts{Queue: remoteQueue, MaxAttempts: 1}
-	for round := range 40 {
+	for round := range 200 {
+		ttl := round/2%2 == 1
+		first := remote
+		if ttl {
+			first = &hopper.InsertOpts{Queue: remoteQueue, MaxAttempts: 1, TTL: time.Hour}
+		}
 		wf := hopper.NewWorkflow("race", nil)
-		s0 := wf.Add(remoteJob{N: 0}, &hopper.StepOpts{Insert: remote})
+		s0 := wf.Add(remoteJob{N: 0}, &hopper.StepOpts{Insert: first})
 		s1 := wf.Add(remoteJob{N: 1}, &hopper.StepOpts{Insert: remote})
 		want := []hopper.JobState{hopper.JobStateDiscarded, hopper.JobStateDiscarded}
 		if round%2 == 0 {
@@ -291,14 +298,18 @@ func TestLeaderExpiryRacesFinish(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.Leases().Claim(ctx, res.Jobs[0].Job.ID, 0, nil); err != nil {
-			t.Fatal(err)
+		expire := `UPDATE hopper_jobs SET expires_at = now() - interval '1 second' WHERE id = $1`
+		if !ttl {
+			if _, err := c.Leases().Claim(ctx, res.Jobs[0].Job.ID, 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			expire = `UPDATE hopper_job_leases SET expires_at = now() - interval '1 second' WHERE id = $1`
 		}
 		l1, err := c.Leases().Claim(ctx, res.Jobs[1].Job.ID, 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := h.pool.Exec(ctx, `UPDATE hopper_job_leases SET expires_at = now() - interval '1 second' WHERE id = $1`, res.Jobs[0].Job.ID); err != nil {
+		if _, err := h.pool.Exec(ctx, expire, res.Jobs[0].Job.ID); err != nil {
 			t.Fatal(err)
 		}
 		finished := make(chan error, 1)

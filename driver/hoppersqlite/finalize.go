@@ -364,8 +364,8 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 	return applied, nil
 }
 
-// tailCascaded is tail for the statements that return the dependents it
-// canceled by ID (JobDiscardExpired, JobExpireLeases).
+// tailCascaded is tail returning the IDs of the dependents it canceled by
+// cascade, for the leader's follow-up (JobDiscardExpired, JobExpireLeases).
 func (x *w) tailCascaded(ctx context.Context, done []finished) ([]driver.JobID, error) {
 	all, err := x.tail(ctx, done)
 	if err != nil {

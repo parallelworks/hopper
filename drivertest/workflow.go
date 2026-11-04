@@ -809,7 +809,7 @@ func testWorkflowExpiryCascaded[TTx any](t *testing.T, f Fixture[TTx]) {
 			exec := d.Executor()
 			jobs := params("step", 3)
 			if duty == "discard expired" {
-				jobs[0].TTL = 50 * time.Millisecond
+				jobs[0].TTL = time.Hour
 			} else {
 				jobs[0].MaxAttempts = 1
 			}
@@ -824,7 +824,7 @@ func testWorkflowExpiryCascaded[TTx any](t *testing.T, f Fixture[TTx]) {
 			var ended []*driver.JobRow
 			var cascaded []driver.JobID
 			if duty == "discard expired" {
-				time.Sleep(100 * time.Millisecond)
+				f.ExpireJob(ctx, t, d, first)
 				ended, cascaded, err = exec.JobDiscardExpired(ctx, 10)
 			} else {
 				expirerID := expirer(ctx, t, f, d)

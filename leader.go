@@ -451,6 +451,9 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 // own dependents can wait on a group the cascade exhausted; without it,
 // they wait for the leader's sweeps.
 func (c *Client[TTx]) followUpEnded(ctx context.Context, jobs []*JobRow, cascaded []JobID) {
+	if len(jobs) == 0 {
+		return
+	}
 	seen := map[JobID]struct{}{}
 	var batches, ended []JobID
 	for _, j := range jobs {
