@@ -638,21 +638,21 @@ func claimRows(ctx context.Context, conn Conn, query string, args ...any) ([]*dr
 var jobFinalizeHeadSQL = `
 WITH RECURSIVE r AS (
   SELECT * FROM unnest(
-    $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::boolean[], $6::jsonb[], $7::jsonb[], $8::boolean[], $11::text[],
+    $1::uuid[], $2::bigint[], $3::text[], $4::float8[], $5::bigint[], $6::jsonb[], $7::jsonb[], $8::boolean[], $11::text[],
     $12::jsonb[], $14::bigint[]
-  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason, log, fence)
+  ) AS r(id, attempted_by, state, delay, give_back, error, output, archive, snooze_reason, log, fence)
 ),
 retry AS (
   UPDATE {{schema}}.hopper_jobs j
   SET state = r.state::{{schema}}.hopper_job_state,
       scheduled_at = CASE WHEN coalesce(j.wake_requested_at >= j.attempted_at, false) THEN now()
                           ELSE now() + make_interval(secs => r.delay) END,
-      attempt = CASE WHEN r.snooze THEN j.attempt - 1 ELSE j.attempt END,
+      attempt = CASE WHEN r.give_back > 0 THEN j.attempt - 1 ELSE j.attempt END,
       errors = CASE WHEN r.error IS NULL THEN j.errors
                     ELSE j.errors || jsonb_set(r.error, '{at}', to_jsonb(now())) END,
       logs = ` + appendLogSQL + `,
       attempted_by = NULL,
-      snooze_reason = CASE WHEN r.snooze AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false)
+      snooze_reason = CASE WHEN r.give_back = 1 AND NOT coalesce(j.wake_requested_at >= j.attempted_at, false)
                            THEN r.snooze_reason END,
       wake_requested_at = NULL
   FROM r
@@ -679,20 +679,36 @@ var jobFinalizeSQL = jobFinalizeHeadSQL + finalizeTailSQL("$9", "$10") + `
 SELECT id, fence, false FROM retry UNION ALL SELECT id, fence, false FROM finished
 UNION ALL SELECT id, 0::bigint, true FROM cascaded`
 
+// giveBack is how result f gives its attempt back, for the finalize
+// statement: 0 not at all, 1 as a snooze, 2 as an interruption
+// (JobFinalize.GiveBack), which is not a snooze to the job's logs or its
+// snooze reason.
+func giveBack(f driver.JobFinalize) int64 {
+	switch {
+	case f.Snooze:
+		return 1
+	case f.GiveBack:
+		return 2
+	}
+	return 0
+}
+
 // appendLogSQL appends an attempt's log, if it has one, to its job's logs,
 // keeping the latest $13. A snooze gives its attempt back, so a job that
 // snoozes again and again would fill its logs with them: a snooze's log,
 // or its lack of one, replaces the log of the previous snooze of the same
-// attempt number. The SET reads j.attempt before the snooze gives it back.
+// attempt number; an interrupted attempt given back (give_back 2) is not a
+// snooze, and its log is appended as an attempt's is. The SET reads
+// j.attempt before the snooze gives it back.
 // A job whose logs do not change keeps its stored value, which is not
 // rewritten: one with no logs keeps NULL (jsonb_path_exists of NULL is
 // NULL, which would otherwise take the ELSE branch), and one whose last
 // entry is removed goes back to NULL.
 const appendLogSQL = `CASE
-         WHEN r.log IS NULL AND NOT (r.snooze AND coalesce(jsonb_path_exists(j.logs, '$[*] ? (exists(@.snoozed) && @.attempt == $a)',
+         WHEN r.log IS NULL AND NOT (r.give_back = 1 AND coalesce(jsonb_path_exists(j.logs, '$[*] ? (exists(@.snoozed) && @.attempt == $a)',
            jsonb_build_object('a', j.attempt)), false)) THEN j.logs
          ELSE nullif(jsonb_path_query_array(
-           CASE WHEN r.snooze
+           CASE WHEN r.give_back = 1
                 THEN jsonb_path_query_array(coalesce(j.logs, '[]'), '$[*] ? (!exists(@.snoozed) || @.attempt != $a)',
                        jsonb_build_object('a', j.attempt))
                 ELSE coalesce(j.logs, '[]') END || CASE WHEN r.log IS NULL THEN '[]' ELSE jsonb_build_array(r.log) END,
@@ -707,7 +723,7 @@ SELECT id, fence, false FROM retry UNION ALL SELECT id, fence, false FROM finish
 // skipLockedSQL makes a finalize statement skip the jobs whose rows another
 // transaction holds (driver.JobFinalizeParams.SkipLocked).
 func skipLockedSQL(query string) string {
-	const unnested = "  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason, log, fence)\n"
+	const unnested = "  ) AS r(id, attempted_by, state, delay, give_back, error, output, archive, snooze_reason, log, fence)\n"
 	if !strings.Contains(query, unnested) {
 		panic("pgsql: finalize statement has no unnested results")
 	}
@@ -732,8 +748,8 @@ var leaseFinalizeHeadSQL = func() string {
 		n        int
 	}{
 		{
-			"$12::jsonb[], $14::bigint[]\n  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason, log, fence)",
-			"$12::jsonb[], $14::bigint[], $15::uuid[]\n  ) AS r(id, attempted_by, state, delay, snooze, error, output, archive, snooze_reason, log, fence, token)", 1,
+			"$12::jsonb[], $14::bigint[]\n  ) AS r(id, attempted_by, state, delay, give_back, error, output, archive, snooze_reason, log, fence)",
+			"$12::jsonb[], $14::bigint[], $15::uuid[]\n  ) AS r(id, attempted_by, state, delay, give_back, error, output, archive, snooze_reason, log, fence, token)", 1,
 		},
 		{
 			"j.attempted_by = r.attempted_by AND j.fence = r.fence",
@@ -773,7 +789,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		fences      = make([]int64, n)
 		states      = make([]string, n)
 		delays      = make([]float64, n)
-		snoozes     = make([]bool, n)
+		giveBacks   = make([]int64, n)
 		reasons     = make([]string, n)
 		errs        = make([][]byte, n)
 		outputs     = make([][]byte, n)
@@ -795,14 +811,11 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		if leased {
 			tokens[i], f.Fence = f.Lease.Token, f.Lease.Fence
 		}
-		switch f.State {
-		case driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded,
-			driver.JobStateRetryable, driver.JobStateScheduled:
-		default:
-			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
+		if err := jobcodec.CheckFinalize(f); err != nil {
+			return nil, err
 		}
 		ids[i], attemptedBy[i], fences[i], states[i] = f.ID, f.AttemptedBy, f.Fence, string(f.State)
-		delays[i], snoozes[i], reasons[i] = max(f.Delay, 0).Seconds(), f.Snooze, jobcodec.StorableText(f.SnoozeReason)
+		delays[i], giveBacks[i], reasons[i] = max(f.Delay, 0).Seconds(), giveBack(f), jobcodec.StorableText(f.SnoozeReason)
 		if f.Error != nil {
 			b, err := jobcodec.MarshalAttemptError(f.Error)
 			if err != nil {
@@ -821,7 +834,7 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		logs[i] = b
 	}
 	args := []any{
-		uuidArray(ids), int64Array(attemptedBy), textArray(states), floatArray(delays), boolArray(snoozes),
+		uuidArray(ids), int64Array(attemptedBy), textArray(states), floatArray(delays), int64Array(giveBacks),
 		jsonArray(errs), jsonArray(outputs), boolArray(archives), driver.ChannelDone, driver.ChannelInsert,
 		nullableTextArray(reasons), jsonArray(logs), keepLogs(params.KeepLogs), int64Array(fences),
 	}

@@ -143,10 +143,10 @@ func TestCLI(t *testing.T) {
 		t.Errorf("jobs get with progress = %q", got)
 	}
 	// A log written by hand may not end in a newline.
-	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET logs = '[{"attempt": 1, "log": "level=INFO msg=one\nlevel=WARN msg=two\n"}, {"attempt": 2, "log": "no newline"}]' WHERE id = $1::uuid`, id); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE hopper_jobs SET logs = '[{"attempt": 1, "interrupted": true, "log": "cut\n"}, {"attempt": 1, "snoozed": true, "log": "nap\n"}, {"attempt": 1, "log": "level=INFO msg=one\nlevel=WARN msg=two\n"}, {"attempt": 2, "log": "no newline"}]' WHERE id = $1::uuid`, id); err != nil {
 		t.Fatal(err)
 	}
-	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "log #1:\n  level=INFO msg=one\n  level=WARN msg=two\nlog #2:\n  no newline\n") {
+	if got := hopperCmd("jobs", "get", id); !strings.Contains(got, "log #1 (interrupted):\n  cut\nlog #1 (snoozed):\n  nap\nlog #1:\n  level=INFO msg=one\n  level=WARN msg=two\nlog #2:\n  no newline\n") {
 		t.Errorf("jobs get with logs = %q", got)
 	}
 	// A job whose logs cannot be read, here without a logs column, is still

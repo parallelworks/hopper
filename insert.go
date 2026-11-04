@@ -282,10 +282,11 @@ func (c *Client[TTx]) JobGet(ctx context.Context, id JobID) (*JobRow, error) {
 // store or from clients without it, come first, then the store's, in
 // attempt order. A store log that a later one of the same attempt number
 // follows, or whose number is past the job's, was a snooze, which gave its
-// attempt back; as in the row, only the latest snooze of each attempt
-// number is returned, and only the latest JobLogs.MaxAttempts logs. A job
-// that is gone yields the store's logs of it, if it has any. If the store
-// fails, the row's logs are returned with the error.
+// attempt back (a store keeps no outcome, so a run the client's stop
+// interrupted reads as one too); as in the row, only the latest snooze of
+// each attempt number is returned, and only the latest JobLogs.MaxAttempts
+// logs. A job that is gone yields the store's logs of it, if it has any. If
+// the store fails, the row's logs are returned with the error.
 func (c *Client[TTx]) JobLogs(ctx context.Context, id JobID) ([]AttemptLog, error) {
 	s := c.cfg.JobLogs.Store
 	if s == nil {

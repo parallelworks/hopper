@@ -87,9 +87,11 @@ type JobLogsConfig struct {
 	// MaxAttempts is how many attempts' logs a job keeps, the latest. Each
 	// snooze keeps its own until the next snooze of the same attempt
 	// number, which replaces it, or removes it if that snooze logged
-	// nothing. A store keeps what it is given: a snooze that logs nothing
-	// writes nothing to it, so it removes only a snooze's log that the
-	// job's row holds. Defaults to 10, and is at most 100.
+	// nothing. Each run a stop interrupted keeps its own as an attempt
+	// does, so a job interrupted again and again can push the logs of its
+	// earlier attempts out. A store keeps what it is given: a snooze that
+	// logs nothing writes nothing to it, so it removes only a snooze's log
+	// that the job's row holds. Defaults to 10, and is at most 100.
 	MaxAttempts int
 	// Level is the lowest level kept. Defaults to slog.LevelInfo. Lines
 	// go to Config.Logger at whatever level its handler takes.

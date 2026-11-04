@@ -654,6 +654,11 @@ type AttemptLog struct {
 	// back: the next attempt has the same number. A job keeps the log of
 	// only the latest snooze of each attempt number.
 	Snoozed bool `json:"snoozed,omitempty"`
+	// Interrupted reports that the client interrupted the attempt, as its
+	// stop does, and gave it back (JobFinalize.GiveBack): the next attempt
+	// has the same number. Every interrupted run's log is kept, as an
+	// attempt's is.
+	Interrupted bool `json:"interrupted,omitempty"`
 	// Log is the attempt's lines, each ending in a newline.
 	Log string `json:"log"`
 }
@@ -1196,6 +1201,13 @@ type JobFinalize struct {
 	// Snooze gives the attempt back, so the retry does not count against
 	// MaxAttempts.
 	Snooze bool
+	// GiveBack gives the attempt back as Snooze does, for an attempt the
+	// client interrupted, as its stop does, rather than one that snoozed:
+	// its Log is kept marked Interrupted, it removes no earlier log, and no
+	// SnoozeReason is stored. It is only for the retryable and scheduled
+	// states, without Snooze: an engine refuses a result that sets it with
+	// either.
+	GiveBack bool
 	// SnoozeReason is stored as the job's SnoozeReason when Snooze is set.
 	SnoozeReason string
 	// Error is appended to the job's errors. Its At field is set by the
@@ -1204,9 +1216,10 @@ type JobFinalize struct {
 	// Output is stored with the finalized job.
 	Output json.RawMessage
 	// Log is appended to the job's logs, if not nil and KeepsLog, with
-	// Snoozed set from Snooze. A snooze, with a Log or without one, first
-	// removes the log of the job's previous snooze of the same attempt
-	// number; a job whose logs that leaves unchanged keeps them as stored.
+	// Snoozed set from Snooze and Interrupted from GiveBack. A snooze, with
+	// a Log or without one, first removes the log of the job's previous
+	// snooze of the same attempt number, but not an interrupted one's; a
+	// job whose logs that leaves unchanged keeps them as stored.
 	Log *AttemptLog
 	// Archive controls whether a terminal job is written to history. Canceled
 	// and discarded jobs are always archived; completed jobs may skip it.

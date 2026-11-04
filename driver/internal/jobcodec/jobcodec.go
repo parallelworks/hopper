@@ -4,11 +4,13 @@
 // that a direct SQL write left in another form reads as what can be made of
 // it, rather than failing the read, so that one such row fails neither the
 // claim that takes it (whose update has committed by the time it is read)
-// nor a listing or the rescuer.
+// nor a listing or the rescuer. It also checks the results a finalize
+// writes, which every engine refuses alike (CheckFinalize).
 package jobcodec
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -38,14 +40,34 @@ func MarshalAttemptError(e *driver.AttemptError) ([]byte, error) {
 	}{e.Attempt, e.Fence, StorableText(e.Error), StorableText(e.Trace), string(e.Rescue)})
 }
 
+// CheckFinalize refuses a result no engine applies: one whose state is not
+// a finalize state, or that gives its attempt back as an interruption
+// (JobFinalize.GiveBack) and also snoozes, or finishes the job, which then
+// has no attempt to give back.
+func CheckFinalize(f driver.JobFinalize) error {
+	switch f.State {
+	case driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded,
+		driver.JobStateRetryable, driver.JobStateScheduled:
+	default:
+		return fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
+	}
+	switch {
+	case f.GiveBack && f.Snooze:
+		return errors.New("hopper: finalize jobs: a result both snoozes and gives its attempt back")
+	case f.GiveBack && f.State.Terminal():
+		return fmt.Errorf("hopper: finalize jobs: a %s result gives its attempt back", f.State)
+	}
+	return nil
+}
+
 // MarshalAttemptLog encodes the log a finalize appends for result f, which
-// a snooze marks Snoozed, its text made storable, or returns nil when there
-// is none to keep (JobFinalize.KeepsLog).
+// a snooze marks Snoozed and a give-back Interrupted, its text made
+// storable, or returns nil when there is none to keep (JobFinalize.KeepsLog).
 func MarshalAttemptLog(f driver.JobFinalize) ([]byte, error) {
 	if f.Log == nil || !f.KeepsLog() {
 		return nil, nil
 	}
-	return json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Log: StorableText(f.Log.Log)})
+	return json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Interrupted: f.GiveBack, Log: StorableText(f.Log.Log)})
 }
 
 // DecodeErrors reads a job's errors, a JSON array of error records. An

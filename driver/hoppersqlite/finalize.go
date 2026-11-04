@@ -163,8 +163,10 @@ func keepLogs(keep int) int {
 // stored, keeping the latest keep. A snooze gives its attempt back, so a job
 // that snoozes again and again would fill its logs with them: a snooze's
 // log, or its lack of one, replaces the log of the job's previous snooze of
-// the same attempt number, attempt. Logs that do not change are returned
-// as stored; none at all, as NULL.
+// the same attempt number, attempt. An interrupted attempt given back
+// (JobFinalize.GiveBack) is not a snooze: its log is appended as an
+// attempt's is. Logs that do not change are returned as stored; none at
+// all, as NULL.
 func appendLog(stored sql.NullString, attempt int, snooze bool, log []byte, keep int) (sql.NullString, error) {
 	var entries []json.RawMessage
 	if stored.Valid {
@@ -219,11 +221,8 @@ type result struct {
 func encodeResults(jobs []driver.JobFinalize) ([]result, error) {
 	out := make([]result, len(jobs))
 	for i, f := range jobs {
-		switch f.State {
-		case driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded,
-			driver.JobStateRetryable, driver.JobStateScheduled:
-		default:
-			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
+		if err := jobcodec.CheckFinalize(f); err != nil {
+			return nil, err
 		}
 		r := result{JobFinalize: f, err: f.Error, reason: nullable(jobcodec.StorableText(f.SnoozeReason))}
 		log, err := jobcodec.MarshalAttemptLog(f)
@@ -330,11 +329,11 @@ func (e *executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 			}
 			attempt := j.Attempt
 			var reason any
-			if r.Snooze {
+			if r.Snooze || r.GiveBack {
 				attempt--
-				if !woken {
-					reason = r.reason
-				}
+			}
+			if r.Snooze && !woken {
+				reason = r.reason
 			}
 			if _, err := x.ExecContext(ctx, `
 				UPDATE hopper_jobs SET state = ?, scheduled_at = ?, attempt = ?, errors = ?, logs = ?, attempted_by = NULL,

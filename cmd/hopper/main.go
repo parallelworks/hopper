@@ -372,11 +372,14 @@ func printJob(w io.Writer, j *hopper.JobRow, logs []hopper.AttemptLog, logsErr s
 		fmt.Fprintf(w, "logs:          unavailable: %s\n", logsErr)
 	}
 	for _, l := range logs {
-		snoozed := ""
-		if l.Snoozed {
-			snoozed = " (snoozed)"
+		label := ""
+		switch {
+		case l.Snoozed:
+			label = " (snoozed)"
+		case l.Interrupted:
+			label = " (interrupted)"
 		}
-		fmt.Fprintf(w, "log #%d%s:\n", l.Attempt, snoozed)
+		fmt.Fprintf(w, "log #%d%s:\n", l.Attempt, label)
 		for line := range strings.Lines(l.Log) {
 			fmt.Fprintf(w, "  %s", line)
 			if !strings.HasSuffix(line, "\n") {

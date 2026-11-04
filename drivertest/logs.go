@@ -166,24 +166,27 @@ func testJobLogsStored[TTx any](t *testing.T, f PostgresFixture[TTx], noBatches 
 
 // testJobLogsFenced finalizes a job from its attempt and, concurrently,
 // from clients that do not own it, such as one whose lease lapsed: only the
-// owner's log is appended, once, and only the owner's snooze that logged
-// nothing removes the log of the snooze before it.
+// owner's log is appended, once, only the owner's snooze that logged
+// nothing removes the log of the snooze before it, and only the owner's
+// interruption (JobFinalize.GiveBack) gives the attempt back, once, keeping
+// that snooze's log.
 func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
-	for round := range 30 {
+	for round := range 40 {
 		id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
 		owner := register(ctx, t, exec)
 		if jobs := claim(ctx, t, exec, owner, 1); len(jobs) != 1 || jobs[0].ID != id {
 			t.Fatal("claim")
 		}
-		state := []driver.JobState{driver.JobStateRetryable, driver.JobStateCompleted, driver.JobStateScheduled}[round%3]
+		state := []driver.JobState{driver.JobStateRetryable, driver.JobStateCompleted, driver.JobStateScheduled, driver.JobStateRetryable}[round%4]
 		snooze := state == driver.JobStateScheduled
-		if snooze {
+		giveBack := round%4 == 3
+		if snooze || giveBack {
 			log := driver.AttemptLog{Attempt: 1, Log: "first snooze\n"}
 			if ids, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{{
-				ID: id, AttemptedBy: owner, Fence: 1, State: state, Snooze: true, Log: &log,
+				ID: id, AttemptedBy: owner, Fence: 1, State: driver.JobStateScheduled, Snooze: true, Log: &log,
 			}}}); err != nil || len(ids) != 1 {
 				t.Fatalf("round %d: first snooze = %v, %v", round, ids, err)
 			}
@@ -193,7 +196,7 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 			}
 		}
 		fence := int64(1)
-		if snooze {
+		if snooze || giveBack {
 			fence = 2
 		}
 		const stale = 4
@@ -205,7 +208,7 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 				by = owner + int64(i)*1000
 			}
 			wg.Go(func() {
-				r := driver.JobFinalize{ID: id, AttemptedBy: by, Fence: fence, State: state, Delay: time.Hour, Snooze: snooze}
+				r := driver.JobFinalize{ID: id, AttemptedBy: by, Fence: fence, State: state, Delay: time.Hour, Snooze: snooze, GiveBack: giveBack}
 				if !snooze {
 					r.Archive, r.Error = true, &driver.AttemptError{Attempt: 1, Error: "x"}
 					r.Log = &driver.AttemptLog{Attempt: 1, Log: fmt.Sprintf("client %d\n", by)}
@@ -226,8 +229,14 @@ func testJobLogsFenced[TTx any](t *testing.T, f Fixture[TTx]) {
 			t.Fatal(err)
 		}
 		want := []driver.AttemptLog{{Attempt: 1, Log: fmt.Sprintf("client %d\n", owner)}}
-		if snooze {
+		switch {
+		case snooze:
 			want = nil
+		case giveBack:
+			want = []driver.AttemptLog{{Attempt: 1, Snoozed: true, Log: "first snooze\n"}, {Attempt: 1, Interrupted: true, Log: want[0].Log}}
+			if j := get(ctx, t, exec, id); j.Attempt != 0 || len(j.Errors) != 1 {
+				t.Fatalf("round %d: job at attempt %d with %d errors, want its attempt given back once, with one error", round, j.Attempt, len(j.Errors))
+			}
 		}
 		if !slices.Equal(got, want) {
 			t.Fatalf("round %d: logs %+v, want %+v", round, got, want)
