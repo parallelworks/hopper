@@ -379,8 +379,10 @@ func (b *bench) waitDrained(ctx context.Context) error {
 // waitBatchesCompleted waits, for at most drainStall, until no batch is
 // open, with the clients still running: a batch whose last jobs finished
 // in concurrent statements, and whose follow-up settle gave up on a held
-// batch row, completes on the leader's next pass, up to a leader interval
-// after the drain. The workflows check reports a batch still open.
+// batch row, completes on the leader's sweep, usually within a leader
+// interval of the drain (longer if a pass stopped partway and the next
+// resumes past it, or a new leader waits out the lease). The workflows
+// check reports a batch still open.
 func (b *bench) waitBatchesCompleted(ctx context.Context) error {
 	deadline := time.Now().Add(drainStall)
 	for {
