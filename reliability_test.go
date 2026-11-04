@@ -516,16 +516,28 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 					}
 				}
 			}
-			reader, err := h.pool.Begin(ctx)
-			if err != nil {
+			// The leader's index loop would build the time partition's index,
+			// which the test's table lacks, and that build would queue behind
+			// the pending lock for as long as it stays, holding a pool
+			// connection and a snapshot that every other build in the
+			// database waits for. Indexed first, the partitions leave the
+			// leader only its bounded waits.
+			if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = reader.Rollback(ctx) }()
+			// The reader and the pending LOCK run on sessions of their own,
+			// out of the client's pool, and the server ends both within a
+			// minute even if the test hangs, so that neither can stall the
+			// client's pool or other tests' builds for longer.
+			reader := h.session("idle_in_transaction_session_timeout=60000")
+			if _, err := reader.Exec(ctx, "BEGIN"); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+partition); err != nil {
 				t.Fatal(err)
 			}
-			ddl, err := h.pool.Begin(ctx)
-			if err != nil {
+			ddl := h.session("lock_timeout=60000", "statement_timeout=60000")
+			if _, err := ddl.Exec(ctx, "BEGIN"); err != nil {
 				t.Fatal(err)
 			}
 			locked := make(chan error, 1)
@@ -533,12 +545,14 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 				_, err := ddl.Exec(ctx, "LOCK TABLE "+partition+" IN ACCESS EXCLUSIVE MODE")
 				locked <- err
 			}()
+			// The reader's end grants the LOCK, released in turn before the
+			// client stops.
 			defer func() {
-				_ = reader.Rollback(ctx)
+				_, _ = reader.Exec(ctx, "ROLLBACK")
 				if err := <-locked; err != nil {
 					t.Errorf("LOCK TABLE: %v", err)
 				}
-				_ = ddl.Rollback(ctx)
+				_, _ = ddl.Exec(ctx, "ROLLBACK")
 			}()
 			waitFor(t, func() bool {
 				return h.count(`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND mode = 'AccessExclusiveLock' AND NOT granted`, partition) == 1
