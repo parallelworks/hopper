@@ -20,7 +20,8 @@ name: Performance gate
 # hot paths. The workflow scenarios, whose jobs each pass through the
 # finalize tail and dependency promotion (and, in workflow-outputs, record
 # and read their dependencies' outputs; in workflow-any, the last step
-# waits for any one of the eight before it), drain 100,000 (ten thousand
+# waits for any one of the eight in the middle, and the finalizing
+# client's follow-up promotes it), drain 100,000 (ten thousand
 # workflows), about as long. The reference numbers in
 # docs/PLAN.md §8.2 come from the release hardware, not from here.
 on:
