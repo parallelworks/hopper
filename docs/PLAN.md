@@ -1130,6 +1130,34 @@ RETURNING j.*;
   every connection replan the finalize statement. The maintenance never
   waits for a lock. Schema v6 also sets `hopper_jobs`' autovacuum thresholds low with no
   cost delay.
+- **No periodic reindex.** The live table's indexes stay bounded without one, so the
+  leader does not reindex them. A btree page that vacuum empties is deleted and reused
+  for new entries, but its file never shrinks: each index grows to the largest backlog
+  it has held and stays that size, as the soak's claim index did after a stall
+  (§8.2). A claim walks only the live leaf pages, not the deleted ones, so the file's
+  size does not slow it.
+  - **Run.** Measured on 2026-11-03 against Postgres 18.3 (default server settings,
+    128 MB `shared_buffers`), with two clients of 50 workers at 3,000 jobs/s for 74
+    minutes: 13.3 million jobs in four priorities. A tenth failed their first attempt and
+    retried, a tenth snoozed once, a tenth were scheduled 1–3 s ahead, and a tenth each
+    carried a unique key, an ordering key or a partition key.
+  - **Bounded.** The heap held at 20.7 MB from minute 15. The leader vacuumed every 19
+    s, and autovacuum ran about once a minute. The claim index's leaf pages stayed
+    between 130 and 200. Its file grew to 6.8 MB within 15 minutes and stayed there
+    until a stall at minute 50 backed 4,000 jobs up in it. It then held at 9.7 MB, of
+    which 1,050 pages were deleted pages and about 150 live. The primary key and the
+    other partial indexes behaved alike: the primary key reached 7.4 MB, the running
+    index 1.2 MB, the unique-key index 1.3 MB, and the rest under 100 KB.
+  - **Reindex.** `REINDEX TABLE CONCURRENTLY` at minute 60 took 49 ms. It shrank the
+    claim index to 2.1 MB and the primary key to 2.7 MB, which regrew to 3.1 MB and 5.5
+    MB within 7 minutes.
+  - **Latency.** Claim statements took a median 0.8–1.4 ms in every window outside the
+    stall, and finalize statements 2.0–2.5 ms. Neither followed the indexes' size: the
+    claim's median was 1.1 ms at 6.8 MB (minutes 33–43) and at 3.1 MB after the
+    reindex (minutes 68–74). A step to 1.3 ms after the stall ended a minute before the
+    reindex ran, with the machine's other load.
+  - **When it helps.** A reindex frees only the disk a one-off backlog left behind, and
+    `operations.md` says how to check for that and when to do it by hand.
 
 - **Batching.** A producer claims only when at least `min(MaxWorkers/4, free slots)`
   slots are free or a short cooldown (20ms by default) has passed. Busy queues are

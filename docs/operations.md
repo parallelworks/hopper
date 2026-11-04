@@ -143,6 +143,23 @@ polling without new database notification writes.
   an hour of completed history deletes that hour's tags rows, which leaves
   dead rows in the day's tags partition for autovacuum until the day is
   dropped.
+- **Index size.** The live table's indexes need no routine reindex (PLAN.md
+  §7.3). Vacuum deletes the btree pages it empties and reuses them, so each
+  index stays the size of the largest backlog it has held. It shrinks only
+  when it is rebuilt, and a claim reads only its live pages. To check, compare
+  an index's leaf pages with its deleted ones (with the `pgstattuple`
+  extension):
+  `SELECT leaf_pages, deleted_pages, avg_leaf_density FROM
+  pgstatindex('hopper.hopper_jobs_claim')`, and its file with
+  `pg_relation_size`. Mostly deleted pages after a backlog has drained is
+  expected. Reindex by hand only to reclaim that disk, for example after an
+  outage left a backlog of millions of jobs, or if live leaf pages keep growing
+  while the backlog does not:
+  `REINDEX TABLE CONCURRENTLY hopper.hopper_jobs`. It runs outside a
+  transaction and blocks neither claims nor finalizes. The leader's vacuum
+  skips the table while it runs, and on the live table it takes seconds at
+  most. One that fails or is canceled leaves an invalid
+  `..._ccnew` index; drop it with `DROP INDEX CONCURRENTLY`.
 - **`shared_buffers`.** Keep the live table, its indexes and the current
   history partition in shared buffers. With Postgres's 128 MB default, a
   burst of history writes evicts the live table and throughput drops by a
