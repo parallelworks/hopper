@@ -764,7 +764,7 @@ func TestFinalizerSettlesHeldBatchesOnStop(t *testing.T) {
 		t.Fatal("stop did not return")
 	}
 	calls := exec.calls()
-	if len(calls) != 3 || !slices.Equal(calls[2], []driver.JobID{a, b}) {
+	if len(calls) != 4 || !slices.Equal(calls[2], []driver.JobID{a}) || !slices.Equal(calls[3], []driver.JobID{b}) {
 		t.Errorf("settles = %v; want a last one of both batches on stop", calls)
 	}
 }
@@ -825,10 +825,10 @@ func TestFinalizerSettlesEachHeldBatchOnItsOwnDelay(t *testing.T) {
 	})
 }
 
-// Of batches whose settles gave up together, a retry that gives up is
-// split, so that the batch whose row is still held is left to wait and
-// the others are settled at once.
-func TestFinalizerSplitsAHeldSettle(t *testing.T) {
+// Batches whose settle gave up together are tried again one at a time, so
+// that the batch whose row is still held is left to wait and the others
+// are settled at once.
+func TestFinalizerSettlesHeldBatchesOneAtATime(t *testing.T) {
 	stuck, free := driver.JobID{9}, driver.JobID{10}
 	exec := &settleExec{holds: func(ids []driver.JobID) bool { return slices.Contains(ids, stuck) }}
 	tun := tuning{finalizeInterval: time.Hour, finalizeBatch: 2, finalizeBuffer: 4, leaderInterval: 2 * time.Hour}
@@ -837,13 +837,13 @@ func TestFinalizerSplitsAHeldSettle(t *testing.T) {
 	f.retrier.first = 10 * time.Millisecond
 	f.submit(batchResult(1, stuck))
 	f.submit(batchResult(2, free))
-	calls := waitSettles(t, exec, 4)
-	want := [][]driver.JobID{{stuck, free}, {stuck, free}, {stuck}, {free}}
-	if !slices.EqualFunc(calls[:4], want, slices.Equal) {
+	calls := waitSettles(t, exec, 3)
+	want := [][]driver.JobID{{stuck, free}, {stuck}, {free}}
+	if !slices.EqualFunc(calls[:3], want, slices.Equal) {
 		t.Errorf("settles = %v; want %v", calls, want)
 	}
 	time.Sleep(15 * time.Millisecond)
-	for _, ids := range exec.calls()[4:] {
+	for _, ids := range exec.calls()[3:] {
 		if slices.Contains(ids, free) {
 			t.Errorf("the free batch was settled again after a settle got it: %v", exec.calls())
 		}
@@ -880,4 +880,91 @@ func TestFinalizerFlushesWhileASettleIsRetried(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// A retry of four batches, two of them held, keeps each held one once,
+// its delay doubled once, and lets the others go.
+func TestSettleRetrierKeepsEachHeldBatchOnce(t *testing.T) {
+	a, b, c, d := driver.JobID{1}, driver.JobID{2}, driver.JobID{3}, driver.JobID{4}
+	exec := &settleExec{holds: func(ids []driver.JobID) bool { return slices.Contains(ids, a) || slices.Contains(ids, d) }}
+	r := newSettleRetrier(exec, slog.New(slog.DiscardHandler), time.Millisecond, time.Hour)
+	r.add([]driver.JobID{a, b, c, d})
+	r.mu.Lock()
+	for id, h := range r.held {
+		h.due = time.Now()
+		r.held[id] = h
+	}
+	r.mu.Unlock()
+	r.attempt(context.Background(), false)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.held) != 2 || r.held[a].delay != 2*time.Millisecond || r.held[d].delay != 2*time.Millisecond {
+		t.Errorf("held after the attempt = %v; want a and d, each with its delay doubled once", r.held)
+	}
+}
+
+// A batch whose settle gives up again while an attempt at it is in flight
+// is kept even when that attempt settles it: the attempt's statement may
+// have begun before the progress the second settle was for committed.
+func TestSettleRetrierKeepsABatchHeldAgainDuringItsAttempt(t *testing.T) {
+	x := driver.JobID{1}
+	settling, release := make(chan struct{}), make(chan struct{})
+	// The follow-up's settle is recorded first, so that the attempt's waits.
+	exec := &settleExec{settles: [][]driver.JobID{{x}}, wait: func() { close(settling); <-release }}
+	r := newSettleRetrier(exec, slog.New(slog.DiscardHandler), time.Millisecond, time.Hour)
+	r.add([]driver.JobID{x})
+	r.mu.Lock()
+	r.held[x] = heldBatch{delay: 4 * time.Millisecond, due: time.Now()}
+	r.mu.Unlock()
+	done := make(chan struct{})
+	go func() { defer close(done); r.attempt(context.Background(), false) }()
+	<-settling
+	r.add([]driver.JobID{x})
+	close(release)
+	<-done
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if h, ok := r.held[x]; !ok || h.delay != time.Millisecond || h.again {
+		t.Errorf("batch held again during its attempt = %+v, %t; want it kept, due after the flush interval", h, ok)
+	}
+}
+
+// settleUntilDone is a stubExec whose BatchSettle gives up on the first
+// call, as a follow-up's whose batch row is held, and then waits for its
+// context, as a settle waiting for a row that stays held.
+type settleUntilDone struct {
+	stubExec
+	n atomic.Int32
+}
+
+func (e *settleUntilDone) BatchSettle(ctx context.Context, _ driver.BatchSettleParams) (driver.BatchSettleResult, error) {
+	if e.n.Add(1) == 1 {
+		return driver.BatchSettleResult{}, driver.ErrRowsHeld
+	}
+	<-ctx.Done()
+	return driver.BatchSettleResult{}, ctx.Err()
+}
+
+// A stop cuts short a settle tried again that is still waiting, and its
+// own last attempt at the batch is bounded by stopSettleTimeout.
+func TestFinalizerStopCutsShortASettleRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		exec := &settleUntilDone{}
+		tun := tuning{finalizeInterval: time.Millisecond, finalizeBatch: 1, finalizeBuffer: 4, leaderInterval: time.Hour}
+		f, stop := newTestFinalizer(exec, tun, nil)
+		f.submit(batchResult(1, driver.JobID{9}))
+		time.Sleep(10 * time.Millisecond)
+		synctest.Wait()
+		if n := exec.n.Load(); n != 2 {
+			t.Fatalf("%d settles; want the follow-up's and a retry waiting", n)
+		}
+		start := time.Now()
+		stop()
+		if took := time.Since(start); took > stopSettleTimeout {
+			t.Errorf("stop took %s with a settle retry waiting; want at most %s", took, stopSettleTimeout)
+		}
+		if n := exec.n.Load(); n != 3 {
+			t.Errorf("%d settles; want the stop's last attempt too", n)
+		}
+	})
 }

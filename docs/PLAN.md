@@ -2790,9 +2790,12 @@ observability without new machinery.
     `driver.ErrRowsHeld`. The finalizer keeps those batches and settles them again beside
     its loop, so that waiting for a held row never holds up a flush. Each has a delay of
     its own, first the flush interval and then doubling while its row stays held, and a
-    retry that gives up is split in halves, as a timed-out flush is, so that only the
-    batches whose rows are held keep waiting. When the client stops, the finalizer makes
-    one last attempt at every batch it holds, within 2 s, before it exits. A workflow
+    retry settles each batch in a statement of its own, so that only the batches whose
+    rows are held keep waiting, and waiting for one holds no other batch's row. A batch whose settle gives up again while a
+    retry of it is in flight is kept, even if that retry settles it, since the retry may
+    have missed the progress the second settle was for. When the client stops, the
+    finalizer cuts short a retry in flight and makes one last attempt at every batch it
+    holds, within 2 s, before it exits. A workflow
     whose last jobs finished in concurrent statements so completes at the client's next
     attempt once the row is free rather than on the leader's next pass, and a cluster
     stopped right after its last jobs finished leaves one open only if the stop's attempt

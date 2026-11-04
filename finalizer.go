@@ -63,9 +63,7 @@ type finalizer struct {
 	// retrier settles again, beside run, the batches whose settle gave up
 	// on a held batch row; run stops it, and waits for its last attempt,
 	// before it returns.
-	retrier     *settleRetrier
-	retrierStop chan struct{}
-	retrierDone chan struct{}
+	retrier *settleRetrier
 
 	in   chan pending
 	done chan struct{} // closed when run returns
@@ -120,8 +118,6 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs
 		in:            make(chan pending, max(t.finalizeBuffer, 2*t.finalizeBatch)),
 		done:          make(chan struct{}),
 		retrier:       newSettleRetrier(exec, logger, t.finalizeInterval, cmp.Or(t.leaderInterval, defaultTuning.leaderInterval)),
-		retrierStop:   make(chan struct{}),
-		retrierDone:   make(chan struct{}),
 	}
 }
 
@@ -213,13 +209,17 @@ func (f *finalizer) stopIfIdle(force bool) bool {
 // context and closes done.
 func (f *finalizer) run(ctx context.Context) {
 	defer close(f.done)
+	// The retrier outlives ctx: it stops once the final drain has written
+	// what the stop left, whose settles can give up too.
+	retrierCtx, stopRetrier := context.WithCancel(context.WithoutCancel(ctx))
+	retrierDone := make(chan struct{})
 	go func() {
-		defer close(f.retrierDone)
-		f.retrier.run(ctx, f.retrierStop, f.crashed.Load)
+		defer close(retrierDone)
+		f.retrier.run(retrierCtx, f.crashed.Load)
 	}()
 	defer func() {
-		close(f.retrierStop)
-		<-f.retrierDone
+		stopRetrier()
+		<-retrierDone
 	}()
 	var (
 		batch    []pending
