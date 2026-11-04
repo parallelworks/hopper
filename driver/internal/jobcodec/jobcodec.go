@@ -39,13 +39,13 @@ func MarshalAttemptError(e *driver.AttemptError) ([]byte, error) {
 }
 
 // MarshalAttemptLog encodes the log a finalize appends for result f, which
-// a snooze marks Snoozed, its text made storable, or returns nil when there
-// is none to keep (JobFinalize.KeepsLog).
+// a snooze marks Snoozed and a give-back Interrupted, its text made
+// storable, or returns nil when there is none to keep (JobFinalize.KeepsLog).
 func MarshalAttemptLog(f driver.JobFinalize) ([]byte, error) {
 	if f.Log == nil || !f.KeepsLog() {
 		return nil, nil
 	}
-	return json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Log: StorableText(f.Log.Log)})
+	return json.Marshal(driver.AttemptLog{Attempt: f.Log.Attempt, Snoozed: f.Snooze, Interrupted: f.GiveBack, Log: StorableText(f.Log.Log)})
 }
 
 // DecodeErrors reads a job's errors, a JSON array of error records. An

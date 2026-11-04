@@ -232,7 +232,7 @@ func TestStopAndCancelRacingStop(t *testing.T) {
 			}
 		}
 		for _, j := range []*driver.JobRow{retried, last, failed} {
-			if f, ok := exec.result(j.ID); !ok || !f.Snooze || f.State != driver.JobStateRetryable || f.Delay != 0 || f.Error == nil || f.Error.Attempt != j.Attempt {
+			if f, ok := exec.result(j.ID); !ok || !f.GiveBack || f.State != driver.JobStateRetryable || f.Delay != 0 || f.Error == nil || f.Error.Attempt != j.Attempt {
 				t.Errorf("job on attempt %d of %d: %+v, %v; want retried at once with its error, its attempt given back", j.Attempt, j.MaxAttempts, f, ok)
 			}
 		}
@@ -308,7 +308,7 @@ func TestStopDeadlineEscalates(t *testing.T) {
 		if cause := <-causes; !errors.Is(cause, ErrClientStopped) {
 			t.Errorf("the job's context was canceled with %v, want ErrClientStopped", cause)
 		}
-		if f, ok := exec.result(job.ID); !ok || !f.Snooze {
+		if f, ok := exec.result(job.ID); !ok || !f.GiveBack {
 			t.Errorf("job = %+v, %v; want its attempt given back", f, ok)
 		}
 
@@ -327,7 +327,7 @@ func TestStopDeadlineEscalates(t *testing.T) {
 		if cause := <-causes; !errors.Is(cause, ErrClientStopped) {
 			t.Errorf("Stop's deadline canceled the job with %v, want ErrClientStopped", cause)
 		}
-		if f, ok := exec.result(job.ID); !ok || !f.Snooze {
+		if f, ok := exec.result(job.ID); !ok || !f.GiveBack {
 			t.Errorf("job after Stop's deadline = %+v, %v; want its attempt given back", f, ok)
 		}
 	})
@@ -363,7 +363,7 @@ func TestStopAndCancelSkipsOnError(t *testing.T) {
 			t.Errorf("OnError was called %d times for attempts the stop canceled", n)
 		}
 		for _, j := range []*driver.JobRow{failed, last} {
-			if f, ok := exec.result(j.ID); !ok || f.State != driver.JobStateRetryable || !f.Snooze || f.Delay != 0 || f.Error == nil {
+			if f, ok := exec.result(j.ID); !ok || f.State != driver.JobStateRetryable || !f.GiveBack || f.Delay != 0 || f.Error == nil {
 				t.Errorf("job on attempt %d of %d: %+v, %v; want retried at once with its error, its attempt given back", j.Attempt, j.MaxAttempts, f, ok)
 			}
 		}
@@ -418,7 +418,7 @@ func TestStopAfterTimeoutCounts(t *testing.T) {
 		if err := c.StopAndCancel(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if f, ok := exec.result(retried.ID); !ok || f.Snooze || f.State != driver.JobStateRetryable || f.Error == nil || !strings.Contains(f.Error.Error, ErrJobTimeout.Error()) {
+		if f, ok := exec.result(retried.ID); !ok || f.GiveBack || f.State != driver.JobStateRetryable || f.Error == nil || !strings.Contains(f.Error.Error, ErrJobTimeout.Error()) {
 			t.Errorf("timed-out job with attempts left: %+v, %v; want a counted retry", f, ok)
 		}
 		if f, ok := exec.result(last.ID); !ok || f.State != driver.JobStateDiscarded {
@@ -453,7 +453,7 @@ func TestStopDeadlineCancelsOnError(t *testing.T) {
 		if err := c.Stop(stopCtx); !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Stop = %v, want its deadline", err)
 		}
-		if f, ok := exec.result(job.ID); !ok || f.State != driver.JobStateRetryable || f.Snooze {
+		if f, ok := exec.result(job.ID); !ok || f.State != driver.JobStateRetryable || f.GiveBack {
 			t.Errorf("job whose hook the deadline canceled: %+v, %v; want its counted retry written", f, ok)
 		}
 	})
@@ -485,7 +485,7 @@ func TestStopAndCancelClaimInFlight(t *testing.T) {
 			t.Errorf("the job from the claim in flight ran, canceled with %v", cause)
 		default:
 		}
-		if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateScheduled || f.Delay != 0 || f.Error != nil {
+		if f, ok := exec.result(job.ID); !ok || !f.GiveBack || f.State != driver.JobStateScheduled || f.Delay != 0 || f.Error != nil {
 			t.Errorf("job from the claim in flight: %+v, %v; want its attempt given back, with no error", f, ok)
 		}
 	})
@@ -551,7 +551,7 @@ func TestStopDeadlineSlowLogClose(t *testing.T) {
 		if d := time.Since(start); d > time.Second+c.tuning.stopGrace {
 			t.Errorf("Stop took %s, past its deadline and grace (%s)", d, time.Second+c.tuning.stopGrace)
 		}
-		if f, ok := exec.result(job.ID); !ok || !f.Snooze || f.State != driver.JobStateRetryable {
+		if f, ok := exec.result(job.ID); !ok || !f.GiveBack || f.State != driver.JobStateRetryable {
 			t.Errorf("job whose log close blocked: %+v, %v; want its result written, its attempt given back", f, ok)
 		}
 	})

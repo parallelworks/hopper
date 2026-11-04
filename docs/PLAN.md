@@ -1424,7 +1424,12 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   its attempt back, so the next attempt has the same number: its log is marked
   `snoozed`, and replaces the log of the previous snooze of that number, as a snooze
   that logged nothing removes it, so a job that polls by snoozing keeps at most one,
-  not `MaxAttempts` of them. `MaxBytes` is at most
+  not `MaxAttempts` of them. An attempt the client's stop interrupted and gave back
+  (§7.12) is not a snooze: the finalize sends `JobFinalize.GiveBack`, not `Snooze`,
+  which gives the attempt back the same way but marks the run's log `interrupted`,
+  keeps it as an attempt's log is kept, removes no snooze's log and stores no snooze
+  reason. A later snooze of the same number leaves it, so the log of the run a stop
+  cut short survives the reruns. `MaxBytes` is at most
   1 MiB, `MaxAttempts` at most 100, and their product at most 4 MiB: each finalize
   that writes a log rewrites the job's whole `logs` value, so the product bounds a
   write's cost (to within each entry's dropped-lines line and JSON escaping), and with
@@ -1487,7 +1492,8 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   store's, in attempt order. A snooze gives the attempt back, so the run after it
   opens a writer under the same ID and attempt, and the store keeps both: a store log
   that another of the same number follows, or whose number is past the job's
-  current attempt, was a snooze. As in the row, only the latest snooze of each
+  current attempt, was a snooze. A store keeps no outcome, so a run a stop interrupted
+  reads as a snooze there too. As in the row, only the latest snooze of each
   attempt number and the latest `MaxAttempts` logs are returned, so a job that
   polls by snoozing for a week renders as a few entries, whatever the store keeps.
   If the store fails, `JobLogs` returns the row's logs with the error (`ErrNotFound`
@@ -2195,11 +2201,13 @@ the client is gone, and that rescue counts the attempt, as any does; since a sto
 up no other attempt, a job with `MaxAttempts: 1` that a stop interrupts runs again:
 delivery is at-least-once anyway, as a rescue reruns a crashed client's jobs, and a job
 that must not repeat should be idempotent. Whether the stop canceled the attempt is read as the worker returns. The
-finalize is a retry with `Snooze` set, which gives the attempt back, and an `Error`,
-which is appended: the rerun has the same attempt number, so `Errors` holds an entry
-for each run of it that fails, and, as for a snooze, the interrupted run's log
-replaces that of an earlier snoozed or interrupted run of the same number, and is
-marked snoozed. A worker that returns nil, `Snooze`, `Cancel` or an output refusal
+finalize is a retry with `GiveBack` set, which gives the attempt back, and an
+`Error`, which is appended: the rerun has the same attempt number, so `Errors` holds an
+entry for each run of it that fails. The interrupted run's log is kept, marked
+`interrupted` (§7.5): unlike a snooze's, it neither replaces an earlier run's log of
+the same number nor is replaced by a later one's. An earlier release set `Snooze`
+instead, so a later snooze of the same number deleted the interrupted run's log, and
+the log read as snoozed. A worker that returns nil, `Snooze`, `Cancel` or an output refusal
 (`ErrOutputTooLarge`) is finalized as it says, and the job's timeout still bounds each
 run: an attempt its timeout ended before the stop came is a timeout, which counts and
 goes to `Config.OnError` as any timeout does, as does a failure the worker returned
@@ -2207,8 +2215,9 @@ before the stop. `MaxAttempts` does not bound a job that every stop interrupts, 
 each interruption adds an entry to `Errors`: only a timeout shorter than the time
 between stops ends such a job, by ending a run before a stop does, and one with no
 timeout, or a longer one, runs again after every stop. A job from a claim in flight as
-the stop cancels the jobs never runs: it gets its attempt back with no error, as a
-`Snooze(0)`. A job interrupted by a fence (§7.6) keeps its attempt counted, as the
+the stop cancels the jobs never runs: it gets its attempt back with no error and can
+run again at once, as after a `Snooze(0)`, but through `GiveBack`, so it removes no
+snooze's log. A job interrupted by a fence (§7.6) keeps its attempt counted, as the
 rescue that may already have run it would. A worker must not stop its own client: the
 stop waits for it. The lease keeps being renewed until the finalizer has flushed, so a
 long drain cannot let it lapse.

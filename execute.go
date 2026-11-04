@@ -30,9 +30,12 @@ import (
 // claim of the job on this client after a rescue, with cause ErrJobFenced.
 func (c *Client[TTx]) execute(ctx context.Context, row *driver.JobRow, qcfg QueueConfig) pending {
 	// A job claimed as the client's stop canceled the jobs (the claim in
-	// flight then) never runs: it gets its attempt back, as a Snooze(0).
+	// flight then) never runs: it gets its attempt back and can run at once,
+	// as after a Snooze(0), but is no snooze to its logs.
 	if errors.Is(context.Cause(ctx), ErrClientStopped) {
-		return pending{job: row, result: snoozed(row, 0, "")}
+		return pending{job: row, result: driver.JobFinalize{
+			ID: row.ID, AttemptedBy: row.AttemptedBy, Fence: row.Fence, State: driver.JobStateScheduled, GiveBack: true,
+		}}
 	}
 	jobCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
@@ -290,11 +293,11 @@ func (c *Client[TTx]) outcome(ctx, jobCtx context.Context, row *driver.JobRow, q
 	}
 	switch {
 	case giveBack:
-		// Snooze gives the attempt back; the error is recorded all the
-		// same, so Errors holds an entry for each run of the attempt's
-		// number that fails.
+		// GiveBack gives the attempt back, without the snooze's handling of
+		// its log; the error is recorded all the same, so Errors holds an
+		// entry for each run of the attempt's number that fails.
 		f.State = driver.JobStateRetryable
-		f.Snooze = true
+		f.GiveBack = true
 	case byWorker || tooLarge || row.Attempt >= row.MaxAttempts:
 		f.State = driver.JobStateDiscarded
 	default:
