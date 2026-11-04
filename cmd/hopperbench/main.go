@@ -376,6 +376,25 @@ func (b *bench) waitDrained(ctx context.Context) error {
 	}
 }
 
+// waitBatchesCompleted waits, for at most drainStall, until no batch is
+// open, with the clients still running: a batch whose last jobs finished
+// in concurrent statements, and whose follow-up settle gave up on a held
+// batch row, completes on the leader's next pass, up to a leader interval
+// after the drain. The workflows check reports a batch still open.
+func (b *bench) waitBatchesCompleted(ctx context.Context) error {
+	deadline := time.Now().Add(drainStall)
+	for {
+		var open bool
+		if err := b.pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM hopper_batches WHERE completed_at IS NULL)").Scan(&open); err != nil {
+			return err
+		}
+		if !open || time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func (b *bench) workflows(ctx context.Context, name string, jobs int, reads, anyOf bool) (result, error) {
 	n := jobs / workflowSteps
 	if n < 1 {
@@ -537,6 +556,9 @@ func (b *bench) drainLoaded(ctx context.Context, name string, jobs int, load fun
 		return result{}, err
 	}
 	elapsed := time.Since(start)
+	if err := b.waitBatchesCompleted(ctx); err != nil {
+		return result{}, err
+	}
 	for _, c := range cs {
 		if err := c.Stop(ctx); err != nil {
 			return result{}, err
