@@ -413,7 +413,7 @@ type Executor interface {
     JobClaim(ctx context.Context, p ClaimParams) ([]*JobRow, error)
     JobFinalizeMany(ctx context.Context, p FinalizeParams) (FinalizeResult, error)
     LeaseRenew(ctx context.Context, p LeaseParams) (LeaseResult, error)
-    LeaderAttempt(ctx context.Context, p LeaderParams) (bool, error)
+    LeaderAttempt(ctx context.Context, p LeaderParams) (LeaderResult, error)
     // ... rescue, retention, queues, subscriptions, listing
 }
 ```

@@ -21,7 +21,8 @@
   retry safe: if another client leads by then, the request asks no one and
   fails, rather than moving leadership again. The leader stops its duties, gives the lease up, and stays out of the
   election for 15 seconds, so another client takes over within a second or
-  so. With no other client that can lead, the install has no leader for those
+  so where clients receive notifications, and within 10 seconds where they
+  poll (`hoppersql`, or a pooler without a listener connection). With no other client that can lead, the install has no leader for those
   15 seconds. The new term starts like any other, so periodic jobs with
   `RunOnStart` insert a job again.
 - **Clients that must not lead.** Set `Config.NeverLead` on a client that

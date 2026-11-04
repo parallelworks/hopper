@@ -292,6 +292,16 @@ type lossyExec struct {
 	ask  bool
 	last time.Time // the elected_at of the last term an attempt returned
 	lost int
+	// gaveUp counts the leases the client deleted.
+	gaveUp atomic.Int32
+}
+
+func (e *lossyExec) LeaderResign(ctx context.Context, clientID int64) (bool, error) {
+	deleted, err := e.Executor.LeaderResign(ctx, clientID)
+	if deleted {
+		e.gaveUp.Add(1)
+	}
+	return deleted, err
 }
 
 func (e *lossyExec) LeaderAttempt(ctx context.Context, p driver.LeaderParams) (driver.LeaderResult, error) {
@@ -449,5 +459,10 @@ func TestLeaderLostTakeoverResponseThenResign(t *testing.T) {
 	exec.mu.Unlock()
 	if lost != 1 {
 		t.Errorf("lost takeover responses = %d, want 1", lost)
+	}
+	// The events alone would be the same had the client ignored the request
+	// and led on: the new term's lease must have been given up.
+	if n := exec.gaveUp.Load(); n != 1 {
+		t.Errorf("leases given up = %d, want 1, the new term's on request", n)
 	}
 }
