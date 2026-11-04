@@ -817,8 +817,8 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		default:
 			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
 		}
-		if f.Snooze && f.GiveBack {
-			return nil, errors.New("hopper: finalize jobs: a result both snoozes and gives its attempt back")
+		if err := jobcodec.CheckGiveBack(f); err != nil {
+			return nil, err
 		}
 		ids[i], attemptedBy[i], fences[i], states[i] = f.ID, f.AttemptedBy, f.Fence, string(f.State)
 		delays[i], giveBacks[i], reasons[i] = max(f.Delay, 0).Seconds(), giveBack(f), jobcodec.StorableText(f.SnoozeReason)

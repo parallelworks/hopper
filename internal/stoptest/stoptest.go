@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,9 +22,9 @@ type block struct{}
 func (block) Kind() string { return "stoptest_block" }
 
 // Run checks that StopAndCancel cancels a running job at once, with
-// ErrClientStopped as its context's cause, records the attempt's error and
-// gives the job its attempt back, its last one too, so another client runs
-// it again and completes it.
+// ErrClientStopped as its context's cause, records the attempt's error,
+// keeps its log marked Interrupted, and gives the job its attempt back, its
+// last one too, so another client runs it again and completes it.
 func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx]) {
 	t.Helper()
 	ctx := context.Background()
@@ -48,6 +49,7 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 	started := make(chan struct{}, 1)
 	cause := make(chan error, 1)
 	first := start(t, func(ctx context.Context, _ *hopper.Job[block]) error {
+		hopper.Logger(ctx).Info("interrupted run")
 		started <- struct{}{}
 		<-ctx.Done()
 		cause <- context.Cause(ctx)
@@ -81,6 +83,10 @@ func Run[TTx any](t *testing.T, newDriver func(t *testing.T) driver.Driver[TTx])
 	}
 	if j.State != hopper.JobStateRetryable || j.Attempt != 0 || len(j.Errors) != 1 || j.Errors[0].Attempt != 1 {
 		t.Fatalf("job after StopAndCancel: %s at attempt %d, errors %v; want retryable with the interrupted attempt's error, the attempt given back", j.State, j.Attempt, j.Errors)
+	}
+	if logs, err := first.JobLogs(ctx, res.Job.ID); err != nil || len(logs) != 1 || logs[0].Attempt != 1 || !logs[0].Interrupted || logs[0].Snoozed ||
+		!strings.Contains(logs[0].Log, "interrupted run") {
+		t.Errorf("logs after StopAndCancel = %+v, %v; want the interrupted run's, marked Interrupted", logs, err)
 	}
 
 	second := start(t, func(context.Context, *hopper.Job[block]) error { return nil })

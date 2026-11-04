@@ -250,7 +250,7 @@ func TestStuckDuringStop(t *testing.T) {
 		if err := <-stopped; err != nil {
 			t.Errorf("StopAndCancel = %v", err)
 		}
-		if f, ok := h.exec.result(job.ID); !ok || !f.GiveBack {
+		if f, ok := h.exec.result(job.ID); !ok || !f.GiveBack || f.Snooze {
 			t.Errorf("result %+v, %v; want its attempt given back", f, ok)
 		}
 	})

@@ -448,8 +448,10 @@ func (c *Client[TTx]) Stop(ctx context.Context) error {
 // panic's trace, is recorded in the job's Errors and logged, but
 // Config.OnError is not consulted. The rerun has the same attempt number,
 // so Errors holds an entry for each run of it that fails, and the
-// interrupted run's log (Config.JobLogs) is kept, marked Interrupted, where
-// a later snooze of the same number does not remove it. A worker that
+// interrupted run's log, kept in the job's row (Config.JobLogs without a
+// Store), is marked Interrupted, and a later snooze of the same number does
+// not remove it; a Store keeps no outcome, so there the run reads as a
+// snooze, as JobLogs says. A worker that
 // returns nil, Snooze, Cancel or an output refusal (ErrOutputTooLarge)
 // completes, snoozes or discards the job as usual. The job's timeout still
 // bounds each run, and an attempt its timeout ended before the stop came

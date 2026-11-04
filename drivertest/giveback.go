@@ -13,7 +13,8 @@ import (
 // error is recorded, and the run's log is kept marked Interrupted, which no
 // snooze of the same attempt number removes, and which itself removes no
 // snooze's log. No snooze reason is stored. A result that both snoozes and
-// gives its attempt back is refused.
+// gives its attempt back is refused, as is one that gives it back and
+// finishes the job.
 func testJobGiveBack[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
@@ -22,18 +23,14 @@ func testJobGiveBack[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	p[0].MaxAttempts = 10
 	id := insert(ctx, t, exec, p)[0].Job.ID
 	clientID := register(ctx, t, exec)
-	claimOne := func() *driver.JobRow {
+	claimNext := func() *driver.JobRow {
 		t.Helper()
 		f.MakeClaimable(ctx, t, d, id)
-		jobs := claim(ctx, t, exec, clientID, 1)
-		if len(jobs) != 1 || jobs[0].ID != id {
-			t.Fatalf("claim = %v", jobs)
-		}
-		return jobs[0]
+		return claimOne(ctx, t, exec, clientID, id)
 	}
 	run := func(result driver.JobFinalize) {
 		t.Helper()
-		j := claimOne()
+		j := claimNext()
 		if j.Attempt != 1 {
 			t.Fatalf("claimed attempt %d, want 1: every run so far gave its attempt back", j.Attempt)
 		}
@@ -76,10 +73,14 @@ func testJobGiveBack[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	run(driver.JobFinalize{State: driver.JobStateScheduled, GiveBack: true})
 	check("after a give-back that logged nothing", 2, interrupted, again, snoozed)
 
-	j := claimOne()
+	j := claimNext()
 	both := driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateScheduled, Snooze: true, GiveBack: true}
 	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{both}}); err == nil {
 		t.Error("a result that both snoozes and gives its attempt back was accepted")
+	}
+	finished := driver.JobFinalize{ID: id, AttemptedBy: clientID, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true, GiveBack: true}
+	if _, err := exec.JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{finished}}); err == nil {
+		t.Error("a completed result that gives its attempt back was accepted")
 	}
 	done := driver.AttemptLog{Attempt: 1, Log: "done\n"}
 	both.Snooze, both.GiveBack, both.State, both.Archive, both.Log = false, false, driver.JobStateCompleted, true, logOf(done)

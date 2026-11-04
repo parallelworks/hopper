@@ -1187,8 +1187,9 @@ type JobFinalize struct {
 	// GiveBack gives the attempt back as Snooze does, for an attempt the
 	// client interrupted, as its stop does, rather than one that snoozed:
 	// its Log is kept marked Interrupted, it removes no earlier log, and no
-	// SnoozeReason is stored. It is not set with Snooze, and only for the
-	// retryable and scheduled states.
+	// SnoozeReason is stored. It is only for the retryable and scheduled
+	// states, without Snooze: an engine refuses a result that sets it with
+	// either.
 	GiveBack bool
 	// SnoozeReason is stored as the job's SnoozeReason when Snooze is set.
 	SnoozeReason string

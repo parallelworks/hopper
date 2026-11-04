@@ -227,8 +227,8 @@ func encodeResults(jobs []driver.JobFinalize) ([]result, error) {
 		default:
 			return nil, fmt.Errorf("hopper: finalize jobs: %s is not a finalize state", f.State)
 		}
-		if f.Snooze && f.GiveBack {
-			return nil, errors.New("hopper: finalize jobs: a result both snoozes and gives its attempt back")
+		if err := jobcodec.CheckGiveBack(f); err != nil {
+			return nil, err
 		}
 		r := result{JobFinalize: f, err: f.Error, reason: nullable(jobcodec.StorableText(f.SnoozeReason))}
 		log, err := jobcodec.MarshalAttemptLog(f)

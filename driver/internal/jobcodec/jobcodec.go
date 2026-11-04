@@ -9,6 +9,7 @@ package jobcodec
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -36,6 +37,19 @@ func MarshalAttemptError(e *driver.AttemptError) ([]byte, error) {
 		Trace   string `json:"trace,omitempty"`
 		Rescue  string `json:"rescue,omitempty"`
 	}{e.Attempt, e.Fence, StorableText(e.Error), StorableText(e.Trace), string(e.Rescue)})
+}
+
+// CheckGiveBack refuses a result that gives its attempt back as an
+// interruption (JobFinalize.GiveBack) and also snoozes, or that finishes
+// the job, which then has no attempt to give back.
+func CheckGiveBack(f driver.JobFinalize) error {
+	switch {
+	case f.GiveBack && f.Snooze:
+		return errors.New("hopper: finalize jobs: a result both snoozes and gives its attempt back")
+	case f.GiveBack && f.State.Terminal():
+		return fmt.Errorf("hopper: finalize jobs: a %s result gives its attempt back", f.State)
+	}
+	return nil
 }
 
 // MarshalAttemptLog encodes the log a finalize appends for result f, which

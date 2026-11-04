@@ -1429,7 +1429,10 @@ SELECT id, fence FROM retry UNION ALL SELECT id, fence FROM done;
   which gives the attempt back the same way but marks the run's log `interrupted`,
   keeps it as an attempt's log is kept, removes no snooze's log and stores no snooze
   reason. A later snooze of the same number leaves it, so the log of the run a stop
-  cut short survives the reruns. `MaxBytes` is at most
+  cut short survives the reruns; each takes one of the latest `MaxAttempts`, so a
+  job that one stop after another interrupts can push its earlier attempts' logs out.
+  An engine refuses a result that sets `GiveBack` with `Snooze` or with a terminal
+  state. `MaxBytes` is at most
   1 MiB, `MaxAttempts` at most 100, and their product at most 4 MiB: each finalize
   that writes a log rewrites the job's whole `logs` value, so the product bounds a
   write's cost (to within each entry's dropped-lines line and JSON escaping), and with
