@@ -515,7 +515,7 @@ func testRetry[TTx any](t *testing.T, f Fixture[TTx]) {
 	if job, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: inserted[2].Job.ID}); err != nil || job.State != driver.JobStateAvailable || !job.ExpiresAt.IsZero() {
 		t.Errorf("retry of scheduled job = %+v, %v", job, err)
 	}
-	if expired, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 0 {
+	if expired, _, err := exec.JobDiscardExpired(ctx, 10); err != nil || len(expired) != 0 {
 		t.Errorf("expired after retry = %+v, %v", expired, err)
 	}
 	if got := claim(ctx, t, exec, clientID, 1); len(got) != 1 || got[0].ID != inserted[2].Job.ID {
@@ -756,7 +756,7 @@ func testTTL[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("expires_at = %s, %s", inserted[0].Job.ExpiresAt, inserted[2].Job.ExpiresAt)
 	}
 	time.Sleep(20 * time.Millisecond)
-	expired, err := exec.JobDiscardExpired(ctx, 100)
+	expired, _, err := exec.JobDiscardExpired(ctx, 100)
 	if err != nil || len(expired) != 1 || expired[0].ID != inserted[1].Job.ID {
 		t.Fatalf("expired = %v, %v", expired, err)
 	}
@@ -766,7 +766,7 @@ func testTTL[TTx any](t *testing.T, f Fixture[TTx]) {
 	if n := f.CountLive(ctx, t, d); n != 2 {
 		t.Errorf("live = %d", n)
 	}
-	if again, err := exec.JobDiscardExpired(ctx, 100); err != nil || len(again) != 0 {
+	if again, _, err := exec.JobDiscardExpired(ctx, 100); err != nil || len(again) != 0 {
 		t.Errorf("second expiry = %v, %v", again, err)
 	}
 
@@ -799,7 +799,7 @@ func testTTL[TTx any](t *testing.T, f Fixture[TTx]) {
 	if jobs := claimAgain(); len(jobs) != 0 {
 		t.Errorf("claimed expired jobs: %+v", jobs)
 	}
-	expired, err = exec.JobDiscardExpired(ctx, 100)
+	expired, _, err = exec.JobDiscardExpired(ctx, 100)
 	if err != nil || len(expired) != 2 {
 		t.Fatalf("expired = %v, %v", expired, err)
 	}

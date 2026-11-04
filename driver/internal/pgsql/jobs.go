@@ -1913,19 +1913,58 @@ WITH RECURSIVE finished AS (
   RETURNING ` + finishedColumns(appendErrorSQL("hopper: expired"), "j.logs", "NULL::jsonb", "true", "'discarded'::text", "$2") + `
 ),
 ` + finalizeTailSQL("$2", "$3") + `
-SELECT ` + finishedSelectColumns + ` FROM finished`
+SELECT ` + finishedSelectColumns + `, false FROM finished
+UNION ALL SELECT ` + finishedSelectColumns + `, true FROM cascaded`
+
+// ended is what a statement that ends jobs returns (endedJobs).
+type ended struct {
+	jobs     []*driver.JobRow
+	cascaded []driver.JobID
+}
+
+// endedJob is a row of a statement that ends jobs: a job it ended, or,
+// with cascaded set, a dependent it canceled by cascade.
+type endedJob struct {
+	job      *driver.JobRow
+	cascaded bool
+}
+
+var scanEndedJobs = collect(func(r Row) (endedJob, error) {
+	var e endedJob
+	var err error
+	e.job, err = scanJob(r, true, &e.cascaded)
+	return e, err
+})
+
+// endedJobs reads the result of a statement that ends jobs: the jobs it
+// ended, and the IDs of the dependents it canceled by cascade.
+func endedJobs(rows Rows, err error) (ended, error) {
+	all, err := scanEndedJobs(rows, err)
+	if err != nil {
+		return ended{}, err
+	}
+	var out ended
+	for _, e := range all {
+		if e.cascaded {
+			out.cascaded = append(out.cascaded, e.job.ID)
+		} else {
+			out.jobs = append(out.jobs, e.job)
+		}
+	}
+	return out, nil
+}
 
 // JobDiscardExpired implements driver.Executor. It waits only briefly for
 // rows another transaction holds (briefly), discarding nothing, with
 // driver.ErrRowsHeld, if it has to.
-func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.JobRow, error) {
-	jobs, err := briefly(ctx, e, func(c Conn) ([]*driver.JobRow, error) {
-		return historyJobs(c.Query(ctx, jobDiscardExpiredSQL, max(limit, 1), driver.ChannelDone, driver.ChannelInsert))
+func (e *Executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.JobRow, []driver.JobID, error) {
+	out, err := briefly(ctx, e, func(c Conn) (ended, error) {
+		return endedJobs(c.Query(ctx, jobDiscardExpiredSQL, max(limit, 1), driver.ChannelDone, driver.ChannelInsert))
 	})
 	if err != nil {
-		return nil, fmt.Errorf("hopper: discard expired jobs: %w", err)
+		return nil, nil, fmt.Errorf("hopper: discard expired jobs: %w", err)
 	}
-	return jobs, nil
+	return out.jobs, out.cascaded, nil
 }
 
 // jobRescueSQL finds running jobs whose client has no live lease, plus jobs
