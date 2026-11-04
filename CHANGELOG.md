@@ -6,6 +6,14 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.12.1](https://github.com/parallelworks/hopper/compare/v0.12.0...v0.12.1) (2026-11-04)
+
+
+### Bug fixes
+
+* **client:** settle again a batch whose settle gave up on a held batch row ([#133](https://github.com/parallelworks/hopper/issues/133)) ([4e1436f](https://github.com/parallelworks/hopper/commit/4e1436f20e3ee31fe74d2de99bc19f8074ee556d))
+* **leader:** the leader follows up the jobs that lease expiry and the TTL discard end ([#131](https://github.com/parallelworks/hopper/issues/131)) ([8d05abb](https://github.com/parallelworks/hopper/commit/8d05abbe329944486afe4b889987bab05e56685f))
+
 ## [0.12.0](https://github.com/parallelworks/hopper/compare/v0.11.0...v0.12.0) (2026-11-04)
 
 
