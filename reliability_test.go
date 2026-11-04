@@ -493,7 +493,8 @@ func TestLeaderMaintainsHistoryPartitions(t *testing.T) {
 // statement that needs that partition queues behind the request, the
 // prunes of the DEFAULT partitions included, which history maintenance runs
 // on the leader's loop: the failed DEFAULT partition's own prune, or, for a
-// time partition, the tags' prunes, which read every history partition.
+// time partition, the failed tags' prune, which reads every partition of
+// the failed outcome table.
 // They wait no longer than the maintenance lock timeout and are deferred,
 // so the leader keeps renewing its lease rather than stall behind the
 // request for as long as the reader stays open.
@@ -564,9 +565,9 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 			// pass's bounded waits for the pending lock: for the DEFAULT
 			// partition, the attach of a failed partition ahead, up to the
 			// maintenance lock timeout, which grows to 2s while passes defer;
-			// and one prune, up to 200ms, the failed DEFAULT partition's or,
-			// for the time partition, the completed tags', the tags' prunes
-			// after it deferred untried. Only an unbounded wait lets it lapse.
+			// and one prune, up to 200ms, the failed DEFAULT partition's, the
+			// failed tags' after it deferred untried, or, for the time
+			// partition, the failed tags'. Only an unbounded wait lets it lapse.
 			// The check outlasts the first passes at 2s, and the lease's
 			// elected_at catches a lapse that the client took back at once,
 			// as a new term, between two checks.
@@ -1294,10 +1295,10 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	tun.Maintenance = 100 * time.Millisecond
 	// While the repair's attach waits for the reader, for up to its lock
 	// timeout (doubling from 0.2s to 2s on the fifth pass), the leader loop's
-	// prunes of the two tags tables' DEFAULT partitions, which read every
-	// history partition, queue behind it. At this maintenance interval they
-	// run on every leader pass, but the first gives up after its own 200ms
-	// lock timeout and the second is deferred untried (docs/PLAN.md §7.8). A
+	// prune of the failed tags table's DEFAULT partition, which reads every
+	// partition of the failed outcome table, queues behind it. At this
+	// maintenance interval it runs on every leader pass, but gives up after
+	// its own 200ms lock timeout (docs/PLAN.md §7.8). A
 	// lapse would end the term and with it the index loop and its count of
 	// deferred passes, which would start over before reaching five, so the
 	// lease keeps a wide margin over a pass's waits.
@@ -1313,6 +1314,70 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	}
 	if v := h.count("SELECT indisvalid::int FROM pg_index WHERE indexrelid = '" + index + "'::regclass"); v != 0 {
 		t.Errorf("%s repaired behind the reader", index)
+	}
+}
+
+// TestTagsPruneReadsOnlyItsOutcomeTable queues a request for an ACCESS
+// EXCLUSIVE lock on a completed history partition behind a transaction that
+// read it, as an operator's DDL waiting for a long report would. The prune
+// of the completed tags table's DEFAULT partition reads the completed
+// outcome table, so it waits for the request up to its lock timeout and is
+// deferred. The failed tags table's reads only the failed outcome table,
+// which the request does not hold, so it runs: it is neither deferred
+// untried after the completed tags' prune nor held off by the lock, and it
+// prunes a tags row whose job has left history.
+func TestTagsPruneReadsOnlyItsOutcomeTable(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	const partition = "hopper_job_history_completed_2100010100"
+	for _, q := range []string{
+		// Far ahead of the partitions maintenance creates, so that no
+		// attach of its own waits for the pending lock.
+		"CREATE TABLE " + partition + " PARTITION OF hopper_job_history_completed FOR VALUES FROM ('2100-01-01 00:00:00+00') TO ('2100-01-01 01:00:00+00')",
+		"INSERT INTO hopper_job_history_tags (state, finalized_at, tag, id) VALUES ('discarded', now() - interval '30 days', 'orphan', hopper_uuidv7())",
+	} {
+		if _, err := h.pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The reader and the pending LOCK run on sessions of their own, which
+	// the server ends within a minute even if the test hangs.
+	reader := h.session("idle_in_transaction_session_timeout=60000")
+	if _, err := reader.Exec(ctx, "BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+partition); err != nil {
+		t.Fatal(err)
+	}
+	ddl := h.session("lock_timeout=60000", "statement_timeout=60000", "idle_in_transaction_session_timeout=60000")
+	if _, err := ddl.Exec(ctx, "BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan error, 1)
+	go func() {
+		_, err := ddl.Exec(ctx, "LOCK TABLE "+partition+" IN ACCESS EXCLUSIVE MODE")
+		locked <- err
+	}()
+	defer func() {
+		_, _ = reader.Exec(ctx, "ROLLBACK")
+		if err := <-locked; err != nil {
+			t.Errorf("LOCK TABLE: %v", err)
+		}
+		_, _ = ddl.Exec(ctx, "ROLLBACK")
+	}()
+	waitFor(t, func() bool {
+		return h.count(`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND mode = 'AccessExclusiveLock' AND NOT granted`, partition) == 1
+	})
+	res, err := h.d.Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"hopper_job_history_tags_completed_default"}; !slices.Equal(res.PruneDeferred, want) {
+		t.Errorf("PruneDeferred = %q, want %q", res.PruneDeferred, want)
+	}
+	if n := h.count("SELECT count(*) FROM hopper_job_history_tags_failed_default WHERE tag = 'orphan'"); n != 0 {
+		t.Errorf("the failed tags' orphaned row was not pruned")
 	}
 }
 

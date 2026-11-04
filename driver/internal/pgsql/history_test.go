@@ -359,8 +359,10 @@ func TestHistoryMaintainPrunesPastListError(t *testing.T) {
 
 // A DEFAULT prune whose lock wait ends at its lock timeout, behind a lock
 // request queued for a long transaction, is deferred to the next maintenance
-// rather than fail the pass, and the tags' prunes after it, which read every
-// history partition, are deferred untried. A statement_timeout may be the
+// rather than fail the pass, and the prune of the tags table that mirrors
+// its outcome table, which reads that table, is deferred untried, while the
+// other tags table's, which reads the other outcome table, runs. A
+// statement_timeout may be the
 // prune's scan running long, so it fails the pass. Either way the group's
 // retention has not run in full, so the tags partitions past retention
 // beside it wait, which a pass whose prune runs drops.
@@ -368,21 +370,22 @@ func TestHistoryMaintainDefersPruneOnlyOnLockTimeout(t *testing.T) {
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	schema := NewSchema("")
 	failedPrune := "DELETE FROM " + schema.Table("hopper_job_history_failed_default")
-	tagsPrune := func(q string) bool {
-		return strings.Contains(q, "DELETE FROM "+schema.Table("hopper_job_history_tags_completed_default")) ||
-			strings.Contains(q, "DELETE FROM "+schema.Table("hopper_job_history_tags_failed_default"))
+	tagsPrune := func(table string) func(string) bool {
+		return func(q string) bool { return strings.Contains(q, "DELETE FROM "+schema.Table(table)) }
 	}
 	const tags = "hopper_job_history_tags_failed_20000101"
 	for _, c := range []struct {
 		name, failExec, code string
 		// failed is the SQLSTATE the pass fails with, if any.
-		failed              string
-		deferred            []string
-		tagsPruned, dropped bool
+		failed   string
+		deferred []string
+		// completedTags and failedTags say whether the tags tables'
+		// prunes were tried.
+		completedTags, failedTags, dropped bool
 	}{
-		{"pruned", "", "", "", nil, true, true},
-		{"lock timeout", failedPrune, "55P03", "", []string{"hopper_job_history_failed_default", "hopper_job_history_tags_completed_default", "hopper_job_history_tags_failed_default"}, false, false},
-		{"statement timeout", failedPrune, "57014", "57014", nil, true, false},
+		{"pruned", "", "", "", nil, true, true, true},
+		{"lock timeout", failedPrune, "55P03", "", []string{"hopper_job_history_failed_default", "hopper_job_history_tags_failed_default"}, true, false, false},
+		{"statement timeout", failedPrune, "57014", "57014", nil, true, true, false},
 	} {
 		var execs []string
 		e := &Executor{Conn: maintainConn{now: now, execs: &execs, failExec: c.failExec, failCode: c.code, tagsExpired: true}, Schema: schema}
@@ -393,8 +396,10 @@ func TestHistoryMaintainDefersPruneOnlyOnLockTimeout(t *testing.T) {
 		if !slices.Equal(res.PruneDeferred, c.deferred) {
 			t.Errorf("%s: PruneDeferred = %q, want %q", c.name, res.PruneDeferred, c.deferred)
 		}
-		if slices.ContainsFunc(execs, tagsPrune) != c.tagsPruned {
-			t.Errorf("%s: tags' prunes tried = %v, want %v", c.name, !c.tagsPruned, c.tagsPruned)
+		for table, want := range map[string]bool{"hopper_job_history_tags_completed_default": c.completedTags, "hopper_job_history_tags_failed_default": c.failedTags} {
+			if slices.ContainsFunc(execs, tagsPrune(table)) != want {
+				t.Errorf("%s: %s's prune tried = %v, want %v", c.name, table, !want, want)
+			}
 		}
 		if slices.Contains(res.Dropped, tags) != c.dropped {
 			t.Errorf("%s: %s dropped = %v, want %v (%+v)", c.name, tags, !c.dropped, c.dropped, res)
