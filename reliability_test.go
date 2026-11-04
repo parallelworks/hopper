@@ -487,6 +487,48 @@ func TestLeaderMaintainsHistoryPartitions(t *testing.T) {
 	})
 }
 
+// pendingAccessExclusive queues a request for an ACCESS EXCLUSIVE lock on
+// relation behind a transaction that read it, as an operator's DDL waiting
+// for a long report would, and returns once the request waits. The reader
+// and the pending LOCK run on sessions of their own, out of the client's
+// pool, and the server ends both within a minute even if the test hangs, so
+// that neither can stall the client's pool or other tests' builds for
+// longer: the LOCK's session also once the LOCK is granted, should the
+// reader's end. release ends the reader, which grants the LOCK, and then the
+// LOCK's transaction; cleanup runs it too, should the test end first.
+func (h *harness) pendingAccessExclusive(relation string) (release func()) {
+	h.t.Helper()
+	ctx := context.Background()
+	reader := h.session("idle_in_transaction_session_timeout=60000")
+	if _, err := reader.Exec(ctx, "BEGIN"); err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+relation); err != nil {
+		h.t.Fatal(err)
+	}
+	ddl := h.session("lock_timeout=60000", "statement_timeout=60000", "idle_in_transaction_session_timeout=60000")
+	if _, err := ddl.Exec(ctx, "BEGIN"); err != nil {
+		h.t.Fatal(err)
+	}
+	locked := make(chan error, 1)
+	go func() {
+		_, err := ddl.Exec(ctx, "LOCK TABLE "+relation+" IN ACCESS EXCLUSIVE MODE")
+		locked <- err
+	}()
+	release = sync.OnceFunc(func() {
+		_, _ = reader.Exec(ctx, "ROLLBACK")
+		if err := <-locked; err != nil {
+			h.t.Errorf("LOCK TABLE: %v", err)
+		}
+		_, _ = ddl.Exec(ctx, "ROLLBACK")
+	})
+	h.t.Cleanup(release)
+	waitFor(h.t, func() bool {
+		return h.count(`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND mode = 'AccessExclusiveLock' AND NOT granted`, relation) == 1
+	})
+	return release
+}
+
 // TestLeaderKeepsLeaseBehindPendingHistoryLock queues a request for an
 // ACCESS EXCLUSIVE lock on a history partition behind a transaction that
 // read it, as an operator's DDL waiting for a long report would. Every
@@ -526,39 +568,9 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 			if _, err := h.d.Executor().HistoryIndex(ctx, driver.HistoryIndexParams{}); err != nil {
 				t.Fatal(err)
 			}
-			// The reader and the pending LOCK run on sessions of their own,
-			// out of the client's pool, and the server ends both within a
-			// minute even if the test hangs, so that neither can stall the
-			// client's pool or other tests' builds for longer: the LOCK's
-			// session also once the LOCK is granted, should the reader's end.
-			reader := h.session("idle_in_transaction_session_timeout=60000")
-			if _, err := reader.Exec(ctx, "BEGIN"); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+partition); err != nil {
-				t.Fatal(err)
-			}
-			ddl := h.session("lock_timeout=60000", "statement_timeout=60000", "idle_in_transaction_session_timeout=60000")
-			if _, err := ddl.Exec(ctx, "BEGIN"); err != nil {
-				t.Fatal(err)
-			}
-			locked := make(chan error, 1)
-			go func() {
-				_, err := ddl.Exec(ctx, "LOCK TABLE "+partition+" IN ACCESS EXCLUSIVE MODE")
-				locked <- err
-			}()
-			// The reader's end grants the LOCK, released in turn before the
-			// client stops.
-			defer func() {
-				_, _ = reader.Exec(ctx, "ROLLBACK")
-				if err := <-locked; err != nil {
-					t.Errorf("LOCK TABLE: %v", err)
-				}
-				_, _ = ddl.Exec(ctx, "ROLLBACK")
-			}()
-			waitFor(t, func() bool {
-				return h.count(`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND mode = 'AccessExclusiveLock' AND NOT granted`, partition) == 1
-			})
+			// Released before the client stops.
+			release := h.pendingAccessExclusive(partition)
+			defer release()
 
 			c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
 			// Maintenance on every leader pass, under a lease that outlasts a
@@ -1298,10 +1310,10 @@ func TestLeaderBacksOffDeferredIndexRepair(t *testing.T) {
 	// prune of the failed tags table's DEFAULT partition, which reads every
 	// partition of the failed outcome table, queues behind it. At this
 	// maintenance interval it runs on every leader pass, but gives up after
-	// its own 200ms lock timeout (docs/PLAN.md §7.8). A
-	// lapse would end the term and with it the index loop and its count of
-	// deferred passes, which would start over before reaching five, so the
-	// lease keeps a wide margin over a pass's waits.
+	// its own 200ms lock timeout (docs/PLAN.md §7.8). A lapse would end the
+	// term and with it the index loop and its count of deferred passes,
+	// which would start over before reaching five, so the lease keeps a wide
+	// margin over a pass's waits.
 	tun.LeaderTTL = 10 * time.Second
 	c.SetTuning(tun)
 	if err := c.Start(ctx); err != nil {
@@ -1341,34 +1353,13 @@ func TestTagsPruneReadsOnlyItsOutcomeTable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The reader and the pending LOCK run on sessions of their own, which
-	// the server ends within a minute even if the test hangs.
-	reader := h.session("idle_in_transaction_session_timeout=60000")
-	if _, err := reader.Exec(ctx, "BEGIN"); err != nil {
-		t.Fatal(err)
+	// The row must be in the DEFAULT partition, whose prune it tests.
+	const orphans = "SELECT count(*) FROM hopper_job_history_tags_failed_default WHERE tag = 'orphan'"
+	if n := h.count(orphans); n != 1 {
+		t.Fatalf("%d orphaned rows in the failed tags' DEFAULT partition, want 1", n)
 	}
-	if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+partition); err != nil {
-		t.Fatal(err)
-	}
-	ddl := h.session("lock_timeout=60000", "statement_timeout=60000", "idle_in_transaction_session_timeout=60000")
-	if _, err := ddl.Exec(ctx, "BEGIN"); err != nil {
-		t.Fatal(err)
-	}
-	locked := make(chan error, 1)
-	go func() {
-		_, err := ddl.Exec(ctx, "LOCK TABLE "+partition+" IN ACCESS EXCLUSIVE MODE")
-		locked <- err
-	}()
-	defer func() {
-		_, _ = reader.Exec(ctx, "ROLLBACK")
-		if err := <-locked; err != nil {
-			t.Errorf("LOCK TABLE: %v", err)
-		}
-		_, _ = ddl.Exec(ctx, "ROLLBACK")
-	}()
-	waitFor(t, func() bool {
-		return h.count(`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND mode = 'AccessExclusiveLock' AND NOT granted`, partition) == 1
-	})
+	release := h.pendingAccessExclusive(partition)
+	defer release()
 	res, err := h.d.Executor().HistoryMaintain(ctx, driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: time.Hour})
 	if err != nil {
 		t.Fatal(err)
@@ -1376,7 +1367,7 @@ func TestTagsPruneReadsOnlyItsOutcomeTable(t *testing.T) {
 	if want := []string{"hopper_job_history_tags_completed_default"}; !slices.Equal(res.PruneDeferred, want) {
 		t.Errorf("PruneDeferred = %q, want %q", res.PruneDeferred, want)
 	}
-	if n := h.count("SELECT count(*) FROM hopper_job_history_tags_failed_default WHERE tag = 'orphan'"); n != 0 {
+	if n := h.count(orphans); n != 0 {
 		t.Errorf("the failed tags' orphaned row was not pruned")
 	}
 }

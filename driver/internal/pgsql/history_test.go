@@ -362,13 +362,14 @@ func TestHistoryMaintainPrunesPastListError(t *testing.T) {
 // rather than fail the pass, and the prune of the tags table that mirrors
 // its outcome table, which reads that table, is deferred untried, while the
 // other tags table's, which reads the other outcome table, runs. A
-// statement_timeout may be the
-// prune's scan running long, so it fails the pass. Either way the group's
-// retention has not run in full, so the tags partitions past retention
-// beside it wait, which a pass whose prune runs drops.
+// statement_timeout may be the prune's scan running long, so it fails the
+// pass. Either way the group's retention has not run in full, so the tags
+// partitions past retention beside it wait, which a pass whose prune runs
+// drops.
 func TestHistoryMaintainDefersPruneOnlyOnLockTimeout(t *testing.T) {
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	schema := NewSchema("")
+	completedPrune := "DELETE FROM " + schema.Table("hopper_job_history_completed_default")
 	failedPrune := "DELETE FROM " + schema.Table("hopper_job_history_failed_default")
 	tagsPrune := func(table string) func(string) bool {
 		return func(q string) bool { return strings.Contains(q, "DELETE FROM "+schema.Table(table)) }
@@ -385,6 +386,9 @@ func TestHistoryMaintainDefersPruneOnlyOnLockTimeout(t *testing.T) {
 	}{
 		{"pruned", "", "", "", nil, true, true, true},
 		{"lock timeout", failedPrune, "55P03", "", []string{"hopper_job_history_failed_default", "hopper_job_history_tags_failed_default"}, true, false, false},
+		// The completed side alone: the failed group's retention runs in
+		// full, so its tags partition past retention goes.
+		{"completed lock timeout", completedPrune, "55P03", "", []string{"hopper_job_history_completed_default", "hopper_job_history_tags_completed_default"}, false, true, true},
 		{"statement timeout", failedPrune, "57014", "57014", nil, true, true, false},
 	} {
 		var execs []string

@@ -265,9 +265,10 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 //
 // SKIP LOCKED skips rows, not tables: the statement still takes its tables'
 // locks, the tags' prune those of every partition and index of the outcome
-// table its check of history reads, and queues behind any request for one that
-// conflicts, such as an ACCESS EXCLUSIVE one (a partition's attach or drop,
-// an index's attach, an operator's DDL) itself waiting for a long reader.
+// table its check of history reads, and history's root's when it plans that
+// table afresh, and queues behind any request for one that conflicts, such
+// as an ACCESS EXCLUSIVE one (a partition's attach or drop, an index's
+// attach, an operator's DDL) itself waiting for a long reader.
 // So its lock waits are bounded by defaultDDLLockTimeout. Unlike a partition
 // ahead, which must exist when its period starts, a prune is not urgent: one
 // that cannot get its locks in time is named in res.PruneDeferred and
@@ -288,7 +289,13 @@ func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.D
 	// this pass, it would most likely wait for the same lock, so it is
 	// deferred untried rather than wait the lock timeout again on the
 	// leader's loop. The other outcome table's, and the other tags group's,
-	// read none of its tables.
+	// read none of its partitions. The two tags groups' prunes share only
+	// history's root, which Postgres locks to read an outcome table's
+	// partition bound when it plans the table afresh: on a new connection,
+	// or after an attach or drop of one of its partitions, which this pass
+	// may have made. A request queued on the root, such as an operator's
+	// ALTER TABLE of hopper_job_history, holds both off, each for its own
+	// lock timeout.
 	if g.mirrors != "" && slices.Contains(res.PruneDeferred, g.mirrors+"_default") {
 		res.PruneDeferred = append(res.PruneDeferred, name)
 		return false, nil

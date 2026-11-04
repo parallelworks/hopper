@@ -1883,9 +1883,9 @@ creation or drop is deferred the same way (§7.10), and so is retention's prune 
 `DEFAULT` partition: `SKIP LOCKED` skips held rows but not the statement's table locks,
 and a tags table's prune reads every partition of the outcome table it mirrors, so a
 request for an `ACCESS EXCLUSIVE` lock on any of them (a partition's attach, an index
-repair's attach, an
-operator's DDL), itself waiting for a long reader, would otherwise hold the prune and
-the leader's loop, lease renewal included, for as long as the reader stayed open. The
+repair's attach, an operator's DDL), itself waiting for a long reader, would otherwise
+hold the prune and the leader's loop, lease renewal included, for as long as the reader
+stayed open. The
 prune runs under a 200 ms `lock_timeout`, and one that cannot get its locks is
 deferred to the next maintenance pass (`HistoryMaintainResult.PruneDeferred`). A prune
 is not urgent the way a partition ahead is, so it neither makes the leader retry on its
@@ -1893,12 +1893,19 @@ next pass nor lengthens the timeout of the partitions' DDL. A tags table's prune
 for each row's job in the outcome table it mirrors alone, not in `hopper_job_history`:
 history and its tags are both partitioned by state into the same two outcomes, so a
 job whose tags row is in one has its history row, if any, in the same outcome table.
-Reading the root would lock every partition and index of both outcome tables, some
-720 hourly `completed` partitions at a month's retention, and let a request on any of
-them hold off both tags prunes. A tags table's prune that comes after a deferred prune
+Reading the root locked every partition and index of both outcome tables for each,
+so the `failed` tags' prune took the `completed` table's too, some 720 hourly
+partitions at a month's retention, and a request on any of them held off both tags
+prunes. The `completed` tags' prune still reads every `completed` partition: bounding
+it by its rows' time range, so that the planner prunes the rest, is a follow-up. A tags table's prune that comes after a deferred prune
 of its outcome table's `DEFAULT` partition is deferred untried, since it reads that
 partition and would most likely wait for the same lock; the other outcome's prunes
-read none of its tables and run. Only the leader's statements are
+read none of its partitions and run. The two tags tables' prunes share only
+`hopper_job_history` itself, which Postgres locks to read an outcome table's partition
+bound when it plans the table afresh (on a new connection, or after an attach or drop
+of one of its partitions), so a request queued on it, such as an operator's `ALTER
+TABLE hopper_job_history`, holds off both, each for its own lock timeout. Only the
+leader's statements are
 bounded (`JobFinalizeParams.BriefWait` for the rescue's): a client's finalizer still
 waits, as before, for a row of another job that a caller's transaction holds, such as
 a dependent its cascade reaches, up to its flush timeout, after which it writes the
