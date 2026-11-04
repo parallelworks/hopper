@@ -1293,8 +1293,9 @@ type HistoryMaintainParams struct {
 	StreamRetention time.Duration
 	// LockTimeout bounds how long creating or dropping a storage unit
 	// waits for its lock, during which the writers of that table queue
-	// behind it; what cannot get its lock in time is deferred. Zero means
-	// the engine's default.
+	// behind it, and how long a prune of a DEFAULT unit waits for its
+	// locks; what cannot get its lock in time is deferred. Zero means the
+	// engine's default.
 	LockTimeout time.Duration
 }
 
@@ -1303,9 +1304,10 @@ type HistoryMaintainResult struct {
 	// Created and Dropped name storage units (partitions on Postgres).
 	Created []string
 	Dropped []string
-	// Deferred names storage units whose creation or drop had to wait for a
-	// transaction that has not ended, such as one that wrote history; a
-	// later pass retries them.
+	// Deferred names storage units whose creation, drop or prune (a
+	// DEFAULT unit's) had to wait for a transaction that has not ended,
+	// such as one that wrote history, or for a lock request queued behind
+	// one; a later pass retries them.
 	Deferred []string
 	// Kept names storage units past retention that wait for HistoryIndex to
 	// build their index: those an invalid index of their outcome table

@@ -487,6 +487,69 @@ func TestLeaderMaintainsHistoryPartitions(t *testing.T) {
 	})
 }
 
+// TestLeaderKeepsLeaseBehindPendingHistoryLock queues a request for an
+// ACCESS EXCLUSIVE lock on a history partition behind a transaction that
+// read it, as an operator's DDL waiting for a long report would. Every
+// statement that needs that partition queues behind the request, the
+// prunes of the DEFAULT partitions included, which history maintenance runs
+// on the leader's loop: the tags' prunes read every history partition.
+// They wait no longer than the maintenance lock timeout and are deferred,
+// so the leader keeps renewing its lease rather than stall behind the
+// request for as long as the reader stays open.
+func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	const partition = "hopper_job_history_failed_default"
+	reader, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Rollback(ctx) }()
+	if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+partition); err != nil {
+		t.Fatal(err)
+	}
+	ddl, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan error, 1)
+	go func() {
+		_, err := ddl.Exec(ctx, "LOCK TABLE "+partition+" IN ACCESS EXCLUSIVE MODE")
+		locked <- err
+	}()
+	defer func() {
+		_ = reader.Rollback(ctx)
+		if err := <-locked; err != nil {
+			t.Errorf("LOCK TABLE: %v", err)
+		}
+		_ = ddl.Rollback(ctx)
+	}()
+	waitFor(t, func() bool {
+		return h.count(`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND mode = 'AccessExclusiveLock' AND NOT granted`, partition) == 1
+	})
+
+	c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
+	// Maintenance on every leader pass, under a lease that outlasts the
+	// longest bounded wait of a pass (the maintenance lock timeout grows to
+	// 2s while passes defer), so that only an unbounded wait lets it lapse.
+	tun := fastTuning
+	tun.Maintenance = 100 * time.Millisecond
+	tun.LeaderTTL = 6 * time.Second
+	c.SetTuning(tun)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, c.IsLeader)
+	elected := time.Now()
+	for time.Since(elected) < 2*tun.LeaderTTL {
+		if h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now()") != 1 || !c.IsLeader() {
+			t.Fatalf("the leader's lease lapsed %s after the election, behind the pending lock on %s", time.Since(elected).Round(time.Millisecond), partition)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // TestLeaderRetriesDeferredPartitions holds off the attach of the
 // partitions ahead with a transaction that writes to the DEFAULT history
 // partition, as an open CompleteTx does. The leader defers them, and creates

@@ -1879,7 +1879,15 @@ Each pass reads its jobs in the same order, oldest first, so while the transacti
 stays open that duty makes no progress on its batch at all, the jobs behind the one
 that reaches the held row included, until the transaction ends; the leader's other
 duties and its lease renewal go on. Before, the whole loop waited. A partition's
-creation or drop is deferred the same way (§7.10). Only the leader's statements are
+creation or drop is deferred the same way (§7.10), and so is retention's prune of a
+`DEFAULT` partition: `SKIP LOCKED` skips held rows but not the statement's table locks,
+and the tags' prune reads every history partition, so a request for an `ACCESS
+EXCLUSIVE` lock on any of them (a partition's attach, an index repair's attach, an
+operator's DDL), itself waiting for a long reader, would otherwise hold the prune and
+the leader's loop, lease renewal included, for as long as the reader stayed open. The
+prune runs under the maintenance `lock_timeout`, and one that cannot get its locks is
+deferred and retried on a later pass, the other tags group's untried, since it waits
+for the same locks. Only the leader's statements are
 bounded (`JobFinalizeParams.BriefWait` for the rescue's): a client's finalizer still
 waits, as before, for a row of another job that a caller's transaction holds, such as
 a dependent its cascade reaches, up to its flush timeout, after which it writes the
@@ -2188,7 +2196,9 @@ partition and are deleted individually once past retention, each pass skipping t
 rows another transaction holds (`FOR UPDATE SKIP LOCKED`), which a later pass deletes:
 a `JobRetryTx` or `JobDeleteTx` of a job past retention, held open, has deleted its
 row, and a prune that waited for it would stop the leader's loop and its lease
-renewal until the caller's transaction ended. Attaching scans the
+renewal until the caller's transaction ended. The prune's table locks wait no longer
+than the `lock_timeout` below, and a prune that cannot get them is deferred like the
+DDL (§7.8). Attaching scans the
 `DEFAULT` partition under an `ACCESS EXCLUSIVE` lock on it, and dropping a partition
 takes a brief `ACCESS EXCLUSIVE` lock on the parent, once per period. A transaction
 that wrote history and is still open (a worker's `CompleteTx`) holds either lock off,
