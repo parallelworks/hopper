@@ -356,6 +356,7 @@ func (l *Leases[TTx]) Finish(ctx context.Context, token LeaseToken, res LeaseRes
 		// As the finalizer follows up a flush: of two last jobs of a batch
 		// or a dependent finished at once, the one that follows up second
 		// completes it.
+		// A settle that gives up leaves the batch to the leader's sweep.
 		settleAndPromote(ctx, c.exec, c.logger, []JobID{row.BatchID}, append([]JobID{row.ID}, cascaded...))
 	}
 	return nil

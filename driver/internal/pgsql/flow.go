@@ -280,8 +280,8 @@ func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 	if len(params.IDs) == 0 {
 		return driver.BatchSettleResult{}, nil
 	}
-	// The settle waits for a batch row only briefly (heldLockTimeout), and
-	// a settle that gives up leaves the batch to the leader.
+	// The settle waits for a batch row only briefly (heldLockTimeout); one
+	// that gives up settles none of the batches and returns ErrRowsHeld.
 	ids := uuidArray(params.IDs)
 	res, err := briefly(ctx, e, func(c Conn) (driver.BatchSettleResult, error) {
 		var (
@@ -292,9 +292,6 @@ func (e *Executor) BatchSettle(ctx context.Context, params driver.BatchSettlePar
 		res.Last = last.ID
 		return res, err
 	})
-	if errors.Is(err, driver.ErrRowsHeld) {
-		return driver.BatchSettleResult{}, nil
-	}
 	if err != nil {
 		return driver.BatchSettleResult{}, fmt.Errorf("hopper: settle batches: %w", err)
 	}

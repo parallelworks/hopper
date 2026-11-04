@@ -104,7 +104,7 @@ func (b *Batch[TTx]) insert(ctx context.Context, exec driver.Executor, inTx bool
 	// leader settles the batch once it commits, and settles it here too if
 	// this attempt fails: the jobs are inserted either way.
 	if !inTx && slices.ContainsFunc(results, func(r *InsertResult) bool { return r.Duplicate && r.Job.State.Terminal() }) {
-		if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{id}}); err != nil {
+		if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{id}}); err != nil && !errors.Is(err, driver.ErrRowsHeld) {
 			b.c.logger.WarnContext(ctx, "hopper: settle batch", "batch_id", id, "error", err)
 		}
 	}

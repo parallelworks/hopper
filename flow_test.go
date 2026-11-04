@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/parallelworks/hopper"
+	"github.com/parallelworks/hopper/driver"
 )
 
 // concurrencyMeter tracks how many jobs run at once, overall and per key.
@@ -515,5 +516,87 @@ func TestBatchCountsFinishedDuplicates(t *testing.T) {
 	waitFor(t, func() bool {
 		got, err := c.BatchGet(ctx, res.ID)
 		return err == nil && !got.CompletedAt.IsZero() && got.Failed == 0
+	})
+}
+
+// A batch whose last jobs finished in concurrent statements, and whose
+// follow-up settle gave up on a batch row another transaction held, is
+// completed by the finalizing client once the row is free, without a
+// leader. The batch's other job is finalized in an open transaction, so the
+// client's finalize misses its progress, and another transaction holds the
+// batch's row until after that one commits.
+func TestBatchSettleThatGaveUpIsRetried(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	exec := h.d.Executor()
+	owner, err := exec.ClientRegister(ctx, driver.ClientRegisterParams{Hostname: "test", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[shard]) error { return nil })
+	hopper.AddWorkFunc(workers, func(context.Context, *hopper.Job[reportDone]) error { return nil })
+	c := h.client(&hopper.Config{
+		Queues:    map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers:   workers,
+		NeverLead: true,
+	})
+	tun := fastTuning
+	tun.LeaderInterval = 10 * time.Second
+	c.SetTuning(tun)
+
+	b := c.NewBatch(hopper.BatchOpts{OnComplete: reportDone{}})
+	b.Add(shard{N: 1}, &hopper.InsertOpts{Queue: "held"})
+	b.Add(shard{N: 2}, nil)
+	res, err := b.Insert(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := exec.JobClaim(ctx, driver.JobClaimParams{Queue: "held", ClientID: owner, Limit: 1})
+	if err != nil || len(claimed.Jobs) != 1 {
+		t.Fatalf("claim = %+v, %v", claimed, err)
+	}
+	sibling, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sibling.Rollback(ctx) //nolint:errcheck // committed on the happy path
+	j := claimed.Jobs[0]
+	if _, err := h.d.UnwrapTx(sibling).JobFinalizeMany(ctx, driver.JobFinalizeParams{Jobs: []driver.JobFinalize{
+		{ID: j.ID, AttemptedBy: owner, Fence: j.Fence, State: driver.JobStateCompleted, Archive: true},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback(ctx) //nolint:errcheck // rolled back on the happy path too
+	if _, err := lock.Exec(ctx, "SELECT 1 FROM hopper_batches WHERE id = $1::uuid FOR UPDATE", res.ID.String()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForJob(t, c, res.Jobs[1].Job.ID, hopper.JobStateCompleted)
+	// Long enough for the follow-up's settle to have given up on the row.
+	time.Sleep(time.Second)
+	if err := sibling.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A settle still waiting for the row began before the commit, and
+	// gives up before the row is free.
+	time.Sleep(time.Second)
+	if got, err := c.BatchGet(ctx, res.ID); err != nil || !got.CompletedAt.IsZero() {
+		t.Fatalf("batch while its row is held = %+v, %v; want it open", got, err)
+	}
+	if err := lock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		got, err := c.BatchGet(ctx, res.ID)
+		return err == nil && !got.CompletedAt.IsZero()
 	})
 }

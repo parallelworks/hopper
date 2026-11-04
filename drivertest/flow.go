@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -453,9 +454,15 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 						batches = append(batches, j.BatchID)
 					}
 				}
-				if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: batches}); err != nil {
-					t.Error(err)
-					return
+				for {
+					_, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: batches})
+					if !errors.Is(err, driver.ErrRowsHeld) {
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						break
+					}
 				}
 			}
 		})
@@ -500,6 +507,51 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("callbacks of the pruned batch = %v", kinds)
 	}
 
+	// A settle that cannot get a batch row in time settles none of the
+	// batches it names and returns ErrRowsHeld, for the caller to settle
+	// them again. An engine that runs one writer at a time leaves no race
+	// to settle, and never gives up.
+	heldRow, freeRow := h.newBatch("heldrow", 2), h.newBatch("freerow", 2)
+	jobs = claim(ctx, t, exec, clientID, 4)
+	if len(jobs) != 4 {
+		t.Fatalf("claimed %d", len(jobs))
+	}
+	byKind := map[string][]driver.JobID{}
+	for _, j := range jobs {
+		byKind[j.Kind] = append(byKind[j.Kind], j.ID)
+	}
+	finalizeCurrent(ctx, t, exec, h.completed(byKind["heldrow"][0]), h.completed(byKind["freerow"][0]))
+	tx, commit, rollback = f.Begin(ctx, t, d)
+	defer rollback() //nolint:errcheck // already committed on the happy path
+	if _, err := d.UnwrapTx(tx).BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{heldRow}}); err != nil {
+		t.Fatalf("BatchSettle in a transaction: %v", err)
+	}
+	_, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{freeRow, heldRow}})
+	if singleWriter(d) {
+		if err != nil {
+			t.Errorf("BatchSettle while a transaction is open: %v", err)
+		}
+	} else if !errors.Is(err, driver.ErrRowsHeld) {
+		t.Errorf("BatchSettle of a held batch row: %v; want ErrRowsHeld", err)
+	}
+	if pf, ok := any(f).(PostgresFixture[TTx]); ok {
+		if n := pf.QueryText(ctx, t, d, "SELECT count(*)::text FROM hopper_batch_progress WHERE batch_id = $1::uuid", freeRow.String()); n != "1" {
+			t.Errorf("%s progress rows of the free batch after a settle that gave up; want its 1 left", n)
+		}
+	}
+	if err := commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{freeRow, heldRow}}); err != nil {
+		t.Errorf("BatchSettle once the row is free: %v", err)
+	}
+	finalizeCurrent(ctx, t, exec, h.completed(byKind["heldrow"][1]), h.completed(byKind["freerow"][1]))
+	for _, id := range []driver.JobID{heldRow, freeRow} {
+		if b, err := exec.BatchGet(ctx, id); err != nil || b.CompletedAt.IsZero() || b.Pending != 0 {
+			t.Errorf("batch after its settle was retried = %+v, %v", b, err)
+		}
+	}
+
 	// Postgres records a batch's progress in rows of its own, which the
 	// settles above leave none of once every batch has completed.
 	if pf, ok := any(f).(PostgresFixture[TTx]); ok {
@@ -511,7 +563,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 
 // testBatchProgressRaces covers the progress rows Postgres's finalizes
 // record a batch's progress in: a settle that cannot get a batch row in
-// time leaves the batch to the sweep; of two clients that finalized a
+// time gives up with ErrRowsHeld; of two clients that finalized a
 // batch's last jobs at the same time, the one settling second waits for the
 // first's settle and completes the batch; the sweep walks batches in ID
 // order; a batch row from before callbacks were checked still completes;
@@ -523,8 +575,8 @@ func testBatchProgressRaces[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	clientID := register(ctx, t, exec)
 	h := newBatchHelpers(ctx, t, exec, clientID)
 
-	// A settle that cannot get a batch row in time leaves the batch to the
-	// sweep, without an error.
+	// A settle that cannot get a batch row in time settles none and returns
+	// ErrRowsHeld; the batch is left to a settle tried again or the sweep.
 	held := h.newBatch("held", 3)
 	jobs := claim(ctx, t, exec, clientID, 3)
 	if len(jobs) != 3 {
@@ -538,8 +590,8 @@ func testBatchProgressRaces[TTx any](t *testing.T, f PostgresFixture[TTx]) {
 	}
 	finalizeCurrent(ctx, t, exec, h.completed(jobs[1].ID))
 	start := time.Now()
-	if res := h.settle(held); res != (driver.BatchSettleResult{}) {
-		t.Errorf("BatchSettle of a held batch row = %+v", res)
+	if res, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{held}}); !errors.Is(err, driver.ErrRowsHeld) || res != (driver.BatchSettleResult{}) {
+		t.Errorf("BatchSettle of a held batch row = %+v, %v; want ErrRowsHeld", res, err)
 	}
 	if took := time.Since(start); took > 3*time.Second {
 		t.Errorf("BatchSettle of a held batch row took %s", took)
