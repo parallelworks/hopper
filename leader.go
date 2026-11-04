@@ -30,21 +30,30 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	// electedAt identifies the term the client leads (the lease's
 	// elected_at): an attempt that returns another has started a new one.
 	var electedAt time.Time
+	// held is whether the last attempt that returned found the lease this
+	// client's, which a term ended by the local clock leaves set: the lease
+	// may still be live, and a stop gives it up.
+	var held bool
 	defer func() {
 		term.end()
-		c.resign(ctx, leaseID)
+		c.resign(ctx, leaseID, held)
 	}()
 
+	// lose ends the term the client has stopped leading, with its event,
+	// logging why.
+	lose := func(msg string, args ...any) {
+		c.logger.WarnContext(ctx, msg, args...)
+		c.emit(EventLeaderLost, nil, "")
+		term.end()
+		term = nil
+	}
 	// endLapsed ends the term once its lease may have expired without a
 	// renewal, by the local clock, with its event. Its loops have been
 	// canceled by then (leaseFence), even while a renewal that kept failing
 	// or waiting kept the loop from seeing the lease go.
 	endLapsed := func() {
 		if term != nil && term.lease.expired() && c.isLeader.Swap(false) {
-			c.logger.WarnContext(ctx, "hopper: leader lease may have expired without a renewal; its term ended", "client_id", leaseID)
-			c.emit(EventLeaderLost, nil, "")
-			term.end()
-			term = nil
+			lose("hopper: leader lease may have expired without a renewal; its term ended", "client_id", leaseID)
 		}
 	}
 	for {
@@ -75,8 +84,10 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		// starts below. One that reports a resign request does not extend
 		// the lease, and the term ends below.
 		if term != nil {
-			renewed := err == nil && res.Leader && res.ElectedAt.Equal(electedAt) &&
-				(res.ResignRequested || term.lease.renew(until))
+			renewed := err == nil && res.Leader && res.ElectedAt.Equal(electedAt)
+			if renewed && !res.ResignRequested {
+				renewed = term.lease.renew(until)
+			}
 			if !renewed {
 				endLapsed()
 			}
@@ -91,10 +102,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		// whose response was lost, which the next renewal reports with the
 		// new term's.
 		if err == nil && res.Leader && !res.ElectedAt.Equal(electedAt) && c.isLeader.Swap(false) {
-			c.logger.WarnContext(ctx, "hopper: leader lease lapsed; its term ended", "client_id", leaseID, "new_client_id", id)
-			c.emit(EventLeaderLost, nil, "")
-			term.end()
-			term = nil
+			lose("hopper: leader lease lapsed; its term ended", "client_id", leaseID, "new_client_id", id)
 		}
 		switch {
 		case err != nil:
@@ -110,6 +118,7 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			// the next leader's.
 			term.end()
 			term = nil
+			held = false
 			c.resignOnRequest(ctx, id)
 			// It stays out of the election for a lease's TTL, so that
 			// another client takes the lease rather than it again, and
@@ -129,19 +138,17 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			}
 			continue
 		case res.Leader:
-			leaseID, electedAt = id, res.ElectedAt
+			leaseID, electedAt, held = id, res.ElectedAt, true
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)
 				c.emit(EventLeaderElected, nil, "")
 				term = c.startTerm(ctx, until)
 			}
 		default:
+			held = false
 			if c.isLeader.Swap(false) {
 				// The ID it led under: a fence may have moved the client on.
-				c.logger.WarnContext(ctx, "hopper: lost leadership", "client_id", leaseID)
-				c.emit(EventLeaderLost, nil, "")
-				term.end()
-				term = nil
+				lose("hopper: lost leadership", "client_id", leaseID)
 			}
 		}
 		select {
@@ -177,7 +184,7 @@ func (c *Client[TTx]) startTerm(ctx context.Context, until time.Time) *leaderTer
 	t.lease.renew(until)
 	var wg sync.WaitGroup
 	wg.Go(func() { t.lease.fence(termCtx, cancel) })
-	wg.Go(func() { c.dutyLoop(termCtx) })
+	wg.Go(func() { c.dutyLoop(termCtx, ctx) })
 	wg.Go(func() { c.maintenanceLoop(termCtx, t) })
 	wg.Go(func() { c.periodicLoop(termCtx) })
 	wg.Go(func() { c.streamLoop(termCtx) })
@@ -207,12 +214,18 @@ func (c *Client[TTx]) pokeLeader() {
 	case c.leaderPoke <- struct{}{}:
 	default:
 	}
+	select {
+	case c.dutyPoke <- struct{}{}:
+	default:
+	}
 }
 
 // resign gives up leadership on stop so a replacement takes over at once.
-// id is the client ID the lease was taken or last renewed under.
-func (c *Client[TTx]) resign(ctx context.Context, id int64) {
-	if !c.isLeader.Swap(false) {
+// id is the client ID the lease was taken or last renewed under. held says
+// whether the lease may still be this client's although its term ended:
+// one whose renewal the local clock gave up on may have committed it.
+func (c *Client[TTx]) resign(ctx context.Context, id int64, held bool) {
+	if !c.isLeader.Swap(false) && !held {
 		return
 	}
 	c.giveUpLease(ctx, id, "")
@@ -257,8 +270,9 @@ func (c *Client[TTx]) resignOnRequest(ctx context.Context, id int64) {
 // goes through the same fenced finalize statement as a worker's result,
 // fenced to the claim each job was found in, so a client that finalizes its
 // own result first wins and the rescue of that job is dropped, even if the
-// job has been claimed again since.
-func (c *Client[TTx]) rescue(ctx context.Context) {
+// job has been claimed again since. A fence of this client's own lease
+// runs under clientCtx (see dutyLoop).
+func (c *Client[TTx]) rescue(ctx, clientCtx context.Context) {
 	for {
 		candidates, err := c.exec.JobRescueCandidates(ctx, driver.JobRescueParams{
 			StuckAfter: c.cfg.RescueStuckAfter,
@@ -277,7 +291,7 @@ func (c *Client[TTx]) rescue(ctx context.Context) {
 		// means our lease has lapsed and the lease loop has not noticed
 		// yet. Fence first, so the jobs stop before they are handed back.
 		if me := c.clientID.Load(); slices.ContainsFunc(candidates, func(cand driver.RescueCandidate) bool { return cand.Job.AttemptedBy == me && !cand.Stuck }) {
-			c.fence(ctx, me)
+			c.fence(clientCtx, me)
 		}
 
 		fin := make([]driver.JobFinalize, len(candidates))
@@ -708,11 +722,17 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 // for a row a caller's transaction holds or behind history maintenance's
 // DDL, waits on its own, and the lease fences it as it does the term's
 // other loops.
-func (c *Client[TTx]) dutyLoop(ctx context.Context) {
+//
+// clientCtx is the client's own context, outliving the term, which a fence
+// of the client's lease that the rescue finds lapsed runs under: once it has
+// canceled the client's jobs, its registration under a new lease must not
+// end with the term. A poke of the leader (pokeLeader) runs the duties at
+// once, as it runs an attempt.
+func (c *Client[TTx]) dutyLoop(ctx, clientCtx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaderInterval)
 	defer ticker.Stop()
 	for {
-		c.rescue(ctx)
+		c.rescue(ctx, clientCtx)
 		c.expireJobLeases(ctx)
 		c.expire(ctx)
 		c.settleBatches(ctx)
@@ -723,6 +743,7 @@ func (c *Client[TTx]) dutyLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		case <-c.dutyPoke:
 		}
 	}
 }
@@ -789,15 +810,25 @@ func (f *leaseFence) expiry() time.Time {
 
 // expired reports whether the lease may have expired without a renewal.
 func (f *leaseFence) expired() bool {
+	return f.left() <= 0
+}
+
+// left is how long the lease is known to be held. The clock is read under
+// f.mu, as renew reads it, so that a renewal either extends the lease before
+// left reads it or comes after and finds it lapsed: a fence that read the
+// clock after releasing the lock could cancel the term's loops just as a
+// renewal extended the lease, which would leave the term running on, its
+// loops gone, for as long as its renewals succeed.
+func (f *leaseFence) left() time.Duration {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return !time.Now().Before(f.until)
+	return time.Until(f.until)
 }
 
 // fence calls cancel once the lease may have expired without a renewal, or
 // returns when ctx ends.
 func (f *leaseFence) fence(ctx context.Context, cancel context.CancelFunc) {
-	timer := time.NewTimer(time.Until(f.expiry()))
+	timer := time.NewTimer(f.left())
 	defer timer.Stop()
 	for {
 		select {
@@ -805,7 +836,7 @@ func (f *leaseFence) fence(ctx context.Context, cancel context.CancelFunc) {
 			return
 		case <-timer.C:
 		}
-		left := time.Until(f.expiry())
+		left := f.left()
 		if left <= 0 {
 			cancel()
 			return

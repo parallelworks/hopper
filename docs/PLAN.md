@@ -1803,7 +1803,16 @@ RETURNING client_id,   -- $me: the client leads
   fence is as good as the cancellation: it reaches the server over a connection of its
   own, so a client cut off from the database can run a statement on past its lease, as
   any client's statements can; the advisory locks that history maintenance and the
-  index builds take keep two leaders' DDL apart meanwhile.
+  index builds take keep two leaders' DDL apart meanwhile. The local clock is the
+  monotonic one, which some systems stop while suspended: a host suspended past the
+  TTL resumes its statements until its next attempt, at once, finds the lease gone.
+  The fence is conservative: a renewal slower than the time the lease had left (some
+  10 s at the defaults) ends a term the server never lapsed, and the next one starts
+  as any does, with its `RunOnStart` jobs. The renewal shares the pool with the term's
+  loops, which can each hold a connection (history maintenance, the index build's
+  two, a duty waiting for a lock), so a pool too small for them leaves it waiting for
+  one, and the term ends at the lease's expiry. A stop after a term the local clock
+  ended still gives up the lease, which the renewal may have committed.
 
 **Resigning on request.** `Client.LeaderResign` (and `hopper leader resign`, and the
 UI's resign action) asks the current leader to give its term up, so that another

@@ -80,6 +80,9 @@ type Client[TTx any] struct {
 	listening  atomic.Bool
 	isLeader   atomic.Bool
 	leaderPoke chan struct{}
+	// dutyPoke runs the leader's duties at once (dutyLoop), as leaderPoke
+	// runs an attempt.
+	dutyPoke chan struct{}
 	// settleAfter and promoteAfter are where the leader's next batch and
 	// workflow sweeps resume. ddlDeferrals counts its history maintenance's
 	// consecutive passes with deferred partition work, and keptLogged and
@@ -138,6 +141,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		logger:       resolved.Logger,
 		workers:      resolved.Workers,
 		leaderPoke:   make(chan struct{}, 1),
+		dutyPoke:     make(chan struct{}, 1),
 		streamPoke:   make(chan struct{}, 1),
 		periodic:     newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
 		events:       newEventBus(),

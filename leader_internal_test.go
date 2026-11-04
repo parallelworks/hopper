@@ -247,7 +247,7 @@ func TestRescueEndsAPassThatRescuedNothing(t *testing.T) {
 	tun.rescueBatch = exec.batch
 	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.DiscardHandler), tuning: tun}
 	c.clientID.Store(2)
-	c.rescue(context.Background())
+	c.rescue(context.Background(), context.Background())
 	if exec.reads != 1 {
 		t.Errorf("the rescue read its candidates %d times in one pass, want 1", exec.reads)
 	}
@@ -286,7 +286,7 @@ func TestRescueFollowsUpItsCascade(t *testing.T) {
 	var logs strings.Builder
 	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.NewTextHandler(&logs, nil)), tuning: defaultTuning, events: &eventBus{}}
 	c.clientID.Store(2)
-	c.rescue(context.Background())
+	c.rescue(context.Background(), context.Background())
 	if len(exec.promoted) != 1 || !slices.Equal(exec.promoted[0], []driver.JobID{{1}, {2}}) {
 		t.Errorf("follow-ups = %v, want one of the discarded job and the job canceled by cascade", exec.promoted)
 	}
