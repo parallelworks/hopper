@@ -203,6 +203,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"Workflows", testWorkflows[TTx]},
 		{"WorkflowFanInConcurrent", testWorkflowFanInConcurrent[TTx]},
 		{"WorkflowCascadeHeld", testWorkflowCascadeHeld[TTx]},
+		{"WorkflowExpiryCascaded", testWorkflowExpiryCascaded[TTx]},
 		{"WorkflowsConcurrent", testWorkflowsConcurrent[TTx]},
 		{"WorkflowAnyOf", testWorkflowAnyOf[TTx]},
 		{"WorkflowAnyOfConcurrent", testWorkflowAnyOfConcurrent[TTx]},

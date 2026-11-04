@@ -169,8 +169,9 @@ func (x *w) releaseLease(ctx context.Context, id driver.JobID) error {
 }
 
 // JobExpireLeases implements driver.Executor.
-func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireLeasesParams) ([]*driver.JobRow, error) {
+func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireLeasesParams) ([]*driver.JobRow, []driver.JobID, error) {
 	var jobs []*driver.JobRow
+	var cascaded []driver.JobID
 	// As the rescue's finalize skips held rows, the expiry waits only
 	// briefly for a write lock another transaction holds, such as a
 	// FinishTx's, and leaves the leases to the next pass.
@@ -228,14 +229,14 @@ func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireL
 			}
 			jobs = append(jobs, job)
 		}
-		_, err = x.tail(ctx, done)
+		cascaded, err = x.tailCascaded(ctx, done)
 		return err
 	})
 	if errors.Is(err, errLockBusy) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("hopper: expire job leases: %w", err)
+		return nil, nil, fmt.Errorf("hopper: expire job leases: %w", err)
 	}
-	return jobs, nil
+	return jobs, cascaded, nil
 }

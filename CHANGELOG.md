@@ -6,6 +6,22 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.12.0](https://github.com/parallelworks/hopper/compare/v0.11.0...v0.12.0) (2026-11-04)
+
+
+### Features
+
+* **client:** ask the leader to resign its term (Client.LeaderResign) ([#123](https://github.com/parallelworks/hopper/issues/123)) ([93333d1](https://github.com/parallelworks/hopper/commit/93333d154111e1707736fd78ec6b46d5c3764a88))
+* **client:** Config.MaxOutputBytes caps a job's output ([#115](https://github.com/parallelworks/hopper/issues/115)) ([560ab11](https://github.com/parallelworks/hopper/commit/560ab11200d206d34e972db7c4e2536105b9562b))
+* **client:** Config.OnStuck reports a worker that has not returned after its job's context was canceled ([#122](https://github.com/parallelworks/hopper/issues/122)) ([4960da5](https://github.com/parallelworks/hopper/commit/4960da55c085714c21980c53b28312946931bef4))
+* **client:** StopAndCancel and a Stopped channel ([#118](https://github.com/parallelworks/hopper/issues/118)) ([cc330dd](https://github.com/parallelworks/hopper/commit/cc330dd3e5d052a63ef46f405cf8f490498a13a0))
+
+
+### Bug fixes
+
+* **bench:** wait for open workflows to complete before stopping the clients ([#132](https://github.com/parallelworks/hopper/issues/132)) ([884aa45](https://github.com/parallelworks/hopper/commit/884aa45be377bf120a19ec11d5cc801d74eaee74))
+* **client:** a stop gives an interrupted attempt back without handling it as a snooze ([#126](https://github.com/parallelworks/hopper/issues/126)) ([e9d3f93](https://github.com/parallelworks/hopper/commit/e9d3f931a1a46c281c4ea45cf297e64e5192f850))
+
 ## [0.11.0](https://github.com/parallelworks/hopper/compare/v0.10.2...v0.11.0) (2026-11-02)
 
 

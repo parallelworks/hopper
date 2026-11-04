@@ -522,7 +522,7 @@ func testExpireLeases[TTx any](t *testing.T, f Fixture[TTx]) {
 	for _, id := range []driver.JobID{retried, last, canceled} {
 		f.ExpireJobLease(ctx, t, d, id)
 	}
-	jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
+	jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
 	if err != nil || len(jobs) != 3 {
 		t.Fatalf("expire = %d jobs, %v; want 3", len(jobs), err)
 	}
@@ -548,7 +548,7 @@ func testExpireLeases[TTx any](t *testing.T, f Fixture[TTx]) {
 	if j := get(ctx, t, exec, retried); j.Attempt != 1 || j.ScheduledAt.After(time.Now().Add(time.Minute)) {
 		t.Errorf("retried job: attempt %d, scheduled %v; want it claimable now", j.Attempt, j.ScheduledAt)
 	}
-	if jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me}); err != nil || len(jobs) != 0 {
+	if jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me}); err != nil || len(jobs) != 0 {
 		t.Errorf("second expire = %d, %v", len(jobs), err)
 	}
 }
@@ -564,7 +564,7 @@ func testExpireLeasesAfterRestart[TTx any](t *testing.T, f Fixture[TTx]) {
 	exec := d.Executor()
 	expire := func(clientID int64, grace time.Duration) []*driver.JobRow {
 		t.Helper()
-		jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: clientID, Grace: grace})
+		jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: clientID, Grace: grace})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -630,12 +630,12 @@ func testExpireLeasesAfterRestartNoGrace[TTx any](t *testing.T, f Fixture[TTx]) 
 	claimByID(ctx, t, exec, id)
 	f.ExpireJobLease(ctx, t, d, id)
 	restart := register(ctx, t, exec)
-	jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
+	jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
 	if err != nil || len(jobs) != 0 {
 		t.Errorf("expire of a one-minute lease within a minute of a restart = %d jobs, %v; want none", len(jobs), err)
 	}
 	f.AgeClientStart(ctx, t, d, restart, time.Hour)
-	jobs, err = exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
+	jobs, _, err = exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
 	if err != nil || len(jobs) != 1 {
 		t.Errorf("expire once the only start predates the renewal = %d jobs, %v; want the lease", len(jobs), err)
 	}
@@ -661,7 +661,7 @@ func testExpireLeasesAfterLapsedStart[TTx any](t *testing.T, f Fixture[TTx]) {
 	f.AgeClientStart(ctx, t, d, crashed, 1500*time.Millisecond)
 	f.ExpireLease(ctx, t, d, crashed)
 	register(ctx, t, exec)
-	jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me, Grace: 1200 * time.Millisecond})
+	jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me, Grace: 1200 * time.Millisecond})
 	if err != nil || len(jobs) != 0 {
 		t.Errorf("expire within the grace of a restart, after a client that crashed before it = %d jobs, %v; want none", len(jobs), err)
 	}
@@ -684,7 +684,7 @@ func testExpireLeasesAfterTwoStarts[TTx any](t *testing.T, f Fixture[TTx]) {
 	first := register(ctx, t, exec)
 	f.AgeClientStart(ctx, t, d, first, 1500*time.Millisecond)
 	register(ctx, t, exec)
-	jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me, Grace: 1200 * time.Millisecond})
+	jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me, Grace: 1200 * time.Millisecond})
 	if err != nil || len(jobs) != 1 {
 		t.Errorf("expire past the grace of the first start = %d jobs, %v; want the lease", len(jobs), err)
 	}
@@ -704,7 +704,7 @@ func testExpireLeasesAfterFutureStart[TTx any](t *testing.T, f Fixture[TTx]) {
 	f.ExpireJobLease(ctx, t, d, id)
 	ahead := register(ctx, t, exec)
 	f.AgeClientStart(ctx, t, d, ahead, -time.Hour)
-	jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
+	jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
 	if err != nil || len(jobs) != 1 {
 		t.Errorf("expire after a client's start an hour ahead = %d jobs, %v; want the lease", len(jobs), err)
 	}
@@ -734,7 +734,7 @@ func testExpireRacesRenew[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	done := make(chan []*driver.JobRow, 1)
 	go func() {
-		jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
+		jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
 		// An expiry that waited past its brief bound for the renewal
 		// gives up with ErrRowsHeld, which the renewal wins too.
 		if err != nil && !errors.Is(err, driver.ErrRowsHeld) {
@@ -785,7 +785,7 @@ func testExpireRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal("finalize in a transaction did not apply")
 	}
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	jobs, err := exec.JobExpireLeases(sctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
+	jobs, _, err := exec.JobExpireLeases(sctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
 	cancel()
 	if err != nil || len(jobs) != 0 {
 		t.Errorf("expire of a job being finalized = %d jobs, %v; want none, at once", len(jobs), err)
@@ -800,7 +800,7 @@ func testExpireRacesFinalize[TTx any](t *testing.T, f Fixture[TTx]) {
 	id = insert(ctx, t, exec, params("k", 1))[0].Job.ID
 	l = claimByID(ctx, t, exec, id)
 	f.ExpireJobLease(ctx, t, d, id)
-	if jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me}); err != nil || len(jobs) != 1 {
+	if jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me}); err != nil || len(jobs) != 1 {
 		t.Fatalf("expire = %d, %v", len(jobs), err)
 	}
 	if applied := finalize(ctx, t, exec, leaseResult(l, driver.JobStateCompleted)); len(applied) != 0 {
@@ -833,7 +833,7 @@ func testExpireRacesCancel[TTx any](t *testing.T, f Fixture[TTx]) {
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		<-start
-		if _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: n, ClientID: me}); err != nil {
+		if _, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: n, ClientID: me}); err != nil {
 			t.Error(err)
 		}
 	})
@@ -853,7 +853,7 @@ func testExpireRacesCancel[TTx any](t *testing.T, f Fixture[TTx]) {
 	close(start)
 	wg.Wait()
 	for {
-		jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: n, ClientID: me})
+		jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: n, ClientID: me})
 		if err != nil {
 			t.Fatal(err)
 		}
