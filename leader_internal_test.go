@@ -149,6 +149,46 @@ func TestMaintainHistoryCountsDeferralsPastFailure(t *testing.T) {
 	}
 }
 
+// messageCounter counts the records whose message contains a substring.
+type messageCounter struct {
+	sub string
+	n   *int
+}
+
+func (h messageCounter) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h messageCounter) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, h.sub) {
+		*h.n++
+	}
+	return nil
+}
+func (h messageCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h messageCounter) WithGroup(string) slog.Handler      { return h }
+
+// A prune deferred behind a lock neither makes the leader retry on its next
+// pass nor lengthens the partitions' lock timeout. A pass that retries
+// deferred partitions retries the prune too, whose deferral is logged once
+// per maintenance interval rather than on every such pass.
+func TestMaintainHistoryPruneDeferred(t *testing.T) {
+	ctx := context.Background()
+	var logged int
+	exec := &maintainExec{res: driver.HistoryMaintainResult{PruneDeferred: []string{"d"}}}
+	c := &Client[struct{}]{exec: exec, logger: slog.New(messageCounter{"prune deferred", &logged}), tuning: defaultTuning}
+	if !c.maintainHistory(ctx) || c.ddlDeferrals != 0 {
+		t.Fatalf("a pass that deferred only a prune asked to be retried on the next leader pass, or counted %d deferrals", c.ddlDeferrals)
+	}
+	exec.res.Deferred = []string{"p"}
+	for range 3 {
+		if c.maintainHistory(ctx) {
+			t.Fatal("a pass that deferred a partition did not ask to be retried on the next leader pass")
+		}
+	}
+	if logged != 1 {
+		t.Errorf("prune deferral logged %d times within a maintenance interval, want once", logged)
+	}
+}
+
 // heldRescueExec has a full batch of rescue candidates whose rows other
 // transactions hold, so that the rescue's finalize, which skips them,
 // applies none. It stops offering them after a few reads.

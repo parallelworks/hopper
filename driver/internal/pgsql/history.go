@@ -240,7 +240,7 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 		}
 	}
 	pruned, pruneErr := e.pruneDefault(ctx, g, keep, res)
-	return mayDrop && !dropsFailed && pruned && pruneErr == nil, errors.Join(append(errs, pruneErr)...)
+	return mayDrop && !dropsFailed && pruned, errors.Join(append(errs, pruneErr)...)
 }
 
 // pruneDefault deletes the rows of g's DEFAULT partition past retention,
@@ -270,11 +270,11 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 // that cannot get its locks in time is named in res.PruneDeferred and
 // reports false, and the next maintenance pass tries again, with the same
 // short timeout, rather than the next leader pass with a longer one, as is
-// a tags group's prune that comes after a deferred prune of history's or of
-// its tags, deferred untried. Only a lock wait defers it: a statement_timeout
-// may be its scan of a large DEFAULT partition running long, which is
-// reported as an error. It reports whether it pruned, which it has with
-// nothing to keep.
+// a tags group's prune that comes after a deferred prune of one of history's
+// DEFAULT partitions or of the other tags group's, deferred untried. Only a
+// lock wait defers it: a statement_timeout may be its scan of a large
+// DEFAULT partition running long, which is reported as an error. It reports
+// whether it pruned, which it has with nothing to keep.
 func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.Duration, res *driver.HistoryMaintainResult) (bool, error) {
 	if keep <= 0 {
 		return true, nil
@@ -337,7 +337,8 @@ func historyDefault(name string) bool {
 // HistoryIndexParams.LockTimeout says otherwise. While it waits, every
 // statement that needs the same table queues behind it, and a transaction
 // that wrote history (a worker's CompleteTx) holds it off until that
-// transaction ends; the next pass retries.
+// transaction ends; the next pass retries. It also bounds, always, the lock
+// waits of a DEFAULT partition's prune (pruneDefault).
 const defaultDDLLockTimeout = 200 * time.Millisecond
 
 // lockTimeoutSetting formats d as a lock_timeout value: defaultDDLLockTimeout

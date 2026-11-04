@@ -1,6 +1,7 @@
 package pgsql
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -228,8 +229,14 @@ type maintainConn struct {
 	now      time.Time
 	execs    *[]string
 	failExec string
+	// failCode is the SQLSTATE of the statements failExec fails, XX000 if
+	// empty.
+	failCode string
 	// failList fails the listing of the failed table's partitions.
 	failList bool
+	// tagsExpired lists a partition past retention of the failed table's
+	// tags table.
+	tagsExpired bool
 }
 
 func (c maintainConn) Begin(context.Context) (Tx, error) { return maintainTx{c}, nil }
@@ -237,7 +244,7 @@ func (c maintainConn) Begin(context.Context) (Tx, error) { return maintainTx{c},
 func (c maintainConn) Exec(_ context.Context, sql string, _ ...any) (int64, error) {
 	*c.execs = append(*c.execs, sql)
 	if c.failExec != "" && strings.Contains(sql, c.failExec) {
-		return 0, codedError("XX000")
+		return 0, codedError(cmp.Or(c.failCode, "XX000"))
 	}
 	return 0, nil
 }
@@ -262,6 +269,8 @@ func (c maintainConn) Query(_ context.Context, sql string, args ...any) (Rows, e
 		return nil, codedError("57014")
 	case strings.Contains(sql, "pg_inherits") && args[0] == NewSchema("").Table("hopper_job_history_failed"):
 		return &stringRows{rows: []string{"hopper_job_history_failed_20000101"}}, nil
+	case c.tagsExpired && strings.Contains(sql, "pg_inherits") && args[0] == NewSchema("").Table("hopper_job_history_tags_failed"):
+		return &stringRows{rows: []string{"hopper_job_history_tags_failed_20000101"}}, nil
 	}
 	return &stringRows{}, nil
 }
@@ -344,5 +353,50 @@ func TestHistoryMaintainPrunesPastListError(t *testing.T) {
 		return strings.Contains(q, "DELETE FROM") && strings.Contains(q, "hopper_job_history_failed_default")
 	}) {
 		t.Error("the failed table's DEFAULT partition was not pruned after a failed listing")
+	}
+}
+
+// A DEFAULT prune whose lock wait ends at its lock timeout, behind a lock
+// request queued for a long transaction, is deferred to the next maintenance
+// rather than fail the pass, and the tags' prunes after it, which read every
+// history partition, are deferred untried. A statement_timeout may be the
+// prune's scan running long, so it fails the pass. Either way the group's
+// retention has not run in full, so the tags partitions past retention
+// beside it wait, which a pass whose prune runs drops.
+func TestHistoryMaintainDefersPruneOnlyOnLockTimeout(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	schema := NewSchema("")
+	failedPrune := "DELETE FROM " + schema.Table("hopper_job_history_failed_default")
+	tagsPrune := func(q string) bool {
+		return strings.Contains(q, "DELETE FROM "+schema.Table("hopper_job_history_tags_completed_default")) ||
+			strings.Contains(q, "DELETE FROM "+schema.Table("hopper_job_history_tags_failed_default"))
+	}
+	const tags = "hopper_job_history_tags_failed_20000101"
+	for _, c := range []struct {
+		name, failExec, code string
+		// failed is the SQLSTATE the pass fails with, if any.
+		failed              string
+		deferred            []string
+		tagsPruned, dropped bool
+	}{
+		{"pruned", "no statement contains this", "", "", nil, true, true},
+		{"lock timeout", failedPrune, "55P03", "", []string{"hopper_job_history_failed_default", "hopper_job_history_tags_completed_default", "hopper_job_history_tags_failed_default"}, false, false},
+		{"statement timeout", failedPrune, "57014", "57014", nil, true, false},
+	} {
+		var execs []string
+		e := &Executor{Conn: maintainConn{now: now, execs: &execs, failExec: c.failExec, failCode: c.code, tagsExpired: true}, Schema: schema}
+		res, err := e.HistoryMaintain(context.Background(), driver.HistoryMaintainParams{CompletedRetention: time.Hour, FailedRetention: time.Hour})
+		if (err != nil) != (c.failed != "") || sqlState(err) != c.failed {
+			t.Errorf("%s: HistoryMaintain error = %v, want SQLSTATE %q", c.name, err, c.failed)
+		}
+		if !slices.Equal(res.PruneDeferred, c.deferred) {
+			t.Errorf("%s: PruneDeferred = %q, want %q", c.name, res.PruneDeferred, c.deferred)
+		}
+		if slices.ContainsFunc(execs, tagsPrune) != c.tagsPruned {
+			t.Errorf("%s: tags' prunes tried = %v, want %v", c.name, !c.tagsPruned, c.tagsPruned)
+		}
+		if slices.Contains(res.Dropped, tags) != c.dropped {
+			t.Errorf("%s: %s dropped = %v, want %v (%+v)", c.name, tags, !c.dropped, c.dropped, res)
+		}
 	}
 }
