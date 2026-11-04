@@ -2,6 +2,7 @@ package hopper
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
@@ -57,7 +58,8 @@ func newSettleRetrier(exec finalizeExecutor, logger *slog.Logger, first, maxDela
 }
 
 // add keeps batches to settle again, each first after the flush interval.
-// A batch already kept keeps its delay.
+// A batch already kept, whose settle gave up again on new progress, starts
+// its delay over.
 func (r *settleRetrier) add(batches []driver.JobID) {
 	if len(batches) == 0 {
 		return
@@ -67,7 +69,10 @@ func (r *settleRetrier) add(batches []driver.JobID) {
 	r.mu.Lock()
 	for _, id := range batches {
 		if h, ok := r.held[id]; ok {
-			h.again = true
+			h.again, h.delay = true, r.first
+			if h.due.After(due) {
+				h.due = due
+			}
 			r.held[id] = h
 			continue
 		}
@@ -136,16 +141,26 @@ func (r *settleRetrier) nextDue() (time.Time, bool) {
 // doubled; once that would pass maxDelay, or when final, it is left to the
 // leader's sweep. A batch a settle gave up on again during the attempt is
 // tried again after the flush interval, whether the attempt settled it or
-// found its row still held. A
-// non-final attempt runs on ctx, and leaves the batches it did not settle
-// before ctx was done as they are, for the final one.
+// found its row still held. A non-final attempt runs on ctx, and leaves
+// the batches it did not settle before ctx was done as they are, for the
+// final one.
+//
+// The batches are settled one after another, those whose delay is shortest
+// first: they have been held the least, and are the likeliest to be free,
+// so that a batch whose row has stayed held, which waits out its lock
+// timeout, neither keeps them waiting nor uses up the stop's last attempt
+// before it reaches them.
 func (r *settleRetrier) attempt(ctx context.Context, final bool) {
+	type try struct {
+		id    driver.JobID
+		delay time.Duration
+	}
 	now := time.Now()
 	r.mu.Lock()
-	var ids []driver.JobID
+	var tries []try
 	for id, h := range r.held {
 		if final || !h.due.After(now) {
-			ids = append(ids, id)
+			tries = append(tries, try{id: id, delay: h.delay})
 			if h.again {
 				h.again = false
 				r.held[id] = h
@@ -153,10 +168,16 @@ func (r *settleRetrier) attempt(ctx context.Context, final bool) {
 		}
 	}
 	r.mu.Unlock()
-	if len(ids) == 0 {
+	if len(tries) == 0 {
 		return
 	}
-	slices.SortFunc(ids, func(a, b driver.JobID) int { return bytes.Compare(a[:], b[:]) })
+	slices.SortFunc(tries, func(a, b try) int {
+		return cmp.Or(cmp.Compare(a.delay, b.delay), bytes.Compare(a.id[:], b.id[:]))
+	})
+	ids := make([]driver.JobID, len(tries))
+	for i, t := range tries {
+		ids[i] = t.id
+	}
 	parent, cancel := ctx, context.CancelFunc(func() {})
 	if final {
 		parent, cancel = context.WithTimeout(context.WithoutCancel(ctx), stopSettleTimeout)

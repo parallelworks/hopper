@@ -882,6 +882,23 @@ func TestFinalizerFlushesWhileASettleIsRetried(t *testing.T) {
 	}
 }
 
+// An attempt settles the batches held the least first, so that one whose
+// row has stayed held, waiting out its lock timeout, does not keep them
+// waiting or use up the stop's last attempt before it reaches them.
+func TestSettleRetrierSettlesTheLeastHeldFirst(t *testing.T) {
+	stale, fresh := driver.JobID{1}, driver.JobID{2}
+	exec := &settleExec{}
+	r := newSettleRetrier(exec, slog.New(slog.DiscardHandler), time.Millisecond, time.Hour)
+	r.add([]driver.JobID{stale, fresh})
+	r.mu.Lock()
+	r.held[stale] = heldBatch{delay: 8 * time.Millisecond, due: time.Now()}
+	r.mu.Unlock()
+	r.attempt(context.Background(), true)
+	if calls, want := exec.calls(), [][]driver.JobID{{fresh}, {stale}}; !slices.EqualFunc(calls, want, slices.Equal) {
+		t.Errorf("settles = %v; want %v, the batch held the least first", calls, want)
+	}
+}
+
 // A retry of four batches, two of them held, keeps each held one once,
 // its delay doubled once, and lets the others go.
 func TestSettleRetrierKeepsEachHeldBatchOnce(t *testing.T) {
@@ -990,4 +1007,22 @@ func TestFinalizerStopCutsShortASettleRetry(t *testing.T) {
 			t.Errorf("%d settles; want the stop's last attempt too", n)
 		}
 	})
+}
+
+// A batch already kept whose settle gives up again, on progress committed
+// since, starts its delay over rather than waiting out the delay its row's
+// earlier holds grew.
+func TestSettleRetrierRestartsTheDelayOfABatchHeldAgain(t *testing.T) {
+	x := driver.JobID{1}
+	r := newSettleRetrier(&settleExec{}, slog.New(slog.DiscardHandler), time.Millisecond, time.Hour)
+	r.add([]driver.JobID{x})
+	r.mu.Lock()
+	r.held[x] = heldBatch{delay: time.Minute, due: time.Now().Add(time.Minute)}
+	r.mu.Unlock()
+	r.add([]driver.JobID{x})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if h := r.held[x]; h.delay != time.Millisecond || time.Until(h.due) > time.Second || !h.again {
+		t.Errorf("batch held again = %+v; want its delay back to the flush interval", h)
+	}
 }

@@ -2793,11 +2793,15 @@ observability without new machinery.
     up a flush. Each has a delay of its own, first the flush interval and then doubling
     while its row stays held, and a retry settles each batch in a statement of its own,
     so that only the batches whose rows are held keep waiting, and waiting for one holds
-    no other batch's row. A batch whose settle gives up again while a retry of it is in
-    flight is kept, even if that retry settles it, since the retry may have missed the
-    progress the second settle was for. When the client stops, the finalizer cuts short
-    a retry in flight and makes one last attempt at every batch it holds, within 2 s,
-    before it exits. A workflow whose last jobs finished in concurrent statements so
+    no other batch's row. A retry settles its batches one after another, those whose
+    delay is shortest first, as the likeliest to be free, so that a batch whose row stays
+    held, waiting out the bound, neither keeps them waiting nor uses up the stop's
+    attempt before it reaches them. A batch whose settle gives up again, on progress
+    committed since, starts its delay over at the flush interval; if a retry of it is in
+    flight, the batch is kept even if that retry settles it, since the retry may have
+    missed the progress the second settle was for. When the client stops, the finalizer
+    cuts short a retry in flight and makes one last attempt at every batch it holds,
+    within 2 s, before it exits. A workflow whose last jobs finished in concurrent statements so
     completes at the client's next attempt once the row is free rather than on the
     leader's next pass, and a cluster stopped right after its last jobs finished leaves
     one open only if the stop's attempt gives up too. Once a batch's next delay would
