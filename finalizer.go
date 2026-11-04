@@ -1,12 +1,10 @@
 package hopper
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"errors"
 	"log/slog"
-	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -62,14 +60,12 @@ type finalizer struct {
 	// local waiters.
 	applied func(job *driver.JobRow, result driver.JobFinalize)
 
-	// held lists the batches whose settle gave up on a row another
-	// transaction held, which run settles again when retry fires, after
-	// retryDelay, doubling from interval up to retryMax; past that they are
-	// left to the leader's sweep. The run goroutine alone uses them.
-	held       map[driver.JobID]struct{}
-	retry      <-chan time.Time
-	retryDelay time.Duration
-	retryMax   time.Duration
+	// retrier settles again, beside run, the batches whose settle gave up
+	// on a held batch row; run stops it, and waits for its last attempt,
+	// before it returns.
+	retrier     *settleRetrier
+	retrierStop chan struct{}
+	retrierDone chan struct{}
 
 	in   chan pending
 	done chan struct{} // closed when run returns
@@ -112,7 +108,6 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs
 		exec:          exec,
 		logger:        logger,
 		interval:      t.finalizeInterval,
-		retryMax:      cmp.Or(t.leaderInterval, defaultTuning.leaderInterval),
 		maxBatch:      t.finalizeBatch,
 		keepLogs:      keepLogs,
 		flushLogBytes: finalizeLogBytes,
@@ -124,6 +119,9 @@ func newFinalizer(exec finalizeExecutor, logger *slog.Logger, t tuning, keepLogs
 		applied:       applied,
 		in:            make(chan pending, max(t.finalizeBuffer, 2*t.finalizeBatch)),
 		done:          make(chan struct{}),
+		retrier:       newSettleRetrier(exec, logger, t.finalizeInterval, cmp.Or(t.leaderInterval, defaultTuning.leaderInterval)),
+		retrierStop:   make(chan struct{}),
+		retrierDone:   make(chan struct{}),
 	}
 }
 
@@ -215,6 +213,14 @@ func (f *finalizer) stopIfIdle(force bool) bool {
 // context and closes done.
 func (f *finalizer) run(ctx context.Context) {
 	defer close(f.done)
+	go func() {
+		defer close(f.retrierDone)
+		f.retrier.run(ctx, f.retrierStop, f.crashed.Load)
+	}()
+	defer func() {
+		close(f.retrierStop)
+		<-f.retrierDone
+	}()
 	var (
 		batch    []pending
 		logBytes int
@@ -234,8 +240,6 @@ func (f *finalizer) run(ctx context.Context) {
 		case <-timer:
 			f.flush(ctx, batch)
 			batch, logBytes, timer = nil, 0, nil
-		case <-f.retry:
-			f.settleHeld(ctx, false)
 		case <-ctx.Done():
 			if f.crashed.Load() {
 				return
@@ -292,7 +296,6 @@ func (f *finalizer) run(ctx context.Context) {
 					expiry = t.C
 				}
 				if f.stopIfIdle(late) {
-					f.settleHeld(ctx, true)
 					return
 				}
 				select {
@@ -525,58 +528,7 @@ func (f *finalizer) followUp(ctx context.Context, finished []pending, cascaded .
 	if len(jobs) == 0 {
 		return
 	}
-	f.hold(settleAndPromote(ctx, f.exec, f.logger, batches, jobs))
-}
-
-// maxHeld bounds the batches the finalizer keeps to settle again; past it,
-// those whose settle gave up are left to the leader's sweep.
-const maxHeld = 10000
-
-// hold keeps batches whose settle gave up to settle again, and schedules
-// that if it is not scheduled yet.
-func (f *finalizer) hold(batches []driver.JobID) {
-	for _, id := range batches {
-		if len(f.held) == maxHeld {
-			break
-		}
-		if f.held == nil {
-			f.held = make(map[driver.JobID]struct{}, len(batches))
-		}
-		f.held[id] = struct{}{}
-	}
-	if len(f.held) > 0 && f.retry == nil {
-		f.retryDelay = f.interval
-		f.retry = time.After(f.retryDelay)
-	}
-}
-
-// settleHeld settles again the batches whose settle gave up. While a row
-// is still held it tries again later, doubling the delay; once the delay
-// would pass retryMax, or when final (the stop's last attempt), the
-// batches are left to the leader's sweep.
-func (f *finalizer) settleHeld(ctx context.Context, final bool) {
-	f.retry = nil
-	if len(f.held) == 0 {
-		return
-	}
-	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
-	defer cancel()
-	ids := slices.SortedFunc(maps.Keys(f.held), func(a, b driver.JobID) int { return bytes.Compare(a[:], b[:]) })
-	_, err := f.exec.BatchSettle(opCtx, driver.BatchSettleParams{IDs: ids})
-	if !errors.Is(err, driver.ErrRowsHeld) {
-		if err != nil {
-			f.logger.WarnContext(ctx, "hopper: settle batches; the leader will", "count", len(f.held), "error", err)
-		}
-		f.held = nil
-		return
-	}
-	f.retryDelay *= 2
-	if final || f.retryDelay > f.retryMax {
-		f.logger.DebugContext(ctx, "hopper: batch rows still held; the leader will settle them", "count", len(f.held))
-		f.held = nil
-		return
-	}
-	f.retry = time.After(f.retryDelay)
+	f.retrier.add(settleAndPromote(ctx, f.exec, f.logger, batches, jobs))
 }
 
 // settleAndPromote settles batches and promotes the dependents of jobs,

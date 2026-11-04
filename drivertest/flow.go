@@ -454,15 +454,18 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 						batches = append(batches, j.BatchID)
 					}
 				}
-				for {
+				// Bounded, so that a row that stays held fails the test
+				// rather than hanging it.
+				for try := 1; ; try++ {
 					_, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: batches})
-					if !errors.Is(err, driver.ErrRowsHeld) {
-						if err != nil {
-							t.Error(err)
-							return
-						}
-						break
+					if errors.Is(err, driver.ErrRowsHeld) && try < 20 {
+						continue
 					}
+					if err != nil {
+						t.Errorf("settle, try %d: %v", try, err)
+						return
+					}
+					break
 				}
 			}
 		})
@@ -510,8 +513,14 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	// A settle that cannot get a batch row in time settles none of the
 	// batches it names and returns ErrRowsHeld, for the caller to settle
 	// them again. An engine that runs one writer at a time leaves no race
-	// to settle, and never gives up.
-	heldRow, freeRow := h.newBatch("heldrow", 2), h.newBatch("freerow", 2)
+	// to settle, and never gives up. The free batch sorts first, so the
+	// settle locks it before it waits for the held one, and giving up must
+	// undo what it did to the free batch.
+	freeRow, heldRow := h.newBatch("rowa", 2), h.newBatch("rowb", 2)
+	freeKind, heldKind := "rowa", "rowb"
+	if bytes.Compare(freeRow[:], heldRow[:]) > 0 {
+		freeRow, heldRow, freeKind, heldKind = heldRow, freeRow, heldKind, freeKind
+	}
 	jobs = claim(ctx, t, exec, clientID, 4)
 	if len(jobs) != 4 {
 		t.Fatalf("claimed %d", len(jobs))
@@ -520,7 +529,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	for _, j := range jobs {
 		byKind[j.Kind] = append(byKind[j.Kind], j.ID)
 	}
-	finalizeCurrent(ctx, t, exec, h.completed(byKind["heldrow"][0]), h.completed(byKind["freerow"][0]))
+	finalizeCurrent(ctx, t, exec, h.completed(byKind[heldKind][0]), h.completed(byKind[freeKind][0]))
 	tx, commit, rollback = f.Begin(ctx, t, d)
 	defer rollback() //nolint:errcheck // already committed on the happy path
 	if _, err := d.UnwrapTx(tx).BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{heldRow}}); err != nil {
@@ -545,7 +554,7 @@ func testBatchesConcurrent[TTx any](t *testing.T, f Fixture[TTx]) {
 	if _, err := exec.BatchSettle(ctx, driver.BatchSettleParams{IDs: []driver.JobID{freeRow, heldRow}}); err != nil {
 		t.Errorf("BatchSettle once the row is free: %v", err)
 	}
-	finalizeCurrent(ctx, t, exec, h.completed(byKind["heldrow"][1]), h.completed(byKind["freerow"][1]))
+	finalizeCurrent(ctx, t, exec, h.completed(byKind[heldKind][1]), h.completed(byKind[freeKind][1]))
 	for _, id := range []driver.JobID{heldRow, freeRow} {
 		if b, err := exec.BatchGet(ctx, id); err != nil || b.CompletedAt.IsZero() || b.Pending != 0 {
 			t.Errorf("batch after its settle was retried = %+v, %v", b, err)

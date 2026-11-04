@@ -2787,12 +2787,16 @@ observability without new machinery.
     is detected; against a leader's finalize under the same bound (§7.8), whichever
     waited first gives up, and the leader tries its finalize again on its next pass). A
     settle that cannot get a batch row settles none of the batches it names and returns
-    `driver.ErrRowsHeld`. The finalizer keeps those batches and settles them again,
-    first after the flush interval and then at doubling delays while a row stays held,
-    and once more when the client stops, before its finalizer exits; so a workflow
-    whose last jobs finished in concurrent statements completes about a flush after
-    the row is free rather than on the leader's next pass, and a cluster stopped right
-    after its last jobs finished leaves none of them open. Once the next delay would
+    `driver.ErrRowsHeld`. The finalizer keeps those batches and settles them again beside
+    its loop, so that waiting for a held row never holds up a flush. Each has a delay of
+    its own, first the flush interval and then doubling while its row stays held, and a
+    retry that gives up is split in halves, as a timed-out flush is, so that only the
+    batches whose rows are held keep waiting. When the client stops, the finalizer makes
+    one last attempt at every batch it holds, within 2 s, before it exits. A workflow
+    whose last jobs finished in concurrent statements so completes at the client's next
+    attempt once the row is free rather than on the leader's next pass, and a cluster
+    stopped right after its last jobs finished leaves one open only if the stop's attempt
+    gives up too. Once a batch's next delay would
     pass a leader interval, or the stop's attempt gives up too, the batches are left to
     the leader, as are those of a `Leases.Finish` or a batch insert whose settle gave
     up; on every pass it sweeps batches with progress rows in ID order (`SKIP LOCKED`,
