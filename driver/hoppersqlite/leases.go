@@ -176,7 +176,7 @@ func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireL
 	// briefly for a write lock another transaction holds, such as a
 	// FinishTx's, and leaves the leases to the next pass.
 	err := e.writeBrief(ctx, func(x *w) error {
-		jobs, cascaded = jobs[:0], cascaded[:0]
+		jobs = jobs[:0]
 		// A client's start later than now, which a host clock set ahead and
 		// then corrected leaves (see clock), counts once the clock
 		// reaches it, as on PostgreSQL.
@@ -229,14 +229,8 @@ func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireL
 			}
 			jobs = append(jobs, job)
 		}
-		all, err := x.tail(ctx, done)
-		if err != nil {
-			return err
-		}
-		for _, f := range all[len(done):] {
-			cascaded = append(cascaded, f.row.job.ID)
-		}
-		return nil
+		cascaded, err = x.tailCascaded(ctx, done)
+		return err
 	})
 	if errors.Is(err, errLockBusy) {
 		return nil, nil, nil

@@ -261,3 +261,72 @@ func TestLeaderExpiryFollowsUpWorkflows(t *testing.T) {
 		})
 	}
 }
+
+// TestLeaderExpiryRacesFinish ends two steps of a workflow at once, one by
+// the leader's expiry of its job lease and one by a lease's Finish, so
+// that each statement may see the other step live and leave the workflow
+// to the follow-ups: in even rounds the steps are an any-of group, which
+// they exhaust, and in odd rounds the workflow's last steps, which
+// complete it. Whichever follows up second cancels the dependent and
+// completes the workflow, with no sweep: no client leads.
+func TestLeaderExpiryRacesFinish(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_leader (client_id, elected_at, expires_at) VALUES (-1, now(), now() + interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+	c := leaseClient(h, &hopper.Config{})
+	remote := &hopper.InsertOpts{Queue: remoteQueue, MaxAttempts: 1}
+	for round := range 40 {
+		wf := hopper.NewWorkflow("race", nil)
+		s0 := wf.Add(remoteJob{N: 0}, &hopper.StepOpts{Insert: remote})
+		s1 := wf.Add(remoteJob{N: 1}, &hopper.StepOpts{Insert: remote})
+		want := []hopper.JobState{hopper.JobStateDiscarded, hopper.JobStateDiscarded}
+		if round%2 == 0 {
+			wf.Add(remoteJob{N: 2}, &hopper.StepOpts{AfterAny: [][]hopper.Step{{s0, s1}}, Insert: remote})
+			want = append(want, hopper.JobStateCanceled)
+		}
+		res, err := c.InsertWorkflow(ctx, wf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Leases().Claim(ctx, res.Jobs[0].Job.ID, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		l1, err := c.Leases().Claim(ctx, res.Jobs[1].Job.ID, 0, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.pool.Exec(ctx, `UPDATE hopper_job_leases SET expires_at = now() - interval '1 second' WHERE id = $1`, res.Jobs[0].Job.ID); err != nil {
+			t.Fatal(err)
+		}
+		finished := make(chan error, 1)
+		go func() {
+			finished <- c.Leases().Finish(ctx, l1.Token, hopper.LeaseResult{Err: errors.New("boom")})
+		}()
+		c.ExpireJobs(ctx)
+		if err := <-finished; err != nil {
+			t.Fatal(err)
+		}
+		for i, want := range want {
+			j, err := c.JobGet(ctx, res.Jobs[i].Job.ID)
+			if err != nil {
+				t.Fatalf("round %d: get s%d: %v", round, i, err)
+			}
+			if j.State != want {
+				t.Fatalf("round %d: s%d is %s; want %s", round, i, j.State, want)
+			}
+		}
+		b, err := c.BatchGet(ctx, res.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.CompletedAt.IsZero() || b.Pending != 0 || b.Failed != len(want) {
+			t.Fatalf("round %d: workflow %+v; want it completed with its %d steps failed", round, b, len(want))
+		}
+	}
+	if c.IsLeader() {
+		t.Error("the client leads, and its sweeps may have decided the workflows")
+	}
+}

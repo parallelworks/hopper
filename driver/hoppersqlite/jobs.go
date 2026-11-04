@@ -887,7 +887,7 @@ func (e *executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 	var jobs []*driver.JobRow
 	var cascaded []driver.JobID
 	err := e.write(ctx, func(x *w) error {
-		jobs, cascaded = jobs[:0], cascaded[:0]
+		jobs = jobs[:0]
 		rows, err := queryAll(ctx, x, scanLive, `SELECT `+liveRowColumns+` FROM hopper_jobs
 			WHERE expires_at <= ? AND state IN ('available', 'scheduled', 'retryable')
 			ORDER BY expires_at LIMIT ?`, x.us(), max(limit, 1))
@@ -911,14 +911,8 @@ func (e *executor) JobDiscardExpired(ctx context.Context, limit int) ([]*driver.
 			}
 			jobs = append(jobs, job)
 		}
-		all, err := x.tail(ctx, done)
-		if err != nil {
-			return err
-		}
-		for _, f := range all[len(done):] {
-			cascaded = append(cascaded, f.row.job.ID)
-		}
-		return nil
+		cascaded, err = x.tailCascaded(ctx, done)
+		return err
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("hopper: discard expired jobs: %w", err)

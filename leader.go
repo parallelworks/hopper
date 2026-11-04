@@ -404,11 +404,11 @@ func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
 		if len(jobs) > 0 {
 			c.logger.WarnContext(ctx, "hopper: job leases expired", "retried", retried, "ended", ended)
 		}
-		c.followUpEnded(ctx, jobs, cascaded)
 		for q := range queues {
 			c.wakeQueue(q)
 			c.notifier.mark(q)
 		}
+		c.followUpEnded(ctx, jobs, cascaded)
 		if len(jobs) < c.tuning.rescueBatch {
 			return
 		}
