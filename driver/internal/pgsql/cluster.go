@@ -110,8 +110,9 @@ ORDER BY c.id`))
 // leaderSQL takes the lease if it is free or expired, starting a term, or
 // renews it for the holder of the live lease. No row is returned when
 // another client holds it. A term is one live lease: a takeover of an
-// expired lease, even the holder's own, starts a new one (elected_at is
-// now()) and clears a resign request. The holder's renewal keeps a
+// expired lease, even the holder's own, starts a new one, whose elected_at
+// (now(), later than the expired lease's, which predates its expiry) the
+// statement returns on every attempt, and clears a resign request. The holder's renewal keeps a
 // request, reports one that names it, and then does not extend the lease,
 // so the holder gives it up within the lease it already has.
 const leaderSQL = `
@@ -127,15 +128,16 @@ ON CONFLICT (name) DO UPDATE SET
   resign_client_id = CASE WHEN hopper_leader.client_id = EXCLUDED.client_id AND hopper_leader.expires_at >= now()
                           THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = EXCLUDED.client_id
-RETURNING client_id, coalesce(resign_client_id = client_id, false), elected_at = now()`
+RETURNING client_id, coalesce(resign_client_id = client_id, false), elected_at`
 
 // LeaderAttempt implements driver.Executor.
 func (e *Executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams) (driver.LeaderResult, error) {
 	var (
-		id            int64
-		resign, fresh bool
+		id        int64
+		resign    bool
+		electedAt time.Time
 	)
-	err := e.Conn.QueryRow(ctx, leaderSQL, params.ClientID, params.TTL.Seconds()).Scan(&id, &resign, &fresh)
+	err := e.Conn.QueryRow(ctx, leaderSQL, params.ClientID, params.TTL.Seconds()).Scan(&id, &resign, &electedAt)
 	if errors.Is(err, ErrNoRows) {
 		return driver.LeaderResult{}, nil
 	}
@@ -143,7 +145,10 @@ func (e *Executor) LeaderAttempt(ctx context.Context, params driver.LeaderParams
 		return driver.LeaderResult{}, fmt.Errorf("hopper: leader attempt: %w", err)
 	}
 	leader := id == params.ClientID
-	return driver.LeaderResult{Leader: leader, NewTerm: leader && fresh, ResignRequested: leader && resign}, nil
+	if !leader {
+		return driver.LeaderResult{}, nil
+	}
+	return driver.LeaderResult{Leader: true, ElectedAt: electedAt.UTC(), ResignRequested: resign}, nil
 }
 
 // leaderResignSQL deletes the lease if this client holds it and, only then,

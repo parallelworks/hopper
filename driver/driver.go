@@ -315,12 +315,13 @@ type Executor interface {
 	Notify(ctx context.Context, channel string, payloads []string) error
 
 	// LeaderAttempt takes or renews the leader lease for a client and
-	// reports whether the client holds it afterwards, whether the attempt
-	// started a term, and whether a LeaderRequestResign asked the holder to
-	// give the lease up. A term is one live lease: taking a free or expired
-	// lease, even the client's own, starts one, and clears a request. The
-	// holder's renewal of its live lease keeps a request, and once it
-	// reports one, does not extend the lease.
+	// reports whether the client holds it afterwards, the term it holds
+	// (the lease's elected_at), and whether a LeaderRequestResign asked the
+	// holder to give the lease up. A term is one live lease: taking a free
+	// or expired lease, even the client's own, starts one, with a new
+	// elected_at, and clears a request. The holder's renewal of its live
+	// lease keeps elected_at and a request, and once it reports a request,
+	// does not extend the lease.
 	LeaderAttempt(ctx context.Context, params LeaderParams) (LeaderResult, error)
 	// LeaderResign gives up leadership if the client holds the lease, and
 	// then signals other clients to elect a replacement. It reports whether
@@ -1250,10 +1251,13 @@ type LeaderParams struct {
 type LeaderResult struct {
 	// Leader reports that the client holds the lease afterwards.
 	Leader bool
-	// NewTerm reports that the attempt took a free or expired lease, even
-	// the client's own, rather than renewing a live one: the client's
-	// previous term, if any, has ended.
-	NewTerm bool
+	// ElectedAt identifies the holder's term: the database time the lease
+	// was taken, which every renewal of the live lease returns again and
+	// every takeover, even the holder's own after a lapse, replaces with a
+	// later one. A client whose attempt returns another ElectedAt than its
+	// term's has left that term, even if the attempt that started the new
+	// one never reported back. Zero unless Leader.
+	ElectedAt time.Time
 	// ResignRequested reports that a LeaderRequestResign asked the client,
 	// as the lease's holder, to give it up.
 	ResignRequested bool

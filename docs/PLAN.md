@@ -1724,7 +1724,7 @@ ON CONFLICT (name) DO UPDATE SET client_id = $me,
   resign_client_id = CASE WHEN renewal THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $me
 RETURNING client_id = $me, coalesce(resign_client_id = client_id, false),
-          elected_at = now();   -- a new term
+          elected_at;           -- the term
 ```
 
 - The TTL is 15s, and the leader renews every 5s.
@@ -1733,10 +1733,15 @@ RETURNING client_id = $me, coalesce(resign_client_id = client_id, false),
   last renewed it with, which a fence (§7.6) may since have replaced.
 - **A term is one live lease.** Taking a free or expired lease starts a term, even when
   the client takes its own lease back after it lapsed, under the same ID or under the
-  one a fence gave it: while the lease was lapsed another client may have led. The
-  statement reports a new term (`elected_at` set now), and a client that still
-  considered itself leader ends the old term, with `EventLeaderLost`, before it starts
-  the new one, with `EventLeaderElected`. The new term starts as any does, so each
+  one a fence gave it: while the lease was lapsed another client may have led. A term
+  is identified by its `elected_at`, which every attempt returns: a renewal of the live
+  lease returns the term's again, and a takeover sets a later one (the expired lease
+  was taken at least a TTL before it expired, and expired before now, so no clock,
+  SQLite's stepped back included, repeats it). The client keeps the `elected_at` its
+  term started with, and an attempt that returns another one ends the old term, with
+  `EventLeaderLost`, before the new one starts, with `EventLeaderElected`. So a
+  takeover whose response was lost cannot merge two terms: the renewal after it reports
+  the new term's `elected_at`. The new term starts as any does, so each
   periodic job with `RunOnStart` inserts a job again (§7.9). Earlier releases kept the
   term across a lapse that no other client filled.
 

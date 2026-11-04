@@ -127,63 +127,88 @@ func testLeaderResignRequest[TTx any](t *testing.T, f Fixture[TTx]) {
 	if id := requestResign(ctx, t, exec, a); id != a {
 		t.Fatalf("request asked client %d, want %d", id, a)
 	}
+	before := leaderAttempt(ctx, t, exec, a).ElectedAt
 	f.ExpireLeader(ctx, t, d)
-	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || !res.NewTerm || res.ResignRequested {
-		t.Fatalf("holder's late renewal of its lapsed lease = %+v, want a new term and no request", res)
+	if res := leaderAttempt(ctx, t, exec, a); !res.Leader || !res.ElectedAt.After(before) || res.ResignRequested {
+		t.Fatalf("holder's late renewal of its lapsed lease = %+v, want a new term (after %v) and no request", res, before)
 	}
 	// Nor does it reach the holder's process under the ID a fence gave it.
 	if id := requestResign(ctx, t, exec, a); id != a {
 		t.Fatalf("request asked client %d, want %d", id, a)
 	}
+	before = leaderAttempt(ctx, t, exec, a).ElectedAt
 	f.ExpireLeader(ctx, t, d)
 	fenced := register(ctx, t, exec)
-	if res := leaderAttempt(ctx, t, exec, fenced); !res.Leader || !res.NewTerm || res.ResignRequested {
-		t.Fatalf("takeover under a fenced client's new ID = %+v, want a new term and no request", res)
+	if res := leaderAttempt(ctx, t, exec, fenced); !res.Leader || !res.ElectedAt.After(before) || res.ResignRequested {
+		t.Fatalf("takeover under a fenced client's new ID = %+v, want a new term (after %v) and no request", res, before)
 	}
 }
 
-// testLeaderTerm checks the terms a leadership attempt reports: taking a
-// free or expired lease, even the client's own, starts one, and renewing a
-// live lease does not; and a renewal that reports a resign request does
-// not extend the lease, so the lease the holder was asked to give up
-// expires when it would have, and another client takes it then.
+// testLeaderTerm checks the terms a leadership attempt reports by the
+// lease's elected_at: taking a free or expired lease, even the client's
+// own, starts a term with a later elected_at, and every renewal of the live
+// lease returns the term's again, so a client whose takeover's response was
+// lost still learns the new term from its next renewal; and a renewal that
+// reports a resign request does not extend the lease, so the lease the
+// holder was asked to give up expires when it would have, and another
+// client takes it then.
 func testLeaderTerm[TTx any](t *testing.T, f Fixture[TTx]) {
 	ctx := context.Background()
 	d := f.NewDriver(t)
 	exec := d.Executor()
 	a, b := register(ctx, t, exec), register(ctx, t, exec)
-	term := func(id int64, ttl time.Duration, want driver.LeaderResult, what string) {
+	var term time.Time // the elected_at of the last term an attempt reported
+	attempt := func(id int64, ttl time.Duration, leader, newTerm, resign bool, what string) {
 		t.Helper()
 		res, err := exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: ttl})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res != want {
-			t.Fatalf("%s = %+v, want %+v", what, res, want)
+		if res.Leader != leader || res.ResignRequested != resign {
+			t.Fatalf("%s = %+v, want leader %v, resign requested %v", what, res, leader, resign)
 		}
+		if !leader {
+			if !res.ElectedAt.IsZero() {
+				t.Fatalf("%s: elected_at %v without the lease", what, res.ElectedAt)
+			}
+			return
+		}
+		switch {
+		case res.ElectedAt.IsZero():
+			t.Fatalf("%s: no elected_at", what)
+		case newTerm && !res.ElectedAt.After(term):
+			t.Fatalf("%s: elected_at %v, want a new term's, after %v", what, res.ElectedAt, term)
+		case !newTerm && !res.ElectedAt.Equal(term):
+			t.Fatalf("%s: elected_at %v, want the term's %v", what, res.ElectedAt, term)
+		}
+		term = res.ElectedAt
 	}
-	term(a, time.Hour, driver.LeaderResult{Leader: true, NewTerm: true}, "first election")
-	term(a, time.Hour, driver.LeaderResult{Leader: true}, "renewal of a live lease")
-	term(b, time.Hour, driver.LeaderResult{}, "another client's attempt on a live lease")
+	attempt(a, time.Hour, true, true, false, "first election")
+	attempt(a, time.Hour, true, false, false, "renewal of a live lease")
+	attempt(b, time.Hour, false, false, false, "another client's attempt on a live lease")
+	attempt(a, time.Hour, true, false, false, "second renewal")
 	f.ExpireLeader(ctx, t, d)
-	term(a, time.Hour, driver.LeaderResult{Leader: true, NewTerm: true}, "holder's retake of its expired lease")
+	// The response of this takeover is lost to the client: it still learns
+	// the new term from the renewal after it.
+	attempt(a, time.Hour, true, true, false, "holder's retake of its expired lease")
+	attempt(a, time.Hour, true, false, false, "renewal after the retake")
 	f.ExpireLeader(ctx, t, d)
-	term(b, time.Hour, driver.LeaderResult{Leader: true, NewTerm: true}, "takeover of an expired lease")
+	attempt(b, time.Hour, true, true, false, "takeover of an expired lease")
 	if _, err := exec.LeaderResign(ctx, b); err != nil {
 		t.Fatal(err)
 	}
 
 	const short = 1500 * time.Millisecond
-	term(a, short, driver.LeaderResult{Leader: true, NewTerm: true}, "election for a short lease")
+	attempt(a, short, true, true, false, "election for a short lease")
 	expires := time.Now().Add(short)
 	if id := requestResign(ctx, t, exec, a); id != a {
 		t.Fatalf("request asked client %d, want %d", id, a)
 	}
 	for range 2 {
-		term(a, time.Hour, driver.LeaderResult{Leader: true, ResignRequested: true}, "renewal after the request")
+		attempt(a, time.Hour, true, false, true, "renewal after the request")
 	}
 	time.Sleep(time.Until(expires) + 200*time.Millisecond)
-	term(b, time.Hour, driver.LeaderResult{Leader: true, NewTerm: true}, "takeover once the asked holder's lease was due to expire")
+	attempt(b, time.Hour, true, true, false, "takeover once the asked holder's lease was due to expire")
 }
 
 // testLeaderResignRacesRenewal makes requests while the leader renews,

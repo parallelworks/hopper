@@ -26,6 +26,9 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	// which a stop gives it up for: a fence may re-register the client
 	// under another before the next attempt notices.
 	var leaseID int64
+	// electedAt identifies the term the client leads (the lease's
+	// elected_at): an attempt that returns another has started a new one.
+	var electedAt time.Time
 	defer func() {
 		term.end()
 		c.resign(ctx, leaseID)
@@ -77,18 +80,21 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			c.resignOnRequest(ctx, id)
 			heldOff = time.Now().Add(c.tuning.leaderTTL)
 		case res.Leader:
-			// A term is one live lease. A client that took over a lease that
-			// had lapsed, even its own and under the same ID, or its old one
-			// under the ID a fence gave it, left its term when the lease
-			// lapsed, and another client may have led since: that term ends,
-			// with its event, before the new one starts.
-			if res.NewTerm && c.isLeader.Swap(false) {
+			// A term is one live lease, identified by its elected_at. A
+			// client that took over a lease that had lapsed, even its own and
+			// under the same ID, or its old one under the ID a fence gave it,
+			// left its term when the lease lapsed, and another client may
+			// have led since: that term ends, with its event, before the new
+			// one starts. Comparing elected_at rather than asking whether this
+			// attempt took the lease catches a takeover whose response was
+			// lost, which the next renewal reports with the new term's.
+			if !res.ElectedAt.Equal(electedAt) && c.isLeader.Swap(false) {
 				c.logger.WarnContext(ctx, "hopper: leader lease lapsed; starting a new term", "client_id", leaseID, "new_client_id", id)
 				c.emit(EventLeaderLost, nil, "")
 				term.end()
 				term = nil
 			}
-			leaseID = id
+			leaseID, electedAt = id, res.ElectedAt
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)
 				c.emit(EventLeaderElected, nil, "")
