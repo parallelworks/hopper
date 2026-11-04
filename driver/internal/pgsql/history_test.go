@@ -222,13 +222,14 @@ func TestDeadlockedBuildIsDeferred(t *testing.T) {
 
 // maintainConn runs HistoryMaintain's statements against a schema whose
 // failed table has one partition past retention, and fails the read of its
-// indexes, or, if failExec is set, the statements that contain it. It
-// records the statements it runs.
+// indexes if failIndexes is set, and the statements that contain failExec if
+// that is. It records the statements it runs.
 type maintainConn struct {
 	Conn
-	now      time.Time
-	execs    *[]string
-	failExec string
+	now         time.Time
+	execs       *[]string
+	failIndexes bool
+	failExec    string
 	// failCode is the SQLSTATE of the statements failExec fails, XX000 if
 	// empty.
 	failCode string
@@ -265,7 +266,7 @@ func (c maintainConn) Query(_ context.Context, sql string, args ...any) (Rows, e
 	switch {
 	case c.failList && strings.Contains(sql, "pg_inherits") && args[0] == NewSchema("").Table("hopper_job_history_failed"):
 		return nil, codedError("XX000")
-	case strings.Contains(sql, "NOT x.indisvalid") && c.failExec == "":
+	case c.failIndexes && strings.Contains(sql, "NOT x.indisvalid"):
 		return nil, codedError("57014")
 	case strings.Contains(sql, "pg_inherits") && args[0] == NewSchema("").Table("hopper_job_history_failed"):
 		return &stringRows{rows: []string{"hopper_job_history_failed_20000101"}}, nil
@@ -299,7 +300,7 @@ func (*stringRows) Close() {}
 func TestHistoryMaintainGoesPastIndexReadError(t *testing.T) {
 	var execs []string
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
-	e := &Executor{Conn: maintainConn{now: now, execs: &execs}, Schema: NewSchema("")}
+	e := &Executor{Conn: maintainConn{now: now, execs: &execs, failIndexes: true}, Schema: NewSchema("")}
 	res, err := e.HistoryMaintain(context.Background(), driver.HistoryMaintainParams{FailedRetention: time.Hour})
 	if sqlState(err) != "57014" {
 		t.Errorf("HistoryMaintain error = %v, want the index read's", err)
@@ -379,7 +380,7 @@ func TestHistoryMaintainDefersPruneOnlyOnLockTimeout(t *testing.T) {
 		deferred            []string
 		tagsPruned, dropped bool
 	}{
-		{"pruned", "no statement contains this", "", "", nil, true, true},
+		{"pruned", "", "", "", nil, true, true},
 		{"lock timeout", failedPrune, "55P03", "", []string{"hopper_job_history_failed_default", "hopper_job_history_tags_completed_default", "hopper_job_history_tags_failed_default"}, false, false},
 		{"statement timeout", failedPrune, "57014", "57014", nil, true, false},
 	} {

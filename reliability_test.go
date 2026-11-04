@@ -528,7 +528,8 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 			// The reader and the pending LOCK run on sessions of their own,
 			// out of the client's pool, and the server ends both within a
 			// minute even if the test hangs, so that neither can stall the
-			// client's pool or other tests' builds for longer.
+			// client's pool or other tests' builds for longer: the LOCK's
+			// session also once the LOCK is granted, should the reader's end.
 			reader := h.session("idle_in_transaction_session_timeout=60000")
 			if _, err := reader.Exec(ctx, "BEGIN"); err != nil {
 				t.Fatal(err)
@@ -536,7 +537,7 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 			if _, err := reader.Exec(ctx, "SELECT count(*) FROM "+partition); err != nil {
 				t.Fatal(err)
 			}
-			ddl := h.session("lock_timeout=60000", "statement_timeout=60000")
+			ddl := h.session("lock_timeout=60000", "statement_timeout=60000", "idle_in_transaction_session_timeout=60000")
 			if _, err := ddl.Exec(ctx, "BEGIN"); err != nil {
 				t.Fatal(err)
 			}
