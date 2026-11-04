@@ -202,3 +202,62 @@ func TestLeaseFinishCancelsAnyOfExhaustedByCascade(t *testing.T) {
 		t.Error("the client leads, and its sweep may have canceled s2")
 	}
 }
+
+// TestLeaderExpiryFollowsUpWorkflows ends a workflow's first step by the
+// leader's expiry, of its job lease and of its TTL, and checks that the
+// expiry follows it up, not the leader's next sweep: s2 waits for any of
+// s1, which waits for s0, so the expiry cancels s1 by cascade and leaves
+// s2's group, exhausted, to its follow-up; s3 waits for any of s0 and runs
+// whatever its group's outcome, which the statement leaves to the
+// follow-up as well. No client leads, so no sweep runs; the test runs the
+// expiry itself.
+func TestLeaderExpiryFollowsUpWorkflows(t *testing.T) {
+	t.Parallel()
+	for _, how := range []string{"lease", "ttl"} {
+		t.Run(how, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t)
+			ctx := context.Background()
+			if _, err := h.pool.Exec(ctx, `INSERT INTO hopper_leader (client_id, elected_at, expires_at) VALUES (-1, now(), now() + interval '1 hour')`); err != nil {
+				t.Fatal(err)
+			}
+			c := leaseClient(h, &hopper.Config{})
+			remote := &hopper.InsertOpts{Queue: remoteQueue, MaxAttempts: 1}
+			first := &hopper.StepOpts{Insert: remote}
+			if how == "ttl" {
+				first = &hopper.StepOpts{Insert: &hopper.InsertOpts{Queue: remoteQueue, TTL: 50 * time.Millisecond}}
+			}
+			wf := hopper.NewWorkflow("expired", nil)
+			s0 := wf.Add(remoteJob{N: 0}, first)
+			s1 := wf.Add(remoteJob{N: 1}, &hopper.StepOpts{After: []hopper.Step{s0}, Insert: remote})
+			wf.Add(remoteJob{N: 2}, &hopper.StepOpts{AfterAny: [][]hopper.Step{{s1}}, Insert: remote})
+			wf.Add(remoteJob{N: 3}, &hopper.StepOpts{AfterAny: [][]hopper.Step{{s0}}, OnDependencyFailure: hopper.DependencyIgnore, Insert: remote})
+			res, err := c.InsertWorkflow(ctx, wf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if how == "lease" {
+				if _, err := c.Leases().Claim(ctx, res.Jobs[0].Job.ID, 0, nil); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.pool.Exec(ctx, `UPDATE hopper_job_leases SET expires_at = now() - interval '1 second'`); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				time.Sleep(100 * time.Millisecond)
+			}
+			c.ExpireJobs(ctx)
+			for i, want := range []hopper.JobState{hopper.JobStateDiscarded, hopper.JobStateCanceled, hopper.JobStateCanceled, hopper.JobStateAvailable} {
+				j, err := c.JobGet(ctx, res.Jobs[i].Job.ID)
+				if err != nil {
+					t.Errorf("get s%d: %v", i, err)
+				} else if j.State != want {
+					t.Errorf("s%d after the expiry is %s; want %s", i, j.State, want)
+				}
+			}
+			if c.IsLeader() {
+				t.Error("the client leads, and its sweep may have decided s2 and s3")
+			}
+		})
+	}
+}

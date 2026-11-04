@@ -1433,7 +1433,7 @@ func TestWorkflowPlansWithoutStatistics(t *testing.T) {
 	if err != nil || swept.Canceled == 0 {
 		t.Fatalf("sweep = %+v, %v; want the jobs of exhausted groups canceled", swept, err)
 	}
-	if _, err := traced.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 100, ClientID: clientID}); err != nil {
+	if _, _, err := traced.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 100, ClientID: clientID}); err != nil {
 		t.Fatal(err)
 	}
 	var pending driver.JobID

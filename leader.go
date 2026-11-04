@@ -376,7 +376,7 @@ func (c *Client[TTx]) age(ctx context.Context) {
 // flight, and a renewal that commits first keeps its lease.
 func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
 	for {
-		jobs, err := c.exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{
+		jobs, cascaded, err := c.exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{
 			Limit: c.tuning.rescueBatch, ClientID: c.clientID.Load(), Grace: c.cfg.JobLeaseGrace,
 		})
 		if errors.Is(err, driver.ErrRowsHeld) {
@@ -404,6 +404,7 @@ func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
 		if len(jobs) > 0 {
 			c.logger.WarnContext(ctx, "hopper: job leases expired", "retried", retried, "ended", ended)
 		}
+		c.followUpEnded(ctx, jobs, cascaded)
 		for q := range queues {
 			c.wakeQueue(q)
 			c.notifier.mark(q)
@@ -417,7 +418,7 @@ func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
 // expire dead-letters waiting jobs whose TTL has passed.
 func (c *Client[TTx]) expire(ctx context.Context) {
 	for {
-		jobs, err := c.exec.JobDiscardExpired(ctx, c.tuning.rescueBatch)
+		jobs, cascaded, err := c.exec.JobDiscardExpired(ctx, c.tuning.rescueBatch)
 		if errors.Is(err, driver.ErrRowsHeld) {
 			c.logger.WarnContext(ctx, "hopper: discard of expired jobs deferred: another transaction holds a row it reaches")
 			return
@@ -435,9 +436,35 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 		if len(jobs) > 0 {
 			c.logger.InfoContext(ctx, "hopper: discarded expired jobs", "count", len(jobs))
 		}
+		c.followUpEnded(ctx, jobs, cascaded)
 		if len(jobs) < c.tuning.rescueBatch {
 			return
 		}
+	}
+}
+
+// followUpEnded follows up the jobs the expiry of job leases or of TTLs
+// ended, as a client follows up its flush: it settles their batches and
+// promotes or cancels the dependents of those of a workflow and of the
+// dependents the statement canceled by cascade. The statement's tail
+// leaves a dependent with an any-of group to it, and one of the cascade's
+// own dependents can wait on a group the cascade exhausted; without it,
+// they wait for the leader's sweeps.
+func (c *Client[TTx]) followUpEnded(ctx context.Context, jobs []*JobRow, cascaded []JobID) {
+	seen := map[JobID]struct{}{}
+	var batches, ended []JobID
+	for _, j := range jobs {
+		if !j.State.Terminal() || j.BatchID.IsZero() {
+			continue
+		}
+		ended = append(ended, j.ID)
+		if _, dup := seen[j.BatchID]; !dup {
+			seen[j.BatchID] = struct{}{}
+			batches = append(batches, j.BatchID)
+		}
+	}
+	if ended = append(ended, cascaded...); len(ended) > 0 {
+		settleAndPromote(ctx, c.exec, c.logger, batches, ended)
 	}
 }
 

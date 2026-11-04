@@ -251,8 +251,10 @@ type Executor interface {
 	// one holds that its statement reaches, such as a dependent it cancels
 	// by cascade, and then discards none and returns ErrRowsHeld: the next
 	// call takes them. On a SingleWriter engine it waits for another
-	// transaction's writes, as every write does.
-	JobDiscardExpired(ctx context.Context, limit int) ([]*JobRow, error)
+	// transaction's writes, as every write does. The dependents it canceled
+	// by cascade are returned by ID, for the caller's follow-up
+	// (WorkflowPromoteReady), as JobFinalizeMany returns them.
+	JobDiscardExpired(ctx context.Context, limit int) (jobs []*JobRow, cascaded []JobID, err error)
 	// JobRescueCandidates returns running jobs whose owning client has no
 	// unexpired lease, plus, if StuckAfter is positive, running jobs claimed
 	// longer ago than that by database time. The caller finalizes them,
@@ -291,8 +293,10 @@ type Executor interface {
 	// row one holds, as JobDiscardExpired does, its jobs' lease rows
 	// included, and then expires none and returns ErrRowsHeld. On a
 	// SingleWriter engine it too waits only briefly for another
-	// transaction's writes, and then expires none.
-	JobExpireLeases(ctx context.Context, params JobExpireLeasesParams) ([]*JobRow, error)
+	// transaction's writes, and then expires none. The dependents it
+	// canceled by cascade are returned by ID, as JobDiscardExpired returns
+	// them.
+	JobExpireLeases(ctx context.Context, params JobExpireLeasesParams) (jobs []*JobRow, cascaded []JobID, err error)
 
 	// ClientRegister creates a lease row for a client process and returns its ID.
 	ClientRegister(ctx context.Context, params ClientRegisterParams) (int64, error)

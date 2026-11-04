@@ -169,13 +169,14 @@ func (x *w) releaseLease(ctx context.Context, id driver.JobID) error {
 }
 
 // JobExpireLeases implements driver.Executor.
-func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireLeasesParams) ([]*driver.JobRow, error) {
+func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireLeasesParams) ([]*driver.JobRow, []driver.JobID, error) {
 	var jobs []*driver.JobRow
+	var cascaded []driver.JobID
 	// As the rescue's finalize skips held rows, the expiry waits only
 	// briefly for a write lock another transaction holds, such as a
 	// FinishTx's, and leaves the leases to the next pass.
 	err := e.writeBrief(ctx, func(x *w) error {
-		jobs = jobs[:0]
+		jobs, cascaded = jobs[:0], cascaded[:0]
 		// A client's start later than now, which a host clock set ahead and
 		// then corrected leaves (see clock), counts once the clock
 		// reaches it, as on PostgreSQL.
@@ -228,14 +229,20 @@ func (e *executor) JobExpireLeases(ctx context.Context, params driver.JobExpireL
 			}
 			jobs = append(jobs, job)
 		}
-		_, err = x.tail(ctx, done)
-		return err
+		all, err := x.tail(ctx, done)
+		if err != nil {
+			return err
+		}
+		for _, f := range all[len(done):] {
+			cascaded = append(cascaded, f.row.job.ID)
+		}
+		return nil
 	})
 	if errors.Is(err, errLockBusy) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("hopper: expire job leases: %w", err)
+		return nil, nil, fmt.Errorf("hopper: expire job leases: %w", err)
 	}
-	return jobs, nil
+	return jobs, cascaded, nil
 }

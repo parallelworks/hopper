@@ -323,7 +323,7 @@ func testDependencyResultsLeaseExpiry[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatal("finalize in a transaction did not apply")
 	}
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	jobs, err := exec.JobExpireLeases(sctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
+	jobs, _, err := exec.JobExpireLeases(sctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me})
 	cancel()
 	if err != nil || len(jobs) != 0 {
 		t.Errorf("expire of a job being finalized = %d jobs, %v; want none", len(jobs), err)
@@ -337,7 +337,7 @@ func testDependencyResultsLeaseExpiry[TTx any](t *testing.T, f Fixture[TTx]) {
 	dep, dependent = workflow()
 	l = claimByID(ctx, t, exec, dep)
 	f.ExpireJobLease(ctx, t, d, dep)
-	if jobs, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me}); err != nil || len(jobs) != 1 {
+	if jobs, _, err := exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: me}); err != nil || len(jobs) != 1 {
 		t.Fatalf("expire = %d, %v", len(jobs), err)
 	}
 	result = leaseResult(l, driver.JobStateCompleted)

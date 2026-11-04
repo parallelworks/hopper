@@ -1,10 +1,12 @@
 package drivertest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -721,11 +723,11 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 				switch duty {
 				case "discard expired":
 					var discarded []*driver.JobRow
-					discarded, err = exec.JobDiscardExpired(lctx, 10)
+					discarded, _, err = exec.JobDiscardExpired(lctx, 10)
 					n = len(discarded)
 				case "lease expiry":
 					var expired []*driver.JobRow
-					expired, err = exec.JobExpireLeases(lctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: expirerID})
+					expired, _, err = exec.JobExpireLeases(lctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: expirerID})
 					n = len(expired)
 				case "rescue":
 					var applied []driver.JobFinalized
@@ -791,6 +793,61 @@ func testWorkflowCascadeHeld[TTx any](t *testing.T, f Fixture[TTx]) {
 			}
 			if j, err := exec.JobGet(ctx, a); err != nil || j.State.Terminal() {
 				t.Fatalf("step whose cancel rolled back = %+v, %v; want it live", j, err)
+			}
+		})
+	}
+}
+
+// testWorkflowExpiryCascaded checks that the expiry of a TTL and of a job
+// lease return the dependents they canceled by cascade, down the graph,
+// apart from the jobs they ended, for the leader's follow-up.
+func testWorkflowExpiryCascaded[TTx any](t *testing.T, f Fixture[TTx]) {
+	for _, duty := range []string{"discard expired", "lease expiry"} {
+		t.Run(duty, func(t *testing.T) {
+			ctx := context.Background()
+			d := f.NewDriver(t)
+			exec := d.Executor()
+			jobs := params("step", 3)
+			if duty == "discard expired" {
+				jobs[0].TTL = 50 * time.Millisecond
+			} else {
+				jobs[0].MaxAttempts = 1
+			}
+			wf, err := exec.WorkflowInsert(ctx, driver.WorkflowInsertParams{
+				Name: "chain", Jobs: jobs,
+				Deps: []driver.JobDependency{{Job: 1, DependsOn: 0}, {Job: 2, DependsOn: 1}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := wf.Jobs[0].Job.ID
+			var ended []*driver.JobRow
+			var cascaded []driver.JobID
+			if duty == "discard expired" {
+				time.Sleep(100 * time.Millisecond)
+				ended, cascaded, err = exec.JobDiscardExpired(ctx, 10)
+			} else {
+				expirerID := expirer(ctx, t, f, d)
+				claimByID(ctx, t, exec, first)
+				f.ExpireJobLease(ctx, t, d, first)
+				ended, cascaded, err = exec.JobExpireLeases(ctx, driver.JobExpireLeasesParams{Limit: 10, ClientID: expirerID})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ended) != 1 || ended[0].ID != first || ended[0].State != driver.JobStateDiscarded {
+				t.Errorf("%s ended %+v; want the first step alone, discarded", duty, ended)
+			}
+			want := []driver.JobID{wf.Jobs[1].Job.ID, wf.Jobs[2].Job.ID}
+			slices.SortFunc(cascaded, func(a, b driver.JobID) int { return bytes.Compare(a[:], b[:]) })
+			slices.SortFunc(want, func(a, b driver.JobID) int { return bytes.Compare(a[:], b[:]) })
+			if !slices.Equal(cascaded, want) {
+				t.Errorf("%s returned %v canceled by cascade; want %v", duty, cascaded, want)
+			}
+			for _, id := range want {
+				if j := get(ctx, t, exec, id); j.State != driver.JobStateCanceled {
+					t.Errorf("dependent %v is %s; want canceled", id, j.State)
+				}
 			}
 		})
 	}

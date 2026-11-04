@@ -2840,7 +2840,9 @@ observability without new machinery.
     is still live, skipping rows a finalize holds. After each flush commits, the
     finalizer runs it on the dependents of the jobs the flush finished and of those it
     canceled by cascade (and the client does for a job it saw `CompleteTx` commit, or
-    that a lease's `Finish` finished), so of the two, the one that follows up
+    that a lease's `Finish` finished, and the leader for the jobs of a workflow its
+    rescue, its expiry of job leases or its discard of jobs past their TTL ended),
+    so of the two, the one that follows up
     second promotes the dependent at once. The leader sweeps up what clients left (a
     client that stopped between commit and follow-up): it walks `hopper_job_deps` a
     chunk at a time in ID order, for at most one leader interval per pass, resuming
@@ -2977,14 +2979,17 @@ observability without new machinery.
       recursive step cannot read its own rows in a subquery: the finalize returns the
       jobs it canceled by cascade (`JobFinalized.Cascaded`), and the finalizing client
       follows them up as it does the jobs it finalized, with `WorkflowPromoteReady`,
-      which cancels the dependent, as the leader's rescue does the jobs of a workflow
-      it discarded and those its finalize canceled by cascade.
+      which cancels the dependent. The leader does the same after its rescue, for the
+      jobs of a workflow it discarded and those its finalize canceled by cascade, and
+      after its expiry of job leases and of TTLs, for the jobs of a workflow they ended
+      and those they canceled by cascade, which they return as the finalize does; the
+      expiry also settles the ended jobs' batches, as a client's follow-up does.
       The leader's sweep does for a client that stopped before its follow-up, whose
       follow-up failed, or whose follow-up skipped a dependent's row held by a
       transaction that then rolled back; for a `Leases.Finish` whose statement committed
       though it returned an error, which the caller's retry finds fenced; and for the
       statements that return no such jobs: `JobCancel`, `JobDelete` and their `Tx` forms
-      on a waiting job, `FinishTx`, and the expiry of job leases and of TTLs. (A flush retried after an error its commit came before finds its jobs
+      on a waiting job, and `FinishTx`. (A flush retried after an error its commit came before finds its jobs
       gone, and follows up those whose results were terminal all the same.) Those are
       rare, and the sweep bounds the delay: it promotes or cancels such a dependent
       within a leader interval (5 s by default) of the statement, or a few with more

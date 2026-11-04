@@ -156,7 +156,7 @@ func testSnoozeReason[TTx any](t *testing.T, f Fixture[TTx], noBatches bool) {
 	}
 	snooze("fifth")
 	f.ExpireJob(ctx, t, d, id)
-	expired, err := exec.JobDiscardExpired(ctx, 10)
+	expired, _, err := exec.JobDiscardExpired(ctx, 10)
 	if err != nil || len(expired) != 1 || expired[0].Errors[len(expired[0].Errors)-1].Error != "hopper: expired while snoozed: fifth" {
 		t.Errorf("expired = %+v, %v", expired, err)
 	}
