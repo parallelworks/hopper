@@ -51,7 +51,9 @@ var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 // for a row another transaction holds that it does not skip, such as a
 // dependent it cancels by cascade, or the lease of a job JobExpireLeases
 // expires that a renewal holds: it finalized none of them. A smaller set of
-// the jobs may not reach that row.
+// the jobs may not reach that row. BatchSettle with IDs returns it when it
+// gave up waiting for a batch row, or the engine broke a deadlock its wait
+// was part of by ending the settle: it settled none of the batches.
 var ErrRowsHeld = errors.New("hopper: another transaction holds a row the statement reaches")
 
 // ErrHistoryIndexRepair wraps the error Executor.HistoryIndex returns when
@@ -925,8 +927,9 @@ type BatchInsertParams struct {
 // BatchSettleParams selects the batches BatchSettle settles.
 type BatchSettleParams struct {
 	// IDs names the batches to settle, waiting briefly for a batch row
-	// another statement holds; one it cannot get is left for the sweep. An
-	// empty non-nil IDs settles nothing.
+	// another statement holds; if it cannot get one, it settles none and
+	// returns ErrRowsHeld, and the caller settles them again or leaves them
+	// to the sweep. An empty non-nil IDs settles nothing.
 	IDs []JobID
 	// When IDs is nil, up to Limit batches with progress and an ID after
 	// After are settled, in ID order, skipping rows other statements hold.
