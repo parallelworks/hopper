@@ -663,15 +663,23 @@ func TestLeaderRenewsLeaseThroughLongHistoryPrune(t *testing.T) {
 
 // TestHistoryMaintenanceStopsWithoutLeaseRenewal holds the leader lease's
 // row so that the leader's renewal waits, while a history prune runs. The
-// leader loop does not see its lease go, but the lease fences maintenance:
-// the prune is canceled once the lease may have expired, within its TTL,
-// rather than run on beside the leader that may follow.
+// lease fences the term: once the lease may have expired, within its TTL,
+// the term ends, its prune canceled, rather than run on beside the leader
+// that may follow, though the renewal has not returned.
 func TestHistoryMaintenanceStopsWithoutLeaseRenewal(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	ctx := context.Background()
 	_, pruning := slowHistoryPrune(t, h, 60)
 	c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
+	events, stopEvents := context.WithCancel(ctx)
+	defer stopEvents()
+	var lost atomic.Int32
+	go func() {
+		for range c.Events(events, hopper.EventLeaderLost) {
+			lost.Add(1)
+		}
+	}()
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -693,6 +701,7 @@ func TestHistoryMaintenanceStopsWithoutLeaseRenewal(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	waitFor(t, func() bool { return !c.IsLeader() && lost.Load() == 1 })
 }
 
 // TestLeaderRetriesDeferredPartitions holds off the attach of the

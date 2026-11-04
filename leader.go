@@ -42,7 +42,33 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		// The lease the attempt takes or renews expires a TTL after the
 		// server's now(), which is no earlier than this.
 		attempted := time.Now()
-		res, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: c.tuning.leaderTTL})
+		// A leader's renewal waits no longer than the lease it renews lasts:
+		// past that the term has ended (below) whatever the attempt returns.
+		actx, cancel := ctx, context.CancelFunc(func() {})
+		if term != nil {
+			actx, cancel = context.WithDeadline(ctx, term.lease.expiry())
+		}
+		res, err := c.exec.LeaderAttempt(actx, driver.LeaderParams{ClientID: id, TTL: c.tuning.leaderTTL})
+		cancel()
+		// A term's lease fences it: once the lease may have expired without
+		// a renewal, by the local clock, its loops have been canceled
+		// (leaseFence), even while a renewal that keeps failing or waiting
+		// kept this loop from seeing the lease go, and the term ends, with
+		// its event. A renewal that came back too late to extend it still
+		// ends it: the loops are gone, and the next term, of the same lease,
+		// starts below.
+		if term != nil {
+			// A renewal that reports a resign request does not extend the
+			// lease, and the term ends below.
+			renewed := err == nil && res.Leader && res.ElectedAt.Equal(electedAt) &&
+				(res.ResignRequested || term.lease.renew(attempted.Add(c.tuning.leaderTTL)))
+			if !renewed && term.lease.expired() && c.isLeader.Swap(false) {
+				c.logger.WarnContext(ctx, "hopper: leader lease may have expired without a renewal; its term ended", "client_id", leaseID)
+				c.emit(EventLeaderLost, nil, "")
+				term.end()
+				term = nil
+			}
+		}
 		// A term is one live lease, identified by its elected_at. A client
 		// that took over a lease that had lapsed, even its own and under the
 		// same ID, or its old one under the ID a fence gave it, left its term
@@ -96,8 +122,6 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)
 				c.emit(EventLeaderElected, nil, "")
 				term = c.startTerm(ctx, attempted.Add(c.tuning.leaderTTL))
-			} else {
-				term.lease.renewed(attempted.Add(c.tuning.leaderTTL))
 			}
 			c.rescue(ctx)
 			c.expireJobLeases(ctx)
@@ -124,8 +148,9 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	}
 }
 
-// leaderTerm is one stretch of leadership. The periodic, stream and
-// history loops run for its duration.
+// leaderTerm is one stretch of leadership. The periodic, stream, history
+// and other term loops run for its duration, and no longer than its lease
+// is known to be held.
 type leaderTerm struct {
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -133,8 +158,8 @@ type leaderTerm struct {
 	// run, which the index loop waits for (see indexLoop).
 	maintained chan struct{}
 	once       sync.Once
-	// lease is how long the term's lease is known to be held, which fences
-	// history maintenance (see maintenanceLoop).
+	// lease is how long the term's lease is known to be held. It cancels
+	// the term's loops once that has passed.
 	lease leaseFence
 }
 
@@ -144,8 +169,9 @@ func (t *leaderTerm) maintainedOnce() { t.once.Do(func() { close(t.maintained) }
 func (c *Client[TTx]) startTerm(ctx context.Context, until time.Time) *leaderTerm {
 	termCtx, cancel := context.WithCancel(ctx)
 	t := &leaderTerm{cancel: cancel, done: make(chan struct{}), maintained: make(chan struct{})}
-	t.lease.renewed(until)
+	t.lease.renew(until)
 	var wg sync.WaitGroup
+	wg.Go(func() { t.lease.fence(termCtx, cancel) })
 	wg.Go(func() { c.maintenanceLoop(termCtx, t) })
 	wg.Go(func() { c.periodicLoop(termCtx) })
 	wg.Go(func() { c.streamLoop(termCtx) })
@@ -674,13 +700,9 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 // the leader loop, not in it, so that no retention statement holds up the
 // lease's renewal: a prune of a DEFAULT partition that grew during an
 // outage deletes a backlog in one statement, and every DDL waits up to its
-// lock timeout. The lease fences each pass: a pass runs only while the
-// lease the leader loop last took or renewed is unexpired, and is canceled,
-// statement and all, once it may have expired without a renewal, even if
-// the leader loop has not yet seen it go (a renewal that keeps failing does
-// not end the term). The end of the term cancels it too, before another
-// term of this client starts. A pass cut short is retried at the next
-// leader interval.
+// lock timeout. Like the term's other loops, it stops, statement and all,
+// when the term ends, and once the term's lease may have expired without a
+// renewal (leaseFence), even before the leader loop sees it go.
 func (c *Client[TTx]) maintenanceLoop(ctx context.Context, t *leaderTerm) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
@@ -690,64 +712,79 @@ func (c *Client[TTx]) maintenanceLoop(ctx context.Context, t *leaderTerm) {
 			return
 		case <-timer.C:
 		}
-		pass, cancel := t.lease.context(ctx)
-		done := c.maintainHistory(pass)
-		fenced := pass.Err() != nil
-		cancel()
-		if fenced && ctx.Err() == nil {
-			c.logger.WarnContext(ctx, "hopper: history maintenance stopped: the leader lease may have expired without a renewal")
-		}
 		wait := c.tuning.maintenanceInterval
-		switch {
-		case fenced || !done:
-			wait = c.tuning.leaderInterval
-		default:
+		if c.maintainHistory(ctx) {
 			t.maintainedOnce()
+		} else {
+			wait = c.tuning.leaderInterval
 		}
 		timer.Reset(wait)
 	}
 }
 
-// leaseFence tracks how long a leader term's lease is known to be held.
+// leaseFence tracks how long a leader term's lease is known to be held, and
+// fences the term by it.
 type leaseFence struct {
 	mu sync.Mutex
 	// until is when the lease last taken or renewed expires at the
-	// earliest, by the local clock: a TTL after the attempt was sent.
+	// earliest, by the local clock: a TTL after the attempt was sent, no
+	// later than the server's now() and the TTL that expires_at holds.
 	until time.Time
+	// lapsed is set once until has passed without a renewal.
+	lapsed bool
 }
 
-// renewed records a renewal of the lease that lasts until until.
-func (f *leaseFence) renewed(until time.Time) {
+// renew records a renewal of the lease that lasts until until, and reports
+// whether it extended it: not once the lease has lapsed, whose term's loops
+// have been canceled.
+func (f *leaseFence) renew(until time.Time) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.lapsed || (!f.until.IsZero() && !time.Now().Before(f.until)) {
+		f.lapsed = true
+		return false
+	}
 	f.until = until
+	return true
 }
 
-// context returns a context derived from parent that is canceled once the
-// lease may have expired: when its last renewal's until passes without a
-// later one. Its cancel function must be called.
-func (f *leaseFence) context(parent context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
-	go func() {
-		timer := time.NewTimer(0)
-		defer timer.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-timer.C:
-			}
-			f.mu.Lock()
-			left := time.Until(f.until)
-			f.mu.Unlock()
-			if left <= 0 {
-				cancel()
-				return
-			}
-			timer.Reset(left)
+// expiry is when the lease expires at the earliest, unless renewed.
+func (f *leaseFence) expiry() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.until
+}
+
+// expired reports whether the lease may have expired without a renewal.
+func (f *leaseFence) expired() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lapsed || !time.Now().Before(f.until)
+}
+
+// fence calls cancel once the lease may have expired without a renewal, or
+// returns when ctx ends.
+func (f *leaseFence) fence(ctx context.Context, cancel context.CancelFunc) {
+	timer := time.NewTimer(time.Until(f.expiry()))
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
 		}
-	}()
-	return ctx, cancel
+		f.mu.Lock()
+		left := time.Until(f.until)
+		if left <= 0 {
+			f.lapsed = true
+		}
+		f.mu.Unlock()
+		if left <= 0 {
+			cancel()
+			return
+		}
+		timer.Reset(left)
+	}
 }
 
 // maintainHistory creates and drops history partitions. It reports false

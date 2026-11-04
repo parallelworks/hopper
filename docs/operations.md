@@ -8,8 +8,9 @@
   the pool.
 - **Pool size.** A worker client needs about four connections for its own
   traffic (claims, finalizes, leases, leader duties) plus one dedicated
-  connection for `LISTEN`, outside the pool. Give the pool what the
-  application needs on top of that.
+  connection for `LISTEN`, outside the pool. The leader needs up to three
+  more while history maintenance and an index build run beside its other
+  duties. Give the pool what the application needs on top of that.
 - **Replicas.** Adding replicas adds throughput. Every replica works jobs;
   every replica except one with `Config.NeverLead` also competes for
   leadership; only the leader runs periodic jobs, rescue and retention, and a

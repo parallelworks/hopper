@@ -1787,6 +1787,21 @@ RETURNING client_id,   -- $me: the client leads
   without `EventLeaderResigned`. The new term starts as any does, so each
   periodic job with `RunOnStart` inserts a job again (§7.9). Earlier releases kept the
   term across a lapse that no other client filled.
+- **The lease fences the term.** At each renewal the leader records the lease's
+  earliest expiry by its own clock: the time it sent the attempt plus the TTL, no later
+  than the server's `now()` plus the TTL that `expires_at` holds. A renewal waits no
+  longer than that, and once it passes without a later renewal the term's loops are
+  canceled, statements and all, by a timer of their own, even while the leader loop is
+  held up and has not seen the lease go: a renewal that keeps failing, or waits for the
+  lease's row, or a duty of the loop that waits. The leader loop then ends the term,
+  with `EventLeaderLost`, and the next attempt that takes the lease starts a new one. A
+  renewal that comes back after the lease may have expired, though it renewed the same
+  `elected_at`, ends the term the same way, and the next starts at once: its loops
+  were canceled. Earlier releases ended a term only once an attempt returned. The
+  fence is as good as the cancellation: it reaches the server over a connection of its
+  own, so a client cut off from the database can run a statement on past its lease, as
+  any client's statements can; the advisory locks that history maintenance and the
+  index builds take keep two leaders' DDL apart meanwhile.
 
 **Resigning on request.** `Client.LeaderResign` (and `hopper leader resign`, and the
 UI's resign action) asks the current leader to give its term up, so that another
@@ -1866,7 +1881,8 @@ leadership, whose next holder would wait the same way. Each duty skips the rows 
 transaction holds that it would change itself (`FOR UPDATE SKIP LOCKED`), and takes
 them on a later pass: the rescue's finalize, the expiry of job leases, the discard of
 jobs past their TTL, aging, the batch settle and its sweep of dependency results,
-workflow promotion, and retention's prune of `DEFAULT` partitions (§7.10). The
+workflow promotion, and, in history maintenance's own loop (below), retention's prune
+of `DEFAULT` partitions (§7.10). The
 statements that finalize jobs (the rescue's, the leases' expiry, the TTL discard) also
 reach rows of other jobs, cancelling dependents by cascade, promoting them and
 completing batches, which such a transaction may hold too: a dependent that a
@@ -1905,23 +1921,19 @@ its own loop of the leader's term, not in the leader loop, at the term's start a
 then every maintenance interval, or every leader interval while a pass deferred
 partition work. Its waits are bounded, but not its work: a prune deletes a `DEFAULT`
 partition's rows past retention in one statement, which after an outage, or a gap in
-the partitions ahead, may be millions of rows, and on the leader loop that statement
-would stop the lease renewal for as long as it ran, and cost the leadership past the
-TTL. Batching the delete would bound each statement but not the pass: the partitions'
-DDL and the prunes of every group still run one after another, each waiting up to its
-lock timeout, and the next slow statement would need its own bound. Off the loop, no
-retention statement holds up the renewal. The lease still fences the pass: the leader
-loop records, at each renewal, the lease's earliest expiry by the local clock (the
-time the attempt was sent plus the TTL, no later than the server's `now()` plus the
-TTL that `expires_at` holds), and a pass runs under a context that is canceled, with
-its statement, once that time passes without a later renewal, even while the leader
-loop has not yet seen the lease go: a renewal that keeps failing does not end the term.
-The end of the term cancels it too, and waits for it, before the client takes part in
-another term. A pass cut short is retried at the next leader interval. The leader
-loop's own statements that write history (the rescue's finalize, the TTL discard) can
-now wait behind a partition's attach or drop, as a worker's `CompleteTx` can, up to
-that statement's lock timeout, at most 2 s; before, the loop ran them one after the
-other.
+the partitions ahead, may be millions of rows, and an attach scans the `DEFAULT`
+partition. On the leader loop either would stop the lease renewal for as long as it
+ran, and cost the leadership past the TTL. Batching the delete would bound each
+statement but not the pass: the attach's scan, and the partitions' DDL and the prunes
+of every group one after another, each waiting up to its lock timeout. Off the loop,
+no retention statement runs between renewals, and the lease fences the loop as it
+does the term's others. A pass cut short by the end of the term is redone by the next
+one. The leader loop's own statements that write history (the rescue's finalize, the
+TTL discard, the leases' expiry) can now wait behind a partition's attach or drop, as
+a worker's `CompleteTx` can: those that reach other jobs' rows give up after their
+500 ms `lock_timeout` and are retried, and the rescue's finalize of jobs of no batch
+waits, for up to the DDL's lock wait and, behind an attach, its scan of the `DEFAULT`
+partition. Before, the loop ran them one after the other.
 
 The index build (`HistoryIndex`) runs in its own loop of the leader's term, once the
 term's first history maintenance has created the partitions ahead and then every
@@ -2176,7 +2188,7 @@ a leader outage, a pass that catches up on whole days while that prune fails or 
 deferred leaves the rows of every hour it drops. The delete names its hour's partition, so its bounds are written into it too, and
 it runs unprepared rather than leave a statement an hour in the connection's cache. A
 deferred drop rolls the delete back
-with it, and its retry, on the next leader pass, deletes again: an hour whose drop is
+with it, and its retry, at the next leader interval, deletes again: an hour whose drop is
 deferred pass after pass pays its delete each time. A delete the server cancels, as a `statement_timeout` shorter than a busy hour's
 delete does, is rolled back to a savepoint and the hour dropped without it, as a previous
 release's leader drops one: its rows stay in the day's partition until it goes, rather
@@ -2223,8 +2235,8 @@ period after installation, or after a long leader outage) land in a `DEFAULT`
 partition and are deleted individually once past retention, each pass skipping the
 rows another transaction holds (`FOR UPDATE SKIP LOCKED`), which a later pass deletes:
 a `JobRetryTx` or `JobDeleteTx` of a job past retention, held open, has deleted its
-row, and a prune that waited for it would stop the leader's loop and its lease
-renewal until the caller's transaction ended. The prune's table locks wait no longer
+row, and a prune that waited for it would hold up history maintenance until the
+caller's transaction ended. The prune's table locks wait no longer
 than 200 ms, and a prune that cannot get them is retried at the next maintenance
 (§7.8). Attaching scans the
 `DEFAULT` partition under an `ACCESS EXCLUSIVE` lock on it, and dropping a partition
@@ -2233,21 +2245,21 @@ that wrote history and is still open (a worker's `CompleteTx`) holds either lock
 and while the DDL waits, every finalize that writes to the same table queues behind
 it. Both therefore run under a `lock_timeout`: one that cannot get its lock is
 reported as deferred, and so are the rest of its kind in the same group, untried,
-since they wait for the same lock. Deferred work is retried on the next leader pass
+since they wait for the same lock. Deferred work is retried at the next leader interval
 rather than the next maintenance interval, with the timeout doubling on each
 consecutive deferral from 200 ms to at most 2 s, so that transactions that keep
 overlapping cannot hold retention, or the partitions ahead, off for good. Maintenance
 therefore holds up a group's finalizes for at most that timeout per kind of DDL each
 pass. A creation's wait for the history maintenance lock, which an overlapping leader's
 creation or index attach holds, runs under the same timeout, so a leader that
-stalls holding it defers the partitions ahead rather than stall this leader's loop and
-its lease renewal. A session `statement_timeout` that runs out during one
+stalls holding it defers the partitions ahead rather than stall this leader's history
+maintenance. A session `statement_timeout` that runs out during one
 of these statements, which it can whatever its length since `lock_timeout` bounds each of
 a statement's lock waits rather than their sum, defers the work the same way rather than
 fail the pass. A creation takes its attach's locks first, in statements of their own,
 so a `statement_timeout` that ends the attach itself, scanning a DEFAULT partition grown
 large, fails the pass, an error each maintenance interval, rather than be retried as a
-wait on every leader pass. A group whose maintenance fails, retention's read of its
+wait at every leader interval. A group whose maintenance fails, retention's read of its
 partitions' indexes included, leaves the other groups to theirs, and within a group a
 failed step leaves only the rest of that step to the next pass: a failed creation
 leaves the partitions after it, not the group's retention, a failed read of the
@@ -3225,7 +3237,7 @@ observability without new machinery.
 | Unit | Backoff, cron parsing and time zones, pattern matching, unique-key construction, the state transition table, option validation. Timers are tested with `testing/synctest`. |
 | Integration | Against real Postgres 14–18 in CI (a service container per version), always with `-race` and `GODEBUG=fips140=only`. Each test gets its own schema, so tests run in parallel. |
 | Driver conformance | `drivertest.Run(t, fixture)` runs the behavioral suite (inserting, unique keys, claiming, every finalize transition and fence, leases, leader, rescue, cancel, retry, TTL, listing, queues, periodic slots, stats, notifications, history maintenance) against every driver. A `Fixture` supplies isolated databases and the few engine-specific hooks (expire a lease or a job, backdate an attempt, store a value as a direct write would, wait until a statement waits for a lock, count rows); what depends on row locks is tested either way by `Capabilities.SingleWriter`. `drivertest.RunPostgres` adds the tests of what the Postgres drivers share beyond the interface (partitions and their indexes, the tags tables, progress rows, planner statistics); other engine internals stay in the driver's own tests. |
-| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. A batch whose last jobs finished in concurrent statements while another transaction held its row, which the finalizing client's settle gives up on: the client settles it again and completes it once the row is free, without a leader. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Job leases: a claim by ID against a client's claim of the same jobs claims each once; concurrent renewals of a lease and of a stale lease of the same job; a renewal held open against the expiry, which the renewal wins; a finish held open against the expiry, which skips the job; cancels that commit while the expiry runs, which leave no job running without its lease; a stale token's finish after an expiry; and holders that renew late at random against the leader's expiry, where every claim ends exactly once, by its Finish or its expiry, and no expiry is recorded before the expiry its holder was last given. A whole-cluster restart while workers hold leases: those that come back within the grace keep them, and a lease never renewed again expires no earlier than the grace after the restart, even when a client that started after the claims crashed with the cluster, its lease lapsing before the restart. Workflow dependencies: two dependencies finalized in concurrent transactions, whose dependent is promoted once both commit and claimed with both results; a leased dependency's result against its lease's expiry, whichever applies giving the dependent its state; the leader's expiry of a step's job lease, or its discard of a step past its TTL, against a lease's `Finish` of its sibling, both of an any-of group or the workflow's last two, where whichever follows up second cancels the dependent and completes the workflow with no sweep; four clients working forty workflows with failing steps, every step claimed with exactly its dependencies' states and outputs and no result left once they complete; the leader's sweep of orphaned results run without pause while workflows are worked, which deletes none of a workflow in flight; and a `JobRetry` of a finished step whose result its dependent read, held open in a transaction while its sibling, the workflow's last step, finalizes, which neither the finalize nor the leader's sweep waits for, and which leaves no result whether it commits or rolls back; and a `JobRetry` of a failed step held open the same way, which neither the finalize nor the leader's settle waits for, and which the finalize completes the workflow without, with the step's failure and `OnFailure`, a failure the workflow keeps, once, after the retry commits and the step completes or fails again. The leader's duties against a caller's transaction held open: retention's prune of a `DEFAULT` partition against a `JobRetryTx` or `JobDeleteTx` of a job past retention, which skips the job's row, and a later pass prunes it once the transaction rolls back; retention's prunes of the `DEFAULT` partitions behind a request for an `ACCESS EXCLUSIVE` lock on a history partition, queued behind a long reader, which wait no longer than their lock timeout, so that the leader keeps its lease; a history maintenance pass whose prune of a `DEFAULT` partition runs for several of the lease's TTLs, which the leader renews its lease through, in the same term, and which is canceled, prune and all, within a TTL once the lease's renewal stops, though the leader loop has not seen the lease go; and the rescue's finalize, the expiry of job leases and the discard of jobs past their TTL against a `JobCancelTx` or `CompleteTx` that canceled their job's dependent by cascade, which each give up after their brief lock wait, and a later pass, once the transaction rolls back, finalizes the job and cancels the dependent. Global and rate limits never exceeded. Ordering keys never run two at once. |
+| Concurrency | N clients by M jobs: every job is finalized exactly once when nothing crashes. A finalize held open in a caller's transaction (`CompleteTx`) against a competing fenced finalize: exactly one applies, whichever way the transaction ends. Uniqueness under concurrent inserts. A batch whose last jobs finished in concurrent statements while another transaction held its row, which the finalizing client's settle gives up on: the client settles it again and completes it once the row is free, without a leader. Periodic slots unique across two leaders. An insert counting finished duplicates against its duplicate's finalize held open: the insert reports the finished job and leaves no live one. A progress write held open in a caller's transaction against the attempt's competing finalize: a write that commits first is kept, one that comes second is fenced. A stuck attempt rescued and claimed again by the same client: its late result does not finalize the new claim, and a cancel still reaches the new claim. Job leases: a claim by ID against a client's claim of the same jobs claims each once; concurrent renewals of a lease and of a stale lease of the same job; a renewal held open against the expiry, which the renewal wins; a finish held open against the expiry, which skips the job; cancels that commit while the expiry runs, which leave no job running without its lease; a stale token's finish after an expiry; and holders that renew late at random against the leader's expiry, where every claim ends exactly once, by its Finish or its expiry, and no expiry is recorded before the expiry its holder was last given. A whole-cluster restart while workers hold leases: those that come back within the grace keep them, and a lease never renewed again expires no earlier than the grace after the restart, even when a client that started after the claims crashed with the cluster, its lease lapsing before the restart. Workflow dependencies: two dependencies finalized in concurrent transactions, whose dependent is promoted once both commit and claimed with both results; a leased dependency's result against its lease's expiry, whichever applies giving the dependent its state; the leader's expiry of a step's job lease, or its discard of a step past its TTL, against a lease's `Finish` of its sibling, both of an any-of group or the workflow's last two, where whichever follows up second cancels the dependent and completes the workflow with no sweep; four clients working forty workflows with failing steps, every step claimed with exactly its dependencies' states and outputs and no result left once they complete; the leader's sweep of orphaned results run without pause while workflows are worked, which deletes none of a workflow in flight; and a `JobRetry` of a finished step whose result its dependent read, held open in a transaction while its sibling, the workflow's last step, finalizes, which neither the finalize nor the leader's sweep waits for, and which leaves no result whether it commits or rolls back; and a `JobRetry` of a failed step held open the same way, which neither the finalize nor the leader's settle waits for, and which the finalize completes the workflow without, with the step's failure and `OnFailure`, a failure the workflow keeps, once, after the retry commits and the step completes or fails again. The leader's duties against a caller's transaction held open: retention's prune of a `DEFAULT` partition against a `JobRetryTx` or `JobDeleteTx` of a job past retention, which skips the job's row, and a later pass prunes it once the transaction rolls back; retention's prunes of the `DEFAULT` partitions behind a request for an `ACCESS EXCLUSIVE` lock on a history partition, queued behind a long reader, which wait no longer than their lock timeout, so that the leader keeps its lease; a history maintenance pass whose prune of a `DEFAULT` partition runs for several of the lease's TTLs, which the leader renews its lease through, in the same term, and which is canceled, prune and all, within a TTL once the lease's renewal stops, waiting for the lease's row, the term ending with `EventLeaderLost`; and the rescue's finalize, the expiry of job leases and the discard of jobs past their TTL against a `JobCancelTx` or `CompleteTx` that canceled their job's dependent by cascade, which each give up after their brief lock wait, and a later pass, once the transaction rolls back, finalizes the job and cancels the dependent. Global and rate limits never exceeded. Ordering keys never run two at once. |
 | Chaos | `pg_terminate_backend` on a client mid-job, followed by rescue and re-run. A client that crashes while running two workflow dependencies: the one rerun elsewhere gives its dependent the output of the attempt that completed, and the one the rescue discards gives its dependent that state and no output. A client that crashes after its workers committed `CompleteTx` transactions but before its finalizer flushed: none of those jobs runs again. A frozen client that loses its lease and must fence itself. Leader killed, new leader within the TTL. Stop with an expired context. Listener dropped, polling continues and the listener reconnects. |
 | Upgrade | Migrate from release N-1 with jobs in every state and live traffic. |
 | Performance | `hopperbench` regression gate on PRs, and the nightly soak (§8.3). |

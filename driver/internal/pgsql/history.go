@@ -269,7 +269,7 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 // ahead, which must exist when its period starts, a prune is not urgent: one
 // that cannot get its locks in time is named in res.PruneDeferred and
 // reports false, and the next maintenance pass tries again, with the same
-// short timeout, rather than the next leader pass with a longer one, as is
+// short timeout, rather than at the next leader interval with a longer one, as is
 // a tags group's prune that comes after a deferred prune of one of history's
 // DEFAULT partitions or of the other tags group's, deferred untried. Only a
 // lock wait defers it: a statement_timeout may be its scan of a large
@@ -1099,8 +1099,8 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// held for this transaction, then check whether the other one has
 	// already created the partition. The lock timeout bounds the wait for
 	// it too: a leader that stalls while it holds it, creating a partition
-	// or attaching an index, would otherwise stall this one's loop, lease
-	// renewal included.
+	// or attaching an index, would otherwise stall this one's history
+	// maintenance.
 	// Partitions are created periods ahead, so this one is deferred instead.
 	if err = setLockTimeout(ctx, tx, lockTimeout); err != nil {
 		return false, false, fmt.Errorf("hopper: create partition %s: %w", name, err)
