@@ -138,7 +138,7 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 	if err != nil {
 		// Without the list, neither the partitions ahead nor those past
 		// retention are known, but the DEFAULT partition's prune needs none.
-		_, pruneErr := e.pruneDefault(ctx, g, keep, lockTimeout, res)
+		_, pruneErr := e.pruneDefault(ctx, g, keep, res)
 		return false, errors.Join(err, pruneErr)
 	}
 	var errs []error
@@ -239,7 +239,7 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 			}
 		}
 	}
-	pruned, pruneErr := e.pruneDefault(ctx, g, keep, lockTimeout, res)
+	pruned, pruneErr := e.pruneDefault(ctx, g, keep, res)
 	return mayDrop && !dropsFailed && pruned && pruneErr == nil, errors.Join(append(errs, pruneErr)...)
 }
 
@@ -265,76 +265,69 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 // check of history reads, and queues behind any request for one that
 // conflicts, such as an ACCESS EXCLUSIVE one (a partition's attach or drop,
 // an index's attach, an operator's DDL) itself waiting for a long reader.
-// So its lock waits are bounded by lockTimeout, like a partition's creation
-// or drop; a prune that cannot get its locks in time is deferred, named in
-// res.Deferred, and reports false, and a later pass retries it, as it does
-// the other tags group's prune, deferred untried. Only a lock
-// wait defers it: a statement_timeout may be its scan of a large DEFAULT
-// partition running long, which is reported as an error. It reports whether
-// it pruned, which it has with nothing to keep.
-func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.Duration, lockTimeout string, res *driver.HistoryMaintainResult) (pruned bool, err error) {
+// So its lock waits are bounded by defaultDDLLockTimeout. Unlike a partition
+// ahead, which must exist when its period starts, a prune is not urgent: one
+// that cannot get its locks in time is named in res.PruneDeferred and
+// reports false, and the next maintenance pass tries again, with the same
+// short timeout, rather than the next leader pass with a longer one, as is
+// a tags group's prune that comes after a deferred prune of history's or of
+// its tags, deferred untried. Only a lock wait defers it: a statement_timeout
+// may be its scan of a large DEFAULT partition running long, which is
+// reported as an error. It reports whether it pruned, which it has with
+// nothing to keep.
+func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.Duration, res *driver.HistoryMaintainResult) (bool, error) {
 	if keep <= 0 {
 		return true, nil
 	}
 	name := g.parent + "_default"
-	table := e.Schema.Table(name)
-	// The tags' prunes read the same tables, every history partition, so
-	// once one is deferred this pass, the other is deferred untried, rather
-	// than wait the lock timeout again on the leader's loop.
-	if g.mirrors != "" && slices.ContainsFunc(res.Deferred, tagsDefault) {
-		res.Deferred = append(res.Deferred, name)
+	// A tags group's prune reads every history partition. Once a prune of
+	// one of history's DEFAULT partitions, or the other tags group's,
+	// which reads them too, is deferred this pass, it would most likely
+	// wait for the same lock, so it is deferred untried rather than wait
+	// the lock timeout again on the leader's loop.
+	if g.mirrors != "" && slices.ContainsFunc(res.PruneDeferred, historyDefault) {
+		res.PruneDeferred = append(res.PruneDeferred, name)
 		return false, nil
 	}
-	tx, err := e.Conn.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("hopper: prune %s: %w", name, err)
-	}
-	defer func() {
-		if err != nil || !pruned {
-			_ = tx.Rollback(context.WithoutCancel(ctx))
-		}
-	}()
-	if err = setLockTimeout(ctx, tx, lockTimeout); err != nil {
-		return false, fmt.Errorf("hopper: prune %s: %w", name, err)
-	}
+	table := e.Schema.Table(name)
 	var n int64
-	if g.mirrors != "" {
-		_, err = tx.Exec(ctx, fmt.Sprintf(`
-			DELETE FROM %[1]s WHERE ctid = ANY (ARRAY(
-			  SELECT ctid FROM %[1]s t WHERE finalized_at < now() - make_interval(secs => $1::float8)
-			    AND NOT EXISTS (SELECT 1 FROM %[2]s h WHERE h.state = t.state AND h.finalized_at = t.finalized_at AND h.id = t.id)
-			  FOR UPDATE OF t SKIP LOCKED))`,
-			table, e.Schema.Table("hopper_job_history")), keep.Seconds())
-	} else {
+	err := e.withTx(ctx, func(tx Tx) (err error) {
+		if err = setLockTimeout(ctx, tx, lockTimeoutSetting(0)); err != nil {
+			return err
+		}
+		if g.mirrors != "" {
+			// The tags rows it deletes are not counted.
+			_, err = tx.Exec(ctx, fmt.Sprintf(`
+				DELETE FROM %[1]s WHERE ctid = ANY (ARRAY(
+				  SELECT ctid FROM %[1]s t WHERE finalized_at < now() - make_interval(secs => $1::float8)
+				    AND NOT EXISTS (SELECT 1 FROM %[2]s h WHERE h.state = t.state AND h.finalized_at = t.finalized_at AND h.id = t.id)
+				  FOR UPDATE OF t SKIP LOCKED))`,
+				table, e.Schema.Table("hopper_job_history")), keep.Seconds())
+			return err
+		}
 		n, err = tx.Exec(ctx,
 			fmt.Sprintf(`DELETE FROM %[1]s WHERE ctid = ANY (ARRAY(
 			  SELECT ctid FROM %[1]s WHERE %[2]s < now() - make_interval(secs => $1::float8) FOR UPDATE SKIP LOCKED))`, table, g.timeColumn),
 			keep.Seconds())
-	}
-	if lockNotAvailable(err) && ctx.Err() == nil {
-		res.Deferred = append(res.Deferred, name)
+		return err
+	})
+	switch {
+	case lockNotAvailable(err) && ctx.Err() == nil:
+		res.PruneDeferred = append(res.PruneDeferred, name)
 		return false, nil
-	}
-	if err != nil {
+	case err != nil:
 		return false, fmt.Errorf("hopper: prune %s: %w", name, err)
 	}
-	if err = tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("hopper: prune %s: %w", name, err)
-	}
-	if g.mirrors == "" {
-		res.Pruned += n
-	}
+	res.Pruned += n
 	return true, nil
 }
 
-// tagsDefault reports whether name is a tags group's DEFAULT partition.
-func tagsDefault(name string) bool {
-	for _, g := range historyGroups {
-		if g.mirrors != "" && name == g.parent+"_default" {
-			return true
-		}
-	}
-	return false
+// historyDefault reports whether name is the DEFAULT partition of one of
+// history's outcome tables or of their tags tables.
+func historyDefault(name string) bool {
+	return slices.ContainsFunc(historyGroups, func(g historyGroup) bool {
+		return (g.root == "hopper_job_history" || g.mirrors != "") && name == g.parent+"_default"
+	})
 }
 
 // defaultDDLLockTimeout bounds how long a partition's creation or drop, a

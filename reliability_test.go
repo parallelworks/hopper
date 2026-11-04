@@ -530,9 +530,14 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 	})
 
 	c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
-	// Maintenance on every leader pass, under a lease that outlasts the
-	// longest bounded wait of a pass (the maintenance lock timeout grows to
-	// 2s while passes defer), so that only an unbounded wait lets it lapse.
+	// Maintenance on every leader pass, under a lease that outlasts a pass's
+	// bounded waits for the pending lock: the attach of a failed partition
+	// ahead, up to the maintenance lock timeout, which grows to 2s while
+	// passes defer, and the failed DEFAULT partition's prune, up to 200ms
+	// (the tags' prunes are deferred untried). Only an unbounded wait lets
+	// it lapse. The check outlasts the first passes at 2s, and the lease's
+	// elected_at catches a lapse that the client took back at once, as a
+	// new term, between two checks.
 	tun := fastTuning
 	tun.Maintenance = 100 * time.Millisecond
 	tun.LeaderTTL = 6 * time.Second
@@ -541,9 +546,13 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, c.IsLeader)
+	var electedAt time.Time
+	if err := h.pool.QueryRow(ctx, "SELECT elected_at FROM hopper_leader").Scan(&electedAt); err != nil {
+		t.Fatal(err)
+	}
 	elected := time.Now()
-	for time.Since(elected) < 2*tun.LeaderTTL {
-		if h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now()") != 1 || !c.IsLeader() {
+	for time.Since(elected) < 3*tun.LeaderTTL {
+		if h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 || !c.IsLeader() {
 			t.Fatalf("the leader's lease lapsed %s after the election, behind the pending lock on %s", time.Since(elected).Round(time.Millisecond), partition)
 		}
 		time.Sleep(100 * time.Millisecond)

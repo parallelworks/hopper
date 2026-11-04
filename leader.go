@@ -691,6 +691,13 @@ func (c *Client[TTx]) maintainHistory(ctx context.Context) bool {
 	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.Pruned > 0 {
 		c.logger.InfoContext(ctx, "hopper: maintained history", "created", res.Created, "dropped", res.Dropped, "pruned", res.Pruned)
 	}
+	// A prune that could not get its locks waits for the next maintenance
+	// interval, not the next leader pass: it is not urgent, and a pass that
+	// retried it would wait the lock timeout again on the leader's loop.
+	if len(res.PruneDeferred) > 0 {
+		c.logger.InfoContext(ctx, "hopper: history DEFAULT partitions' prune deferred to the next maintenance: a lock request, such as a DDL statement waiting for a long transaction, held their tables",
+			"deferred", res.PruneDeferred)
+	}
 	// A kept partition waits for its build, whose failures the index loop
 	// warns about, so it is only logged, once per maintenance interval: the
 	// passes that retry deferred work in between, on every leader pass, are

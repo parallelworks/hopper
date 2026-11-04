@@ -1885,9 +1885,13 @@ and the tags' prune reads every history partition, so a request for an `ACCESS
 EXCLUSIVE` lock on any of them (a partition's attach, an index repair's attach, an
 operator's DDL), itself waiting for a long reader, would otherwise hold the prune and
 the leader's loop, lease renewal included, for as long as the reader stayed open. The
-prune runs under the maintenance `lock_timeout`, and one that cannot get its locks is
-deferred and retried on a later pass, the other tags group's untried, since it waits
-for the same locks. Only the leader's statements are
+prune runs under a 200 ms `lock_timeout`, and one that cannot get its locks is
+deferred to the next maintenance pass (`HistoryMaintainResult.PruneDeferred`). A prune
+is not urgent the way a partition ahead is, so it neither makes the leader retry on its
+next pass nor lengthens the timeout of the partitions' DDL. A tags group's prune that
+comes after a deferred prune of history's `DEFAULT` partitions or of the other tags
+group's is deferred untried, since it reads every history partition and would most
+likely wait for the same lock. Only the leader's statements are
 bounded (`JobFinalizeParams.BriefWait` for the rescue's): a client's finalizer still
 waits, as before, for a row of another job that a caller's transaction holds, such as
 a dependent its cascade reaches, up to its flush timeout, after which it writes the
@@ -2197,8 +2201,8 @@ rows another transaction holds (`FOR UPDATE SKIP LOCKED`), which a later pass de
 a `JobRetryTx` or `JobDeleteTx` of a job past retention, held open, has deleted its
 row, and a prune that waited for it would stop the leader's loop and its lease
 renewal until the caller's transaction ended. The prune's table locks wait no longer
-than the `lock_timeout` below, and a prune that cannot get them is deferred like the
-DDL (§7.8). Attaching scans the
+than 200 ms, and a prune that cannot get them is retried at the next maintenance
+(§7.8). Attaching scans the
 `DEFAULT` partition under an `ACCESS EXCLUSIVE` lock on it, and dropping a partition
 takes a brief `ACCESS EXCLUSIVE` lock on the parent, once per period. A transaction
 that wrote history and is still open (a worker's `CompleteTx`) holds either lock off,
