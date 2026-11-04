@@ -19,7 +19,9 @@ name: Performance gate
 # effects, such as the leader's first statistics refresh, rather than the
 # hot paths. The workflow scenarios, whose jobs each pass through the
 # finalize tail and dependency promotion (and, in workflow-outputs, record
-# and read their dependencies' outputs), drain 100,000 (ten thousand
+# and read their dependencies' outputs; in workflow-any, the last step
+# waits for any one of the eight in the middle, and the finalizing
+# client's follow-up promotes it), drain 100,000 (ten thousand
 # workflows), about as long. The reference numbers in
 # docs/PLAN.md §8.2 come from the release hardware, not from here.
 on:
@@ -61,7 +63,7 @@ jobs:
           --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       DATABASE_URL: postgres://hopper:hopper@localhost:5432/hopper_bench?sslmode=disable
-      SCENARIOS: throughput,insert,copy,workflow,workflow-outputs
+      SCENARIOS: throughput,insert,copy,workflow,workflow-outputs,workflow-any
       ROUNDS: "6"
       JOBS: "300000"
       WORKFLOW_JOBS: "100000"
