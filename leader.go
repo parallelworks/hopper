@@ -22,23 +22,75 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	// term is the current leadership: the periodic loop runs under it and
 	// stops when it ends.
 	var term *leaderTerm
+	// leaseID is the client ID the lease was last taken or renewed under,
+	// which a stop gives it up for: a fence may re-register the client
+	// under another before the next attempt notices.
+	var leaseID int64
+	// electedAt identifies the term the client leads (the lease's
+	// elected_at): an attempt that returns another has started a new one.
+	var electedAt time.Time
 	defer func() {
 		term.end()
-		c.resign(ctx)
+		c.resign(ctx, leaseID)
 	}()
 
 	var lastMaintenance time.Time
 	for {
-		ok, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: c.clientID.Load(), TTL: c.tuning.leaderTTL})
+		// The attempt's ID is the one a resign gives the lease up for: a
+		// fence may re-register the client under another meanwhile.
+		id := c.clientID.Load()
+		res, err := c.exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: c.tuning.leaderTTL})
+		// A term is one live lease, identified by its elected_at. A client
+		// that took over a lease that had lapsed, even its own and under the
+		// same ID, or its old one under the ID a fence gave it, left its term
+		// when the lease lapsed, and another client may have led since: that
+		// term ends, with its event, before the new one starts or, if the new
+		// one was asked to resign, is resigned. Comparing elected_at rather
+		// than asking whether this attempt took the lease catches a takeover
+		// whose response was lost, which the next renewal reports with the
+		// new term's.
+		if err == nil && res.Leader && !res.ElectedAt.Equal(electedAt) && c.isLeader.Swap(false) {
+			c.logger.WarnContext(ctx, "hopper: leader lease lapsed; its term ended", "client_id", leaseID, "new_client_id", id)
+			c.emit(EventLeaderLost, nil, "")
+			term.end()
+			term = nil
+		}
 		switch {
 		case err != nil:
 			if ctx.Err() != nil {
 				return
 			}
 			c.logger.WarnContext(ctx, "hopper: leader attempt", "error", err)
-		case ok:
+		case res.ResignRequested:
+			// Asked to resign (Client.LeaderResign): no duty runs again in
+			// this term. Its loops end before the lease is given up, and
+			// within the lease it holds (the renewal that reported the
+			// request did not extend it), so no duty of this client overlaps
+			// the next leader's.
+			term.end()
+			term = nil
+			c.resignOnRequest(ctx, id)
+			// It stays out of the election for a lease's TTL, so that
+			// another client takes the lease rather than it again, and
+			// attempts again as soon as the hold-off ends, not at the next
+			// tick after it.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(c.tuning.leaderTTL):
+			}
+			// A tick or poke from during the hold-off is stale: the attempt
+			// that follows covers it, so it must not repeat that attempt.
+			ticker.Reset(c.tuning.leaderInterval)
+			select {
+			case <-c.leaderPoke:
+			default:
+			}
+			continue
+		case res.Leader:
+			leaseID, electedAt = id, res.ElectedAt
 			if !c.isLeader.Swap(true) {
-				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", c.clientID.Load())
+				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)
 				c.emit(EventLeaderElected, nil, "")
 				lastMaintenance = time.Time{}
 				term = c.startTerm(ctx)
@@ -56,7 +108,8 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			}
 		default:
 			if c.isLeader.Swap(false) {
-				c.logger.WarnContext(ctx, "hopper: lost leadership", "client_id", c.clientID.Load())
+				// The ID it led under: a fence may have moved the client on.
+				c.logger.WarnContext(ctx, "hopper: lost leadership", "client_id", leaseID)
 				c.emit(EventLeaderLost, nil, "")
 				term.end()
 				term = nil
@@ -119,17 +172,46 @@ func (c *Client[TTx]) pokeLeader() {
 }
 
 // resign gives up leadership on stop so a replacement takes over at once.
-func (c *Client[TTx]) resign(ctx context.Context) {
+// id is the client ID the lease was taken or last renewed under.
+func (c *Client[TTx]) resign(ctx context.Context, id int64) {
 	if !c.isLeader.Swap(false) {
 		return
 	}
+	c.giveUpLease(ctx, id, "")
+}
+
+// giveUpLease deletes the leader lease if client id holds it, and then
+// signals the other clients to elect a replacement, and logs which way the
+// lease went; why ("" or " on request") says what ended the term. It runs
+// on a context of its own, so that a stopping client still gives the lease
+// up. If the statement fails, the lease expires instead, within the TTL
+// its last renewal left it.
+func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64, why string) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := c.exec.LeaderResign(rctx, c.clientID.Load()); err != nil {
-		c.logger.WarnContext(ctx, "hopper: resign leadership", "error", err)
-		return
+	deleted, err := c.exec.LeaderResign(rctx, id)
+	switch {
+	case err != nil:
+		c.logger.WarnContext(ctx, "hopper: resign leadership"+why+"; the lease expires instead", "client_id", id, "error", err)
+	case !deleted:
+		c.logger.InfoContext(ctx, "hopper: stopped leading"+why+"; the lease had already passed on", "client_id", id)
+	default:
+		c.logger.InfoContext(ctx, "hopper: resigned leadership"+why, "client_id", id)
 	}
-	c.logger.InfoContext(ctx, "hopper: resigned leadership", "client_id", c.clientID.Load())
+}
+
+// resignOnRequest ends a term on a resign request, once the term's loops
+// have ended: it gives the lease client id holds up and signals the other
+// clients to elect a replacement. The event marks the end of the term,
+// whichever way the lease went, and only of a term the client announced
+// (EventLeaderElected): an attempt that took the lease but failed to
+// report it started none.
+func (c *Client[TTx]) resignOnRequest(ctx context.Context, id int64) {
+	led := c.isLeader.Swap(false)
+	c.giveUpLease(ctx, id, " on request")
+	if led {
+		c.emit(EventLeaderResigned, nil, "")
+	}
 }
 
 // rescue moves running jobs whose client has lost its lease back to

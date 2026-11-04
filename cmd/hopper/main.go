@@ -8,6 +8,7 @@
 //	hopper queues list|pause|resume [name]
 //	hopper queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]
 //	hopper clients list
+//	hopper leader resign [-leader ID]
 //	hopper stats
 //
 // The database comes from -database-url or HOPPER_DATABASE_URL. Every command
@@ -64,6 +65,7 @@ commands:
   queues pause|resume <name>
   queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]   (omitted limits are removed)
   clients list
+  leader resign [-leader ID]   (asks the leader, or only client ID if it leads, to give up its term)
   workflows get <id>
   subscriptions list
   streams consumers
@@ -123,6 +125,8 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		return c.queues(ctx, rest[1:])
 	case "clients":
 		return c.clients(ctx, rest[1:])
+	case "leader":
+		return c.leader(ctx, rest[1:])
 	case "workflows":
 		return c.workflows(ctx, rest[1:])
 	case "subscriptions":
@@ -457,15 +461,51 @@ func (c *cli) clients(ctx context.Context, args []string) error {
 	}
 	return c.print(clients, func(w io.Writer) {
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tHOST\tSTARTED\tLEASE\tINFO")
+		fmt.Fprintln(tw, "ID\tHOST\tSTARTED\tLEASE\tLEADER\tINFO")
 		for _, cl := range clients {
 			lease := "expired"
 			if until := time.Until(cl.ExpiresAt); until > 0 {
 				lease = "live (" + until.Round(time.Second).String() + ")"
 			}
-			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", cl.ID, cl.Hostname, cl.StartedAt.Local().Format(time.RFC3339), lease, cl.Info)
+			leader := ""
+			if cl.Leader {
+				leader = "leader"
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", cl.ID, cl.Hostname, cl.StartedAt.Local().Format(time.RFC3339), lease, leader, cl.Info)
 		}
 		tw.Flush()
+	})
+}
+
+// leader asks the current leader to resign its term (Client.LeaderResign).
+// With -leader it asks only that client, and fails if it no longer leads,
+// so that a retry after a takeover does not move leadership again.
+func (c *cli) leader(ctx context.Context, args []string) error {
+	if len(args) < 1 || args[0] != "resign" {
+		return errors.New("leader: resign [-leader ID]")
+	}
+	fs := flag.NewFlagSet("hopper leader resign", flag.ContinueOnError)
+	fs.SetOutput(c.out)
+	leaderID := fs.Int64("leader", 0, "ask only this client, if it leads (default: whichever client leads)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("leader: resign [-leader ID]")
+	}
+	id, err := c.client.LeaderResign(ctx, *leaderID)
+	if errors.Is(err, hopper.ErrNotLeader) {
+		return fmt.Errorf("client %d does not lead: %w", *leaderID, err)
+	}
+	if err != nil {
+		return err
+	}
+	return c.print(map[string]int64{"asked": id}, func(w io.Writer) {
+		if id == 0 {
+			fmt.Fprintln(w, "no leader")
+			return
+		}
+		fmt.Fprintf(w, "asked leader client %d to resign\n", id)
 	})
 }
 

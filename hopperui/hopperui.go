@@ -1,7 +1,7 @@
 // Package hopperui is a web UI for hopper: an http.Handler that browses
 // queues, jobs, history, workflows, subscriptions, stream consumers and
-// clients, and can retry, cancel, delete, pause, resume and seek when the
-// application allows it.
+// clients, and can retry, cancel, delete, pause, resume, seek and ask the
+// leader to resign when the application allows it.
 //
 //	mux.Handle("/hopper/", http.StripPrefix("/hopper", hopperui.New(client, &hopperui.Config{
 //	    Prefix:    "/hopper",
@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,10 @@ const (
 	ActionPause  Action = "pause"
 	ActionResume Action = "resume"
 	ActionSeek   Action = "seek"
+	// ActionResign asks the cluster's leader to give up its term
+	// (Client.LeaderResign). The UI names the leader its page showed, so
+	// a stale page asks no client elected since.
+	ActionResign Action = "resign"
 )
 
 // Config tunes the UI. A nil *Config means the defaults.
@@ -55,7 +60,10 @@ type Config struct {
 	// without it.
 	Prefix string
 	// Authorize is asked before every action; returning an error refuses
-	// it with 403. With no hook the UI is read-only.
+	// it with 403. With no hook the UI is read-only. A hook that allows
+	// every action, or every action but some it names, also allows those
+	// added in later releases, such as ActionResign, which moves the
+	// cluster's leadership; list the actions it allows to avoid that.
 	Authorize func(r *http.Request, action Action) error
 	// Title is shown in the header. Defaults to "hopper".
 	Title string
@@ -99,6 +107,7 @@ func New[TTx any](client *hopper.Client[TTx], cfg *Config) http.Handler {
 	mux.HandleFunc("GET /consumers", u.consumers)
 	mux.HandleFunc("POST /consumers/{name}/seek", u.seek)
 	mux.HandleFunc("GET /clients", u.clients)
+	mux.HandleFunc("POST /clients/leader/resign", u.leaderResign)
 	mux.HandleFunc("GET /static/style.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		http.ServeContent(w, r, "style.css", time.Time{}, bytes.NewReader(styleCSS))
@@ -555,7 +564,49 @@ func (u *ui[TTx]) clients(w http.ResponseWriter, r *http.Request) {
 		u.fail(w, err)
 		return
 	}
-	u.render(w, r, "clients", clients)
+	data := clientsData{Clients: clients}
+	for _, c := range clients {
+		if c.Leader {
+			data.Leader = c.ID
+		}
+	}
+	u.render(w, r, "clients", data)
+}
+
+func (u *ui[TTx]) leaderResign(w http.ResponseWriter, r *http.Request) {
+	if !u.authorize(w, r, ActionResign) {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// The leader the page showed: a page from before a takeover must not
+	// ask the client elected since.
+	leader, err := strconv.ParseInt(r.Form.Get("leader"), 10, 64)
+	if err != nil || leader <= 0 {
+		http.Error(w, "leader: the client ID of the leader to ask", http.StatusBadRequest)
+		return
+	}
+	id, err := u.client.LeaderResign(r.Context(), leader)
+	if errors.Is(err, hopper.ErrNotLeader) {
+		u.back(w, r, "/clients", fmt.Sprintf("client %d no longer leads; no client was asked", leader))
+		return
+	}
+	if err != nil {
+		u.fail(w, err)
+		return
+	}
+	u.back(w, r, "/clients", fmt.Sprintf("asked leader client %d to resign", id))
+}
+
+type clientsData struct {
+	Clients []*hopper.ClientRow
+	// Leader is the ID of the listed client that holds the live leader
+	// lease, or 0. A lease whose holder's row was pruned (its client lease
+	// lapsed, and its leader lease lapses within a TTL) has none, while
+	// Stats, which reads the lease alone, still reports it.
+	Leader int64
 }
 
 // Template helpers.

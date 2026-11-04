@@ -97,3 +97,7 @@ func (c *Client[TTx]) ClientID() int64 { return c.clientID.Load() }
 
 // DefaultBackoff exposes the retry backoff for tests.
 var DefaultBackoff = defaultBackoff
+
+// FenceTo moves the client to another client ID as a fence's
+// re-registration does, without the loops noticing yet.
+func (c *Client[TTx]) FenceTo(id int64) { c.clientID.Store(id) }

@@ -11,7 +11,7 @@
 //
 // The suite covers inserting (including unique keys and replace), claiming
 // (order, ownership, expiry, SKIP LOCKED), every finalize transition and its
-// fencing to the claim (also inside a caller's transaction), snooze reasons, a retry that gives its attempt back, leases, claims by ID and their job leases, leader election, rescue candidates,
+// fencing to the claim (also inside a caller's transaction), snooze reasons, a retry that gives its attempt back, leases, claims by ID and their job leases, leader election, rescue candidates, requests that the leader resign,
 // cancel, retry, TTL expiry, listing, queues, periodic slots, stats,
 // notifications and history maintenance. What depends on whether the engine
 // locks rows or runs one writer at a time (driver.Capabilities.SingleWriter)
@@ -153,6 +153,10 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"FinalizeTxConcurrent", testFinalizeTxConcurrent[TTx]},
 		{"Lease", testLease[TTx]},
 		{"Leader", testLeader[TTx]},
+		{"LeaderTerm", testLeaderTerm[TTx]},
+		{"LeaderResignRequest", testLeaderResignRequest[TTx]},
+		{"LeaderResignRacesRenewal", testLeaderResignRacesRenewal[TTx]},
+		{"LeaderResignRacesElection", testLeaderResignRacesElection[TTx]},
 		{"Rescue", testRescue[TTx]},
 		{"Cancel", testCancel[TTx]},
 		{"Retry", testRetry[TTx]},

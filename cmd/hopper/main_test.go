@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -202,6 +203,59 @@ func TestCLI(t *testing.T) {
 	}
 	if got := hopperCmd("clients", "list"); !strings.Contains(got, "ID") {
 		t.Errorf("clients list = %q", got)
+	}
+	if got := hopperCmd("leader", "resign"); !strings.Contains(got, "no leader") {
+		t.Errorf("leader resign with no leader = %q", got)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
+		VALUES ('default', 42, now(), now() + interval '1 minute')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []string{"-schema", schema, "leader", "resign", "-leader", "41"}, new(bytes.Buffer)); !errors.Is(err, hopper.ErrNotLeader) {
+		t.Errorf("leader resign -leader of a client that does not lead = %v, want ErrNotLeader", err)
+	}
+	var unasked *int64
+	if err := pool.QueryRow(ctx, "SELECT resign_client_id FROM hopper_leader").Scan(&unasked); err != nil || unasked != nil {
+		t.Errorf("resign_client_id after a request of another client = %v, %v; want NULL", unasked, err)
+	}
+	var asked map[string]int64
+	if err := json.Unmarshal([]byte(hopperCmd("-json", "leader", "resign", "-leader", "42")), &asked); err != nil || asked["asked"] != 42 {
+		t.Errorf("json leader resign -leader 42 = %v, %v; want client 42 asked", asked, err)
+	}
+	// clients list marks the client that holds the live leader lease.
+	if _, err := pool.Exec(ctx, `INSERT INTO hopper_clients (id, hostname, expires_at) OVERRIDING SYSTEM VALUE
+		VALUES (42, 'leader-host', now() + interval '1 minute'), (43, 'other-host', now() + interval '1 minute')`); err != nil {
+		t.Fatal(err)
+	}
+	listed := hopperCmd("clients", "list")
+	if !strings.Contains(listed, "LEADER") {
+		t.Errorf("clients list has no LEADER column: %q", listed)
+	}
+	for _, line := range strings.Split(listed, "\n") {
+		host, leads := strings.Contains(line, "leader-host"), strings.Contains(line, " leader ")
+		if strings.Contains(line, "-host") && host != leads {
+			t.Errorf("clients list line %q: marked leader %v, want %v", line, leads, host)
+		}
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(hopperCmd("-json", "clients", "list")), &rows); err != nil {
+		t.Fatal(err)
+	}
+	marked := 0
+	for _, r := range rows {
+		if (r["ID"] == float64(42)) != (r["Leader"] == true) {
+			t.Errorf("json clients list row %v: Leader marks the wrong client", r)
+		}
+		if r["Leader"] == true {
+			marked++
+		}
+	}
+	if marked != 1 {
+		t.Errorf("json clients list marks %d leaders, want client 42", marked)
+	}
+	var flagged int64
+	if err := pool.QueryRow(ctx, "SELECT resign_client_id FROM hopper_leader").Scan(&flagged); err != nil || flagged != 42 {
+		t.Errorf("resign_client_id = %d, %v; want 42", flagged, err)
 	}
 	if got := hopperCmd("stats"); !strings.Contains(got, "q1") {
 		t.Errorf("stats = %q", got)

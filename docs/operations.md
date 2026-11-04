@@ -14,6 +14,17 @@
   every replica except one with `Config.NeverLead` also competes for
   leadership; only the leader runs periodic jobs, rescue and retention, and a
   replacement takes over within 15 seconds of the leader stopping.
+- **Moving the leader.** Before a planned restart of the leader's node, or to
+  move periodic jobs, rescue and retention off a busy one, ask the leader to
+  resign: `hopper leader resign -leader ID`, `Client.LeaderResign`, or the
+  UI's clients page. Naming the leader (`hopper stats` shows it) makes a
+  retry safe: if another client leads by then, the request asks no one and
+  fails, rather than moving leadership again. The leader stops its duties, gives the lease up, and stays out of the
+  election for 15 seconds, so another client takes over within a second or
+  so where clients receive notifications, and within 10 seconds where they
+  poll (`hoppersql`, or a pooler without a listener connection). With no other client that can lead, the install has no leader for those
+  15 seconds. The new term starts like any other, so periodic jobs with
+  `RunOnStart` insert a job again.
 - **Clients that must not lead.** Set `Config.NeverLead` on a client that
   shares an install it should not run, such as a developer's process pointed
   at a shared environment. It claims and works jobs like any other, but never
@@ -325,8 +336,8 @@ one with `client.JobRetry` or `hopper jobs retry <id>`.
 - The `hopperui` module is a web UI: mount `hopperui.New(client, cfg)` under a
   path of your application (`http.StripPrefix`) to browse queues, jobs,
   workflows, subscriptions, consumers and clients. Pass `Config.Authorize` to
-  enable retry, cancel, delete, pause, resume and seek; without it the UI is
-  read-only. A browser's cross-site request to an action is refused
+  enable retry, cancel, delete, pause, resume, seek and asking the leader to
+  resign; without it the UI is read-only. A browser's cross-site request to an action is refused
   (`http.CrossOriginProtection`), so another site cannot act with an
   operator's cookies.
 - `pg_stat_activity` shows the listener connection as
@@ -342,6 +353,7 @@ hopper jobs get|retry|cancel|delete <id>
 hopper jobs retry -from-start <id>
 hopper queues list|pause|resume [name]
 hopper clients list
+hopper leader resign [-leader ID]
 hopper stats
 ```
 

@@ -413,7 +413,7 @@ type Executor interface {
     JobClaim(ctx context.Context, p ClaimParams) ([]*JobRow, error)
     JobFinalizeMany(ctx context.Context, p FinalizeParams) (FinalizeResult, error)
     LeaseRenew(ctx context.Context, p LeaseParams) (LeaseResult, error)
-    LeaderAttempt(ctx context.Context, p LeaderParams) (bool, error)
+    LeaderAttempt(ctx context.Context, p LeaderParams) (LeaderResult, error)
     // ... rescue, retention, queues, subscriptions, listing
 }
 ```
@@ -636,7 +636,8 @@ CREATE TABLE hopper_leader (
   name       text PRIMARY KEY DEFAULT 'default',
   client_id  bigint      NOT NULL,
   elected_at timestamptz NOT NULL,
-  expires_at timestamptz NOT NULL
+  expires_at timestamptz NOT NULL,
+  resign_client_id bigint             -- the holder a resign request asked (v24)
 );
 
 CREATE TABLE hopper_queues (
@@ -727,6 +728,12 @@ the promotion and the cancel look a dependent's groups up (§11), in the same lo
 release's probe of the edges that read matches neither, and reads a finished job's edges by
 `hopper_job_deps_depends_on` during a rolling upgrade. Its down script turns the edges
 of groups into `ignore` edges, which is how the previous release treats them.
+Schema v24 adds `resign_client_id` to `hopper_leader`, the holder a resign request
+asked to give its term up (§7.8). A nullable column with no default rewrites nothing.
+The `ALTER` tries as v10's does, with a short `lock_timeout` per try in a loop: every
+leader renewal and `Stats` reads the table, and would otherwise queue behind the
+`ALTER` while it waits for a session that holds a lock on the table for long, such as
+a `pg_dump`.
 
 ### 6.1 Job IDs
 Job IDs are UUIDv7. They are safe to expose outside the application (in URLs, APIs
@@ -1735,16 +1742,94 @@ still belong late in the transaction, as `CompleteTx` does.
 Leadership is a lease row in `hopper_leader`:
 
 ```sql
+-- renewal: the holder's own lease, still live
 INSERT INTO hopper_leader (name, client_id, elected_at, expires_at)
 VALUES ('default', $me, now(), now() + $ttl)
-ON CONFLICT (name) DO UPDATE SET client_id = $me, elected_at = now(), expires_at = now() + $ttl
+ON CONFLICT (name) DO UPDATE SET client_id = $me,
+  elected_at = CASE WHEN renewal THEN hopper_leader.elected_at ELSE now() END,
+  expires_at = CASE WHEN renewal AND hopper_leader.resign_client_id = $me
+                    THEN hopper_leader.expires_at ELSE now() + $ttl END,
+  resign_client_id = CASE WHEN renewal THEN hopper_leader.resign_client_id END
 WHERE hopper_leader.expires_at < now() OR hopper_leader.client_id = $me
-RETURNING client_id = $me;
+RETURNING client_id,   -- $me: the client leads
+          coalesce(resign_client_id = client_id, false),
+          elected_at;           -- the term
 ```
 
 - The TTL is 15s, and the leader renews every 5s.
 - On graceful stop the leader deletes its row and sends a `hopper_leader` notification,
-  so a replacement takes over immediately.
+  so a replacement takes over immediately. It deletes the row under the client ID it
+  last renewed it with, which a fence (§7.6) may since have replaced.
+- **A term is one live lease.** Taking a free or expired lease starts a term, even when
+  the client takes its own lease back after it lapsed, under the same ID or under the
+  one a fence gave it: while the lease was lapsed another client may have led. A term
+  is identified by its `elected_at`, which every attempt returns: a renewal of the live
+  lease returns the term's again, and a takeover sets a later one (the expired lease
+  was taken at least a TTL before it expired, and expired before now, so no clock,
+  SQLite's stepped back included, repeats it). The client keeps the `elected_at` its
+  term started with, and an attempt that returns another one ends the old term, with
+  `EventLeaderLost`, before the new one starts, with `EventLeaderElected`. So a
+  takeover whose response was lost cannot merge two terms: the renewal after it reports
+  the new term's `elected_at`. If that renewal also reports a resign request, the old
+  term still ends with `EventLeaderLost`, and the new one, never announced, is resigned
+  without `EventLeaderResigned`. The new term starts as any does, so each
+  periodic job with `RunOnStart` inserts a job again (§7.9). Earlier releases kept the
+  term across a lapse that no other client filled.
+
+**Resigning on request.** `Client.LeaderResign` (and `hopper leader resign`, and the
+UI's resign action) asks the current leader to give its term up, so that another
+client takes over without waiting for the leader to stop or its lease to expire:
+before a planned restart of the leader's node, or to move the duties off a busy one.
+Any client can ask, including one that never leads. The request is one statement:
+
+```sql
+UPDATE hopper_leader SET resign_client_id = client_id
+WHERE name = 'default' AND expires_at > now() AND ($leader = 0 OR client_id = $leader)
+RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
+```
+
+- The request names the holder of the live lease, by database time, and returns its
+  ID, or nothing when no client leads. It names that holder only: a later holder is
+  never asked by an earlier request, and a request that loses the race to an election
+  asks the new holder or no one, never the client whose lease had expired.
+- The caller names the leader it means (`LeaderResign(ctx, leaderID)`, `hopper leader
+  resign -leader ID`), as `Stats` or the clients list showed it, and the request asks
+  that client only if it holds the live lease; otherwise it asks no one and
+  `LeaderResign` returns `ErrNotLeader`. So a request retried after a takeover, or made
+  from a stale view, cannot move leadership a second time, as a job lease's exact
+  fence keeps a stale holder from acting (§7.14). A `leaderID` of 0 asks whichever
+  client leads. The UI always names the leader its page showed, which it reads from `Clients`: each
+  `ClientRow` reports whether that client holds the live lease (`Leader`).
+- The request is a column rather than only a notification, because a notification is
+  lost when the leader's listener is reconnecting. The notification wakes the leader
+  at once; without it the leader sees the request on its next renewal, within 5s.
+- A request lives as long as the one live lease it was made of. The holder's renewal of
+  its live lease keeps the column, and its `RETURNING` reports a request that names it.
+  Any takeover of an expired lease starts a term and clears it, even the holder's own,
+  so a request never outlives the term it was made in, and a lapse ends both together.
+- A renewal that reports a request does not extend the lease: the holder gives it up
+  within the lease it already holds, and if the delete fails, the lease expires when it
+  would have.
+- The leader that sees the request ends its term first: it cancels the loops the term
+  runs (periodic jobs, stream delivery, the live and index maintenance, log retention)
+  and waits for them, and runs none of the duties on the leader loop again. Only then
+  does it delete its row and send the `resigned` notification, as on a graceful stop. No duty of the resigning
+  client runs after the row is gone, so its duties never overlap the next leader's,
+  except a log retention call into a `LogStore` that ignores its context's cancellation,
+  which the term does not wait for (§7.5). The delete reports whether it removed the
+  lease, and the log tells a lease given up from one that had already passed on; if
+  the delete fails, the lease expires instead. Either way `EventLeaderResigned` marks
+  the end of the term, once.
+- Only the leader acts on the `resign` notification; the other clients' listeners
+  ignore it, so a request costs no election attempts until the `resigned` one.
+- It then stays out of the election for one TTL, by its
+  own clock (the hold-off schedules its own attempts and compares no stored time), so
+  that another client wins the election the notification starts rather than it again.
+  A cluster whose only leader-eligible client resigned is leaderless for that TTL, and
+  then the same client is elected again. Either way the next term starts as any term
+  does, so each periodic job with `RunOnStart` inserts a job again (§7.9).
+- A leader of the previous release never reads the column and ignores the request,
+  which then asks no one once its term ends.
 
 A lease table is used instead of `pg_advisory_lock` for three reasons: it works behind
 PgBouncer in transaction mode and behind RDS Proxy, it can be inspected with plain SQL,
@@ -3040,7 +3125,7 @@ observability without new machinery.
   gauges for queue depth by state, the oldest claimable job's age and live clients from
   `Stats`. Prometheus users export through the OTel exporter.
 - **CLI (`cmd/hopper`, core module):** `migrate up|down|version`, `jobs list|get|retry|cancel|delete`,
-  `queues list|pause|resume|limit`, `clients list`, `workflows get`, `subscriptions list`,
+  `queues list|pause|resume|limit`, `clients list` (which marks the leader), `leader resign [-leader ID]`, `workflows get`, `subscriptions list`,
   `streams consumers|seek` and `stats`, all with `-json`. Benchmarks are the separate
   `hopperbench` command.
 - **Web UI (`hopperui` module):** `hopperui.New(client, cfg)` is an embeddable
@@ -3048,7 +3133,7 @@ observability without new machinery.
   (depths, limits, paused state), jobs and history (filtered by queue, state, kind and
   tag, paged by ID), a job's tags, args, metadata, output and errors, workflows as a DAG (SVG, laid
   out by dependency depth), subscriptions, stream consumers and clients. Retry, cancel,
-  delete (behind a confirmation), pause, resume and seek are offered only when the application supplies
+  delete (behind a confirmation), pause, resume, seek and asking the leader to resign are offered only when the application supplies
   `Config.Authorize`, which is asked before every action; without it the UI is
   read-only. Actions are POSTs, and a browser's cross-site request to one is refused
   (`http.CrossOriginProtection`). It is server-rendered HTML with no scripts and no external assets, so it

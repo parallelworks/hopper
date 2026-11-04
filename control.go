@@ -287,6 +287,56 @@ func (c *Client[TTx]) Clients(ctx context.Context) ([]*ClientRow, error) {
 	return c.exec.ClientList(ctx)
 }
 
+// ErrNotLeader is returned by LeaderResign when the client it names does
+// not hold the leader lease: another client was elected since the caller
+// saw it lead, or no client leads.
+var ErrNotLeader = errors.New("hopper: not the leader")
+
+// LeaderResign asks the cluster's leader to give its term up, so that
+// another client takes over: before a planned restart of the leader's
+// host, say, or to move the leader's duties off a busy node. Any client can
+// ask, including one that works no queue, and so can `hopper leader
+// resign` and hopperui.
+//
+// leaderID names the leader meant, as Stats or Clients reported it, so
+// that a retried request, or one made from a stale view, cannot ask a
+// client elected since: if that client does not hold the live lease,
+// LeaderResign asks no one and returns ErrNotLeader. A leaderID of 0 asks
+// whichever client leads, and returns 0 and no error if none does. On
+// success it returns the client ID asked.
+//
+// The request is recorded on the leader lease, so it reaches the leader at
+// its next renewal: at once through a notification where the engine has
+// them, and within the 5 seconds between renewals otherwise. The leader
+// then stops its duties, finishing or abandoning those in progress as it
+// does when it loses the lease, gives the lease up and sits out the
+// election for the 15 seconds of a lease, so that another client is
+// elected, usually at once. It emits EventLeaderResigned, and runs no
+// duty after it gave the lease up. A cluster with no other
+// client has no leader until the resigned one is elected again. The next
+// term starts as any term does, so each periodic job with RunOnStart
+// inserts a job again. A request lives as long as the leader's live
+// lease: if that lease lapses first, even if the same client then takes
+// it back, the request ends with the term, and no later term is asked. A
+// leader of an earlier release ignores it.
+func (c *Client[TTx]) LeaderResign(ctx context.Context, leaderID int64) (int64, error) {
+	if leaderID < 0 {
+		return 0, fmt.Errorf("hopper: leader resign: invalid client ID %d", leaderID)
+	}
+	id, err := c.exec.LeaderRequestResign(ctx, leaderID)
+	if err != nil {
+		return 0, err
+	}
+	if id == 0 && leaderID != 0 {
+		return 0, ErrNotLeader
+	}
+	// The leader may be this client, whose listener may be down.
+	if id != 0 && id == c.clientID.Load() {
+		c.pokeLeader()
+	}
+	return id, nil
+}
+
 // Stats is a snapshot of queue depths and cluster state.
 type Stats = driver.Stats
 
@@ -419,16 +469,29 @@ type EventKind string
 
 // Event kinds.
 const (
-	EventJobCompleted  EventKind = "job.completed"
-	EventJobFailed     EventKind = "job.failed" // an attempt failed; the job will retry
-	EventJobSnoozed    EventKind = "job.snoozed"
-	EventJobCanceled   EventKind = "job.canceled"
-	EventJobDiscarded  EventKind = "job.discarded"
-	EventJobRescued    EventKind = "job.rescued"
-	EventJobStuck      EventKind = "job.stuck" // a canceled job's worker has not returned; see Config.OnStuck
+	EventJobCompleted EventKind = "job.completed"
+	EventJobFailed    EventKind = "job.failed" // an attempt failed; the job will retry
+	EventJobSnoozed   EventKind = "job.snoozed"
+	EventJobCanceled  EventKind = "job.canceled"
+	EventJobDiscarded EventKind = "job.discarded"
+	EventJobRescued   EventKind = "job.rescued"
+	EventJobStuck     EventKind = "job.stuck" // a canceled job's worker has not returned; see Config.OnStuck
+	// EventLeaderElected is emitted when the client starts a term as
+	// leader. A term is one live lease: a client that takes its own lease
+	// back after it lapsed starts a new term, emitting EventLeaderLost and
+	// then EventLeaderElected, and its periodic jobs with RunOnStart insert
+	// a job again.
 	EventLeaderElected EventKind = "leader.elected"
-	EventLeaderLost    EventKind = "leader.lost"
-	EventLeaseLost     EventKind = "lease.lost"
+	// EventLeaderLost is emitted when the client's term ends because it
+	// lost the lease: another client holds it, or it lapsed (see
+	// EventLeaderElected). A graceful Stop emits neither it nor
+	// EventLeaderResigned.
+	EventLeaderLost EventKind = "leader.lost"
+	// EventLeaderResigned is emitted, in place of EventLeaderLost, by a
+	// leader whose term ended on request (Client.LeaderResign), once,
+	// whether it deleted the lease or the lease had passed on or expires.
+	EventLeaderResigned EventKind = "leader.resigned"
+	EventLeaseLost      EventKind = "lease.lost"
 )
 
 // Event is one occurrence on a client.

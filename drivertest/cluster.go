@@ -53,11 +53,14 @@ func testLeader[TTx any](t *testing.T, f Fixture[TTx]) {
 	a, b := register(ctx, t, exec), register(ctx, t, exec)
 	attempt := func(id int64) bool {
 		t.Helper()
-		ok, err := exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: time.Hour})
+		res, err := exec.LeaderAttempt(ctx, driver.LeaderParams{ClientID: id, TTL: time.Hour})
 		if err != nil {
 			t.Fatal(err)
 		}
-		return ok
+		if res.ResignRequested {
+			t.Errorf("client %d was asked to resign, though no client asked", id)
+		}
+		return res.Leader
 	}
 	if !attempt(a) {
 		t.Fatal("first attempt failed")
@@ -73,14 +76,14 @@ func testLeader[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Errorf("leader in stats = %d, %v; want %d", stats.Leader, err, a)
 	}
 	// A non-holder's resign is a no-op.
-	if err := exec.LeaderResign(ctx, b); err != nil {
-		t.Fatal(err)
+	if deleted, err := exec.LeaderResign(ctx, b); err != nil || deleted {
+		t.Fatalf("non-holder's resign = %v, %v; want nothing deleted", deleted, err)
 	}
 	if attempt(b) {
 		t.Fatal("non-holder's resign freed the lease")
 	}
-	if err := exec.LeaderResign(ctx, a); err != nil {
-		t.Fatal(err)
+	if deleted, err := exec.LeaderResign(ctx, a); err != nil || !deleted {
+		t.Fatalf("holder's resign = %v, %v; want the lease deleted", deleted, err)
 	}
 	if !attempt(b) {
 		t.Fatal("b could not take the lease after a resigned")

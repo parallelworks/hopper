@@ -126,8 +126,10 @@ func Owner(ctx context.Context) fmt.Stringer {
 const (
 	// ChannelInsert carries the queue name of a committed insert.
 	ChannelInsert = "hopper_insert"
-	// ChannelLeader is signaled when a leader resigns, so a replacement is
-	// elected without waiting for the lease to expire.
+	// ChannelLeader is signaled when a leader resigns ("resigned"), so a
+	// replacement is elected without waiting for the lease to expire, and
+	// when a client asks the leader to resign ("resign"), so the leader
+	// renews, and finds the request, at once.
 	ChannelLeader = "hopper_leader"
 	// ChannelControl carries operator actions: "cancel:<job id>",
 	// "pause:<queue>", "resume:<queue>" and "limit:<queue>" (limits
@@ -312,12 +314,27 @@ type Executor interface {
 	// notifications return nil.
 	Notify(ctx context.Context, channel string, payloads []string) error
 
-	// LeaderAttempt takes or renews the leader lease for a client. It
-	// returns true if the client is the leader afterwards.
-	LeaderAttempt(ctx context.Context, params LeaderParams) (bool, error)
-	// LeaderResign gives up leadership if the client holds it, and signals
-	// other clients to elect a replacement.
-	LeaderResign(ctx context.Context, clientID int64) error
+	// LeaderAttempt takes or renews the leader lease for a client and
+	// reports whether the client holds it afterwards, the term it holds
+	// (the lease's elected_at), and whether a LeaderRequestResign asked the
+	// holder to give the lease up. A term is one live lease: taking a free
+	// or expired lease, even the client's own, starts one, with a new
+	// elected_at, and clears a request. The holder's renewal of its live
+	// lease keeps elected_at and a request, and once it reports a request,
+	// does not extend the lease.
+	LeaderAttempt(ctx context.Context, params LeaderParams) (LeaderResult, error)
+	// LeaderResign gives up leadership if the client holds the lease, and
+	// then signals other clients to elect a replacement. It reports whether
+	// it deleted the lease: false if another client holds it, or none does.
+	LeaderResign(ctx context.Context, clientID int64) (bool, error)
+	// LeaderRequestResign asks the client that holds a live leader lease,
+	// by database time, to give it up: it records the request on the lease,
+	// naming that client, which the holder's next LeaderAttempt reports,
+	// and signals ChannelLeader with "resign". A leaderID of 0 asks whichever
+	// client holds the lease; another asks only if that client holds it. It
+	// returns the client ID asked, or 0 if it asked no one. A request names
+	// the holder it was made of only, so a later holder is never asked.
+	LeaderRequestResign(ctx context.Context, leaderID int64) (int64, error)
 
 	// QueueEnsure records queues a client works, so they are listed even
 	// before any job is inserted.
@@ -1230,6 +1247,22 @@ type LeaderParams struct {
 	TTL      time.Duration
 }
 
+// LeaderResult is the outcome of a leadership attempt.
+type LeaderResult struct {
+	// Leader reports that the client holds the lease afterwards.
+	Leader bool
+	// ElectedAt identifies the holder's term: the database time the lease
+	// was taken, which every renewal of the live lease returns again and
+	// every takeover, even the holder's own after a lapse, replaces with a
+	// later one. A client whose attempt returns another ElectedAt than its
+	// term's has left that term, even if the attempt that started the new
+	// one never reported back. Zero unless Leader.
+	ElectedAt time.Time
+	// ResignRequested reports that a LeaderRequestResign asked the client,
+	// as the lease's holder, to give it up.
+	ResignRequested bool
+}
+
 // HistoryMaintainParams sets retention per outcome.
 type HistoryMaintainParams struct {
 	// CompletedRetention is how long completed jobs are kept.
@@ -1478,6 +1511,9 @@ type ClientRow struct {
 	StartedAt time.Time
 	ExpiresAt time.Time
 	Info      json.RawMessage
+	// Leader reports that the client holds the live leader lease, by
+	// database time.
+	Leader bool
 }
 
 // ClientRenewParams extends a lease.
