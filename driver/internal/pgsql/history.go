@@ -292,7 +292,7 @@ func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.D
 	table := e.Schema.Table(name)
 	var n int64
 	err := e.withTx(ctx, func(tx Tx) (err error) {
-		if err = setLockTimeout(ctx, tx, lockTimeoutSetting(0)); err != nil {
+		if err = setLockTimeout(ctx, tx, lockTimeoutSetting(defaultDDLLockTimeout)); err != nil {
 			return err
 		}
 		if g.mirrors != "" {

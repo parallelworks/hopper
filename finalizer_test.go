@@ -376,7 +376,7 @@ func TestFinalizerDrainRacingSubmits(t *testing.T) {
 	for round := range 50 {
 		exec := &stubExec{}
 		var dropped atomic.Int64
-		f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+		f := newFinalizer(exec, slog.New(messageCounter{"result dropped", &dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
 		f.logs.max = 300
 		ctx, cancel := context.WithCancel(context.Background())
 		go f.run(ctx)
@@ -405,7 +405,7 @@ func TestFinalizerDrainRacingSubmits(t *testing.T) {
 func TestFinalizerDrainTimeout(t *testing.T) {
 	exec := &stubExec{}
 	var dropped, applied atomic.Int64
-	f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {},
+	f := newFinalizer(exec, slog.New(messageCounter{"result dropped", &dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {},
 		func(*driver.JobRow, driver.JobFinalize) { applied.Add(1) })
 	f.drainTimeout = 50 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
@@ -458,7 +458,7 @@ func TestFinalizerDrainTimeout(t *testing.T) {
 func TestFinalizerDrainWritesResultsHandedInBeforeDeadline(t *testing.T) {
 	exec := &stubExec{release: make(chan struct{}), started: make(chan int, 8)}
 	var dropped atomic.Int64
-	f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	f := newFinalizer(exec, slog.New(messageCounter{"result dropped", &dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
 	f.drainTimeout = 200 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	f.submits.Add(2) // a job still finishing keeps the drain open
@@ -505,7 +505,7 @@ func (e *heldOnceExec) JobFinalizeMany(ctx context.Context, params driver.JobFin
 func TestFinalizerDrainWaitsForHeldRetry(t *testing.T) {
 	exec := &heldOnceExec{}
 	var dropped atomic.Int64
-	f := newFinalizer(exec, slog.New(dropCounter{&dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
+	f := newFinalizer(exec, slog.New(messageCounter{"result dropped", &dropped}), tuning{finalizeInterval: time.Hour, finalizeBatch: 4, finalizeBuffer: 8}, 0, func(string) {}, func(*driver.JobRow, driver.JobFinalize) {})
 	ctx, cancel := context.WithCancel(context.Background())
 	go f.run(ctx)
 	f.submit(pending{job: &driver.JobRow{Queue: "default"}, result: driver.JobFinalize{ID: driver.JobID{1}, State: driver.JobStateCompleted}, heldByTx: true})
@@ -520,19 +520,23 @@ func TestFinalizerDrainWaitsForHeldRetry(t *testing.T) {
 	}
 }
 
-// dropCounter counts the finalizer's warnings of dropped results.
-type dropCounter struct{ n *atomic.Int64 }
+// messageCounter counts the records whose message contains sub, such as the
+// finalizer's warnings of dropped results.
+type messageCounter struct {
+	sub string
+	n   *atomic.Int64
+}
 
-func (h dropCounter) Enabled(context.Context, slog.Level) bool { return true }
+func (h messageCounter) Enabled(context.Context, slog.Level) bool { return true }
 
-func (h dropCounter) Handle(_ context.Context, r slog.Record) error {
-	if strings.Contains(r.Message, "result dropped") {
+func (h messageCounter) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, h.sub) {
 		h.n.Add(1)
 	}
 	return nil
 }
-func (h dropCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h dropCounter) WithGroup(string) slog.Handler      { return h }
+func (h messageCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h messageCounter) WithGroup(string) slog.Handler      { return h }
 
 // claimExec has one job running in a claim, and applies only the results
 // of that claim, as the finalize statement does.

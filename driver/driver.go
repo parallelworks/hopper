@@ -1310,8 +1310,10 @@ type HistoryMaintainResult struct {
 	// PruneDeferred names DEFAULT storage units whose prune could not get
 	// its locks within the engine's default lock timeout, held off by a
 	// lock request queued behind a long transaction, such as a DDL waiting
-	// for a reader; the next maintenance pass retries them. A prune is not
-	// urgent, so it does not make the caller retry sooner, as Deferred does.
+	// for a reader, and those whose prune, after such a deferral, was not
+	// tried since it would wait for the same locks; the next maintenance
+	// pass retries them. A prune is not urgent, so it does not make the
+	// caller retry sooner, as Deferred does.
 	PruneDeferred []string
 	// Kept names storage units past retention that wait for HistoryIndex to
 	// build their index: those an invalid index of their outcome table

@@ -2146,10 +2146,10 @@ retention too, as a day's last hour's always is, and as every hour's of a day th
 pass catches up on is, deletes none: the same pass drops that partition after the
 hour. When that partition has to wait instead, for another hour of its day that is
 kept or deferred, for its own deferred drop, or while history's retention fails (as a
-`DEFAULT` prune that outlasts `statement_timeout` does on every pass), the hour's rows
-stay in it until it goes, and listings walk past them. After a leader outage, a pass
-that catches up on whole days while that prune fails leaves the rows of every hour it
-drops. The delete names its hour's partition, so its bounds are written into it too, and
+`DEFAULT` prune that outlasts `statement_timeout` does on every pass) or its prune is
+deferred, the hour's rows stay in it until it goes, and listings walk past them. After
+a leader outage, a pass that catches up on whole days while that prune fails or is
+deferred leaves the rows of every hour it drops. The delete names its hour's partition, so its bounds are written into it too, and
 it runs unprepared rather than leave a statement an hour in the connection's cache. A
 deferred drop rolls the delete back
 with it, and its retry, on the next leader pass, deletes again: an hour whose drop is
