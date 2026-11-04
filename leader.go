@@ -11,11 +11,11 @@ import (
 	"github.com/parallelworks/hopper/driver"
 )
 
-// leaderLoop competes for the leader lease and, while holding it, runs the
-// singleton duties: rescuing jobs from lost clients and pruning expired
-// client rows, and starts the term's loops, among them history retention's
-// (maintenanceLoop). Duties are idempotent, because two leaders can briefly
-// overlap during a partition.
+// leaderLoop competes for the leader lease and renews it, and runs nothing
+// else: while it holds the lease, the term's loops run the singleton duties
+// beside it (dutyLoop, maintenanceLoop and the others startTerm starts), so
+// that none of them holds up the renewal. Duties are idempotent, because two
+// leaders can briefly overlap during a partition.
 func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaderInterval)
 	defer ticker.Stop()
@@ -35,38 +35,50 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		c.resign(ctx, leaseID)
 	}()
 
+	// endLapsed ends the term once its lease may have expired without a
+	// renewal, by the local clock, with its event. Its loops have been
+	// canceled by then (leaseFence), even while a renewal that kept failing
+	// or waiting kept the loop from seeing the lease go.
+	endLapsed := func() {
+		if term != nil && term.lease.expired() && c.isLeader.Swap(false) {
+			c.logger.WarnContext(ctx, "hopper: leader lease may have expired without a renewal; its term ended", "client_id", leaseID)
+			c.emit(EventLeaderLost, nil, "")
+			term.end()
+			term = nil
+		}
+	}
 	for {
 		// The attempt's ID is the one a resign gives the lease up for: a
 		// fence may re-register the client under another meanwhile.
 		id := c.clientID.Load()
+		// A term whose lease has gone ends before the attempt, which then
+		// tries for the lease as any election does, at once, rather than
+		// send a renewal with no time left and wait a leader interval more.
+		endLapsed()
 		// The lease the attempt takes or renews expires a TTL after the
-		// server's now(), which is no earlier than this.
+		// server's now(), which is no earlier than this: until.
 		attempted := time.Now()
-		// A leader's renewal waits no longer than the lease it renews lasts:
-		// past that the term has ended (below) whatever the attempt returns.
-		actx, cancel := ctx, context.CancelFunc(func() {})
+		until := attempted.Add(c.tuning.leaderTTL)
+		// An attempt waits no longer than the lease it would leave lasts: an
+		// election's lease is gone a TTL after it was sent, and a renewal's
+		// term ends once the lease it renews may have expired (below),
+		// whatever the attempt returns.
+		deadline := until
 		if term != nil {
-			actx, cancel = context.WithDeadline(ctx, term.lease.expiry())
+			deadline = term.lease.expiry()
 		}
+		actx, cancel := context.WithDeadline(ctx, deadline)
 		res, err := c.exec.LeaderAttempt(actx, driver.LeaderParams{ClientID: id, TTL: c.tuning.leaderTTL})
 		cancel()
-		// A term's lease fences it: once the lease may have expired without
-		// a renewal, by the local clock, its loops have been canceled
-		// (leaseFence), even while a renewal that keeps failing or waiting
-		// kept this loop from seeing the lease go, and the term ends, with
-		// its event. A renewal that came back too late to extend it still
-		// ends it: the loops are gone, and the next term, of the same lease,
-		// starts below.
+		// A renewal that came back too late to extend the lease still ends
+		// the term: its loops are gone, and the next term, of the same lease,
+		// starts below. One that reports a resign request does not extend
+		// the lease, and the term ends below.
 		if term != nil {
-			// A renewal that reports a resign request does not extend the
-			// lease, and the term ends below.
 			renewed := err == nil && res.Leader && res.ElectedAt.Equal(electedAt) &&
-				(res.ResignRequested || term.lease.renew(attempted.Add(c.tuning.leaderTTL)))
-			if !renewed && term.lease.expired() && c.isLeader.Swap(false) {
-				c.logger.WarnContext(ctx, "hopper: leader lease may have expired without a renewal; its term ended", "client_id", leaseID)
-				c.emit(EventLeaderLost, nil, "")
-				term.end()
-				term = nil
+				(res.ResignRequested || term.lease.renew(until))
+			if !renewed {
+				endLapsed()
 			}
 		}
 		// A term is one live lease, identified by its elected_at. A client
@@ -121,15 +133,8 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 			if !c.isLeader.Swap(true) {
 				c.logger.InfoContext(ctx, "hopper: elected leader", "client_id", id)
 				c.emit(EventLeaderElected, nil, "")
-				term = c.startTerm(ctx, attempted.Add(c.tuning.leaderTTL))
+				term = c.startTerm(ctx, until)
 			}
-			c.rescue(ctx)
-			c.expireJobLeases(ctx)
-			c.expire(ctx)
-			c.settleBatches(ctx)
-			c.promoteReady(ctx)
-			c.age(ctx)
-			c.pruneClients(ctx)
 		default:
 			if c.isLeader.Swap(false) {
 				// The ID it led under: a fence may have moved the client on.
@@ -172,6 +177,7 @@ func (c *Client[TTx]) startTerm(ctx context.Context, until time.Time) *leaderTer
 	t.lease.renew(until)
 	var wg sync.WaitGroup
 	wg.Go(func() { t.lease.fence(termCtx, cancel) })
+	wg.Go(func() { c.dutyLoop(termCtx) })
 	wg.Go(func() { c.maintenanceLoop(termCtx, t) })
 	wg.Go(func() { c.periodicLoop(termCtx) })
 	wg.Go(func() { c.streamLoop(termCtx) })
@@ -694,6 +700,33 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 	}
 }
 
+// dutyLoop runs the leader's singleton duties at the start of its term and
+// then every leader interval: rescuing jobs from lost clients, expiring job
+// leases and jobs past their TTL, settling batches, promoting workflow jobs,
+// aging and pruning stale client rows. It runs beside the leader loop, not
+// in it, so that no duty holds up the lease's renewal: a duty that waits,
+// for a row a caller's transaction holds or behind history maintenance's
+// DDL, waits on its own, and the lease fences it as it does the term's
+// other loops.
+func (c *Client[TTx]) dutyLoop(ctx context.Context) {
+	ticker := time.NewTicker(c.tuning.leaderInterval)
+	defer ticker.Stop()
+	for {
+		c.rescue(ctx)
+		c.expireJobLeases(ctx)
+		c.expire(ctx)
+		c.settleBatches(ctx)
+		c.promoteReady(ctx)
+		c.age(ctx)
+		c.pruneClients(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 // maintenanceLoop maintains history (maintainHistory) on the leader at
 // the start of its term and then every maintenance interval, or at the
 // next leader interval while a pass deferred partition work. It runs beside
@@ -728,10 +761,10 @@ type leaseFence struct {
 	mu sync.Mutex
 	// until is when the lease last taken or renewed expires at the
 	// earliest, by the local clock: a TTL after the attempt was sent, no
-	// later than the server's now() and the TTL that expires_at holds.
+	// later than the server's now() and the TTL that expires_at holds. Once
+	// it has passed it stays put, since no renewal extends it then, so the
+	// lease stays lapsed.
 	until time.Time
-	// lapsed is set once until has passed without a renewal.
-	lapsed bool
 }
 
 // renew records a renewal of the lease that lasts until until, and reports
@@ -740,8 +773,7 @@ type leaseFence struct {
 func (f *leaseFence) renew(until time.Time) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.lapsed || (!f.until.IsZero() && !time.Now().Before(f.until)) {
-		f.lapsed = true
+	if !f.until.IsZero() && !time.Now().Before(f.until) {
 		return false
 	}
 	f.until = until
@@ -759,7 +791,7 @@ func (f *leaseFence) expiry() time.Time {
 func (f *leaseFence) expired() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.lapsed || !time.Now().Before(f.until)
+	return !time.Now().Before(f.until)
 }
 
 // fence calls cancel once the lease may have expired without a renewal, or
@@ -773,12 +805,7 @@ func (f *leaseFence) fence(ctx context.Context, cancel context.CancelFunc) {
 			return
 		case <-timer.C:
 		}
-		f.mu.Lock()
-		left := time.Until(f.until)
-		if left <= 0 {
-			f.lapsed = true
-		}
-		f.mu.Unlock()
+		left := time.Until(f.expiry())
 		if left <= 0 {
 			cancel()
 			return
