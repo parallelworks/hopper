@@ -62,13 +62,20 @@ func newHarness(t *testing.T) *harness {
 // client returns a client with fast tuning. It is stopped at test end.
 func (h *harness) client(cfg *hopper.Config) *hopper.Client[pgxTx] {
 	h.t.Helper()
+	return h.clientOn(h.d, cfg)
+}
+
+// clientOn is client on driver d, such as h.d wrapped so that some of its
+// executor's statements behave as a test needs.
+func (h *harness) clientOn(d driver.Driver[pgxTx], cfg *hopper.Config) *hopper.Client[pgxTx] {
+	h.t.Helper()
 	if cfg.Logger == nil {
 		cfg.Logger = testLogger()
 	}
 	if cfg.PollInterval == 0 {
 		cfg.PollInterval = 100 * time.Millisecond
 	}
-	c, err := hopper.NewClient(h.d, cfg)
+	c, err := hopper.NewClient(d, cfg)
 	if err != nil {
 		h.t.Fatalf("NewClient: %v", err)
 	}

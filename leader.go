@@ -343,7 +343,7 @@ func (c *Client[TTx]) rescue(ctx, clientCtx context.Context) {
 			// holds off the history table it writes, such as a DDL statement
 			// waiting for a long reader: the next pass tries again, rather
 			// than hold the leader's other duties up while it bisects.
-			c.logger.WarnContext(ctx, "hopper: rescue deferred: another transaction holds a row it reaches, or a lock request a table it writes", "candidates", len(candidates))
+			c.logger.WarnContext(ctx, "hopper: rescue deferred: another transaction holds a row it reaches, or a lock request holds off a table it writes", "candidates", len(candidates))
 			return
 		}
 		if err != nil {
@@ -446,7 +446,7 @@ func (c *Client[TTx]) expireJobLeases(ctx context.Context) {
 			Limit: c.tuning.rescueBatch, ClientID: c.clientID.Load(), Grace: c.cfg.JobLeaseGrace,
 		})
 		if errors.Is(err, driver.ErrRowsHeld) {
-			c.logger.WarnContext(ctx, "hopper: job lease expiry deferred: another transaction holds a row it reaches, or a lock request a table it writes")
+			c.logger.WarnContext(ctx, "hopper: job lease expiry deferred: another transaction holds a row it reaches, or a lock request holds off a table it writes")
 			return
 		}
 		if err != nil {
@@ -486,7 +486,7 @@ func (c *Client[TTx]) expire(ctx context.Context) {
 	for {
 		jobs, cascaded, err := c.exec.JobDiscardExpired(ctx, c.tuning.rescueBatch)
 		if errors.Is(err, driver.ErrRowsHeld) {
-			c.logger.WarnContext(ctx, "hopper: discard of expired jobs deferred: another transaction holds a row it reaches, or a lock request a table it writes")
+			c.logger.WarnContext(ctx, "hopper: discard of expired jobs deferred: another transaction holds a row it reaches, or a lock request holds off a table it writes")
 			return
 		}
 		if err != nil {

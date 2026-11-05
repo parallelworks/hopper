@@ -702,9 +702,11 @@ func TestLeaderRenewsLeaseThroughLongHistoryPrune(t *testing.T) {
 
 // TestRescueGivesUpBehindPendingHistoryLock leaves a lost client's job with
 // no attempts left, for the leader's rescue to discard, behind a request for
-// an ACCESS EXCLUSIVE lock on the failed DEFAULT history partition, queued
-// behind a transaction that read it, as an attach's scan or an operator's
-// DDL would hold it. The rescue's finalize of a job of no batch writes its
+// an ACCESS EXCLUSIVE lock on the failed outcome table, queued behind a
+// transaction that read it, as an operator's DDL would hold it: whichever
+// of its partitions the job's history goes to, the DEFAULT one or, past
+// midnight UTC, the day's that the leader created ahead, the insert locks
+// the table first. The rescue's finalize of a job of no batch writes its
 // history there, and waits for the table's lock no longer than the leader's
 // other finalizes do: it gives up, logs the rescue deferred, and the next
 // pass tries again, so that the leader's other duties go on, rather than
@@ -725,8 +727,7 @@ func TestRescueGivesUpBehindPendingHistoryLock(t *testing.T) {
 	victim.Abandon()
 	close(w.release)
 
-	const partition = "hopper_job_history_failed_default"
-	release := h.pendingAccessExclusive(partition)
+	release := h.pendingAccessExclusive("hopper_job_history_failed")
 	defer release()
 	probe := h.session()
 	count := func(query string, args ...any) int {
@@ -805,19 +806,9 @@ func TestLeaderRenewsLeaseWhileDutyWaits(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	exec := &stuckDutyExec{Executor: h.d.Executor()}
-	c, err := hopper.NewClient[pgxTx](stuckDutyDriver{Driver: h.d, exec: exec}, &hopper.Config{
+	c := h.clientOn(stuckDutyDriver{Driver: h.d, exec: exec}, &hopper.Config{
 		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
 		Workers: hopper.NewWorkers(),
-		Logger:  testLogger(),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.SetTuning(fastTuning)
-	t.Cleanup(func() {
-		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = c.Stop(sctx)
 	})
 	lost := leaderLosses(t, c)
 	if err := c.Start(ctx); err != nil {

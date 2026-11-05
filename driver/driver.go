@@ -52,10 +52,10 @@ var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 // dependent it cancels by cascade, or the lease of a job JobExpireLeases
 // expires that a renewal holds, or for a lock on a table it writes, such as
 // a history partition that a DDL statement holds or waits for: it finalized
-// none of them. A smaller set of
-// the jobs may not reach that row. BatchSettle with IDs returns it when it
-// gave up waiting for a batch row, or the engine broke a deadlock its wait
-// was part of by ending the settle: it settled none of the batches.
+// none of them. A smaller set of the jobs may not reach that row. BatchSettle
+// with IDs returns it when it gave up waiting for a batch row, or the engine
+// broke a deadlock its wait was part of by ending the settle: it settled
+// none of the batches.
 var ErrRowsHeld = errors.New("hopper: another transaction holds a row the statement reaches")
 
 // ErrHistoryIndexRepair wraps the error Executor.HistoryIndex returns when
