@@ -258,9 +258,9 @@ func (c *Client[TTx]) resign(ctx context.Context, id int64, held bool) {
 // giveUpLease deletes the leader lease if client id holds it, and then
 // signals the other clients to elect a replacement, and logs which way the
 // lease went; why ("", " on request" or " after a fence") says what ended
-// the term. It runs on a context of its own, so that a stopping client still
-// gives the lease up. If the statement fails, the lease expires instead, within the TTL
-// its last renewal left it.
+// the term. It runs on a context of its own, so that a stopping client
+// still gives the lease up. If the statement fails, the lease expires
+// instead, within the TTL its last renewal left it.
 func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64, why string) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
