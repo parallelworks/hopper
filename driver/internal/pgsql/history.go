@@ -250,7 +250,10 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 // row in a DEFAULT partition can belong to a job in one of history's time
 // partitions, which stays until its whole period is past, so the tags' prune
 // keeps the rows whose job is still there, and takes those a job left
-// without its trigger (a TRUNCATE of a partition).
+// without its trigger (a TRUNCATE of a partition). It looks for the job in
+// the outcome table it mirrors (g.mirrors) alone, which holds every history
+// row of its states: history and its tags are both partitioned by state,
+// into the same outcomes.
 //
 // It skips the rows another transaction holds, which the next pass takes:
 // a JobRetryTx or JobDeleteTx held open deletes its job's history row, and
@@ -261,17 +264,18 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 // partitioned one.
 //
 // SKIP LOCKED skips rows, not tables: the statement still takes its tables'
-// locks, the tags' prune those of every history partition and index its
-// check of history reads, and queues behind any request for one that
-// conflicts, such as an ACCESS EXCLUSIVE one (a partition's attach or drop,
-// an index's attach, an operator's DDL) itself waiting for a long reader.
+// locks, the tags' prune those of every partition and index of the outcome
+// table its check of history reads, and history's root's when it plans that
+// table afresh, and queues behind any request for one that conflicts, such
+// as an ACCESS EXCLUSIVE one (a partition's attach or drop, an index's
+// attach, an operator's DDL) itself waiting for a long reader.
 // So its lock waits are bounded by defaultDDLLockTimeout. Unlike a partition
 // ahead, which must exist when its period starts, a prune is not urgent: one
 // that cannot get its locks in time is named in res.PruneDeferred and
 // reports false, and the next maintenance pass tries again, with the same
 // short timeout, rather than at the next leader interval with a longer one, as is
-// a tags group's prune that comes after a deferred prune of one of history's
-// DEFAULT partitions or of the other tags group's, deferred untried. Only a
+// a tags group's prune that comes after a deferred prune of the DEFAULT
+// partition of the outcome table it mirrors, deferred untried. Only a
 // lock wait defers it: a statement_timeout may be its scan of a large
 // DEFAULT partition running long, which is reported as an error. It reports
 // whether it pruned, which it has with nothing to keep.
@@ -280,12 +284,18 @@ func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.D
 		return true, nil
 	}
 	name := g.parent + "_default"
-	// A tags group's prune reads every history partition. Once a prune of
-	// one of history's DEFAULT partitions, or the other tags group's,
-	// which reads them too, is deferred this pass, it would most likely
-	// wait for the same lock, so it is deferred untried rather than wait
-	// the lock timeout again.
-	if g.mirrors != "" && slices.ContainsFunc(res.PruneDeferred, historyDefault) {
+	// A tags group's prune reads every partition of the outcome table it
+	// mirrors. Once the prune of that table's DEFAULT partition is deferred
+	// this pass, it would most likely wait for the same lock, so it is
+	// deferred untried rather than wait the lock timeout again. The other
+	// outcome table's, and the other tags group's, read none of its
+	// partitions. The two tags groups' prunes share only history's root,
+	// which Postgres locks to read an outcome table's partition bound when
+	// it plans the table afresh: on a new connection, or after an attach or
+	// drop of one of its partitions, which this pass may have made. A
+	// request queued on the root, such as an operator's ALTER TABLE of
+	// hopper_job_history, holds both off, each for its own lock timeout.
+	if g.mirrors != "" && slices.Contains(res.PruneDeferred, g.mirrors+"_default") {
 		res.PruneDeferred = append(res.PruneDeferred, name)
 		return false, nil
 	}
@@ -302,7 +312,7 @@ func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.D
 				  SELECT ctid FROM %[1]s t WHERE finalized_at < now() - make_interval(secs => $1::float8)
 				    AND NOT EXISTS (SELECT 1 FROM %[2]s h WHERE h.state = t.state AND h.finalized_at = t.finalized_at AND h.id = t.id)
 				  FOR UPDATE OF t SKIP LOCKED))`,
-				table, e.Schema.Table("hopper_job_history")), keep.Seconds())
+				table, e.Schema.Table(g.mirrors)), keep.Seconds())
 			return err
 		}
 		n, err = tx.Exec(ctx,
@@ -320,14 +330,6 @@ func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.D
 	}
 	res.Pruned += n
 	return true, nil
-}
-
-// historyDefault reports whether name is the DEFAULT partition of one of
-// history's outcome tables or of their tags tables.
-func historyDefault(name string) bool {
-	return slices.ContainsFunc(historyGroups, func(g historyGroup) bool {
-		return (g.root == "hopper_job_history" || g.mirrors != "") && name == g.parent+"_default"
-	})
 }
 
 // defaultDDLLockTimeout bounds how long a partition's creation or drop, a
