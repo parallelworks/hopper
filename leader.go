@@ -50,11 +50,14 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 	// endLapsed ends the term once its lease may have expired without a
 	// renewal, by the local clock, with its event. Its loops have been
 	// canceled by then (leaseFence), even while a renewal that kept failing
-	// or waiting kept the loop from seeing the lease go.
-	endLapsed := func() {
+	// or waiting kept the loop from seeing the lease go. It reports whether
+	// it ended the term.
+	endLapsed := func() bool {
 		if term != nil && term.lease.expired() && c.isLeader.Swap(false) {
 			lose("hopper: leader lease may have expired without a renewal; its term ended", "client_id", leaseID)
+			return true
 		}
+		return false
 	}
 	for {
 		// The attempt's ID is the one a resign gives the lease up for: a
@@ -83,13 +86,14 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		// the term: its loops are gone, and the next term, of the same lease,
 		// starts below. One that reports a resign request does not extend
 		// the lease, and the term ends below.
+		lapsed := false
 		if term != nil {
 			renewed := err == nil && res.Leader && res.ElectedAt.Equal(electedAt)
 			if renewed && !res.ResignRequested {
 				renewed = term.lease.renew(until)
 			}
 			if !renewed {
-				endLapsed()
+				lapsed = endLapsed()
 			}
 		}
 		// A term is one live lease, identified by its elected_at. A client
@@ -110,6 +114,14 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 				return
 			}
 			c.logger.WarnContext(ctx, "hopper: leader attempt", "error", err)
+			// A renewal that failed once its lease may have expired, as one
+			// sent with little of the lease left does at its deadline, ended
+			// the term: the lease is tried for at once, as an election, as a
+			// term that lapsed before its attempt is, not a leader interval
+			// later. The term is gone, so this retries once.
+			if lapsed {
+				continue
+			}
 		case res.ResignRequested:
 			// Asked to resign (Client.LeaderResign): no duty runs again in
 			// this term. Its loops end before the lease is given up, and
@@ -328,7 +340,8 @@ func (c *Client[TTx]) rescue(ctx, clientCtx context.Context) {
 		if errors.Is(err, driver.ErrRowsHeld) {
 			// A transaction held open holds a row the batch's finalize
 			// reaches, a dependent of one of its jobs: the next pass tries
-			// again, rather than hold the leader's loop up while it bisects.
+			// again, rather than hold the leader's other duties up while it
+			// bisects.
 			c.logger.WarnContext(ctx, "hopper: rescue deferred: another transaction holds a row it reaches", "candidates", len(candidates))
 			return
 		}
@@ -731,6 +744,13 @@ func (c *Client[TTx]) liveLoop(ctx context.Context) {
 func (c *Client[TTx]) dutyLoop(ctx, clientCtx context.Context) {
 	ticker := time.NewTicker(c.tuning.leaderInterval)
 	defer ticker.Stop()
+	// A poke from before the term, such as the one that started the
+	// election it won or one sent while another client led, is covered by
+	// the term's first pass, so it must not repeat that pass.
+	select {
+	case <-c.dutyPoke:
+	default:
+	}
 	for {
 		c.rescue(ctx, clientCtx)
 		c.expireJobLeases(ctx)

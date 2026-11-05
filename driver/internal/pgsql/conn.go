@@ -86,14 +86,14 @@ func (e *Executor) withTx(ctx context.Context, fn func(tx Tx) error) (err error)
 // heldLockTimeout, a lockTimeoutSetting value, bounds how long a statement
 // run briefly waits for a row another transaction holds.
 //
-// The leader's loop runs its statements that finalize jobs
+// The leader's duty loop runs its statements that finalize jobs
 // (JobDiscardExpired, JobExpireLeases, and JobFinalizeMany with BriefWait,
 // which its rescue runs) that way. Each skips the jobs it would finalize
 // that another transaction holds, but its cascade, promotion and batch
 // updates reach other rows, which a caller's transaction may hold for as
 // long as it stays open: a dependent that a JobCancelTx or JobDeleteTx held
 // open has canceled or deleted. A wait as long as the caller's transaction
-// would hold up the leader's other duties and its lease's renewal. Skipping
+// would hold up the leader's other duties. Skipping
 // such a row instead would be wrong: a cascade that skipped a dependent the
 // caller's transaction then rolled back would leave it pending behind a
 // failed dependency. The statement gives up instead, and its jobs are tried

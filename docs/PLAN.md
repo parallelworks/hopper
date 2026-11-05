@@ -1646,7 +1646,7 @@ word.
   left to that claim. The rescue's finalize skips rows another transaction holds (a `CompleteTx` that
   has not ended, §7.5) and retries them on the next pass, and gives up after a brief
   wait for a row of another job its cascade reaches (§7.8), so one such row cannot hold
-  up the leader's loop and its lease renewal; a full batch that rescues nothing ends
+  up the leader's other duties; a full batch that rescues nothing ends
   the pass rather than read the same rows again. The read takes the oldest candidates
   first, so while a full batch of them stays held, candidates behind them wait for
   those transactions to end; reading past held rows would change the rescue's query
@@ -1796,7 +1796,9 @@ RETURNING client_id,   -- $me: the client leads
   the leader loop is held up and has not seen the lease go: a renewal that keeps
   failing, or waits for the lease's row or for a pool connection. The leader
   loop then ends the term, with `EventLeaderLost`, before its next attempt, which tries
-  for the lease at once as an election, and starts a new term if it takes it. A
+  for the lease at once as an election, and starts a new term if it takes it; so does
+  a renewal that fails once the lease may have expired, as one sent with little of the
+  lease left does at its deadline. A
   renewal that comes back after the lease may have expired, though it renewed the same
   `elected_at`, ends the term the same way, and the next starts at once: its loops
   were canceled. Earlier releases ended a term only once an attempt returned. The
@@ -1849,9 +1851,9 @@ RETURNING client_id;   -- and pg_notify('hopper_leader', 'resign')
   within the lease it already holds, and if the delete fails, the lease expires when it
   would have.
 - The leader that sees the request ends its term first: it cancels the loops the term
-  runs (periodic jobs, stream delivery, history retention, the live and index
-  maintenance, log retention)
-  and waits for them, and runs none of the duties on the leader loop again. Only then
+  runs (the duties, periodic jobs, stream delivery, history retention, the live and
+  index maintenance, log retention)
+  and waits for them, so none of its duties runs again. Only then
   does it delete its row and send the `resigned` notification, as on a graceful stop. No duty of the resigning
   client runs after the row is gone, so its duties never overlap the next leader's,
   except a log retention call into a `LogStore` that ignores its context's cancellation,

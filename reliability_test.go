@@ -634,6 +634,23 @@ func slowHistoryPrune(t *testing.T, h *harness, rows int) (*pgx.Conn, func() boo
 	return probe, pruning
 }
 
+// leaderLosses counts c's EventLeaderLost events until the test ends. A term
+// that the local clock ended and the next attempt took back keeps the
+// lease's elected_at, and is over before a poll of IsLeader sees it, so
+// only the event tells it from a term that went on.
+func leaderLosses(t *testing.T, c *hopper.Client[pgxTx]) *atomic.Int32 {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	lost := new(atomic.Int32)
+	go func() {
+		for range c.Events(ctx, hopper.EventLeaderLost) {
+			lost.Add(1)
+		}
+	}()
+	return lost
+}
+
 // TestLeaderRenewsLeaseThroughLongHistoryPrune runs a history maintenance
 // pass whose prune of a DEFAULT partition takes several of the lease's TTLs,
 // as a prune of the backlog an outage left does. Maintenance runs beside the
@@ -644,6 +661,7 @@ func TestLeaderRenewsLeaseThroughLongHistoryPrune(t *testing.T) {
 	ctx := context.Background()
 	probe, pruning := slowHistoryPrune(t, h, 20)
 	c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
+	lost := leaderLosses(t, c)
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -659,7 +677,7 @@ func TestLeaderRenewsLeaseThroughLongHistoryPrune(t *testing.T) {
 		if err := probe.QueryRow(ctx, "SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
-		if n != 1 || !c.IsLeader() {
+		if n != 1 || !c.IsLeader() || lost.Load() != 0 {
 			t.Fatalf("the leader's lease lapsed %s into a history prune", time.Since(started).Round(time.Millisecond))
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -730,6 +748,7 @@ func TestLeaderRenewsLeaseWhileRescueWaits(t *testing.T) {
 	})
 
 	survivor := h.started(workers, 1)
+	lost := leaderLosses(t, survivor)
 	// The rescue's finalize waits behind the request, as one more lock
 	// request on the partition not granted.
 	waitFor(t, func() bool {
@@ -741,7 +760,7 @@ func TestLeaderRenewsLeaseWhileRescueWaits(t *testing.T) {
 	}
 	started := time.Now()
 	for time.Since(started) < 3*fastTuning.LeaderTTL {
-		if count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 || !survivor.IsLeader() {
+		if count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 || !survivor.IsLeader() || lost.Load() != 0 {
 			t.Fatalf("the leader's lease lapsed %s into a rescue waiting for its lock", time.Since(started).Round(time.Millisecond))
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -762,14 +781,7 @@ func TestHistoryMaintenanceStopsWithoutLeaseRenewal(t *testing.T) {
 	ctx := context.Background()
 	_, pruning := slowHistoryPrune(t, h, 60)
 	c := h.client(&hopper.Config{Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: hopper.NewWorkers()})
-	events, stopEvents := context.WithCancel(ctx)
-	defer stopEvents()
-	var lost atomic.Int32
-	go func() {
-		for range c.Events(events, hopper.EventLeaderLost) {
-			lost.Add(1)
-		}
-	}()
+	lost := leaderLosses(t, c)
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
