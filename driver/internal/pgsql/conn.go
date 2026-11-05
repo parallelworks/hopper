@@ -84,7 +84,11 @@ func (e *Executor) withTx(ctx context.Context, fn func(tx Tx) error) (err error)
 }
 
 // heldLockTimeout, a lockTimeoutSetting value, bounds how long a statement
-// run briefly waits for a row another transaction holds.
+// run briefly waits for a row another transaction holds, or for a table's
+// lock that a lock request queued before it holds off: each finalize writes
+// history, which a partition's attach or drop, or an operator's DDL, waiting
+// for its lock, or an attach scanning the DEFAULT partition, holds up for
+// as long as it waits or runs.
 //
 // The leader's duty loop runs its statements that finalize jobs
 // (JobDiscardExpired, JobExpireLeases, and JobFinalizeMany with BriefWait,
