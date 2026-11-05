@@ -55,7 +55,16 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	pool := testdb.Pool(t)
+	return newHarnessIn(t, testdb.URL(t))
+}
+
+// newHarnessIn is like newHarness, in the database at dbURL: a test that
+// queues a lock request for long, whose snapshot every CREATE INDEX
+// CONCURRENTLY in its database waits for, runs in a database of its own
+// (testdb.Database).
+func newHarnessIn(t *testing.T, dbURL string) *harness {
+	t.Helper()
+	pool := testdb.PoolIn(t, dbURL)
 	return &harness{t: t, pool: pool, d: testdb.Driver(pool)}
 }
 

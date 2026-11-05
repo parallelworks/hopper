@@ -541,12 +541,22 @@ func (h *harness) pendingAccessExclusive(relation string) (release func()) {
 // deferred, so history maintenance goes on, pass after pass, rather than
 // stall behind the request for as long as the reader stays open, and the
 // leader keeps its lease.
+//
+// The pending request holds a snapshot while it waits, its catalog
+// snapshot from looking the partition up, however the LOCK is sent, and
+// every CREATE INDEX CONCURRENTLY in its database waits for it. So each
+// subtest runs in a database of its own, where the request holds up no
+// other test's builds, nor the sibling subtest's. The check lasts at least
+// two of the lease's TTLs from the election, so that a renewal held up
+// behind the request would let the lease lapse within it, and five passes,
+// so that it reaches those at the capped lock timeout. The lease's TTL is
+// 6s, so that a slow CI machine's late renewal does not end the term.
 func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 	t.Parallel()
 	for _, partition := range []string{"hopper_job_history_failed_default", "hopper_job_history_failed_21000101"} {
 		t.Run(partition, func(t *testing.T) {
 			t.Parallel()
-			h := newHarness(t)
+			h := newHarnessIn(t, testdb.Database(t, ""))
 			ctx := context.Background()
 			if partition != "hopper_job_history_failed_default" {
 				// Far ahead of the partitions the leader creates, so that
@@ -583,16 +593,18 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 			// Maintenance at every leader interval, its bounded waits for the
 			// pending lock: for the DEFAULT partition, the attach of a failed
 			// partition ahead, up to the maintenance lock timeout, which grows
-			// to 2s while passes defer; and one prune, up to 200ms, the failed
+			// while passes defer; and one prune, up to 200ms, the failed
 			// DEFAULT partition's, the failed tags' after it deferred untried,
-			// or, for the time partition, the failed tags'. The check outlasts
-			// the first passes at 2s, and the lease's elected_at catches a
-			// lapse that the client took back at once, as a new term, between
-			// two checks.
+			// or, for the time partition, the failed tags'. A pass stuck behind
+			// the request would log no more deferred prunes, and the check
+			// below would time out, saying how many passes logged theirs. A
+			// lost term stops maintenance too, so it is checked first, to fail
+			// as what it is, at once.
 			tun := fastTuning
 			tun.Maintenance = 100 * time.Millisecond
 			tun.LeaderTTL = 6 * time.Second
 			c.SetTuning(tun)
+			lost := leaderLosses(t, c)
 			if err := c.Start(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -602,14 +614,26 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 				t.Fatal(err)
 			}
 			elected := time.Now()
-			for time.Since(elected) < 3*tun.LeaderTTL {
-				if h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 || !c.IsLeader() {
-					t.Fatalf("the leader's lease lapsed %s after the election, behind the pending lock on %s", time.Since(elected).Round(time.Millisecond), partition)
-				}
-				time.Sleep(100 * time.Millisecond)
+			termEnded := func() {
+				t.Helper()
+				t.Fatalf("the leader's term ended behind the pending lock on %s, %s after the election", partition, time.Since(elected).Round(time.Millisecond))
 			}
-			if n := deferred.total(); n < 2 {
-				t.Fatalf("history maintenance deferred its prunes behind the pending lock on %s in %d passes over %s; want it to go on, pass after pass", partition, n, 3*tun.LeaderTTL)
+			for deferred.total() < 5 || time.Since(elected) < 2*tun.LeaderTTL {
+				if lost.Load() != 0 || !c.IsLeader() {
+					termEnded()
+				}
+				if time.Since(elected) > 30*time.Second {
+					t.Fatalf("history maintenance logged %d passes' deferred prunes behind the pending lock on %s in %s; want it to go on, pass after pass",
+						deferred.total(), partition, time.Since(elected).Round(time.Millisecond))
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if lost.Load() != 0 || !c.IsLeader() {
+				termEnded()
+			}
+			if n := h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt); n != 1 {
+				t.Fatalf("the leader's lease lapsed behind the pending lock on %s, %s after the election: %d live leases of its term, want 1",
+					partition, time.Since(elected).Round(time.Millisecond), n)
 			}
 		})
 	}
@@ -714,7 +738,9 @@ func TestLeaderRenewsLeaseThroughLongHistoryPrune(t *testing.T) {
 // discards the job. The leader keeps its term throughout.
 func TestRescueGivesUpBehindPendingHistoryLock(t *testing.T) {
 	t.Parallel()
-	h := newHarness(t)
+	// The pending request stays for several of the lease's TTLs: in a
+	// database of its own, it holds up no other test's index builds.
+	h := newHarnessIn(t, testdb.Database(t, ""))
 	ctx := context.Background()
 	w := newBlocker()
 	workers := hopper.NewWorkers()
