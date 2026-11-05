@@ -1772,6 +1772,13 @@ RETURNING client_id,   -- $me: the client leads
 - On graceful stop the leader deletes its row and sends a `hopper_leader` notification,
   so a replacement takes over immediately. It deletes the row under the client ID it
   last renewed it with, which a fence (§7.6) may since have replaced.
+- **A fence ends the term.** The new ID a fence gives the client cannot renew the
+  lease held under the old one. The leader loop sees the new ID before its next
+  attempt, at once, since the fence wakes it. It ends the term, with `EventLeaderLost`,
+  and deletes the lease under the old ID with the same statement and notification as
+  a stop. Its attempt under the new ID is then an election, which it or another client
+  wins at once. Earlier releases left the old lease to expire, so no client led for up
+  to a TTL after a leader was fenced.
 - **A term is one live lease.** Taking a free or expired lease starts a term, even when
   the client takes its own lease back after it lapsed, under the same ID or under the
   one a fence gave it: while the lease was lapsed another client may have led. A term

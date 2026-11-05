@@ -273,6 +273,28 @@ func TestLeaderStopAfterFence(t *testing.T) {
 	}
 }
 
+// TestLeaderGivesUpLeaseAfterFence moves a leader to another client ID, as
+// a fence does, while its lease, held under the old ID, has most of a long
+// TTL left: the leader ends its term and gives that lease up, so a client
+// leads again under a current ID well before the old lease would expire.
+func TestLeaderGivesUpLeaseAfterFence(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	tun := fastTuning
+	tun.LeaseTTL, tun.LeaseRenew, tun.LeaderTTL = time.Minute, 30*time.Second, time.Minute
+	a := h.startedWith(hopper.NewWorkers(), 1, tun)
+	lost := leaderLosses(t, a)
+	waitFor(t, a.IsLeader)
+	b := h.startedWith(hopper.NewWorkers(), 1, tun)
+	old := a.ClientID()
+	a.FenceTo(old + 1_000_000)
+	waitFor(t, func() bool {
+		return h.count(`SELECT count(*) FROM hopper_leader WHERE client_id <> $1 AND expires_at > now()`, old) == 1 &&
+			(a.IsLeader() || b.IsLeader())
+	})
+	waitFor(t, func() bool { return lost.Load() == 1 })
+}
+
 // lossyDriver is a driver whose executor, once armed, loses the response
 // of the first leadership attempt that started a term: the takeover
 // commits, but the client sees an error.

@@ -67,6 +67,18 @@ func (c *Client[TTx]) leaderLoop(ctx context.Context) {
 		// tries for the lease as any election does, at once, rather than
 		// send a renewal with no time left and wait a leader interval more.
 		endLapsed()
+		// A fence has moved the client to a new ID since it last took or
+		// renewed the lease, which the new ID cannot renew: the term ends,
+		// and the lease is given up under the old ID, so that the election
+		// below, and the other clients' that its notification starts, need
+		// not wait for it to expire.
+		if held && leaseID != id {
+			if c.isLeader.Swap(false) {
+				lose("hopper: client fenced; its leader term ended", "client_id", leaseID, "new_client_id", id)
+			}
+			held = false
+			c.giveUpLease(ctx, leaseID, " after a fence")
+		}
 		// The lease the attempt takes or renews expires a TTL after the
 		// server's now(), which is no earlier than this: until.
 		attempted := time.Now()
@@ -245,9 +257,9 @@ func (c *Client[TTx]) resign(ctx context.Context, id int64, held bool) {
 
 // giveUpLease deletes the leader lease if client id holds it, and then
 // signals the other clients to elect a replacement, and logs which way the
-// lease went; why ("" or " on request") says what ended the term. It runs
-// on a context of its own, so that a stopping client still gives the lease
-// up. If the statement fails, the lease expires instead, within the TTL
+// lease went; why ("", " on request" or " after a fence") says what ended
+// the term. It runs on a context of its own, so that a stopping client still
+// gives the lease up. If the statement fails, the lease expires instead, within the TTL
 // its last renewal left it.
 func (c *Client[TTx]) giveUpLease(ctx context.Context, id int64, why string) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
