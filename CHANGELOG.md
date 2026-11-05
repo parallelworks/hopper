@@ -6,6 +6,16 @@ pull requests (see [docs/releasing.md](docs/releasing.md)); the design
 record is [docs/PLAN.md](docs/PLAN.md). Until v1.0.0, minor versions may
 change the API.
 
+## [0.12.2](https://github.com/parallelworks/hopper/compare/v0.12.1...v0.12.2) (2026-11-05)
+
+
+### Bug fixes
+
+* **leader:** bound the rescue's finalize of jobs of no batch like the leader's other finalizes ([#141](https://github.com/parallelworks/hopper/issues/141)) ([ed6b592](https://github.com/parallelworks/hopper/commit/ed6b5927169b2755237d8a31572d473c2da39b0e))
+* **leader:** retention's DEFAULT partition prune waits no longer than the maintenance lock timeout ([#136](https://github.com/parallelworks/hopper/issues/136)) ([63fe0ae](https://github.com/parallelworks/hopper/commit/63fe0aeb7322070be846139921501675a553bb9d))
+* **leader:** run the leader's duties and history maintenance beside the lease renewal, fenced by the lease ([#138](https://github.com/parallelworks/hopper/issues/138)) ([bd14c2d](https://github.com/parallelworks/hopper/commit/bd14c2d127dc5683d9075609862dd45309aa1a11))
+* **leader:** the tags prune reads only the outcome table it mirrors ([#139](https://github.com/parallelworks/hopper/issues/139)) ([b39770e](https://github.com/parallelworks/hopper/commit/b39770ef32676b642832287e6870abbdba735c1d))
+
 ## [0.12.1](https://github.com/parallelworks/hopper/compare/v0.12.0...v0.12.1) (2026-11-04)
 
 
