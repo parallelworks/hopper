@@ -700,15 +700,17 @@ func TestLeaderRenewsLeaseThroughLongHistoryPrune(t *testing.T) {
 	}
 }
 
-// TestLeaderRenewsLeaseWhileRescueWaits leaves a lost client's job with no
-// attempts left, for the leader's rescue to discard, behind a request for an
-// ACCESS EXCLUSIVE lock on the failed DEFAULT history partition, queued
+// TestRescueGivesUpBehindPendingHistoryLock leaves a lost client's job with
+// no attempts left, for the leader's rescue to discard, behind a request for
+// an ACCESS EXCLUSIVE lock on the failed DEFAULT history partition, queued
 // behind a transaction that read it, as an attach's scan or an operator's
-// DDL would hold it. The rescue's finalize of a job of no batch waits for
-// the table's lock for as long as the request stays. The duties run beside
-// the leader loop, so the leader renews its lease meanwhile, in the same
-// term.
-func TestLeaderRenewsLeaseWhileRescueWaits(t *testing.T) {
+// DDL would hold it. The rescue's finalize of a job of no batch writes its
+// history there, and waits for the table's lock no longer than the leader's
+// other finalizes do: it gives up, logs the rescue deferred, and the next
+// pass tries again, so that the leader's other duties go on, rather than
+// wait for as long as the request stays. Once the request ends, a pass
+// discards the job. The leader keeps its term throughout.
+func TestRescueGivesUpBehindPendingHistoryLock(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)
 	ctx := context.Background()
@@ -736,26 +738,103 @@ func TestLeaderRenewsLeaseWhileRescueWaits(t *testing.T) {
 		return n
 	}
 
-	survivor := h.started(workers, 1)
-	lost := leaderLosses(t, survivor)
-	// The rescue's finalize waits behind the request, as one more lock
-	// request on the partition not granted.
-	waitFor(t, func() bool {
-		return survivor.IsLeader() && count(`SELECT count(*) FROM pg_locks WHERE relation = to_regclass($1) AND NOT granted`, partition) > 1
+	deferred := &timeoutLog{counts: map[string]int{}, message: "rescue deferred", key: "candidates", level: slog.LevelWarn}
+	survivor := h.client(&hopper.Config{
+		Queues: map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}}, Workers: workers,
+		Logger: slog.New(deferred),
 	})
+	lost := leaderLosses(t, survivor)
+	if err := survivor.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, survivor.IsLeader)
 	var electedAt time.Time
 	if err := probe.QueryRow(ctx, "SELECT elected_at FROM hopper_leader").Scan(&electedAt); err != nil {
 		t.Fatal(err)
 	}
+	// Pass after pass gives up behind the request, each within its brief
+	// lock wait: a rescue that waited for the request would log none.
 	started := time.Now()
-	for time.Since(started) < 3*fastTuning.LeaderTTL {
-		if count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 || !survivor.IsLeader() || lost.Load() != 0 {
-			t.Fatalf("the leader's lease lapsed %s into a rescue waiting for its lock", time.Since(started).Round(time.Millisecond))
+	for deferred.total() < 3 {
+		if time.Since(started) > 15*time.Second {
+			t.Fatalf("the rescue logged %d passes deferred behind the pending lock in %s; want it to give up, pass after pass", deferred.total(), time.Since(started).Round(time.Millisecond))
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 	if n := count("SELECT count(*) FROM hopper_jobs WHERE state = 'running'"); n != 1 {
-		t.Fatalf("%d jobs running, want the lost one, its rescue waiting", n)
+		t.Fatalf("%d jobs running, want the lost one, its rescue deferred", n)
+	}
+	if lost.Load() != 0 || count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 {
+		t.Fatal("the leader's term ended behind the pending lock")
+	}
+	release()
+	waitFor(t, func() bool {
+		return count("SELECT count(*) FROM hopper_jobs") == 0 && count("SELECT count(*) FROM hopper_job_history WHERE state = 'discarded'") == 1
+	})
+}
+
+// stuckDutyExec is an executor whose leader duty of pruning stale clients
+// waits until its context ends, with no time limit, as a duty stuck behind a
+// lock no bound covers would.
+type stuckDutyExec struct {
+	driver.Executor
+	stuck atomic.Int32
+}
+
+func (e *stuckDutyExec) ClientPruneExpired(ctx context.Context) (int64, error) {
+	e.stuck.Add(1)
+	defer e.stuck.Add(-1)
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
+// stuckDutyDriver is a driver whose executor is a stuckDutyExec.
+type stuckDutyDriver struct {
+	driver.Driver[pgxTx]
+	exec *stuckDutyExec
+}
+
+func (d stuckDutyDriver) Executor() driver.Executor { return d.exec }
+
+// TestLeaderRenewsLeaseWhileDutyWaits runs a leader whose duty of pruning
+// stale clients never returns. The duties run in a loop of the term beside
+// the leader loop, so the leader renews its lease meanwhile, in the same
+// term, rather than lose it to a duty that holds up the renewal.
+func TestLeaderRenewsLeaseWhileDutyWaits(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	exec := &stuckDutyExec{Executor: h.d.Executor()}
+	c, err := hopper.NewClient[pgxTx](stuckDutyDriver{Driver: h.d, exec: exec}, &hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers: hopper.NewWorkers(),
+		Logger:  testLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetTuning(fastTuning)
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = c.Stop(sctx)
+	})
+	lost := leaderLosses(t, c)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return c.IsLeader() && exec.stuck.Load() == 1 })
+	var electedAt time.Time
+	if err := h.pool.QueryRow(ctx, "SELECT elected_at FROM hopper_leader").Scan(&electedAt); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	for time.Since(started) < 3*fastTuning.LeaderTTL {
+		if lost.Load() != 0 || !c.IsLeader() ||
+			h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 {
+			t.Fatalf("the leader's lease lapsed %s into a duty that waits", time.Since(started).Round(time.Millisecond))
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

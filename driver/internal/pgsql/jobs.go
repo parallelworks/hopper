@@ -859,12 +859,16 @@ func (e *Executor) JobFinalizeMany(ctx context.Context, params driver.JobFinaliz
 		applied []driver.JobFinalized
 		err     error
 	)
-	if params.BriefWait && !params.NoBatches {
+	if params.BriefWait {
 		// The statement may reach rows of other jobs another transaction
 		// holds, such as a dependent that a JobCancelTx held open has
-		// canceled by cascade; past a brief wait for them it gives up on
-		// every job, with driver.ErrRowsHeld. Jobs of no batch have no
-		// dependents, and their statement reaches no other job's rows.
+		// canceled by cascade, and it writes history, whose tables a lock
+		// request can hold: a partition's attach or drop, itself waiting for
+		// a transaction that wrote history, an attach's scan of the DEFAULT
+		// partition, or an operator's DDL waiting for a long reader. Past a
+		// brief wait for either it gives up on every job, with
+		// driver.ErrRowsHeld. Jobs of no batch have no dependents, but their
+		// history is written all the same.
 		applied, err = briefly(ctx, e, run)
 	} else {
 		applied, err = run(e.Conn)

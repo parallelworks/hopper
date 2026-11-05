@@ -50,7 +50,9 @@ var ErrJobLocked = errors.New("hopper: another transaction holds the job's row")
 // JobDiscardExpired and JobExpireLeases when the statement gave up waiting
 // for a row another transaction holds that it does not skip, such as a
 // dependent it cancels by cascade, or the lease of a job JobExpireLeases
-// expires that a renewal holds: it finalized none of them. A smaller set of
+// expires that a renewal holds, or for a lock on a table it writes, such as
+// a history partition that a DDL statement holds or waits for: it finalized
+// none of them. A smaller set of
 // the jobs may not reach that row. BatchSettle with IDs returns it when it
 // gave up waiting for a batch row, or the engine broke a deadlock its wait
 // was part of by ending the settle: it settled none of the batches.
@@ -1138,10 +1140,11 @@ type JobFinalizeParams struct {
 	// it finalizes none of the jobs and returns ErrRowsHeld. The leader's
 	// rescue sets it, with SkipLocked, so that no caller's transaction holds
 	// up the leader's duties; a client's finalizer does not, and waits for the
-	// row. It has no effect on a SingleWriter engine, whose SkipLocked
-	// already waits only briefly, with NoBatches, whose statement reaches no
-	// other job's rows, or on an Executor in a caller's transaction, where a
-	// bound would last the caller's whole transaction.
+	// row. The bound covers the statement's table locks too, such as a
+	// history partition's that a DDL statement holds or waits for, with or
+	// without NoBatches. It has no effect on a SingleWriter engine, whose
+	// SkipLocked already waits only briefly, or on an Executor in a caller's
+	// transaction, where a bound would last the caller's whole transaction.
 	BriefWait bool
 	// KeepLogs is the most attempt logs a job keeps, the latest; a job given
 	// another drops its oldest. Zero keeps them all.
