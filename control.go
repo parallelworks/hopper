@@ -483,9 +483,10 @@ const (
 	// a job again.
 	EventLeaderElected EventKind = "leader.elected"
 	// EventLeaderLost is emitted when the client's term ends because it
-	// lost the lease: another client holds it, or it lapsed (see
-	// EventLeaderElected). A graceful Stop emits neither it nor
-	// EventLeaderResigned.
+	// lost the lease: another client holds it, it lapsed (see
+	// EventLeaderElected), or a fence (EventLeaseLost) moved the client to
+	// a new ID, which cannot renew the lease held under the old one. A
+	// graceful Stop emits neither it nor EventLeaderResigned.
 	EventLeaderLost EventKind = "leader.lost"
 	// EventLeaderResigned is emitted, in place of EventLeaderLost, by a
 	// leader whose term ended on request (Client.LeaderResign), once,

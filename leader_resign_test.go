@@ -273,6 +273,47 @@ func TestLeaderStopAfterFence(t *testing.T) {
 	}
 }
 
+// TestLeaderGivesUpLeaseAfterFence moves a leader to another client ID, as
+// a fence does, while its lease, held under the old ID, has most of a long
+// TTL left: the leader ends its term and gives that lease up, so a client
+// leads again under a current ID well before the old lease would expire.
+// The lease is given up only once the term's loops have ended, so no duty
+// of the old term overlaps the next leader's.
+func TestLeaderGivesUpLeaseAfterFence(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	tun := fastTuning
+	tun.LeaseTTL, tun.LeaseRenew, tun.LeaderTTL = time.Minute, 30*time.Second, time.Minute
+	exec := &dutyExec{Executor: h.d.Executor()}
+	a := h.clientOn(dutyDriver{Driver: h.d, exec: exec}, &hopper.Config{
+		Queues:  map[string]hopper.QueueConfig{hopper.QueueDefault: {MaxWorkers: 1}},
+		Workers: hopper.NewWorkers(),
+	})
+	a.SetTuning(tun)
+	if err := a.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	lost := leaderLosses(t, a)
+	// The term's live-table pass runs until the term ends.
+	waitFor(t, func() bool { return a.IsLeader() && exec.running.Load() == 1 })
+	b := h.startedWith(hopper.NewWorkers(), 1, tun)
+	old := a.ClientID()
+	a.FenceTo(old + 1_000_000)
+	// The client that leads holds the live lease, under its current ID.
+	waitFor(t, func() bool {
+		for _, c := range []*hopper.Client[pgxTx]{a, b} {
+			if c.IsLeader() && h.count(`SELECT count(*) FROM hopper_leader WHERE client_id = $1 AND expires_at > now()`, c.ClientID()) == 1 {
+				return true
+			}
+		}
+		return false
+	})
+	waitFor(t, func() bool { return lost.Load() == 1 })
+	if n := exec.overlapped.Load(); n != 0 {
+		t.Errorf("the fenced leader gave its lease up while a duty of its term ran (%d times)", n)
+	}
+}
+
 // lossyDriver is a driver whose executor, once armed, loses the response
 // of the first leadership attempt that started a term: the takeover
 // commits, but the client sees an error.
