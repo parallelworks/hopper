@@ -541,6 +541,14 @@ func (h *harness) pendingAccessExclusive(relation string) (release func()) {
 // deferred, so history maintenance goes on, pass after pass, rather than
 // stall behind the request for as long as the reader stays open, and the
 // leader keeps its lease.
+//
+// The pending request holds a snapshot while it waits, its catalog
+// snapshot from looking the partition up, however the LOCK is sent, and
+// every CREATE INDEX CONCURRENTLY in the database waits for it, other
+// tests' and the sibling subtest's included. So the test holds it for no
+// longer than the passes it checks take, a few seconds, rather than for a
+// fixed span of the lease's TTLs: maintenance runs beside the leader loop,
+// so its waits no longer bear on the lease's renewal.
 func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 	t.Parallel()
 	for _, partition := range []string{"hopper_job_history_failed_default", "hopper_job_history_failed_21000101"} {
@@ -583,16 +591,15 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 			// Maintenance at every leader interval, its bounded waits for the
 			// pending lock: for the DEFAULT partition, the attach of a failed
 			// partition ahead, up to the maintenance lock timeout, which grows
-			// to 2s while passes defer; and one prune, up to 200ms, the failed
+			// while passes defer; and one prune, up to 200ms, the failed
 			// DEFAULT partition's, the failed tags' after it deferred untried,
-			// or, for the time partition, the failed tags'. The check outlasts
-			// the first passes at 2s, and the lease's elected_at catches a
-			// lapse that the client took back at once, as a new term, between
-			// two checks.
+			// or, for the time partition, the failed tags'. A pass stuck behind
+			// the request would log no more deferred prunes, and the waitFor
+			// below would time out.
 			tun := fastTuning
 			tun.Maintenance = 100 * time.Millisecond
-			tun.LeaderTTL = 6 * time.Second
 			c.SetTuning(tun)
+			lost := leaderLosses(t, c)
 			if err := c.Start(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -601,15 +608,15 @@ func TestLeaderKeepsLeaseBehindPendingHistoryLock(t *testing.T) {
 			if err := h.pool.QueryRow(ctx, "SELECT elected_at FROM hopper_leader").Scan(&electedAt); err != nil {
 				t.Fatal(err)
 			}
-			elected := time.Now()
-			for time.Since(elected) < 3*tun.LeaderTTL {
-				if h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 || !c.IsLeader() {
-					t.Fatalf("the leader's lease lapsed %s after the election, behind the pending lock on %s", time.Since(elected).Round(time.Millisecond), partition)
+			started := time.Now()
+			for deferred.total() < 3 {
+				if time.Since(started) > 15*time.Second {
+					t.Fatalf("history maintenance logged %d passes' deferred prunes behind the pending lock on %s in %s; want it to go on, pass after pass", deferred.total(), partition, time.Since(started).Round(time.Millisecond))
 				}
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(50 * time.Millisecond)
 			}
-			if n := deferred.total(); n < 2 {
-				t.Fatalf("history maintenance deferred its prunes behind the pending lock on %s in %d passes over %s; want it to go on, pass after pass", partition, n, 3*tun.LeaderTTL)
+			if lost.Load() != 0 || h.count("SELECT count(*) FROM hopper_leader WHERE expires_at > now() AND elected_at = $1", electedAt) != 1 {
+				t.Fatalf("the leader's term ended behind the pending lock on %s, %s after the election", partition, time.Since(started).Round(time.Millisecond))
 			}
 		})
 	}
