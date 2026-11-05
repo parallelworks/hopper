@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/parallelworks/hopper/driver"
@@ -173,6 +174,46 @@ func TestMaintainHistoryPruneDeferred(t *testing.T) {
 	}
 }
 
+// A leader term's fence lasts while its lease is known to be held: past the
+// until it started with when a renewal extends it, and no longer than the
+// last renewal's, when it cancels the term. A renewal that comes back once
+// the lease may have expired does not extend it.
+func TestLeaseFence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var f leaseFence
+		f.renew(time.Now().Add(2 * time.Second))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go f.fence(ctx, cancel)
+		time.Sleep(time.Second)
+		if !f.renew(time.Now().Add(2 * time.Second)) {
+			t.Fatal("a renewal within the lease did not extend it")
+		}
+		time.Sleep(1500 * time.Millisecond)
+		synctest.Wait()
+		if ctx.Err() != nil || f.expired() {
+			t.Fatal("the term was fenced although a renewal extended the lease")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if ctx.Err() == nil || !f.expired() {
+			t.Fatal("the term outlived the lease's last renewal")
+		}
+		if f.renew(time.Now().Add(2 * time.Second)) {
+			t.Fatal("a renewal after the lease may have expired extended it")
+		}
+	})
+	synctest.Test(t, func(t *testing.T) {
+		// Past until, before the fence's timer has run.
+		var f leaseFence
+		f.renew(time.Now().Add(time.Second))
+		time.Sleep(time.Second)
+		if f.renew(time.Now().Add(time.Second)) || !f.expired() {
+			t.Fatal("a renewal at the lease's expiry extended it")
+		}
+	})
+}
+
 // heldRescueExec has a full batch of rescue candidates whose rows other
 // transactions hold, so that the rescue's finalize, which skips them,
 // applies none. It stops offering them after a few reads.
@@ -206,7 +247,7 @@ func TestRescueEndsAPassThatRescuedNothing(t *testing.T) {
 	tun.rescueBatch = exec.batch
 	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.DiscardHandler), tuning: tun}
 	c.clientID.Store(2)
-	c.rescue(context.Background())
+	c.rescue(context.Background(), context.Background())
 	if exec.reads != 1 {
 		t.Errorf("the rescue read its candidates %d times in one pass, want 1", exec.reads)
 	}
@@ -245,7 +286,7 @@ func TestRescueFollowsUpItsCascade(t *testing.T) {
 	var logs strings.Builder
 	c := &Client[struct{}]{exec: exec, logger: slog.New(slog.NewTextHandler(&logs, nil)), tuning: defaultTuning, events: &eventBus{}}
 	c.clientID.Store(2)
-	c.rescue(context.Background())
+	c.rescue(context.Background(), context.Background())
 	if len(exec.promoted) != 1 || !slices.Equal(exec.promoted[0], []driver.JobID{{1}, {2}}) {
 		t.Errorf("follow-ups = %v, want one of the discarded job and the job canceled by cascade", exec.promoted)
 	}

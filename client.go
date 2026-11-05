@@ -80,11 +80,16 @@ type Client[TTx any] struct {
 	listening  atomic.Bool
 	isLeader   atomic.Bool
 	leaderPoke chan struct{}
+	// dutyPoke runs the leader's duties at once (dutyLoop), as leaderPoke
+	// runs an attempt.
+	dutyPoke chan struct{}
 	// settleAfter and promoteAfter are where the leader's next batch and
-	// workflow sweeps resume, ddlDeferrals counts its consecutive passes
-	// with deferred partition work, and keptLogged and pruneDeferredLogged
-	// are when it last logged partitions kept past retention for their index
-	// and DEFAULT partitions' prunes deferred.
+	// workflow sweeps resume. ddlDeferrals counts its history maintenance's
+	// consecutive passes with deferred partition work, and keptLogged and
+	// pruneDeferredLogged are when it last logged partitions kept past
+	// retention for their index and DEFAULT partitions' prunes deferred;
+	// only the term's maintenance loop uses them, and a term's loops end
+	// before the next term's start.
 	settleAfter, promoteAfter driver.JobID
 	// resultsSweptAt is when the leader last deleted orphaned dependency
 	// results.
@@ -136,6 +141,7 @@ func NewClient[TTx any](d driver.Driver[TTx], cfg *Config) (*Client[TTx], error)
 		logger:       resolved.Logger,
 		workers:      resolved.Workers,
 		leaderPoke:   make(chan struct{}, 1),
+		dutyPoke:     make(chan struct{}, 1),
 		streamPoke:   make(chan struct{}, 1),
 		periodic:     newPeriodicJobs(resolved.Periodic, resolved.Logger, len(resolved.Queues) == 0),
 		events:       newEventBus(),

@@ -237,8 +237,7 @@ SELECT (`, 1)
 // maintenance interval rather than on every pass. It skips a row another
 // transaction holds, as resultsClearedSQL does: a JobRetryTx held open that
 // deletes the result the statement completing its workflow skipped, which
-// the leader, its every duty and its lease's renewal would otherwise wait
-// for. A retry that rolls back leaves the row to the next sweep.
+// the leader's every duty would otherwise wait for. A retry that rolls back leaves the row to the next sweep.
 const jobResultsOrphansSQL = `
 DELETE FROM {{schema}}.hopper_job_results r WHERE (r.batch_id, r.job_id) IN (
   SELECT o.batch_id, o.job_id FROM {{schema}}.hopper_job_results o

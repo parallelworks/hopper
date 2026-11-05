@@ -1137,7 +1137,7 @@ type JobFinalizeParams struct {
 	// cascade that a JobCancelTx held open has canceled: past a brief wait
 	// it finalizes none of the jobs and returns ErrRowsHeld. The leader's
 	// rescue sets it, with SkipLocked, so that no caller's transaction holds
-	// up the leader's loop; a client's finalizer does not, and waits for the
+	// up the leader's duties; a client's finalizer does not, and waits for the
 	// row. It has no effect on a SingleWriter engine, whose SkipLocked
 	// already waits only briefly, with NoBatches, whose statement reaches no
 	// other job's rows, or on an Executor in a caller's transaction, where a

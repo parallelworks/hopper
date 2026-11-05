@@ -257,8 +257,8 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 //
 // It skips the rows another transaction holds, which the next pass takes:
 // a JobRetryTx or JobDeleteTx held open deletes its job's history row, and
-// a prune that waited for it would hold up the leader's loop, and its
-// lease's renewal, for as long as the caller kept its transaction open. The
+// a prune that waited for it would hold up history maintenance for as long
+// as the caller kept its transaction open. The
 // rows are locked by a subquery and deleted by their ctid, which a row
 // locked by the statement keeps: the DEFAULT partition is a table, not a
 // partitioned one.
@@ -273,7 +273,7 @@ func (e *Executor) maintainGroup(ctx context.Context, g historyGroup, now time.T
 // ahead, which must exist when its period starts, a prune is not urgent: one
 // that cannot get its locks in time is named in res.PruneDeferred and
 // reports false, and the next maintenance pass tries again, with the same
-// short timeout, rather than the next leader pass with a longer one, as is
+// short timeout, rather than at the next leader interval with a longer one, as is
 // a tags group's prune that comes after a deferred prune of the DEFAULT
 // partition of the outcome table it mirrors, deferred untried. Only a
 // lock wait defers it: a statement_timeout may be its scan of a large
@@ -287,15 +287,14 @@ func (e *Executor) pruneDefault(ctx context.Context, g historyGroup, keep time.D
 	// A tags group's prune reads every partition of the outcome table it
 	// mirrors. Once the prune of that table's DEFAULT partition is deferred
 	// this pass, it would most likely wait for the same lock, so it is
-	// deferred untried rather than wait the lock timeout again on the
-	// leader's loop. The other outcome table's, and the other tags group's,
-	// read none of its partitions. The two tags groups' prunes share only
-	// history's root, which Postgres locks to read an outcome table's
-	// partition bound when it plans the table afresh: on a new connection,
-	// or after an attach or drop of one of its partitions, which this pass
-	// may have made. A request queued on the root, such as an operator's
-	// ALTER TABLE of hopper_job_history, holds both off, each for its own
-	// lock timeout.
+	// deferred untried rather than wait the lock timeout again. The other
+	// outcome table's, and the other tags group's, read none of its
+	// partitions. The two tags groups' prunes share only history's root,
+	// which Postgres locks to read an outcome table's partition bound when
+	// it plans the table afresh: on a new connection, or after an attach or
+	// drop of one of its partitions, which this pass may have made. A
+	// request queued on the root, such as an operator's ALTER TABLE of
+	// hopper_job_history, holds both off, each for its own lock timeout.
 	if g.mirrors != "" && slices.Contains(res.PruneDeferred, g.mirrors+"_default") {
 		res.PruneDeferred = append(res.PruneDeferred, name)
 		return false, nil
@@ -1102,8 +1101,8 @@ func (e *Executor) createPartition(ctx context.Context, g historyGroup, name str
 	// held for this transaction, then check whether the other one has
 	// already created the partition. The lock timeout bounds the wait for
 	// it too: a leader that stalls while it holds it, creating a partition
-	// or attaching an index, would otherwise stall this one's loop, lease
-	// renewal included.
+	// or attaching an index, would otherwise stall this one's history
+	// maintenance.
 	// Partitions are created periods ahead, so this one is deferred instead.
 	if err = setLockTimeout(ctx, tx, lockTimeout); err != nil {
 		return false, false, fmt.Errorf("hopper: create partition %s: %w", name, err)
