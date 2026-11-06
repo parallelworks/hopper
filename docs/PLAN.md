@@ -1725,8 +1725,9 @@ is never older than the attempt it was set during, even on a clock stepped back.
 finalize reads it under the same row lock, in the statement that writes the attempt's
 result, so a wake is never lost: one that locks the row first leaves the mark, which
 the finalize (waiting for the row, or skipping it and trying again, §7.5) then reads;
-one that locks it second finds the job waiting and brings it forward. How the attempt
-ends decides what the mark does:
+one that locks it second finds the attempt over and retries the job as `JobRetry` does:
+a waiting job is brought forward, and a job the attempt finished (completed, canceled or
+discarded) is re-driven from history. How the attempt ends decides what the mark does:
 
 - **Snooze, or a retryable error with attempts left:** the job is runnable at once
   instead of after its delay, the snooze without its reason, and the mark is cleared.

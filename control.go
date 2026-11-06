@@ -18,8 +18,9 @@ import (
 
 // Sentinel errors from control operations.
 var (
-	// ErrJobRunning is returned by JobRetry and JobDelete for a running
-	// job, and by Leases.Claim for a job running at the fence it names.
+	// ErrJobRunning is returned by JobRetry (unless IfRunning) and
+	// JobDelete for a running job, and by Leases.Claim for a job running at
+	// the fence it names.
 	ErrJobRunning = driver.ErrJobRunning
 	// ErrUniqueConflict is returned by JobRetry when a live job holds the
 	// same unique key.
@@ -130,7 +131,8 @@ func FromStart() RetryOption {
 // or whose job lease expires, which is retried at once anyway, or
 // discarded on its last attempt. The mark is the attempt's: the next
 // attempt does not see it. A job that is not running is retried as without
-// the option.
+// the option: a wake that comes once the attempt has completed, been
+// canceled or been discarded re-drives the job from history.
 //
 // The mark is set while the job's row is held by the statement that found
 // it running, and the finalize reads it holding the row too, so a wake is
