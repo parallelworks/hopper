@@ -147,6 +147,9 @@ func TestJobRetryIfRunningWakesARunningJob(t *testing.T) {
 	ctx := context.Background()
 	started := make(chan int, 10)
 	release := make(chan struct{})
+	// Released on a failure too, so that the client's stop need not wait.
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
 	var calls [2]atomic.Int32
 	workers := hopper.NewWorkers()
 	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[noop]) error {
@@ -192,7 +195,7 @@ func TestJobRetryIfRunningWakesARunningJob(t *testing.T) {
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	close(release)
+	unblock()
 	if job := waitForJob(t, c, snoozing.Job.ID, hopper.JobStateCompleted); calls[0].Load() != 2 {
 		t.Errorf("woken job = %+v after %d calls", job, calls[0].Load())
 	}

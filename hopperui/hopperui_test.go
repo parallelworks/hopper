@@ -256,6 +256,8 @@ func TestUI(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT wake_requested_at IS NOT NULL FROM hopper_jobs WHERE id = $1", [16]byte(busy.Job.ID)).Scan(&woken); err != nil || woken {
 		t.Fatalf("retry without the option marked the running job: %v, %v", woken, err)
 	}
+	code, body = post(admin, "/jobs/"+busy.Job.ID.String()+"/retry", url.Values{"if": {"running"}, "from": {"start"}}, true)
+	want(400, body, code, "from the start")
 	code, _ = post(admin, "/jobs/"+busy.Job.ID.String()+"/retry", url.Values{"if": {"running"}}, true)
 	want(303, "", code)
 	if err := pool.QueryRow(ctx, "SELECT wake_requested_at IS NOT NULL FROM hopper_jobs WHERE id = $1", [16]byte(busy.Job.ID)).Scan(&woken); err != nil || !woken {

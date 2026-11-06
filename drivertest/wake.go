@@ -61,15 +61,18 @@ func testRetryIfRunning[TTx any](t *testing.T, f Fixture[TTx]) {
 	remove(id)
 
 	// A wake makes the snooze the attempt ends in run at once, without its
-	// reason and keeping the TTL. The mark is the attempt's: the next
-	// attempt's snooze waits.
+	// reason, and clears the TTL as a retry does. The mark is the attempt's:
+	// the next attempt's snooze waits, though that attempt is dated before
+	// the mark, so that only the finalize's clearing of it keeps it from
+	// counting.
 	id = start()
 	wakeRunning(ctx, t, exec, id)
 	finalizeCurrent(ctx, t, exec, snooze(id))
-	if j := get(ctx, t, exec, id); !due(ctx, t, exec, id) || f.SnoozeReason(ctx, t, d, id) != "" || j.ExpiresAt.IsZero() {
+	if j := get(ctx, t, exec, id); !due(ctx, t, exec, id) || f.SnoozeReason(ctx, t, d, id) != "" || !j.ExpiresAt.IsZero() {
 		t.Fatalf("woken snooze = %+v, reason %q", j, f.SnoozeReason(ctx, t, d, id))
 	}
 	claimOne(ctx, t, exec, clientID, id)
+	f.AgeAttempt(ctx, t, d, id, time.Hour)
 	finalizeCurrent(ctx, t, exec, snooze(id))
 	if due(ctx, t, exec, id) {
 		t.Fatal("a wake of an earlier attempt woke the next one")
@@ -83,6 +86,31 @@ func testRetryIfRunning[TTx any](t *testing.T, f Fixture[TTx]) {
 	finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: driver.JobStateRetryable, Delay: time.Hour, Error: &driver.AttemptError{Attempt: 1, Error: "x"}})
 	if j := get(ctx, t, exec, id); j.State != driver.JobStateRetryable || !due(ctx, t, exec, id) {
 		t.Fatalf("woken retry = %+v", j)
+	}
+	remove(id)
+
+	// A mark is never dated before its attempt, even on a clock stepped
+	// back: an attempt dated an hour ahead of the clock is woken all the
+	// same, by IfRunning and by a key's wake.
+	id = start()
+	f.AgeAttempt(ctx, t, d, id, -time.Hour)
+	wakeRunning(ctx, t, exec, id)
+	finalizeCurrent(ctx, t, exec, snooze(id))
+	if !due(ctx, t, exec, id) {
+		t.Fatal("a wake during an attempt dated ahead of the clock was lost")
+	}
+	remove(id)
+	keyed := params("k", 1)
+	keyed[0].OrderingKey = "a"
+	id = insert(ctx, t, exec, keyed)[0].Job.ID
+	claimOne(ctx, t, exec, clientID, id)
+	f.AgeAttempt(ctx, t, d, id, -time.Hour)
+	if _, err := exec.JobRetryOrderingKey(ctx, driver.JobRetryOrderingKeyParams{Queue: "default", OrderingKey: "a", Limit: 10}); err != nil {
+		t.Fatal(err)
+	}
+	finalizeCurrent(ctx, t, exec, snooze(id))
+	if !due(ctx, t, exec, id) {
+		t.Fatal("a key's wake during an attempt dated ahead of the clock was lost")
 	}
 	remove(id)
 
@@ -123,6 +151,7 @@ func testRetryIfRunning[TTx any](t *testing.T, f Fixture[TTx]) {
 		t.Fatalf("expired lease's job = %+v", j)
 	}
 	claimOne(ctx, t, exec, clientID, id)
+	f.AgeAttempt(ctx, t, d, id, time.Hour)
 	finalizeCurrent(ctx, t, exec, snooze(id))
 	if due(ctx, t, exec, id) {
 		t.Fatal("a wake of an expired lease's attempt woke the next one")
