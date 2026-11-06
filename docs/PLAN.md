@@ -1718,10 +1718,10 @@ is held by a live job.
 `JobRetry(ctx, id, hopper.IfRunning())` wakes a job whether it runs or not, for a
 caller whose transaction changed what a supervising job waits for. A job that is not
 running is retried as above. A running one is marked instead (`wake_requested_at`, the
-column a key's wake sets, §6, §10), in the statement that finds it running, with its row
-locked by `JobRetry`'s `FOR UPDATE`, and returned still running; the call does not
-wake its queue. The mark is `greatest(statement_timestamp(), attempted_at)`, so it is
-never older than the attempt it was set during, even on a clock stepped back. The
+column a key's wake sets, §6, §10), while `JobRetry`'s `FOR UPDATE`, which found it
+running, holds its row, and returned still running; the call does not wake its queue.
+The mark, as a key's wake's, is `greatest(statement_timestamp(), attempted_at)`, so it
+is never older than the attempt it was set during, even on a clock stepped back. The
 finalize reads it under the same row lock, in the statement that writes the attempt's
 result, so a wake is never lost: one that locks the row first leaves the mark, which
 the finalize (waiting for the row, or skipping it and trying again, §7.5) then reads;
@@ -1730,7 +1730,9 @@ ends decides what the mark does:
 
 - **Snooze, or a retryable error with attempts left:** the job is runnable at once
   instead of after its delay, the snooze without its reason, and the mark is cleared.
-  The job keeps its TTL: unlike a retry, a wake does not override the deadline.
+  The mark clears the job's TTL as a retry does, so the same call overrides the
+  deadline whether it finds the attempt over or not (unlike a key's wake, whose
+  mark keeps it).
 - **Complete, cancel, discard:** the mark goes with the row. A retryable error on the
   last attempt is a discard (the client decides that before the finalize) and stays one.
 - **A job lease's `Finish`** is a finalize of the same statement, fenced by the lease:
@@ -1746,7 +1748,9 @@ never inherits it. The mark fences nothing: a result that the fence (client, att
 drops leaves the mark to the statement that does end the attempt. `FromStart` cannot be
 combined with `IfRunning`, which is refused before the call reaches the database: the
 mark carries no progress reset. `hopper jobs retry -if-running` and the web UI's
-"wake after this attempt" button on a running job's page do the same. A job of an open batch re-driven from history counts in the
+"wake after this attempt" button on a running job's page do the same.
+
+A job of an open batch re-driven from history counts in the
 batch again as pending, and no longer as failed: a batch or workflow whose re-driven
 job then completes runs `OnSuccess` and `OnComplete`, not `OnFailure`, and one whose
 re-driven job fails again counts it once (§11). A retry that finds the batch
@@ -2827,7 +2831,9 @@ observability without new machinery.
     keeps its `scheduled_at`, so it keeps its claim order and aging. It does not
     interrupt a running job, but marks it (`wake_requested_at`, schema v10): if that
     attempt ends in a snooze or a retry, the finalize makes the job runnable at once
-    and clears the mark, and a mark older than the attempt is ignored. The mark is a
+    and clears the mark, and a mark older than the attempt is ignored. The mark,
+    `greatest(statement_timestamp(), attempted_at)`, is never older than the attempt it
+    was set during, even on a clock stepped back. The mark is a
     statement of its own, before the wake, so the wake's snapshot is taken after it: a
     job that finishes its attempt before the mark reaches it is waiting by then and is
     woken, and one that finishes after sees the mark. The claim, the aging pass

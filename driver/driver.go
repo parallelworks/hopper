@@ -233,8 +233,9 @@ type Executor interface {
 	// if the batch has not completed, as pending again and, if it had
 	// failed, no longer as failed. A completed batch's counts never change,
 	// by the retry or by the job's next finish. With params.IfRunning, a
-	// running job is marked instead, in the statement that finds it running,
-	// as JobRetryOrderingKey marks one, and returned as it is.
+	// running job is marked instead, while the row lock that found it
+	// running is held, as JobRetryOrderingKey marks one, and returned as it
+	// is.
 	JobRetry(ctx context.Context, params JobRetryParams) (*JobRow, error)
 	// JobDelete removes a job that is not running and returns it as it was
 	// last stored. A waiting job is canceled as JobCancel does, so its

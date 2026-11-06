@@ -132,11 +132,12 @@ func FromStart() RetryOption {
 // attempt does not see it. A job that is not running is retried as without
 // the option.
 //
-// The mark is set in the statement that finds the job running, holding its
-// row, and the finalize reads it holding the row too, so a wake is never
-// lost: either it finds the attempt over and retries the job, or the
-// attempt's result, written after it, finds the mark. Unlike a retry, the
-// mark keeps the job's TTL. It cannot be combined with FromStart.
+// The mark is set while the job's row is held by the statement that found
+// it running, and the finalize reads it holding the row too, so a wake is
+// never lost: either it finds the attempt over and retries the job, or the
+// attempt's result, written after it, finds the mark. As a retry does, the
+// wake clears the job's TTL, running or not. It cannot be combined with
+// FromStart.
 func IfRunning() RetryOption {
 	return func(p *driver.JobRetryParams) { p.IfRunning = true }
 }

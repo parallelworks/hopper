@@ -382,10 +382,16 @@ func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var opts []hopper.RetryOption
-		if r.FormValue("from") == "start" {
+		fromStart, ifRunning := r.FormValue("from") == "start", r.FormValue("if") == "running"
+		if fromStart && ifRunning {
+			// No page sends both, which JobRetry refuses.
+			http.Error(w, "a wake of a running job cannot run it from the start", http.StatusBadRequest)
+			return
+		}
+		if fromStart {
 			opts = append(opts, hopper.FromStart())
 		}
-		if r.FormValue("if") == "running" {
+		if ifRunning {
 			opts = append(opts, hopper.IfRunning())
 		}
 		job, err = u.client.JobRetry(r.Context(), id, opts...)
