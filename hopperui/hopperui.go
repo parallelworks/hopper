@@ -385,7 +385,14 @@ func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
 		if r.FormValue("from") == "start" {
 			opts = append(opts, hopper.FromStart())
 		}
+		if r.FormValue("if") == "running" {
+			opts = append(opts, hopper.IfRunning())
+		}
 		job, err = u.client.JobRetry(r.Context(), id, opts...)
+		if err == nil && job.State == hopper.JobStateRunning {
+			u.back(w, r, "/jobs/"+id.String(), "job is running: it runs again at once if this attempt ends in a snooze or a retry")
+			return
+		}
 	case "cancel":
 		if !u.authorize(w, r, ActionCancel) {
 			return

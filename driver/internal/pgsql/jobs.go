@@ -1746,6 +1746,14 @@ func (e *Executor) JobDelete(ctx context.Context, id driver.JobID) (*driver.JobR
 const jobRunNowSQL = `state = 'available', scheduled_at = least(scheduled_at, statement_timestamp()), snooze_reason = NULL, wake_requested_at = NULL`
 
 var (
+	// jobMarkRunningSQL marks a running job that JobRetry with IfRunning
+	// found, holding its row, so that its finalize honors the wake. The mark
+	// is never dated before the attempt: the finalize takes such a mark for
+	// one of an earlier attempt.
+	jobMarkRunningSQL = fmt.Sprintf(`
+UPDATE {{schema}}.hopper_jobs SET wake_requested_at = greatest(statement_timestamp(), attempted_at)
+WHERE id = $1 AND `+isRunning("state")+`
+RETURNING %s`, JobColumns(""))
 	jobRetryLiveSQL = fmt.Sprintf(`
 UPDATE {{schema}}.hopper_jobs SET `+jobRunNowSQL+`, expires_at = NULL, progress = CASE WHEN $2 THEN NULL ELSE progress END
 WHERE id = $1 AND state <> 'running'
@@ -1842,6 +1850,9 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 				uuidParam(job.BatchID), uuidParam(id))
 			return err
 		case err != nil:
+			return err
+		case driver.JobState(state) == driver.JobStateRunning && params.IfRunning:
+			job, err = scanJob(tx.QueryRow(ctx, jobMarkRunningSQL, uuidParam(id)), false)
 			return err
 		case driver.JobState(state) == driver.JobStateRunning:
 			return driver.ErrJobRunning

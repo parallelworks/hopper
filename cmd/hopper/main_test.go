@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"testing"
@@ -167,6 +168,12 @@ func TestCLI(t *testing.T) {
 	}
 	if got := hopperCmd("jobs", "retry", "-from-start", id); strings.Contains(got, "progress:") || !strings.Contains(got, "state:         available") {
 		t.Errorf("jobs retry -from-start = %q", got)
+	}
+	if got := hopperCmd("jobs", "retry", "-if-running", id); !strings.Contains(got, "state:         available") {
+		t.Errorf("jobs retry -if-running of a waiting job = %q", got)
+	}
+	if err := run(ctx, []string{"-schema", schema, "jobs", "retry", "-from-start", "-if-running", id}, io.Discard); err == nil {
+		t.Error("jobs retry -from-start -if-running succeeded")
 	}
 	if got := hopperCmd("jobs", "cancel", id); !strings.Contains(got, "state:         canceled") {
 		t.Errorf("jobs cancel = %q", got)

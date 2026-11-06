@@ -138,6 +138,69 @@ func TestJobRetryOrderingKeyWakesASnoozedKey(t *testing.T) {
 	}
 }
 
+// TestJobRetryIfRunningWakesARunningJob wakes a job while it runs, in a
+// transaction: the snooze its attempt then returns runs it again at once,
+// while a failure on its last attempt still discards it.
+func TestJobRetryIfRunningWakesARunningJob(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+	started := make(chan int, 10)
+	release := make(chan struct{})
+	var calls [2]atomic.Int32
+	workers := hopper.NewWorkers()
+	hopper.AddWorkFunc(workers, func(_ context.Context, job *hopper.Job[noop]) error {
+		if calls[job.Args.N].Add(1) > 1 {
+			return nil
+		}
+		started <- job.Args.N
+		<-release
+		if job.Args.N == 0 {
+			return &hopper.SnoozeError{Duration: time.Hour, Reason: "waiting"}
+		}
+		return errors.New("failed")
+	})
+	c := h.started(workers, 2)
+	b := h.client(&hopper.Config{})
+	snoozing, err := c.Insert(ctx, noop{N: 0}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failing, err := c.Insert(ctx, noop{N: 1}, &hopper.InsertOpts{MaxAttempts: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	<-started
+
+	if _, err := b.JobRetry(ctx, snoozing.Job.ID); !errors.Is(err, hopper.ErrJobRunning) {
+		t.Fatalf("JobRetry of a running job = %v, want ErrJobRunning", err)
+	}
+	if _, err := b.JobRetry(ctx, snoozing.Job.ID, hopper.IfRunning(), hopper.FromStart()); err == nil {
+		t.Fatal("JobRetry with IfRunning and FromStart: no error")
+	}
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, id := range []hopper.JobID{snoozing.Job.ID, failing.Job.ID} {
+		if job, err := b.JobRetryTx(ctx, tx, id, hopper.IfRunning()); err != nil || job.State != hopper.JobStateRunning {
+			t.Fatalf("JobRetryTx IfRunning of a running job = %+v, %v", job, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if job := waitForJob(t, c, snoozing.Job.ID, hopper.JobStateCompleted); calls[0].Load() != 2 {
+		t.Errorf("woken job = %+v after %d calls", job, calls[0].Load())
+	}
+	if job := waitForJob(t, c, failing.Job.ID, hopper.JobStateDiscarded); calls[1].Load() != 1 {
+		t.Errorf("woken job on its last attempt = %+v after %d calls", job, calls[1].Load())
+	}
+}
+
 func TestTTLDiscardsUnstartedJobs(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t)

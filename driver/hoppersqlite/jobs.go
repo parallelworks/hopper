@@ -837,6 +837,12 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 			}
 			_, err = x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id = ? AND job_id = ?`, idParam(job.BatchID), idParam(id))
 			return err
+		case row.job.State == driver.JobStateRunning && params.IfRunning:
+			// The mark is never dated before the attempt, which the finalize
+			// would take for a mark of an earlier attempt.
+			job, err = scanJob(x.QueryRowContext(ctx, `UPDATE hopper_jobs SET wake_requested_at = max(?, coalesce(attempted_at, 0))
+				WHERE id = ? RETURNING `+jobColumns, x.us(), idParam(id)), false)
+			return err
 		case row.job.State == driver.JobStateRunning:
 			return driver.ErrJobRunning
 		}
