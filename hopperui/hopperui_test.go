@@ -198,6 +198,9 @@ func TestUI(t *testing.T) {
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())
 	want(200, body, code, "canceled", "/retry")
+	// A wake from a page that showed the job running leaves it finished.
+	code, body = post(admin, "/jobs/"+job.Job.ID.String()+"/retry", url.Values{"if": {"running"}}, true)
+	want(409, body, code, "job is canceled; a wake leaves a finished job alone")
 	code, _ = post(admin, "/jobs/"+job.Job.ID.String()+"/retry", nil, true)
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())
@@ -244,6 +247,25 @@ func TestUI(t *testing.T) {
 	}
 	code, body = post(admin, "/jobs/"+busy.Job.ID.String()+"/delete", nil, true)
 	want(409, body, code, "running")
+	// A running job offers a wake instead of a retry, which marks it.
+	code, body = get(admin, "/jobs/"+busy.Job.ID.String())
+	want(200, body, code, `<input type="hidden" name="if" value="running">`)
+	if strings.Contains(body, "run now") {
+		t.Error("a running job offers a run now")
+	}
+	code, body = post(admin, "/jobs/"+busy.Job.ID.String()+"/retry", nil, true)
+	want(409, body, code, "running")
+	var woken bool
+	if err := pool.QueryRow(ctx, "SELECT wake_requested_at IS NOT NULL FROM hopper_jobs WHERE id = $1", [16]byte(busy.Job.ID)).Scan(&woken); err != nil || woken {
+		t.Fatalf("retry without the option marked the running job: %v, %v", woken, err)
+	}
+	code, body = post(admin, "/jobs/"+busy.Job.ID.String()+"/retry", url.Values{"if": {"running"}, "from": {"start"}}, true)
+	want(400, body, code, "from the start")
+	code, _ = post(admin, "/jobs/"+busy.Job.ID.String()+"/retry", url.Values{"if": {"running"}}, true)
+	want(303, "", code)
+	if err := pool.QueryRow(ctx, "SELECT wake_requested_at IS NOT NULL FROM hopper_jobs WHERE id = $1", [16]byte(busy.Job.ID)).Scan(&woken); err != nil || !woken {
+		t.Errorf("wake left no mark on the running job: %v, %v", woken, err)
+	}
 	leased, err := client.Insert(ctx, ping{N: 4}, &hopper.InsertOpts{Queue: "busy"})
 	if err != nil {
 		t.Fatal(err)

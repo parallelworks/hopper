@@ -123,7 +123,8 @@
   {{if $.Data.Live}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/cancel"><button>cancel</button></form>{{end}}
   {{if ne (print .State) "running"}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/retry"><button>{{if $.Data.Live}}run now{{else}}retry{{end}}</button></form>
   {{if .Progress}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/retry"><input type="hidden" name="from" value="start"><button>{{if $.Data.Live}}run now{{else}}retry{{end}} from the start</button></form>{{end}}
-  <details class="confirm"><summary>delete</summary><form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/delete"><button>delete permanently</button></form></details>{{end}}
+  <details class="confirm"><summary>delete</summary><form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/delete"><button>delete permanently</button></form></details>
+  {{else}}<form method="post" action="{{$.Prefix}}/jobs/{{.ID}}/retry"><input type="hidden" name="if" value="running"><button title="if this attempt ends in a snooze or a retry, run it again at once">wake after this attempt</button></form>{{end}}
 </p>{{end}}
 <dl>
   <dt>created</dt><dd>{{ts .CreatedAt}}</dd>

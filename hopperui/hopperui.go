@@ -382,10 +382,30 @@ func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var opts []hopper.RetryOption
-		if r.FormValue("from") == "start" {
+		fromStart, ifRunning := r.FormValue("from") == "start", r.FormValue("if") == "running"
+		if fromStart && ifRunning {
+			// No page sends both, which JobRetry refuses.
+			http.Error(w, "a wake of a running job cannot run it from the start", http.StatusBadRequest)
+			return
+		}
+		if fromStart {
 			opts = append(opts, hopper.FromStart())
 		}
+		if ifRunning {
+			opts = append(opts, hopper.IfRunning())
+		}
 		job, err = u.client.JobRetry(r.Context(), id, opts...)
+		switch {
+		case err != nil:
+		case job.State == hopper.JobStateRunning:
+			u.back(w, r, "/jobs/"+id.String(), "job is running: it runs again at once if this attempt ends in a snooze or a retry")
+			return
+		case ifRunning && job.State.Terminal():
+			// The page showed the job running before it finished; a wake
+			// leaves a finished job alone.
+			http.Error(w, fmt.Sprintf("hopper: job is %s; a wake leaves a finished job alone", job.State), http.StatusConflict)
+			return
+		}
 	case "cancel":
 		if !u.authorize(w, r, ActionCancel) {
 			return

@@ -1745,7 +1745,24 @@ func (e *Executor) JobDelete(ctx context.Context, id driver.JobID) (*driver.JobR
 // transaction's began earlier.
 const jobRunNowSQL = `state = 'available', scheduled_at = least(scheduled_at, statement_timestamp()), snooze_reason = NULL, wake_requested_at = NULL`
 
+// jobWakeMarkSQL is the SET item of a wake that finds a job running
+// (JobRetryOrderingKey, JobRetry with IfRunning), which its finalize
+// honors. The mark is the statement's time, not the transaction's: in a
+// caller's transaction that began before the attempt, now() would date it
+// before attempted_at. Nor is it ever dated before the attempt, even on a
+// clock stepped back: the finalize takes such a mark for one of an earlier
+// attempt.
+const jobWakeMarkSQL = `wake_requested_at = greatest(statement_timestamp(), attempted_at)`
+
 var (
+	// jobMarkRunningSQL marks a running job that JobRetry with IfRunning
+	// found, holding its row, so that its finalize honors the wake. It
+	// clears the TTL, as a retry of a waiting job does, so that whether the
+	// wake overrides the deadline does not depend on when the attempt ends.
+	jobMarkRunningSQL = fmt.Sprintf(`
+UPDATE {{schema}}.hopper_jobs SET `+jobWakeMarkSQL+`, expires_at = NULL
+WHERE id = $1 AND `+isRunning("state")+`
+RETURNING %s`, JobColumns(""))
 	jobRetryLiveSQL = fmt.Sprintf(`
 UPDATE {{schema}}.hopper_jobs SET `+jobRunNowSQL+`, expires_at = NULL, progress = CASE WHEN $2 THEN NULL ELSE progress END
 WHERE id = $1 AND state <> 'running'
@@ -1808,6 +1825,14 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 		var state string
 		err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
 		switch {
+		case errors.Is(err, ErrNoRows) && params.IfRunning:
+			// A wake leaves a finished job alone, one that finished while
+			// the wake waited for its row among them.
+			job, err = scanJob(tx.QueryRow(ctx, jobGetQuery, uuidParam(id)), true, new(sql.NullTime))
+			if errors.Is(err, ErrNoRows) {
+				return driver.ErrNotFound
+			}
+			return err
 		case errors.Is(err, ErrNoRows):
 			var failed bool
 			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id), params.FromStart), false, &failed)
@@ -1843,6 +1868,9 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 			return err
 		case err != nil:
 			return err
+		case driver.JobState(state) == driver.JobStateRunning && params.IfRunning:
+			job, err = scanJob(tx.QueryRow(ctx, jobMarkRunningSQL, uuidParam(id)), false)
+			return err
 		case driver.JobState(state) == driver.JobStateRunning:
 			return driver.ErrJobRunning
 		}
@@ -1859,12 +1887,10 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 }
 
 // jobMarkOrderingKeySQL marks the key's running job (through the unique
-// index on running ordering keys) so that its finalize honors the wake. The
-// mark is the statement's time, not the transaction's: in a caller's
-// transaction that began before the attempt, now() would date the mark
-// before attempted_at, and the finalize would take it for a stale one.
+// index on running ordering keys) so that its finalize honors the wake
+// (jobWakeMarkSQL).
 const jobMarkOrderingKeySQL = `
-UPDATE {{schema}}.hopper_jobs SET wake_requested_at = statement_timestamp()
+UPDATE {{schema}}.hopper_jobs SET ` + jobWakeMarkSQL + `
 WHERE queue = $1 AND ordering_key = $2 AND state = 'running'`
 
 // jobRetryOrderingKeySQL locks a batch of the key's waiting jobs in seq

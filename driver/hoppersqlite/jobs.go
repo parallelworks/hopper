@@ -486,14 +486,7 @@ func (e *executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 // JobGet implements driver.Executor.
 func (e *executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
 	var leaseExpiresAt micros
-	job, err := scanJob(e.read().QueryRowContext(ctx, `
-		SELECT `+liveAsHistory+`,
-		  (SELECT l.expires_at FROM hopper_job_leases l WHERE l.id = hopper_jobs.id AND l.fence = hopper_jobs.fence
-		   AND hopper_jobs.attempted_by IS NULL AND hopper_jobs.state = 'running')
-		FROM hopper_jobs WHERE id = ?1
-		UNION ALL
-		SELECT `+historyColumns+`, NULL FROM hopper_job_history WHERE id = ?1
-		LIMIT 1`, idParam(id)), true, &leaseExpiresAt)
+	job, err := scanJob(e.read().QueryRowContext(ctx, jobGetSQL, idParam(id)), true, &leaseExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, driver.ErrNotFound
 	}
@@ -503,6 +496,16 @@ func (e *executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow,
 	job.LeaseExpiresAt = leaseExpiresAt.time()
 	return job, nil
 }
+
+// jobGetSQL reads a job, live or from history, with its job lease's expiry.
+const jobGetSQL = `
+SELECT ` + liveAsHistory + `,
+  (SELECT l.expires_at FROM hopper_job_leases l WHERE l.id = hopper_jobs.id AND l.fence = hopper_jobs.fence
+   AND hopper_jobs.attempted_by IS NULL AND hopper_jobs.state = 'running')
+FROM hopper_jobs WHERE id = ?1
+UNION ALL
+SELECT ` + historyColumns + `, NULL FROM hopper_job_history WHERE id = ?1
+LIMIT 1`
 
 // JobLogs implements driver.Executor.
 func (e *executor) JobLogs(ctx context.Context, id driver.JobID) ([]driver.AttemptLog, error) {
@@ -769,6 +772,13 @@ func (e *executor) JobDelete(ctx context.Context, id driver.JobID) (*driver.JobR
 // scheduled_at, so it keeps its place in claim order and its aging.
 const runNowSQL = `state = 'available', scheduled_at = min(scheduled_at, ?), snooze_reason = NULL, wake_requested_at = NULL`
 
+// wakeMarkSQL is the SET item of a wake that finds a job running
+// (JobRetryOrderingKey, JobRetry with IfRunning), which its finalize
+// honors, given the write's time. The mark is never dated before the
+// attempt, even on a clock stepped back: the finalize takes such a mark for
+// one of an earlier attempt.
+const wakeMarkSQL = `wake_requested_at = max(?, coalesce(attempted_at, 0))`
+
 // retryHistorySQL moves a finalized job back to the live table with its
 // history (attempts, errors, progress unless from the start, logs, fence)
 // intact, a fresh seq, and one more attempt if it had run out. Its tags are
@@ -791,6 +801,13 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 		row, err := x.lockState(ctx, id)
 		switch {
 		case err != nil:
+			return err
+		case row == nil && params.IfRunning:
+			// A wake leaves a finished job alone.
+			job, err = scanJob(x.QueryRowContext(ctx, jobGetSQL, idParam(id)), true, new(micros))
+			if errors.Is(err, sql.ErrNoRows) {
+				return driver.ErrNotFound
+			}
 			return err
 		case row == nil:
 			var (
@@ -837,6 +854,10 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 			}
 			_, err = x.ExecContext(ctx, `DELETE FROM hopper_job_results WHERE batch_id = ? AND job_id = ?`, idParam(job.BatchID), idParam(id))
 			return err
+		case row.job.State == driver.JobStateRunning && params.IfRunning:
+			job, err = scanJob(x.QueryRowContext(ctx, `UPDATE hopper_jobs SET `+wakeMarkSQL+`, expires_at = NULL
+				WHERE id = ? RETURNING `+jobColumns, x.us(), idParam(id)), false)
+			return err
 		case row.job.State == driver.JobStateRunning:
 			return driver.ErrJobRunning
 		}
@@ -861,7 +882,7 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 func (e *executor) JobRetryOrderingKey(ctx context.Context, params driver.JobRetryOrderingKeyParams) (int, error) {
 	var n int64
 	err := e.write(ctx, func(x *w) error {
-		if _, err := x.ExecContext(ctx, `UPDATE hopper_jobs SET wake_requested_at = ?
+		if _, err := x.ExecContext(ctx, `UPDATE hopper_jobs SET `+wakeMarkSQL+`
 			WHERE queue = ? AND ordering_key = ? AND state = 'running'`, x.us(), params.Queue, params.OrderingKey); err != nil {
 			return err
 		}

@@ -18,8 +18,9 @@ import (
 
 // Sentinel errors from control operations.
 var (
-	// ErrJobRunning is returned by JobRetry and JobDelete for a running
-	// job, and by Leases.Claim for a job running at the fence it names.
+	// ErrJobRunning is returned by JobRetry (unless IfRunning) and
+	// JobDelete for a running job, and by Leases.Claim for a job running at
+	// the fence it names.
 	ErrJobRunning = driver.ErrJobRunning
 	// ErrUniqueConflict is returned by JobRetry when a live job holds the
 	// same unique key.
@@ -65,7 +66,8 @@ func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, id JobID) (*JobRo
 // explicit retry overrides the wait, so the job's TTL no longer applies:
 // a job past its deadline still runs. The job resumes from its progress
 // (RecordStep), unless FromStart is given. It returns ErrJobRunning for a
-// running job.
+// running job, unless IfRunning is given, which also leaves a finished job
+// alone.
 //
 // A job of a batch or workflow that has not completed, re-driven from
 // history, counts in it as pending again and no longer as failed, so one
@@ -76,9 +78,13 @@ func (c *Client[TTx]) JobCancelTx(ctx context.Context, tx TTx, id JobID) (*JobRo
 // a batch whose last other job finishes while the retry commits may
 // complete without it, as with JobRetryTx.
 func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID, opts ...RetryOption) (*JobRow, error) {
-	job, err := c.exec.JobRetry(ctx, retryParams(id, opts))
+	p, err := retryParams(id, opts)
 	if err != nil {
 		return nil, err
+	}
+	job, err := c.exec.JobRetry(ctx, p)
+	if err != nil || job.State == JobStateRunning || job.State.Terminal() {
+		return job, err
 	}
 	c.wakeQueue(job.Queue)
 	c.notifier.mark(job.Queue)
@@ -89,12 +95,17 @@ func (c *Client[TTx]) JobRetry(ctx context.Context, id JobID, opts ...RetryOptio
 // is woken when the transaction commits. Until then the job's batch does
 // not see it as pending again: on Postgres, a batch whose last other job
 // finishes meanwhile completes without it, with its failure if it had
-// failed.
+// failed. A running job that IfRunning marks has its result wait for tx,
+// as with JobRetryOrderingKeyTx: call it late in tx.
 func (c *Client[TTx]) JobRetryTx(ctx context.Context, tx TTx, id JobID, opts ...RetryOption) (*JobRow, error) {
-	exec := c.driver.UnwrapTx(tx)
-	job, err := exec.JobRetry(ctx, retryParams(id, opts))
+	p, err := retryParams(id, opts)
 	if err != nil {
 		return nil, err
+	}
+	exec := c.driver.UnwrapTx(tx)
+	job, err := exec.JobRetry(ctx, p)
+	if err != nil || job.State == JobStateRunning || job.State.Terminal() {
+		return job, err
 	}
 	if err := exec.Notify(ctx, driver.ChannelInsert, []string{job.Queue}); err != nil {
 		return nil, err
@@ -112,12 +123,41 @@ func FromStart() RetryOption {
 	return func(p *driver.JobRetryParams) { p.FromStart = true }
 }
 
-func retryParams(id JobID, opts []RetryOption) driver.JobRetryParams {
+// IfRunning makes JobRetry a wake, for a caller that changed what a job
+// waits for: a waiting job is brought forward as JobRetry does, a running
+// job is marked instead of refused, and a finished job (completed,
+// canceled or discarded) is left alone and returned as it is, with no
+// error. A supervisor's late wake never restarts finished work, including
+// a wake that waited for the row while the attempt's finish was written.
+//
+// A marked job is returned still running. If its attempt then ends in a
+// snooze or a retry, the job is runnable at once instead of after its
+// delay, as with JobRetryOrderingKey, and without the snooze's reason. A
+// completion, a cancel or a discard, a retry on the job's last attempt
+// among them, is not changed, and neither is an attempt the leader rescues
+// or whose job lease expires, which is retried at once anyway, or
+// discarded on its last attempt. The mark is the attempt's: the next
+// attempt does not see it.
+//
+// The mark is set while the job's row is held by the statement that found
+// it running, and the finalize reads it holding the row too, so a wake is
+// never lost: either it finds the attempt over and brings the job forward,
+// or the attempt's result, written after it, finds the mark. As a retry
+// does, the wake clears the TTL of a job it marks or brings forward. It
+// cannot be combined with FromStart.
+func IfRunning() RetryOption {
+	return func(p *driver.JobRetryParams) { p.IfRunning = true }
+}
+
+func retryParams(id JobID, opts []RetryOption) (driver.JobRetryParams, error) {
 	p := driver.JobRetryParams{ID: id}
 	for _, o := range opts {
 		o(&p)
 	}
-	return p
+	if p.FromStart && p.IfRunning {
+		return p, errors.New("hopper: FromStart and IfRunning cannot be combined")
+	}
+	return p, nil
 }
 
 // JobDelete removes a job that is not running, from the live table or from

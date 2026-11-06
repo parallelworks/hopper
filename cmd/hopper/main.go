@@ -4,7 +4,7 @@
 //	hopper jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-priority P]
 //	                 [-tag T]... [-any-tag T]... [-metadata JSON] [-id ID]... [-newest] [-limit N]
 //	hopper jobs get|retry|cancel|delete <id>
-//	hopper jobs retry -from-start <id>
+//	hopper jobs retry [-from-start] [-if-running] <id>
 //	hopper queues list|pause|resume [name]
 //	hopper queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]
 //	hopper clients list
@@ -60,7 +60,7 @@ commands:
   jobs list [-queue Q] [-kind K] [-state S] [-ordering-key K] [-priority P]
             [-tag T]... [-any-tag T]... [-metadata JSON] [-id ID]... [-newest] [-limit N]
   jobs get|retry|cancel|delete <id>
-  jobs retry -from-start <id>
+  jobs retry [-from-start] [-if-running] <id>   (-if-running: a running job runs again at once if its attempt snoozes or retries)
   queues list
   queues pause|resume <name>
   queues limit <name> [-global N] [-rate R] [-burst B] [-partition P] [-aging D]   (omitted limits are removed)
@@ -248,16 +248,23 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 			tw.Flush()
 		})
 	case "get", "retry", "cancel", "delete":
-		var opts []hopper.RetryOption
+		var (
+			opts []hopper.RetryOption
+			wake bool
+		)
 		if args[0] == "retry" {
 			fs := flag.NewFlagSet("hopper jobs retry", flag.ContinueOnError)
 			fs.SetOutput(c.out)
 			fromStart := fs.Bool("from-start", false, "clear the job's progress, so that it runs all its steps again")
+			ifRunning := fs.Bool("if-running", false, "if the job is running, run it again at once if its attempt ends in a snooze or a retry")
 			if err := fs.Parse(args[1:]); err != nil {
 				return err
 			}
 			if *fromStart {
 				opts = append(opts, hopper.FromStart())
+			}
+			if wake = *ifRunning; wake {
+				opts = append(opts, hopper.IfRunning())
 			}
 			args = append(args[:1], fs.Args()...)
 		}
@@ -307,6 +314,9 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		}
 		if logsErr != nil {
 			return fmt.Errorf("jobs get: read the job's logs: %w", logsErr)
+		}
+		if wake && job.State.Terminal() {
+			return fmt.Errorf("jobs retry -if-running: the job is %s; a wake leaves a finished job alone", job.State)
 		}
 		return nil
 	default:
