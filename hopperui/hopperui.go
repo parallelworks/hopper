@@ -395,8 +395,15 @@ func (u *ui[TTx]) jobAction(w http.ResponseWriter, r *http.Request) {
 			opts = append(opts, hopper.IfRunning())
 		}
 		job, err = u.client.JobRetry(r.Context(), id, opts...)
-		if err == nil && job.State == hopper.JobStateRunning {
+		switch {
+		case err != nil:
+		case job.State == hopper.JobStateRunning:
 			u.back(w, r, "/jobs/"+id.String(), "job is running: it runs again at once if this attempt ends in a snooze or a retry")
+			return
+		case ifRunning && job.State.Terminal():
+			// The page showed the job running before it finished; a wake
+			// leaves a finished job alone.
+			http.Error(w, fmt.Sprintf("hopper: job is %s; a wake leaves a finished job alone", job.State), http.StatusConflict)
 			return
 		}
 	case "cancel":

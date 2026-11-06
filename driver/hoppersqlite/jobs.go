@@ -486,14 +486,7 @@ func (e *executor) JobRecordProgress(ctx context.Context, params driver.JobRecor
 // JobGet implements driver.Executor.
 func (e *executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow, error) {
 	var leaseExpiresAt micros
-	job, err := scanJob(e.read().QueryRowContext(ctx, `
-		SELECT `+liveAsHistory+`,
-		  (SELECT l.expires_at FROM hopper_job_leases l WHERE l.id = hopper_jobs.id AND l.fence = hopper_jobs.fence
-		   AND hopper_jobs.attempted_by IS NULL AND hopper_jobs.state = 'running')
-		FROM hopper_jobs WHERE id = ?1
-		UNION ALL
-		SELECT `+historyColumns+`, NULL FROM hopper_job_history WHERE id = ?1
-		LIMIT 1`, idParam(id)), true, &leaseExpiresAt)
+	job, err := scanJob(e.read().QueryRowContext(ctx, jobGetSQL, idParam(id)), true, &leaseExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, driver.ErrNotFound
 	}
@@ -503,6 +496,16 @@ func (e *executor) JobGet(ctx context.Context, id driver.JobID) (*driver.JobRow,
 	job.LeaseExpiresAt = leaseExpiresAt.time()
 	return job, nil
 }
+
+// jobGetSQL reads a job, live or from history, with its job lease's expiry.
+const jobGetSQL = `
+SELECT ` + liveAsHistory + `,
+  (SELECT l.expires_at FROM hopper_job_leases l WHERE l.id = hopper_jobs.id AND l.fence = hopper_jobs.fence
+   AND hopper_jobs.attempted_by IS NULL AND hopper_jobs.state = 'running')
+FROM hopper_jobs WHERE id = ?1
+UNION ALL
+SELECT ` + historyColumns + `, NULL FROM hopper_job_history WHERE id = ?1
+LIMIT 1`
 
 // JobLogs implements driver.Executor.
 func (e *executor) JobLogs(ctx context.Context, id driver.JobID) ([]driver.AttemptLog, error) {
@@ -798,6 +801,13 @@ func (e *executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 		row, err := x.lockState(ctx, id)
 		switch {
 		case err != nil:
+			return err
+		case row == nil && params.IfRunning:
+			// A wake leaves a finished job alone.
+			job, err = scanJob(x.QueryRowContext(ctx, jobGetSQL, idParam(id)), true, new(micros))
+			if errors.Is(err, sql.ErrNoRows) {
+				return driver.ErrNotFound
+			}
 			return err
 		case row == nil:
 			var (

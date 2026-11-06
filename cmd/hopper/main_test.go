@@ -178,6 +178,10 @@ func TestCLI(t *testing.T) {
 	if got := hopperCmd("jobs", "cancel", id); !strings.Contains(got, "state:         canceled") {
 		t.Errorf("jobs cancel = %q", got)
 	}
+	var wakeOut bytes.Buffer
+	if err := run(ctx, []string{"-schema", schema, "jobs", "retry", "-if-running", id}, &wakeOut); err == nil || !strings.Contains(err.Error(), "finished job alone") || !strings.Contains(wakeOut.String(), "state:         canceled") {
+		t.Errorf("jobs retry -if-running of a canceled job = %v, %q", err, wakeOut.String())
+	}
 	if got := hopperCmd("jobs", "retry", id); !strings.Contains(got, "state:         available") {
 		t.Errorf("jobs retry = %q", got)
 	}

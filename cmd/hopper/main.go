@@ -248,7 +248,10 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 			tw.Flush()
 		})
 	case "get", "retry", "cancel", "delete":
-		var opts []hopper.RetryOption
+		var (
+			opts []hopper.RetryOption
+			wake bool
+		)
 		if args[0] == "retry" {
 			fs := flag.NewFlagSet("hopper jobs retry", flag.ContinueOnError)
 			fs.SetOutput(c.out)
@@ -260,7 +263,7 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 			if *fromStart {
 				opts = append(opts, hopper.FromStart())
 			}
-			if *ifRunning {
+			if wake = *ifRunning; wake {
 				opts = append(opts, hopper.IfRunning())
 			}
 			args = append(args[:1], fs.Args()...)
@@ -311,6 +314,9 @@ func (c *cli) jobs(ctx context.Context, args []string) error {
 		}
 		if logsErr != nil {
 			return fmt.Errorf("jobs get: read the job's logs: %w", logsErr)
+		}
+		if wake && job.State.Terminal() {
+			return fmt.Errorf("jobs retry -if-running: the job is %s; a wake leaves a finished job alone", job.State)
 		}
 		return nil
 	default:

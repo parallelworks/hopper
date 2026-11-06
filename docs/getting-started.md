@@ -164,7 +164,8 @@ return &hopper.SnoozeError{Duration: 10 * time.Minute, Reason: "export not ready
 A job that snoozes to look at something again later can be woken early by the
 transaction that changes it. With `hopper.IfRunning()`, the wake is not lost if
 the job is running at the time: if that attempt then snoozes or retries, the
-job runs again at once instead.
+job runs again at once instead. A job that has already finished is left alone,
+so a late wake never restarts finished work.
 
 ```go
 client.JobRetryTx(ctx, tx, supervisorID, hopper.IfRunning())
@@ -685,7 +686,7 @@ A few rules apply to leased jobs:
 ```go
 client.JobCancel(ctx, id)            // any live job, on any replica
 client.JobRetry(ctx, id)             // re-drive from the dead-letter queue
-client.JobRetry(ctx, id, hopper.IfRunning()) // run now, or right after its running attempt snoozes or retries
+client.JobRetry(ctx, id, hopper.IfRunning()) // wake: run now, or right after its running attempt snoozes or retries; finished jobs are left alone
 client.JobRetryOrderingKey(ctx, queue, key) // run a key's waiting jobs now
 client.JobDelete(ctx, id)            // remove a job that is not running
 job, err := client.JobGet(ctx, id)   // live or historical

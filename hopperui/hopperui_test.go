@@ -198,6 +198,9 @@ func TestUI(t *testing.T) {
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())
 	want(200, body, code, "canceled", "/retry")
+	// A wake from a page that showed the job running leaves it finished.
+	code, body = post(admin, "/jobs/"+job.Job.ID.String()+"/retry", url.Values{"if": {"running"}}, true)
+	want(409, body, code, "job is canceled; a wake leaves a finished job alone")
 	code, _ = post(admin, "/jobs/"+job.Job.ID.String()+"/retry", nil, true)
 	want(303, "", code)
 	code, body = get(admin, "/jobs/"+job.Job.ID.String())

@@ -1825,6 +1825,14 @@ func (e *Executor) JobRetry(ctx context.Context, params driver.JobRetryParams) (
 		var state string
 		err := tx.QueryRow(ctx, jobLockStateSQL, uuidParam(id)).Scan(&state)
 		switch {
+		case errors.Is(err, ErrNoRows) && params.IfRunning:
+			// A wake leaves a finished job alone, one that finished while
+			// the wake waited for its row among them.
+			job, err = scanJob(tx.QueryRow(ctx, jobGetQuery, uuidParam(id)), true, new(sql.NullTime))
+			if errors.Is(err, ErrNoRows) {
+				return driver.ErrNotFound
+			}
+			return err
 		case errors.Is(err, ErrNoRows):
 			var failed bool
 			job, err = scanJob(tx.QueryRow(ctx, jobRetryHistorySQL, uuidParam(id), params.FromStart), false, &failed)

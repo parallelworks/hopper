@@ -235,7 +235,8 @@ type Executor interface {
 	// by the retry or by the job's next finish. With params.IfRunning, a
 	// running job is marked instead, while the row lock that found it
 	// running is held, as JobRetryOrderingKey marks one, has its TTL
-	// cleared as a retry's is, and is returned still running.
+	// cleared as a retry's is, and is returned still running; a finished
+	// job, live or in history, is returned unchanged.
 	JobRetry(ctx context.Context, params JobRetryParams) (*JobRow, error)
 	// JobDelete removes a job that is not running and returns it as it was
 	// last stored. A waiting job is canceled as JobCancel does, so its
@@ -682,7 +683,7 @@ type JobRetryParams struct {
 	FromStart bool
 	// IfRunning marks a running job, and clears its TTL, rather than
 	// return ErrJobRunning: if its attempt ends in a snooze or a retry, the
-	// job is runnable at once.
+	// job is runnable at once. A finished job is left alone and returned.
 	IfRunning bool
 }
 

@@ -114,13 +114,20 @@ func testRetryIfRunning[TTx any](t *testing.T, f Fixture[TTx]) {
 	}
 	remove(id)
 
-	// A terminal end is not changed.
+	// A terminal end is not changed, and a wake of the finished job, unlike
+	// a retry, leaves it alone and returns it.
 	for _, state := range []driver.JobState{driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded} {
 		id = start()
 		wakeRunning(ctx, t, exec, id)
 		finalizeCurrent(ctx, t, exec, driver.JobFinalize{ID: id, AttemptedBy: clientID, State: state, Archive: true})
 		if j := get(ctx, t, exec, id); j.State != state {
 			t.Errorf("woken job ending %s = %+v", state, j)
+		}
+		if j, err := exec.JobRetry(ctx, driver.JobRetryParams{ID: id, IfRunning: true}); err != nil || j.ID != id || j.State != state {
+			t.Errorf("JobRetry IfRunning of a %s job = %+v, %v", state, j, err)
+		}
+		if j := get(ctx, t, exec, id); j.State != state || f.CountLive(ctx, t, d) != 0 {
+			t.Errorf("%s job after a wake = %+v, %d live", state, j, f.CountLive(ctx, t, d))
 		}
 	}
 
@@ -258,5 +265,39 @@ func testRetryIfRunningTx[TTx any](t *testing.T, f Fixture[TTx]) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// testRetryIfRunningRacesFinish wakes a running job while a transaction
+// holds the finish of its attempt: the wake waits for the row, finds the
+// job finished once the transaction commits, and leaves it alone.
+func testRetryIfRunningRacesFinish[TTx any](t *testing.T, f Fixture[TTx]) {
+	ctx := context.Background()
+	d := f.NewDriver(t)
+	exec := d.Executor()
+	clientID := register(ctx, t, exec)
+	for _, state := range []driver.JobState{driver.JobStateCompleted, driver.JobStateCanceled, driver.JobStateDiscarded} {
+		id := insert(ctx, t, exec, params("k", 1))[0].Job.ID
+		claimOne(ctx, t, exec, clientID, id)
+		tx, commit, rollback := f.Begin(ctx, t, d)
+		defer rollback() //nolint:errcheck // committed below
+		finalizeCurrent(ctx, t, d.UnwrapTx(tx), driver.JobFinalize{ID: id, AttemptedBy: clientID, State: state, Archive: true})
+		var (
+			wg   sync.WaitGroup
+			woke *driver.JobRow
+			err  error
+		)
+		wg.Go(func() { woke, err = exec.JobRetry(ctx, driver.JobRetryParams{ID: id, IfRunning: true}) })
+		f.WaitForLockWait(ctx, t, d)
+		if err := commit(); err != nil {
+			t.Fatal(err)
+		}
+		wg.Wait()
+		if err != nil || woke.State != state {
+			t.Fatalf("a wake that waited for a %s finish = %+v, %v", state, woke, err)
+		}
+		if j := get(ctx, t, exec, id); j.State != state || f.CountLive(ctx, t, d) != 0 {
+			t.Fatalf("a wake that waited for a %s finish re-ran the job: %+v", state, j)
+		}
 	}
 }

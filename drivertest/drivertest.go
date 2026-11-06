@@ -166,6 +166,7 @@ func Run[TTx any](t *testing.T, f Fixture[TTx]) {
 		{"RetryIfRunning", testRetryIfRunning[TTx]},
 		{"RetryIfRunningConcurrent", testRetryIfRunningConcurrent[TTx]},
 		{"RetryIfRunningTx", testRetryIfRunningTx[TTx]},
+		{"RetryIfRunningRacesFinish", testRetryIfRunningRacesFinish[TTx]},
 		{"TTL", testTTL[TTx]},
 		{"SnoozeReason", func(t *testing.T, f Fixture[TTx]) { testSnoozeReason(t, f, false) }},
 		{"SnoozeReasonNoBatches", func(t *testing.T, f Fixture[TTx]) { testSnoozeReason(t, f, true) }},
