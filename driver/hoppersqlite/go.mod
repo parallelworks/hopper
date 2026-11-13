@@ -10,8 +10,8 @@ godebug fips140=only
 
 require (
 	github.com/parallelworks/hopper v0.12.2 // x-release-please-version
-	golang.org/x/sys v0.49.0
-	modernc.org/sqlite v1.61.0
+	golang.org/x/sys v0.50.0
+	modernc.org/sqlite v1.61.1
 )
 
 require (

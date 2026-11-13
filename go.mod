@@ -8,7 +8,7 @@ toolchain go1.27.3
 // fips140=only mode proves that nothing non-approved sneaks in.
 godebug fips140=only
 
-require github.com/jackc/pgx/v5 v5.11.0
+require github.com/jackc/pgx/v5 v5.12.0
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
