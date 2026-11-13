@@ -7,7 +7,7 @@ toolchain go1.27.3
 godebug fips140=only
 
 require (
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/parallelworks/hopper v0.12.2 // x-release-please-version
 )
 
